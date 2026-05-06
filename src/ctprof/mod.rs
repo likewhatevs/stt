@@ -932,7 +932,12 @@ pub struct ThreadState {
     /// wake-side tally.
     /// Zero on kernels without `CONFIG_SCHEDSTATS`. Zero under
     /// sched_ext: `__update_stats_enqueue_sleeper` is called
-    /// from CFS/RT/DL paths only.
+    /// from CFS/RT/DL paths only. Also zero when either
+    /// `sum_sleep_runtime` or `sum_block_runtime` fails to parse
+    /// from `/proc/<tid>/sched`: the residual is uncomputable
+    /// without both halves, and falling back to the unsubtracted
+    /// `sum_sleep_runtime` would mislabel involuntary block as
+    /// voluntary sleep.
     pub voluntary_sleep_ns: crate::metric_types::MonotonicNs,
     /// Longest single sleep window in nanoseconds.
     /// `/proc/<tid>/sched` `sleep_max` emitted via `PN_SCHEDSTAT`
@@ -2175,27 +2180,36 @@ fn capture_thread_at_with_tally(
         // sleep — the operationally useful signal — and avoids the
         // need for a derived metric at compare time.
         //
-        // `saturating_sub` is defense-in-depth against TWO
-        // distinct underflow paths:
-        // 1. Kernel ordering: `__update_stats_enqueue_sleeper`
-        //    adds to `sum_sleep_runtime` BEFORE adding the same
-        //    delta to `sum_block_runtime`, so an in-tree kernel
-        //    today never produces `block > sleep`.
-        // 2. Parse asymmetry: `parse_sched` returns
-        //    `Option<u64>` per field — `sum_sleep_runtime` may
-        //    fail to parse while `sum_block_runtime` succeeds
-        //    (or vice versa). The `unwrap_or(0)` chains then
-        //    yield `0_u64.saturating_sub(real_block)`, which
-        //    would wrap on plain `-` but saturates to 0 here.
-        //    This is the more frequent underflow path in
-        //    practice — kernel changes are rare, parse misses
-        //    can happen on any kernel that drifts the
-        //    `se.statistics.` prefix or omits a field.
+        // The subtraction is only meaningful when BOTH halves
+        // parsed successfully. If `sum_block_runtime` is missing,
+        // an `unwrap_or(0)` fallback would yield
+        // `sum_sleep_runtime - 0 = full_sleep_total`, mislabelling
+        // the involuntary-block component as voluntary sleep and
+        // breaking the field-doc contract ("voluntary only"). If
+        // `sum_sleep_runtime` is missing, the fallback would yield
+        // `0 - block`, which `saturating_sub` collapses to 0 but
+        // also discards any real voluntary signal that might have
+        // been recorded if the kernel had emitted both. Either
+        // half-missing case means the value is uncomputable, so
+        // it falls through to 0 — matching the "absent data → 0"
+        // convention used by every sibling field at this site
+        // (e.g. `wait_sum`, `sleep_max`, `block_sum`) and
+        // co-locating with the existing `block_sum: 0` that the
+        // same parse miss already produces below.
+        //
+        // `saturating_sub` remains in the both-Some path as
+        // defense against the kernel-ordering edge case:
+        // `__update_stats_enqueue_sleeper` adds to
+        // `sum_sleep_runtime` BEFORE adding the same delta to
+        // `sum_block_runtime`, so a sample read between those
+        // writes can transiently yield `block > sleep` even
+        // though every in-tree path eventually settles to
+        // `block <= sleep`.
         voluntary_sleep_ns: MonotonicNs(
-            sched
-                .sleep_sum
-                .unwrap_or(0)
-                .saturating_sub(sched.block_sum.unwrap_or(0)),
+            match (sched.sleep_sum, sched.block_sum) {
+                (Some(sleep), Some(block)) => sleep.saturating_sub(block),
+                _ => 0,
+            },
         ),
         sleep_max: PeakNs(sched.sleep_max.unwrap_or(0)),
         block_sum: MonotonicNs(sched.block_sum.unwrap_or(0)),
@@ -2877,9 +2891,8 @@ fn capture_with(
     // the new upper-layer inode — so the cache misses correctly
     // and re-resolves the rewritten binary.
     let tgids = iter_tgids_at(proc_root);
-    let probe_cache: std::sync::Mutex<
-        std::collections::HashMap<(u64, u64), CachedAttachResult>,
-    > = std::sync::Mutex::new(std::collections::HashMap::new());
+    let probe_cache: std::sync::Mutex<std::collections::HashMap<(u64, u64), CachedAttachResult>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
     let summary_mutex = std::sync::Mutex::new(ProbeSummary::default());
 
     let probe_map: std::collections::HashMap<i32, Option<crate::host_thread_probe::JemallocProbe>> =
@@ -2913,201 +2926,202 @@ fn capture_with(
                 .build();
             let work = || {
                 tgids
-                .par_iter()
-                .copied()
-                .filter(|&tgid| tgid != self_pid)
-                .map(|tgid| {
-                    // Catch panics from the per-tgid attach pipeline so
-                    // a single rogue worker (fd exhaustion, OOM during
-                    // DWARF parse, or any panic-on-bug under
-                    // `attach_jemalloc_at`) cannot tear down
-                    // `pool.install` and the surrounding capture call.
-                    // Without this guard, `rayon::ThreadPool::install`
-                    // re-throws worker panics into the calling thread,
-                    // collapsing the entire snapshot into an unwind on
-                    // a single tgid's failure. On panic we record a
-                    // `worker-panic` attach tag against the summary
-                    // (counted under `failed`, surfaced in
-                    // `dominant_failure` when it dominates) and return
-                    // `(tgid, None)` so phase 2 still walks the tgid's
-                    // threads with the absent-counter default. The tag
-                    // is treated as actionable — a panicking attach is
-                    // a bug or resource-exhaustion signal, distinct
-                    // from the benign `jemalloc-not-found` /
-                    // `readlink-failure` outcomes the dominant-tag
-                    // filter suppresses.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let cache_key = std::fs::metadata(
-                            proc_root.join(tgid.to_string()).join("exe"),
-                        )
-                        .ok()
-                        .map(|m| {
-                            use std::os::unix::fs::MetadataExt;
-                            (m.dev(), m.ino())
-                        });
+                    .par_iter()
+                    .copied()
+                    .filter(|&tgid| tgid != self_pid)
+                    .map(|tgid| {
+                        // Catch panics from the per-tgid attach pipeline so
+                        // a single rogue worker (fd exhaustion, OOM during
+                        // DWARF parse, or any panic-on-bug under
+                        // `attach_jemalloc_at`) cannot tear down
+                        // `pool.install` and the surrounding capture call.
+                        // Without this guard, `rayon::ThreadPool::install`
+                        // re-throws worker panics into the calling thread,
+                        // collapsing the entire snapshot into an unwind on
+                        // a single tgid's failure. On panic we record a
+                        // `worker-panic` attach tag against the summary
+                        // (counted under `failed`, surfaced in
+                        // `dominant_failure` when it dominates) and return
+                        // `(tgid, None)` so phase 2 still walks the tgid's
+                        // threads with the absent-counter default. The tag
+                        // is treated as actionable — a panicking attach is
+                        // a bug or resource-exhaustion signal, distinct
+                        // from the benign `jemalloc-not-found` /
+                        // `readlink-failure` outcomes the dominant-tag
+                        // filter suppresses.
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let cache_key =
+                                std::fs::metadata(proc_root.join(tgid.to_string()).join("exe"))
+                                    .ok()
+                                    .map(|m| {
+                                        use std::os::unix::fs::MetadataExt;
+                                        (m.dev(), m.ino())
+                                    });
 
-                        if let Some(key) = cache_key {
-                            // `unwrap_or_else(into_inner)` on every
-                            // shared-mutex lock so a prior worker
-                            // panic that poisoned a lock cannot
-                            // cascade-poison every subsequent worker
-                            // — the catch_unwind arm below records
-                            // the failure as a `worker-panic`
-                            // attach-tag bump, and surviving workers
-                            // should still make progress on the
-                            // partially-mutated state rather than
-                            // re-panicking out of `pool.install` and
-                            // collapsing the snapshot.
-                            let cached = probe_cache
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get(&key)
-                                .cloned();
-                            if let Some(cached_result) = cached {
-                                let mut s = summary_mutex
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                s.tgids_walked += 1;
-                                match &cached_result.failed_tag {
-                                    None => {
-                                        // Success path — original miss
-                                        // already credited
-                                        // `jemalloc_detected`. Re-apply
-                                        // here so cache hits stay
-                                        // symmetric with cache misses;
-                                        // without this, only the first
-                                        // sharer of a `(dev, ino)`
-                                        // would count toward
-                                        // `jemalloc_detected` and
-                                        // every subsequent reuse
-                                        // would silently undercount.
-                                        s.jemalloc_detected += 1;
-                                        tracing::debug!(tgid, "ctprof probe: cache hit (jemalloc)");
-                                    }
-                                    Some(tag) => {
-                                        // Failure path — re-apply the
-                                        // SAME bookkeeping
-                                        // [`record_attach_outcome`]
-                                        // applied on the original
-                                        // miss: bump
-                                        // `attach_tag_counts[tag]`
-                                        // unconditionally, and
-                                        // `failed` for actionable
-                                        // tags only (matching the
-                                        // dominant-tag filter in
-                                        // [`ProbeSummary::dominant_tag`]).
-                                        // Without this, repeat hits
-                                        // on a failed binary would
-                                        // credit only `tgids_walked`
-                                        // and the dominant-failure
-                                        // signal would degrade as
-                                        // shared-inode reuse climbs.
-                                        // Logging stays at debug level
-                                        // — the original miss already
-                                        // emitted the warn-level event
-                                        // for actionable tags; spamming
-                                        // a warn per cache hit would
-                                        // drown the operator log.
-                                        *s.attach_tag_counts.entry(tag).or_insert(0) += 1;
-                                        if !matches!(*tag, "jemalloc-not-found" | "readlink-failure") {
-                                            s.failed += 1;
-                                        }
-                                        tracing::debug!(tgid, tag, "ctprof probe: cache hit (prior failure)");
-                                    }
-                                }
-                                cached_result.probe
-                            } else {
-                                // Stateless attach (the expensive ELF parse +
-                                // DWARF walk) runs OUTSIDE the summary mutex
-                                // so rayon workers parallelise it. The lock
-                                // is only held for the cheap counter +
-                                // tracing application via `record_attach_outcome`.
-                                //
-                                // Shared-inode cache misses can produce
-                                // duplicate parses when N workers enter
-                                // simultaneously — all run the attach before
-                                // any inserts. The cache fully amortises
-                                // subsequent lookups; the duplicate work is
-                                // bounded by the rayon pool size.
-                                let outcome = attach_probe_for_tgid_at(proc_root, tgid);
-                                let mut s = summary_mutex
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                let res = record_attach_outcome(tgid, outcome, &mut s);
-                                drop(s);
-                                let probe = res.probe.clone();
-                                probe_cache
+                            if let Some(key) = cache_key {
+                                // `unwrap_or_else(into_inner)` on every
+                                // shared-mutex lock so a prior worker
+                                // panic that poisoned a lock cannot
+                                // cascade-poison every subsequent worker
+                                // — the catch_unwind arm below records
+                                // the failure as a `worker-panic`
+                                // attach-tag bump, and surviving workers
+                                // should still make progress on the
+                                // partially-mutated state rather than
+                                // re-panicking out of `pool.install` and
+                                // collapsing the snapshot.
+                                let cached = probe_cache
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
-                                    .insert(key, res);
-                                probe
+                                    .get(&key)
+                                    .cloned();
+                                if let Some(cached_result) = cached {
+                                    let mut s =
+                                        summary_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                    s.tgids_walked += 1;
+                                    match &cached_result.failed_tag {
+                                        None => {
+                                            // Success path — original miss
+                                            // already credited
+                                            // `jemalloc_detected`. Re-apply
+                                            // here so cache hits stay
+                                            // symmetric with cache misses;
+                                            // without this, only the first
+                                            // sharer of a `(dev, ino)`
+                                            // would count toward
+                                            // `jemalloc_detected` and
+                                            // every subsequent reuse
+                                            // would silently undercount.
+                                            s.jemalloc_detected += 1;
+                                            tracing::debug!(
+                                                tgid,
+                                                "ctprof probe: cache hit (jemalloc)"
+                                            );
+                                        }
+                                        Some(tag) => {
+                                            // Failure path — re-apply the
+                                            // SAME bookkeeping
+                                            // [`record_attach_outcome`]
+                                            // applied on the original
+                                            // miss: bump
+                                            // `attach_tag_counts[tag]`
+                                            // unconditionally, and
+                                            // `failed` for actionable
+                                            // tags only (matching the
+                                            // dominant-tag filter in
+                                            // [`ProbeSummary::dominant_tag`]).
+                                            // Without this, repeat hits
+                                            // on a failed binary would
+                                            // credit only `tgids_walked`
+                                            // and the dominant-failure
+                                            // signal would degrade as
+                                            // shared-inode reuse climbs.
+                                            // Logging stays at debug level
+                                            // — the original miss already
+                                            // emitted the warn-level event
+                                            // for actionable tags; spamming
+                                            // a warn per cache hit would
+                                            // drown the operator log.
+                                            *s.attach_tag_counts.entry(tag).or_insert(0) += 1;
+                                            if !matches!(
+                                                *tag,
+                                                "jemalloc-not-found" | "readlink-failure"
+                                            ) {
+                                                s.failed += 1;
+                                            }
+                                            tracing::debug!(
+                                                tgid,
+                                                tag,
+                                                "ctprof probe: cache hit (prior failure)"
+                                            );
+                                        }
+                                    }
+                                    cached_result.probe
+                                } else {
+                                    // Stateless attach (the expensive ELF parse +
+                                    // DWARF walk) runs OUTSIDE the summary mutex
+                                    // so rayon workers parallelise it. The lock
+                                    // is only held for the cheap counter +
+                                    // tracing application via `record_attach_outcome`.
+                                    //
+                                    // Shared-inode cache misses can produce
+                                    // duplicate parses when N workers enter
+                                    // simultaneously — all run the attach before
+                                    // any inserts. The cache fully amortises
+                                    // subsequent lookups; the duplicate work is
+                                    // bounded by the rayon pool size.
+                                    let outcome = attach_probe_for_tgid_at(proc_root, tgid);
+                                    let mut s =
+                                        summary_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                    let res = record_attach_outcome(tgid, outcome, &mut s);
+                                    drop(s);
+                                    let probe = res.probe.clone();
+                                    probe_cache
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(key, res);
+                                    probe
+                                }
+                            } else {
+                                // No cache key — exe symlink unreadable. Same
+                                // attach-outside-lock pattern as the cache-miss
+                                // branch above; result is not cached because
+                                // there's no key to file it under.
+                                let outcome = attach_probe_for_tgid_at(proc_root, tgid);
+                                let mut s = summary_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                record_attach_outcome(tgid, outcome, &mut s).probe
                             }
-                        } else {
-                            // No cache key — exe symlink unreadable. Same
-                            // attach-outside-lock pattern as the cache-miss
-                            // branch above; result is not cached because
-                            // there's no key to file it under.
-                            let outcome = attach_probe_for_tgid_at(proc_root, tgid);
-                            let mut s = summary_mutex
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            record_attach_outcome(tgid, outcome, &mut s).probe
-                        }
-                    }));
-                    let probe = match result {
-                        Ok(p) => p,
-                        Err(panic_payload) => {
-                            // Recover the panic message string for
-                            // the operator log. The payload is a
-                            // `Box<dyn Any + Send>` whose runtime
-                            // type is `&'static str` for `panic!("…")`
-                            // with a literal and `String` for
-                            // `panic!("{…}", …)` with formatted args.
-                            // Both of `attach_jemalloc_at`'s likely
-                            // panic sites (and the test seam in
-                            // `attach_probe_for_tgid_at`) panic with
-                            // a formatted message → `String`. Other
-                            // panic types (typed values, custom
-                            // payloads) collapse to a placeholder so
-                            // the log line still surfaces the tgid.
-                            let panic_msg = panic_payload
-                                .downcast_ref::<&str>()
-                                .copied()
-                                .or_else(|| {
-                                    panic_payload
-                                        .downcast_ref::<String>()
-                                        .map(|s| s.as_str())
-                                })
-                                .unwrap_or("<non-string panic payload>");
-                            // Bump counters to mirror what
-                            // `record_attach_outcome` would have done
-                            // for an attach error: tgids_walked++,
-                            // worker-panic tag++, failed++. The lock
-                            // may be poisoned if the inner panic
-                            // happened mid-update of the summary, so
-                            // recover via `PoisonError::into_inner`
-                            // rather than `.unwrap()` — bumping a
-                            // counter on partially-mutated state is
-                            // strictly less bad than re-panicking out
-                            // of the worker and tearing down
-                            // `pool.install`.
-                            let mut s = summary_mutex
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            s.tgids_walked += 1;
-                            *s.attach_tag_counts.entry("worker-panic").or_insert(0) += 1;
-                            s.failed += 1;
-                            tracing::error!(
-                                tgid,
-                                panic_msg,
-                                "ctprof probe: attach worker panicked; tgid skipped",
-                            );
-                            None
-                        }
-                    };
-                    (tgid, probe)
-                })
-                .collect()
+                        }));
+                        let probe = match result {
+                            Ok(p) => p,
+                            Err(panic_payload) => {
+                                // Recover the panic message string for
+                                // the operator log. The payload is a
+                                // `Box<dyn Any + Send>` whose runtime
+                                // type is `&'static str` for `panic!("…")`
+                                // with a literal and `String` for
+                                // `panic!("{…}", …)` with formatted args.
+                                // Both of `attach_jemalloc_at`'s likely
+                                // panic sites (and the test seam in
+                                // `attach_probe_for_tgid_at`) panic with
+                                // a formatted message → `String`. Other
+                                // panic types (typed values, custom
+                                // payloads) collapse to a placeholder so
+                                // the log line still surfaces the tgid.
+                                let panic_msg = panic_payload
+                                    .downcast_ref::<&str>()
+                                    .copied()
+                                    .or_else(|| {
+                                        panic_payload.downcast_ref::<String>().map(|s| s.as_str())
+                                    })
+                                    .unwrap_or("<non-string panic payload>");
+                                // Bump counters to mirror what
+                                // `record_attach_outcome` would have done
+                                // for an attach error: tgids_walked++,
+                                // worker-panic tag++, failed++. The lock
+                                // may be poisoned if the inner panic
+                                // happened mid-update of the summary, so
+                                // recover via `PoisonError::into_inner`
+                                // rather than `.unwrap()` — bumping a
+                                // counter on partially-mutated state is
+                                // strictly less bad than re-panicking out
+                                // of the worker and tearing down
+                                // `pool.install`.
+                                let mut s = summary_mutex.lock().unwrap_or_else(|e| e.into_inner());
+                                s.tgids_walked += 1;
+                                *s.attach_tag_counts.entry("worker-panic").or_insert(0) += 1;
+                                s.failed += 1;
+                                tracing::error!(
+                                    tgid,
+                                    panic_msg,
+                                    "ctprof probe: attach worker panicked; tgid skipped",
+                                );
+                                None
+                            }
+                        };
+                        (tgid, probe)
+                    })
+                    .collect()
             };
             match pool_result {
                 Ok(pool) => pool.install(work),

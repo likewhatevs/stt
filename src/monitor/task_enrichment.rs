@@ -168,7 +168,14 @@ impl LockSlowpathRegistry {
     pub fn match_pc(&self, pc: u64) -> Option<&'static str> {
         let probe = |start: Option<u64>, name: &'static str| -> Option<&'static str> {
             let s = start?;
-            if pc >= s && pc < s + LOCK_SLOWPATH_FN_MAX_SIZE {
+            // Symbol KVAs come from the guest's vmlinux. A corrupt
+            // ELF could place a slowpath symbol near u64::MAX; the
+            // window upper bound `s + 4096` would wrap, and `pc <
+            // wrapped` would falsely match every PC. checked_add
+            // returning None means "this symbol can't define a
+            // valid window" — treat as no match for that pattern.
+            let end = s.checked_add(LOCK_SLOWPATH_FN_MAX_SIZE)?;
+            if pc >= s && pc < end {
                 Some(name)
             } else {
                 None

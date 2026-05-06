@@ -2796,8 +2796,7 @@ Hugepagesize:       2048 kB
 
         let init_delta = STATIC_INIT_CALLS.load(Ordering::Relaxed) - init_before;
         let meminfo_delta = MEMINFO_READ_CALLS.load(Ordering::Relaxed) - meminfo_before;
-        let cpufreq_delta =
-            CPUFREQ_GOVERNORS_READ_CALLS.load(Ordering::Relaxed) - cpufreq_before;
+        let cpufreq_delta = CPUFREQ_GOVERNORS_READ_CALLS.load(Ordering::Relaxed) - cpufreq_before;
 
         assert!(
             init_delta <= 1,

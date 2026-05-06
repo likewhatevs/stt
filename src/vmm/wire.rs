@@ -53,8 +53,13 @@ use zerocopy::{FromBytes, IntoBytes};
 /// Message-type discriminant for the bulk TLV stream.
 ///
 /// Each variant maps to a 32-bit on-wire value via [`Self::wire_value`].
-/// The values are 4-character ASCII tags so a hex dump of a captured
-/// frame reads as the tag it represents (e.g. `0x4558_4954` = `"EXIT"`).
+/// The values are 4-character ASCII tags chosen so the integer literal
+/// itself spells the tag in hex (e.g. `0x4558_4954` reads as `"EXIT"`
+/// — `45`='E', `58`='X', `49`='I', `54`='T'). Because the wire format
+/// is little-endian, a raw byte-level hex dump of a captured frame
+/// shows the bytes in reverse order (e.g. `54 49 58 45` for the
+/// `Exit` tag, which spells `"TIXE"` byte-by-byte). The integer
+/// hex value spells the tag; the on-wire bytes are reversed.
 ///
 /// On-wire values are stable across host/guest builds — adding a new
 /// variant requires picking a fresh ASCII tag and updating
@@ -70,22 +75,62 @@ pub enum MsgType {
     ScenarioEnd,
     /// Guest exit code (payload: 4-byte LE i32).
     Exit,
-    /// Test result (payload: JSON-encoded `AssertResult`).
+    /// Test result (payload: bincode-encoded `AssertResult`).
     TestResult,
     /// Scheduler process exit (payload: 4-byte LE i32 exit code).
     SchedExit,
     /// Guest crash diagnostic (payload: UTF-8 panic + backtrace).
-    /// Only `Crash` may travel via the COM2 fallback transport; the
-    /// panic hook cannot block on virtio backpressure.
+    /// Reserved tag — never travels on the bulk port. Panic
+    /// diagnostics are written directly to COM2 (`/dev/ttyS1`)
+    /// because `virtio_console` TX can block on host backpressure
+    /// and blocking inside a fault handler would deadlock the
+    /// guest before the diagnostic reached the host.
     Crash,
-    /// Per-payload-invocation metrics (payload: JSON-encoded
+    /// Per-payload-invocation metrics (payload: bincode-encoded
     /// `PayloadMetrics`).
     PayloadMetrics,
     /// Raw stdout/stderr captured from an LlmExtract payload (payload:
-    /// JSON-encoded `RawPayloadOutput`).
+    /// bincode-encoded `RawPayloadOutput`).
     RawPayloadOutput,
     /// Coverage profraw blob.
     Profraw,
+    /// Guest→host stdout chunk. Payload: opaque UTF-8 bytes. Each
+    /// frame carries one chunk read from the guest's stdout pipe;
+    /// host concatenates chunks in arrival order to reconstruct the
+    /// stream. Replaces the prior COM2 stdout redirect.
+    Stdout,
+    /// Guest→host stderr chunk. Payload: opaque UTF-8 bytes. Same
+    /// chunked semantics as [`Self::Stdout`].
+    Stderr,
+    /// Guest→host scheduler-log chunk. Payload: opaque UTF-8 bytes
+    /// from the scheduler child process's captured log. Replaces
+    /// the prior COM2 SCHED_OUTPUT_START/END dump path. The host
+    /// concatenates chunks in arrival order; the existing
+    /// `SCHED_OUTPUT_START` / `SCHED_OUTPUT_END` delimiters and the
+    /// embedded BPF verifier section are preserved verbatim
+    /// inside the chunk bytes.
+    SchedLog,
+    /// Guest→host lifecycle phase event. Payload: 1-byte
+    /// [`LifecyclePhase`] discriminant followed by an optional
+    /// UTF-8 reason buffer (used by `SchedulerNotAttached`'s
+    /// suffix detail). Replaces the prior `KTSTR_INIT_STARTED` /
+    /// `KTSTR_PAYLOAD_STARTING` / `SCHEDULER_DIED` /
+    /// `SCHEDULER_NOT_ATTACHED` sentinel strings on COM2.
+    Lifecycle,
+    /// Guest→host shell-exec exit. Payload: 4-byte LE i32 exit
+    /// code from `cargo ktstr shell --exec <cmd>`. Replaces the
+    /// prior COM2 `KTSTR_EXEC_EXIT=N` sentinel line.
+    ExecExit,
+    /// Guest→host kernel ring-buffer dump. Payload: opaque UTF-8
+    /// bytes from `rmesg::logs_raw`. Sent on the
+    /// initramfs-extraction failure path so the host sees the
+    /// kernel OOM messages without scraping COM2.
+    Dmesg,
+    /// Guest→host probe-pipeline JSON output. Payload: opaque UTF-8
+    /// bytes from the probe output stream. Replaces the prior
+    /// COM2 ProbeDrain path so probe JSON does not interleave
+    /// with sched-log dumps on the same serial port.
+    ProbeOutput,
     /// Guest→host on-demand snapshot request (payload:
     /// [`SnapshotRequestPayload`]). The freeze coordinator's bulk-drain
     /// path intercepts this frame, runs the CAPTURE / WATCH dispatch,
@@ -97,6 +142,21 @@ pub enum MsgType {
     /// carries the matching request_id, the status, and a UTF-8
     /// reason buffer for the failure path.
     SnapshotReply,
+    /// Guest→host system-ready signal (payload: empty).
+    ///
+    /// Emitted by the guest's `ktstr_guest_init` after
+    /// `mount_filesystems()` completes, so by the time the host
+    /// observes the frame the guest's `setup_per_cpu_areas` and
+    /// KASLR randomization (both kernel-boot prerequisites) are
+    /// already done. The freeze coordinator's bulk-drain dispatch
+    /// promotes a CRC-valid SYS_RDY frame into the monitor's
+    /// boot-complete eventfd, so the monitor's pre-sample
+    /// `epoll_wait` returns within microseconds rather than
+    /// waiting for the 30 s fallback timeout. Replaces an earlier
+    /// trigger that fired on the first port-0 TX byte (kernel
+    /// printk via `/dev/hvc0`), which depended on incidental
+    /// console traffic rather than an explicit readiness signal.
+    SysRdy,
 }
 
 impl MsgType {
@@ -116,6 +176,14 @@ impl MsgType {
             MsgType::Profraw => MSG_TYPE_PROFRAW,
             MsgType::SnapshotRequest => MSG_TYPE_SNAPSHOT_REQUEST,
             MsgType::SnapshotReply => MSG_TYPE_SNAPSHOT_REPLY,
+            MsgType::SysRdy => MSG_TYPE_SYS_RDY,
+            MsgType::Stdout => MSG_TYPE_STDOUT,
+            MsgType::Stderr => MSG_TYPE_STDERR,
+            MsgType::SchedLog => MSG_TYPE_SCHED_LOG,
+            MsgType::Lifecycle => MSG_TYPE_LIFECYCLE,
+            MsgType::ExecExit => MSG_TYPE_EXEC_EXIT,
+            MsgType::Dmesg => MSG_TYPE_DMESG,
+            MsgType::ProbeOutput => MSG_TYPE_PROBE_OUTPUT,
         }
     }
 
@@ -136,6 +204,99 @@ impl MsgType {
             MSG_TYPE_PROFRAW => Some(MsgType::Profraw),
             MSG_TYPE_SNAPSHOT_REQUEST => Some(MsgType::SnapshotRequest),
             MSG_TYPE_SNAPSHOT_REPLY => Some(MsgType::SnapshotReply),
+            MSG_TYPE_SYS_RDY => Some(MsgType::SysRdy),
+            MSG_TYPE_STDOUT => Some(MsgType::Stdout),
+            MSG_TYPE_STDERR => Some(MsgType::Stderr),
+            MSG_TYPE_SCHED_LOG => Some(MsgType::SchedLog),
+            MSG_TYPE_LIFECYCLE => Some(MsgType::Lifecycle),
+            MSG_TYPE_EXEC_EXIT => Some(MsgType::ExecExit),
+            MSG_TYPE_DMESG => Some(MsgType::Dmesg),
+            MSG_TYPE_PROBE_OUTPUT => Some(MsgType::ProbeOutput),
+            _ => None,
+        }
+    }
+
+    /// `true` for control frames the freeze coordinator interprets
+    /// internally and that must NOT surface as test verdict entries
+    /// in [`super::host_comms::BulkDrainResult`]. Both the
+    /// coordinator's mid-run `bulk_messages_for_closure` filter and
+    /// `collect_results`'s post-run drain key on this single
+    /// classifier so the gate stays in lockstep — adding a new
+    /// internal control frame is a one-line update here.
+    ///
+    /// The current internal set:
+    ///   - [`MsgType::SnapshotRequest`] — has its matching
+    ///     [`MsgType::SnapshotReply`] delivered over port-1 RX; the
+    ///     request itself carries no test verdict.
+    ///   - [`MsgType::SnapshotReply`] — host→guest only on port-1 RX.
+    ///     A guest TX frame stamped with this tag is illegitimate
+    ///     (only the host coordinator emits replies); drop it instead
+    ///     of bucketing it as a phantom verdict entry. Including the
+    ///     tag in the internal set keeps the dispatch and the
+    ///     `collect_results` post-run drain in lockstep — both filter
+    ///     the same way.
+    ///   - [`MsgType::SysRdy`] — its only semantic is the eventfd
+    ///     promotion that releases the monitor's pre-sample
+    ///     `epoll_wait`.
+    pub const fn is_coordinator_internal(self) -> bool {
+        matches!(
+            self,
+            MsgType::SnapshotRequest | MsgType::SnapshotReply | MsgType::SysRdy
+        )
+    }
+}
+
+/// Lifecycle phase carried in the 1-byte header of a
+/// [`MsgType::Lifecycle`] payload. Replaces the prior
+/// `KTSTR_INIT_STARTED` / `KTSTR_PAYLOAD_STARTING` /
+/// `SCHEDULER_DIED` / `SCHEDULER_NOT_ATTACHED` COM2 sentinels.
+///
+/// `SchedulerNotAttached` carries an optional UTF-8 reason suffix
+/// (the bytes following the 1-byte phase header in the TLV
+/// payload) — every other variant has an empty suffix.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum LifecyclePhase {
+    /// Init started — devtmpfs mounted, initramfs verified,
+    /// equivalent to the legacy `KTSTR_INIT_STARTED` sentinel.
+    InitStarted,
+    /// Payload starting — guest dispatch is about to invoke the
+    /// `#[ktstr_test]` body. Equivalent to the legacy
+    /// `KTSTR_PAYLOAD_STARTING` sentinel.
+    PayloadStarting,
+    /// Scheduler process exited during startup. Equivalent to the
+    /// legacy `SCHEDULER_DIED` sentinel.
+    SchedulerDied,
+    /// Scheduler stayed alive but never attached to sched_ext (BPF
+    /// verifier reject, ops mismatch, sysfs absent). Equivalent to
+    /// the legacy `SCHEDULER_NOT_ATTACHED:<reason>` sentinel; the
+    /// reason suffix lives in the bytes after the 1-byte phase
+    /// header.
+    SchedulerNotAttached,
+}
+
+impl LifecyclePhase {
+    /// 1-byte on-wire discriminant. `0` is reserved as the
+    /// "unknown / invalid" sentinel — host parsers reject zero
+    /// rather than silently mapping it to a known phase.
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            LifecyclePhase::InitStarted => 1,
+            LifecyclePhase::PayloadStarting => 2,
+            LifecyclePhase::SchedulerDied => 3,
+            LifecyclePhase::SchedulerNotAttached => 4,
+        }
+    }
+
+    /// Reverse the wire mapping. Returns `None` for `0`
+    /// (reserved sentinel) or any value not present in the variant
+    /// list — host parsers skip unknown phases and log them rather
+    /// than panicking.
+    pub const fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(LifecyclePhase::InitStarted),
+            2 => Some(LifecyclePhase::PayloadStarting),
+            3 => Some(LifecyclePhase::SchedulerDied),
+            4 => Some(LifecyclePhase::SchedulerNotAttached),
             _ => None,
         }
     }
@@ -162,7 +323,7 @@ pub const MSG_TYPE_SCENARIO_END: u32 = 0x5343_454E; // "SCEN"
 /// Guest exit code (payload: 4-byte i32).
 pub const MSG_TYPE_EXIT: u32 = 0x4558_4954; // "EXIT"
 
-/// Test result (payload: JSON-encoded AssertResult).
+/// Test result (payload: bincode-encoded AssertResult).
 pub const MSG_TYPE_TEST_RESULT: u32 = 0x5445_5354; // "TEST"
 
 /// Scheduler process exit (payload: 4-byte i32 exit code).
@@ -172,11 +333,11 @@ pub const MSG_TYPE_SCHED_EXIT: u32 = 0x5343_4458; // "SCDX"
 pub const MSG_TYPE_CRASH: u32 = 0x4352_5348; // "CRSH"
 
 /// Per-payload-invocation metrics
-/// (payload: JSON-encoded `crate::test_support::PayloadMetrics`).
+/// (payload: bincode-encoded `crate::test_support::PayloadMetrics`).
 pub const MSG_TYPE_PAYLOAD_METRICS: u32 = 0x504d_4554; // "PMET"
 
 /// Raw stdout/stderr captured from an LlmExtract payload
-/// (payload: JSON-encoded `crate::test_support::RawPayloadOutput`).
+/// (payload: bincode-encoded `crate::test_support::RawPayloadOutput`).
 pub const MSG_TYPE_RAW_PAYLOAD_OUTPUT: u32 = 0x5241_574f; // "RAWO"
 
 /// Coverage profraw blob (payload: raw `.profraw` bytes from
@@ -191,14 +352,77 @@ pub const MSG_TYPE_SNAPSHOT_REQUEST: u32 = 0x534e_5251; // "SNRQ"
 /// (payload: [`SnapshotReplyPayload`]).
 pub const MSG_TYPE_SNAPSHOT_REPLY: u32 = 0x534e_5250; // "SNRP"
 
+/// Guest→host system-ready signal (payload: empty).
+///
+/// Tag spelled `"SRDY"` in hex digits; on-wire bytes (LE) are
+/// `0x59 0x44 0x52 0x53` (`"YDRS"` byte-by-byte). The freeze
+/// coordinator's bulk-drain dispatch promotes a CRC-valid
+/// `MSG_TYPE_SYS_RDY` frame into the monitor's boot-complete
+/// eventfd. See [`MsgType::SysRdy`] for the protocol contract.
+pub const MSG_TYPE_SYS_RDY: u32 = 0x5352_4459; // "SRDY"
+
+/// Guest→host stdout chunk (payload: opaque UTF-8 bytes).
+///
+/// Replaces the prior COM2 stdout redirect: the guest dups fd 1
+/// onto the write-end of an internal pipe and a forwarder thread
+/// chunks the pipe's read-end into TLV frames bounded by
+/// [`super::bulk::MAX_BULK_FRAME_PAYLOAD`].
+pub const MSG_TYPE_STDOUT: u32 = 0x534f_5554; // "SOUT"
+
+/// Guest→host stderr chunk (payload: opaque UTF-8 bytes).
+///
+/// Same chunked redirect semantics as [`MSG_TYPE_STDOUT`], applied
+/// to fd 2.
+pub const MSG_TYPE_STDERR: u32 = 0x5345_5252; // "SERR"
+
+/// Guest→host scheduler-log chunk (payload: opaque UTF-8 bytes).
+///
+/// Replaces the prior COM2 SCHED_OUTPUT_START/END dump in
+/// `dump_sched_output`. The host concatenates chunks in arrival
+/// order; the embedded `SCHED_OUTPUT_START` / `SCHED_OUTPUT_END`
+/// markers and the BPF verifier section travel verbatim inside
+/// the chunk bytes.
+pub const MSG_TYPE_SCHED_LOG: u32 = 0x5343_4c47; // "SCLG"
+
+/// Guest→host lifecycle phase event.
+///
+/// Payload layout: 1-byte [`LifecyclePhase`] discriminant followed
+/// by an optional UTF-8 reason buffer (used by
+/// `SchedulerNotAttached`'s suffix detail; empty for every other
+/// phase). Replaces the COM2 `KTSTR_INIT_STARTED` /
+/// `KTSTR_PAYLOAD_STARTING` / `SCHEDULER_DIED` /
+/// `SCHEDULER_NOT_ATTACHED` sentinel strings.
+pub const MSG_TYPE_LIFECYCLE: u32 = 0x4c49_4645; // "LIFE"
+
+/// Guest→host shell-exec exit code (payload: 4-byte LE i32).
+///
+/// Replaces the prior COM2 `KTSTR_EXEC_EXIT=N` sentinel line
+/// emitted by `cargo ktstr shell --exec <cmd>`.
+pub const MSG_TYPE_EXEC_EXIT: u32 = 0x4558_4358; // "EXCX"
+
+/// Guest→host kernel ring-buffer dump (payload: opaque UTF-8 bytes).
+///
+/// Sent on the initramfs-extraction failure path so the host sees
+/// the kernel OOM messages without scraping COM2.
+pub const MSG_TYPE_DMESG: u32 = 0x444d_5347; // "DMSG"
+
+/// Guest→host probe-pipeline JSON output (payload: opaque UTF-8
+/// bytes).
+///
+/// Replaces the prior COM2 ProbeDrain path so probe output and
+/// scheduler-log dumps stop interleaving on the same serial port.
+pub const MSG_TYPE_PROBE_OUTPUT: u32 = 0x5052_4f42; // "PROB"
+
 // ---------------------------------------------------------------------------
 // ShmMessage — TLV header
 // ---------------------------------------------------------------------------
 
 /// 16-byte TLV header preceding each payload on the wire.
 ///
-/// Both the legacy SHM ring and the bulk virtio-console port-1 channel
-/// use this exact layout. CRC32 covers payload bytes only (not the
+/// Used as the framing header for the bulk virtio-console port-1
+/// channel; the type name `ShmMessage` is retained from the
+/// predecessor SHM ring transport (now removed in favour of the
+/// virtio-console port). CRC32 covers payload bytes only (not the
 /// header).
 ///
 /// SAFETY: `repr(C)` with four `u32` fields produces a 16-byte struct
@@ -589,12 +813,47 @@ mod tests {
             MSG_TYPE_PROFRAW,
             MSG_TYPE_SNAPSHOT_REQUEST,
             MSG_TYPE_SNAPSHOT_REPLY,
+            MSG_TYPE_SYS_RDY,
+            MSG_TYPE_STDOUT,
+            MSG_TYPE_STDERR,
+            MSG_TYPE_SCHED_LOG,
+            MSG_TYPE_LIFECYCLE,
+            MSG_TYPE_EXEC_EXIT,
+            MSG_TYPE_DMESG,
+            MSG_TYPE_PROBE_OUTPUT,
         ];
         for (i, a) in ids.iter().enumerate() {
             for b in &ids[i + 1..] {
                 assert_ne!(a, b, "duplicate MSG_TYPE id 0x{a:08x}");
             }
         }
+    }
+
+    /// Pin the on-wire byte order of `msg_type` to little-endian.
+    /// The integer literal `0x4558_4954` spells `"EXIT"` in hex digits
+    /// (`45`='E', `58`='X', `49`='I', `54`='T'), but the LE encoding
+    /// places the least-significant byte first — so a raw byte dump
+    /// of a serialized `ShmMessage` shows `[0x54, 0x49, 0x58, 0x45]`,
+    /// which spells `"TIXE"` byte-by-byte. A future change that
+    /// flipped the host to big-endian or switched zerocopy's
+    /// serialization order would silently break the wire contract
+    /// with the kernel virtio_console driver and every existing
+    /// guest writer; this test fails loudly instead.
+    #[test]
+    fn msg_type_exit_wire_bytes_are_le() {
+        let f = ShmMessage {
+            msg_type: MSG_TYPE_EXIT,
+            length: 0,
+            crc32: 0,
+            _pad: 0,
+        };
+        let bytes = f.as_bytes();
+        // First 4 bytes of the header are msg_type as a u32 LE.
+        assert_eq!(&bytes[..4], &MSG_TYPE_EXIT.to_le_bytes());
+        // Spell-out check: the LE byte sequence is "TIXE", not "EXIT".
+        // If the wire ever flips to BE, this assertion fails before the
+        // guest driver sees the malformed frame.
+        assert_eq!(&bytes[..4], b"TIXE");
     }
 
     /// `ShmMessage` header is exactly 16 bytes with no padding.
@@ -621,6 +880,14 @@ mod tests {
             MsgType::Profraw,
             MsgType::SnapshotRequest,
             MsgType::SnapshotReply,
+            MsgType::SysRdy,
+            MsgType::Stdout,
+            MsgType::Stderr,
+            MsgType::SchedLog,
+            MsgType::Lifecycle,
+            MsgType::ExecExit,
+            MsgType::Dmesg,
+            MsgType::ProbeOutput,
         ];
         for variant in all {
             let v = variant.wire_value();
@@ -662,10 +929,107 @@ mod tests {
             MsgType::SnapshotRequest.wire_value(),
             MSG_TYPE_SNAPSHOT_REQUEST
         );
-        assert_eq!(
-            MsgType::SnapshotReply.wire_value(),
-            MSG_TYPE_SNAPSHOT_REPLY
-        );
+        assert_eq!(MsgType::SnapshotReply.wire_value(), MSG_TYPE_SNAPSHOT_REPLY);
+        assert_eq!(MsgType::SysRdy.wire_value(), MSG_TYPE_SYS_RDY);
+        assert_eq!(MsgType::Stdout.wire_value(), MSG_TYPE_STDOUT);
+        assert_eq!(MsgType::Stderr.wire_value(), MSG_TYPE_STDERR);
+        assert_eq!(MsgType::SchedLog.wire_value(), MSG_TYPE_SCHED_LOG);
+        assert_eq!(MsgType::Lifecycle.wire_value(), MSG_TYPE_LIFECYCLE);
+        assert_eq!(MsgType::ExecExit.wire_value(), MSG_TYPE_EXEC_EXIT);
+        assert_eq!(MsgType::Dmesg.wire_value(), MSG_TYPE_DMESG);
+        assert_eq!(MsgType::ProbeOutput.wire_value(), MSG_TYPE_PROBE_OUTPUT);
+    }
+
+    /// `is_coordinator_internal` flips on for SnapshotRequest,
+    /// SnapshotReply, and SysRdy and stays off for every
+    /// test-verdict-bearing variant. SnapshotReply is host→guest
+    /// only on port-1 RX; a guest TX frame stamped with this tag
+    /// is illegitimate and must be dropped rather than bucketed
+    /// as a phantom verdict entry. Pinning this matrix here means
+    /// a future contributor adding a new control frame must
+    /// explicitly opt into the gate (or explicitly opt out by
+    /// adding a "verdict-bearing" entry to the test) — the freeze
+    /// coord's mid-run filter and `collect_results`'s post-run
+    /// drain both key on this single classifier (search for
+    /// `is_coordinator_internal` in `freeze_coord.rs`).
+    #[test]
+    fn is_coordinator_internal_matches_filter_set() {
+        let internal = [
+            MsgType::SnapshotRequest,
+            MsgType::SnapshotReply,
+            MsgType::SysRdy,
+        ];
+        let verdict = [
+            MsgType::Stimulus,
+            MsgType::ScenarioStart,
+            MsgType::ScenarioEnd,
+            MsgType::Exit,
+            MsgType::TestResult,
+            MsgType::SchedExit,
+            MsgType::Crash,
+            MsgType::PayloadMetrics,
+            MsgType::RawPayloadOutput,
+            MsgType::Profraw,
+            MsgType::Stdout,
+            MsgType::Stderr,
+            MsgType::SchedLog,
+            MsgType::Lifecycle,
+            MsgType::ExecExit,
+            MsgType::Dmesg,
+            MsgType::ProbeOutput,
+        ];
+        for v in internal {
+            assert!(
+                v.is_coordinator_internal(),
+                "{v:?} must be classified as coordinator-internal"
+            );
+        }
+        for v in verdict {
+            assert!(
+                !v.is_coordinator_internal(),
+                "{v:?} carries test verdict data and must NOT be filtered out"
+            );
+        }
+    }
+
+    /// `LifecyclePhase` round-trips through `wire_value` →
+    /// `from_wire`. Phase values are byte-stable across builds so
+    /// the host never silently misclassifies a future guest's
+    /// phase signal.
+    #[test]
+    fn lifecycle_phase_round_trips() {
+        let all = [
+            LifecyclePhase::InitStarted,
+            LifecyclePhase::PayloadStarting,
+            LifecyclePhase::SchedulerDied,
+            LifecyclePhase::SchedulerNotAttached,
+        ];
+        for p in all {
+            let v = p.wire_value();
+            assert_eq!(LifecyclePhase::from_wire(v), Some(p));
+        }
+    }
+
+    /// `LifecyclePhase::from_wire(0)` returns `None` — `0` is
+    /// reserved as the unknown / invalid sentinel so a
+    /// zero-initialised payload byte never silently maps to
+    /// `InitStarted`.
+    #[test]
+    fn lifecycle_phase_zero_is_reserved() {
+        assert_eq!(LifecyclePhase::from_wire(0), None);
+        assert_eq!(LifecyclePhase::from_wire(0xFF), None);
+    }
+
+    /// Pin the `LifecyclePhase` discriminants. Wire values are part
+    /// of the protocol contract — a future change that reorders
+    /// the enum variants would silently shift this mapping unless
+    /// pinned by an explicit assertion here.
+    #[test]
+    fn lifecycle_phase_wire_values_are_stable() {
+        assert_eq!(LifecyclePhase::InitStarted.wire_value(), 1);
+        assert_eq!(LifecyclePhase::PayloadStarting.wire_value(), 2);
+        assert_eq!(LifecyclePhase::SchedulerDied.wire_value(), 3);
+        assert_eq!(LifecyclePhase::SchedulerNotAttached.wire_value(), 4);
     }
 
     /// `SnapshotRequestPayload` round-trips through bytes — guards
@@ -683,8 +1047,7 @@ mod tests {
         };
         let bytes = p.as_bytes();
         assert_eq!(bytes.len(), 8 + SNAPSHOT_TAG_MAX);
-        let back =
-            SnapshotRequestPayload::read_from_bytes(bytes).expect("payload deserializes");
+        let back = SnapshotRequestPayload::read_from_bytes(bytes).expect("payload deserializes");
         let request_id = back.request_id;
         let kind = back.kind;
         assert_eq!(request_id, 0xDEAD_BEEF);
@@ -704,8 +1067,7 @@ mod tests {
         };
         let bytes = p.as_bytes();
         assert_eq!(bytes.len(), 8 + SNAPSHOT_REASON_MAX);
-        let back =
-            SnapshotReplyPayload::read_from_bytes(bytes).expect("payload deserializes");
+        let back = SnapshotReplyPayload::read_from_bytes(bytes).expect("payload deserializes");
         let request_id = back.request_id;
         let status = back.status;
         assert_eq!(request_id, 0xCAFE_BABE);

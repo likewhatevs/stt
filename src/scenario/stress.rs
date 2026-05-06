@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 fn per_cpu_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
     let all = ctx.topo.all_cpus();
+    if all.is_empty() {
+        return Vec::new();
+    }
     let n = (all.len() - 1).min(64);
     (0..n)
         .map(|i| {
@@ -37,6 +40,9 @@ pub fn custom_cgroup_per_cpu(ctx: &Ctx) -> Result<AssertResult> {
 
 fn reuse_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
     let all = ctx.topo.all_cpus();
+    if all.is_empty() {
+        return Vec::new();
+    }
     let n = (all.len() - 1).min(15);
     let half = n / 2;
     (0..half)
@@ -50,6 +56,9 @@ fn reuse_defs(ctx: &super::Ctx) -> Vec<CgroupDef> {
 
 fn cgroup_exhaust_reuse_steps(ctx: &Ctx) -> Vec<Step> {
     let all = ctx.topo.all_cpus();
+    if all.is_empty() {
+        return Vec::new();
+    }
     let n = (all.len() - 1).min(15);
     let half = n / 2;
 
@@ -227,9 +236,21 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
     thread::sleep(ctx.duration / 3);
     // Remove cg_3 — guard still tracks it, but explicit removal
     // during the scenario is fine; guard's drop will skip missing cgroups.
-    if let Some(h) = handles.pop() {
-        h.stop_and_collect();
-    }
+    // The cg_3 reports must flow through the scenario's assertion
+    // checks alongside the surviving handles' reports — discarding
+    // the WorkerReports lost the entire mid-run cg_3 workload from
+    // the scenario verdict, masking starvation/affinity violations
+    // that occurred during cg_3's duration/3 hold.
+    let cg3_result: Option<AssertResult> = handles.pop().map(|h| {
+        let reports = h.stop_and_collect();
+        if ctx.assert.has_worker_checks() {
+            // cg_3 was created via add_cgroup_no_cpuset, so there is
+            // no cpuset/numa narrow to apply.
+            ctx.assert.assert_cgroup_with_numa(&reports, None, None)
+        } else {
+            assert::assert_not_starved(&reports)
+        }
+    });
     // Best-effort early teardown: the CgroupGroup guard's Drop
     // skips missing cgroups, so a transient ENOENT (already
     // unwound by a sibling step) or EBUSY (drain races a stray
@@ -240,7 +261,11 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
         tracing::warn!(err = %format!("{e:#}"), "stress: early remove_cgroup(cg_3) failed; guard Drop will retry on scenario teardown");
     }
     thread::sleep(ctx.duration / 3);
-    Ok(collect_all(handles, &ctx.assert))
+    let mut r = collect_all(handles, &ctx.assert);
+    if let Some(cg3) = cg3_result {
+        r.merge(cg3);
+    }
+    Ok(r)
 }
 
 /// LLC-specific cpusets + tight flip loop. Uses Instant::now() deadline
@@ -254,6 +279,15 @@ pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
     let llc1_full: BTreeSet<usize> = ctx.topo.llc_aligned_cpuset(1);
     if llc0_full.is_empty() {
         return Ok(AssertResult::skip("LLC0 has no CPUs"));
+    }
+    // LLC1 is also load-bearing — the cross-LLC flip below assigns
+    // cg_1 to llc1 and cg_0 to a cross0=llc1 set on flipped
+    // iterations. An empty llc1 makes both writes degenerate
+    // (cg_0 set_cpuset to empty errors, cg_1 has no CPUs to run
+    // workers on) and there is no race to probe. Skip rather than
+    // silently degrade.
+    if llc1_full.is_empty() {
+        return Ok(AssertResult::skip("LLC1 has no CPUs"));
     }
 
     // Reserve one CPU from LLC0 for cg_0 to avoid cg_0-starvation.

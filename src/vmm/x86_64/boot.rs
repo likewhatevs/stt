@@ -137,10 +137,26 @@ pub fn write_boot_params(
     params.hdr.cmdline_size = cmdline.len() as u32;
     params.hdr.kernel_alignment = 0x100_0000;
 
-    // Initrd
+    // Initrd. The 64-bit boot protocol splits both the ramdisk
+    // address and ramdisk size across two fields each:
+    //   * `hdr.ramdisk_image` (offset 0x218 within boot_params) — low 32 bits of GPA
+    //   * `ext_ramdisk_image` (offset 0x0c0 within boot_params) — high 32 bits of GPA
+    //   * `hdr.ramdisk_size`  (offset 0x21c within boot_params) — low 32 bits of size
+    //   * `ext_ramdisk_size`  (offset 0x0c4 within boot_params) — high 32 bits of size
+    // The kernel reconstructs the full 64-bit values as
+    // `(ext << 32) | hdr_field` — see `get_ramdisk_image` and
+    // `get_ramdisk_size` in arch/x86/kernel/setup.c. Populating both
+    // halves keeps an initrd placed above 4 GB from being silently
+    // truncated; matches the kexec-bzimage64 setter pattern in
+    // arch/x86/kernel/kexec-bzimage64.c.
     if let (Some(addr), Some(size)) = (initrd_addr, initrd_size) {
-        params.hdr.ramdisk_image = addr as u32;
+        params.hdr.ramdisk_image = (addr & 0xffff_ffff) as u32;
+        params.ext_ramdisk_image = (addr >> 32) as u32;
         params.hdr.ramdisk_size = size;
+        // `initrd_size` is `u32` today so the high bits are always
+        // zero; assigning 0 explicitly documents the contract and
+        // survives any future widening of `initrd_size` to `u64`.
+        params.ext_ramdisk_size = 0;
     }
 
     // ACPI RSDP address — tell the kernel where to find it
@@ -269,8 +285,27 @@ fn kvm_segment_from_gdt(entry: u64, table_index: u8) -> kvm_bindings::kvm_segmen
     }
 }
 
-// x2APIC enable bit in IA32_APIC_BASE MSR (bit 10).
+// IA32_APIC_BASE MSR bits per Intel SDM Vol. 3A 11.4.4 / 11.12.1:
+//   bit 10 (EXTD)  — x2APIC mode enable
+//   bit 11 (EN)    — xAPIC global enable
+//
+// x2APIC mode requires BOTH bits set. Per Intel SDM Vol. 3A 11.12.1.4
+// "x2APIC State Transitions", the legal states are:
+//
+//   EN=0 EXTD=0 — APIC disabled
+//   EN=1 EXTD=0 — xAPIC mode
+//   EN=1 EXTD=1 — x2APIC mode
+//   EN=0 EXTD=1 — INVALID (reserved; #GP on write)
+//
+// KVM sets `EN` at vCPU reset (arch/x86/kvm/lapic.c::kvm_lapic_reset
+// stores `APIC_DEFAULT_PHYS_BASE | MSR_IA32_APICBASE_ENABLE`), so the
+// `apic_base` returned by `get_sregs()` already has bit 11 set. We OR
+// both bits explicitly here so the legal x2APIC transition (EN=1,
+// EXTD=1) does not depend on KVM's reset default — if a future KVM
+// change ever cleared `EN` at reset, OR-ing only `EXTD` would land
+// in the invalid (EN=0, EXTD=1) state and #GP at the next MSR write.
 const X2APIC_ENABLE_BIT: u64 = 1 << 10;
+const XAPIC_GLOBAL_ENABLE_BIT: u64 = 1 << 11;
 
 /// Set up GDT, segment registers, and page tables for 64-bit long mode.
 /// GDT layout matches Firecracker/libkrun exactly:
@@ -327,7 +362,10 @@ pub fn setup_sregs(guest_mem: &GuestMemoryMmap, vcpu: &VcpuFd, x2apic: bool) -> 
     sregs.cr3 = PML4_START;
 
     if x2apic {
-        sregs.apic_base |= X2APIC_ENABLE_BIT;
+        // OR both EXTD (bit 10) and EN (bit 11) — see constant doc
+        // above for why explicit EN avoids the invalid (EN=0, EXTD=1)
+        // state if a future KVM ever stops setting EN at vCPU reset.
+        sregs.apic_base |= X2APIC_ENABLE_BIT | XAPIC_GLOBAL_ENABLE_BIT;
     }
 
     vcpu.set_sregs(&sregs).context("set sregs")?;
@@ -595,21 +633,61 @@ mod tests {
     #[test]
     fn write_boot_params_with_initrd() {
         let mem = test_mem(16);
-        write_boot_params(
-            &mem,
-            "console=ttyS0",
-            16,
-            Some(0x200000),
-            Some(4096),
-            None,
-        )
-        .unwrap();
+        write_boot_params(&mem, "console=ttyS0", 16, Some(0x200000), Some(4096), None).unwrap();
         use linux_loader::loader::bootparam::boot_params;
         let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
         let ramdisk_image = { params.hdr.ramdisk_image };
         let ramdisk_size = { params.hdr.ramdisk_size };
+        let ext_ramdisk_image = { params.ext_ramdisk_image };
+        let ext_ramdisk_size = { params.ext_ramdisk_size };
         assert_eq!(ramdisk_image, 0x200000);
         assert_eq!(ramdisk_size, 4096);
+        // Sub-4 GB initrd must zero the high halves; otherwise the
+        // kernel reconstructs `(ext << 32) | low` and reads garbage.
+        assert_eq!(ext_ramdisk_image, 0, "ext_ramdisk_image should be 0 for sub-4GB addr");
+        assert_eq!(ext_ramdisk_size, 0, "ext_ramdisk_size should be 0 for u32-bounded size");
+    }
+
+    #[test]
+    fn write_boot_params_initrd_above_4gb_splits_address() {
+        // Initrd placed at 5 GB (address > 0xFFFF_FFFF) must populate
+        // both halves: hdr.ramdisk_image with the low 32 bits and
+        // ext_ramdisk_image with the high 32 bits. Reading just the
+        // low half (the pre-fix behaviour) silently truncated the
+        // address to its 32-bit residue and the kernel decompressed
+        // garbage — see the kernel-side reconstruction in
+        // arch/x86/kernel/setup.c get_ramdisk_image.
+        let mem = test_mem(16);
+        let high_addr: u64 = 0x1_4000_0000; // 5 GB
+        write_boot_params(&mem, "console=ttyS0", 16, Some(high_addr), Some(4096), None).unwrap();
+        use linux_loader::loader::bootparam::boot_params;
+        let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
+        let ramdisk_image = { params.hdr.ramdisk_image };
+        let ext_ramdisk_image = { params.ext_ramdisk_image };
+        assert_eq!(ramdisk_image, (high_addr & 0xffff_ffff) as u32);
+        assert_eq!(ext_ramdisk_image, (high_addr >> 32) as u32);
+        // Reconstruct as the kernel does and assert round-trip equality.
+        let reconstructed = ((ext_ramdisk_image as u64) << 32) | (ramdisk_image as u64);
+        assert_eq!(reconstructed, high_addr);
+    }
+
+    #[test]
+    fn write_boot_params_initrd_at_4gb_boundary() {
+        // Boundary case: addr == 0x1_0000_0000 (exactly 4 GB).
+        // Pre-fix this would truncate to 0; the fix should write
+        // ext_ramdisk_image=1 and hdr.ramdisk_image=0.
+        let mem = test_mem(16);
+        let boundary_addr: u64 = 0x1_0000_0000;
+        write_boot_params(&mem, "console=ttyS0", 16, Some(boundary_addr), Some(4096), None)
+            .unwrap();
+        use linux_loader::loader::bootparam::boot_params;
+        let params: boot_params = mem.read_obj(GuestAddress(BOOT_PARAMS_ADDR)).unwrap();
+        let ramdisk_image = { params.hdr.ramdisk_image };
+        let ext_ramdisk_image = { params.ext_ramdisk_image };
+        assert_eq!(ramdisk_image, 0);
+        assert_eq!(ext_ramdisk_image, 1);
+        let reconstructed = ((ext_ramdisk_image as u64) << 32) | (ramdisk_image as u64);
+        assert_eq!(reconstructed, boundary_addr);
     }
 
     #[test]
@@ -946,10 +1024,21 @@ mod tests {
         let vm = KtstrKvm::new(topo, 64, false).unwrap();
         setup_sregs(&vm.guest_mem, &vm.vcpus[0], true).unwrap();
         let sregs = vm.vcpus[0].get_sregs().unwrap();
+        // x2APIC mode requires BOTH EN (bit 11) and EXTD (bit 10).
+        // The (EN=0, EXTD=1) state is reserved per Intel SDM Vol. 3A
+        // 11.12.1.4 — pinning both bits here prevents a future KVM
+        // change from silently flipping the post-state into the
+        // invalid combination.
         assert_ne!(
             sregs.apic_base & X2APIC_ENABLE_BIT,
             0,
-            "x2APIC bit should be set when x2apic=true"
+            "EXTD (bit 10) should be set when x2apic=true"
+        );
+        assert_ne!(
+            sregs.apic_base & XAPIC_GLOBAL_ENABLE_BIT,
+            0,
+            "EN (bit 11) should be set when x2apic=true — x2APIC \
+             mode is invalid without xAPIC global enable"
         );
     }
 
@@ -990,5 +1079,4 @@ mod tests {
         let params = write_boot_params(&mem, "console=ttyS0", 5120, None, None, None);
         assert!(params.is_ok());
     }
-
 }

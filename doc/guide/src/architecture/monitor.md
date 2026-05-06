@@ -231,9 +231,9 @@ u32 at the specified byte offset within the map's value region.
 ### Prerequisites
 
 - **vmlinux**: Required for ELF symbols and BTF. Must match the guest
-  kernel.
-- **nokaslr**: Required on the guest command line. Text mapping
-  translation assumes `phys_base = 0`.
+  kernel. Symbols include `phys_base` so the runtime KASLR offset can
+  be resolved via a page-table walk through the BSP's CR3, breaking
+  the chicken-and-egg between text-symbol PA translation and KASLR.
 
 ## Probe pipeline
 

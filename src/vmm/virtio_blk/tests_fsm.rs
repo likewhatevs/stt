@@ -1631,3 +1631,163 @@ fn queue_config_rejected_after_driver_ok() {
     // (QUEUE_MAX_SIZE), not 64.
     assert_eq!(dev.worker.queues[0].size(), QUEUE_MAX_SIZE);
 }
+
+/// FAILED (bit 0x80) must be accepted on top of any FSM state.
+/// virtio-v1.2 §2.1.1 — `virtio_add_status(dev,
+/// VIRTIO_CONFIG_S_FAILED)` is the kernel's exit path on probe
+/// failure (drivers/virtio/virtio.c:363, 570, 606, 643). The
+/// kernel reads `get_status`, ORs in FAILED, and writes the
+/// result, so `val == current_status | FAILED` regardless of the
+/// FSM rung the driver had reached. Pins the FAILED early-accept
+/// branch in `set_status` at every legal predecessor state so a
+/// regression that re-routes the FAILED bit through the
+/// FSM-ladder match (and rejects it as an "illegal FSM
+/// transition") surfaces here. Mirrors
+/// `virtio_console::set_status_failed_accepted_at_every_fsm_state`.
+#[test]
+fn set_status_failed_accepted_at_every_fsm_state() {
+    // From device_status = 0.
+    let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, VIRTIO_CONFIG_S_FAILED);
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        VIRTIO_CONFIG_S_FAILED,
+        "FAILED from status=0 must be accepted",
+    );
+
+    // From device_status = S_ACK.
+    let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK | VIRTIO_CONFIG_S_FAILED);
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        S_ACK | VIRTIO_CONFIG_S_FAILED,
+        "FAILED from status=S_ACK must be accepted (S_ACK preserved)",
+    );
+
+    // From device_status = S_DRV.
+    let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV | VIRTIO_CONFIG_S_FAILED);
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        S_DRV | VIRTIO_CONFIG_S_FAILED,
+        "FAILED from status=S_DRV must be accepted (S_DRV preserved)",
+    );
+
+    // From device_status = S_OK (full FSM walk via init_device).
+    let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+    init_device(&mut dev);
+    assert_eq!(dev.device_status.load(Ordering::Acquire), S_OK);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK | VIRTIO_CONFIG_S_FAILED);
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        S_OK | VIRTIO_CONFIG_S_FAILED,
+        "FAILED from status=S_OK must be accepted (S_OK preserved)",
+    );
+}
+
+/// FAILED combined with a non-FAILED unrecognised new bit must
+/// be rejected — the FAILED early-accept only triggers when
+/// `new_bits == VIRTIO_CONFIG_S_FAILED` (FAILED alone, no other
+/// new bits). A guest mixing FAILED with garbage extra bits is
+/// misbehaving in a way unrelated to the legitimate FAILED
+/// signal. Mirrors
+/// `virtio_console::set_status_failed_plus_unknown_bit_rejected`.
+#[tracing_test::traced_test]
+#[test]
+fn set_status_failed_plus_unknown_bit_rejected() {
+    let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+    // val = ACK | FAILED | 0x10. new_bits = FAILED | 0x10 ≠
+    // FAILED alone, so the early-accept branch does NOT trigger;
+    // the FSM-ladder match has no arm for the union → reject.
+    write_reg(
+        &mut dev,
+        VIRTIO_MMIO_STATUS,
+        S_ACK | VIRTIO_CONFIG_S_FAILED | 0x10,
+    );
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        S_ACK,
+        "FAILED combined with a non-FAILED unknown bit must be \
+         rejected — the early-accept is gated on FAILED alone",
+    );
+    assert!(
+        logs_contain("illegal FSM transition"),
+        "FAILED+unknown-bit must emit the FSM-ladder rejection warn",
+    );
+}
+
+/// FAILED accepted on top of NEEDS_RESET when the kernel
+/// follows the documented `get_status` → OR-in-FAILED → write
+/// sequence. The poisoned device exposes NEEDS_RESET via
+/// `get_status`, the kernel's `virtio_add_status(FAILED)` reads
+/// that and writes back `NEEDS_RESET | FAILED`. The monotone-bit
+/// gate accepts (val ⊇ current); the FAILED branch stores both
+/// bits. Pins that NEEDS_RESET does NOT swallow a legitimate
+/// FAILED signal arriving with NEEDS_RESET present — the failure
+/// dump must show both states so an operator can distinguish
+/// "device declared itself broken" (NEEDS_RESET) from "driver
+/// gave up" (FAILED).
+#[test]
+fn set_status_failed_accepted_on_top_of_needs_reset() {
+    let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+    // Plant NEEDS_RESET via the same fetch_or the worker would
+    // use on queue poison.
+    dev.device_status
+        .fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        VIRTIO_CONFIG_S_NEEDS_RESET,
+    );
+    // Kernel-style sequence: read get_status, OR in FAILED, write.
+    let current = dev.device_status.load(Ordering::Acquire);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, current | VIRTIO_CONFIG_S_FAILED);
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        VIRTIO_CONFIG_S_NEEDS_RESET | VIRTIO_CONFIG_S_FAILED,
+        "FAILED must land alongside NEEDS_RESET when the kernel \
+         follows the get_status | FAILED write sequence",
+    );
+}
+
+/// FAILED on an idempotent re-write (FAILED already set) is a
+/// no-op via the `new_bits == 0` short-circuit — the FAILED
+/// early-accept only fires when FAILED is the SOLE new bit.
+/// Pins the interaction between the idempotent-rewrite gate and
+/// the FAILED branch so a future refactor that reorders them
+/// surfaces here. The kernel's `virtio_features_ok` post-write
+/// `get_status` re-read does not retrigger an MMIO write, but
+/// any path that issues a duplicate FAILED store must remain a
+/// silent no-op rather than logging a warn each time.
+#[tracing_test::traced_test]
+#[test]
+fn set_status_failed_idempotent_rewrite_is_noop() {
+    let mut dev = make_device(VIRTIO_BLK_DEFAULT_CAPACITY_BYTES, DiskThrottle::default());
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK | VIRTIO_CONFIG_S_FAILED);
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        S_ACK | VIRTIO_CONFIG_S_FAILED,
+        "FAILED accepted on first write",
+    );
+    // Duplicate FAILED store: same value, same bits — must
+    // short-circuit at `new_bits == 0` without re-emitting the
+    // warn or rejecting.
+    write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK | VIRTIO_CONFIG_S_FAILED);
+    assert_eq!(
+        dev.device_status.load(Ordering::Acquire),
+        S_ACK | VIRTIO_CONFIG_S_FAILED,
+        "idempotent FAILED re-write must NOT alter device_status",
+    );
+    assert!(
+        !logs_contain("illegal FSM transition"),
+        "idempotent FAILED re-write must NOT emit the illegal-transition warn",
+    );
+    assert!(
+        !logs_contain("attempted to clear"),
+        "idempotent FAILED re-write must NOT emit the clear-bit warn",
+    );
+}

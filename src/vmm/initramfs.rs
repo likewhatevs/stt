@@ -121,16 +121,41 @@ fn read_cstr(data: &[u8], offset: usize) -> Option<&str> {
 /// lib dirs feed the interp hints and are propagated to transitive deps.
 /// Walks transitive deps via level-parallel BFS. Returns empty result
 /// for static binaries or non-ELF files.
-#[tracing::instrument(skip_all, fields(binary = %binary.display()))]
 pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
-    // Cache results by canonical path — avoids re-resolving the same
-    // binary across concurrent initramfs builds (nextest parallelism).
-    static CACHE: LazyLock<std::sync::Mutex<HashMap<PathBuf, SharedLibs>>> =
+    resolve_shared_libs_inner(binary, &[])
+}
+
+/// Like [`resolve_shared_libs`] but seeds the BFS with additional
+/// interp-relative hint directories on top of the ones derived from
+/// the binary's own PT_INTERP. Use this when walking the interpreter
+/// itself: the linker has no PT_INTERP of its own, so the auto-derived
+/// hint set is empty and toolchain-local libs (interp→libA→libB chains
+/// through `/opt/toolchain/lib`) would otherwise fall off the BFS at
+/// libA's resolution step.
+fn resolve_shared_libs_with_extra_interp_hints(
+    binary: &Path,
+    extra_interp_hints: &[PathBuf],
+) -> Result<SharedLibs> {
+    resolve_shared_libs_inner(binary, extra_interp_hints)
+}
+
+#[tracing::instrument(skip_all, fields(binary = %binary.display(), extra_hints = extra_interp_hints.len()))]
+fn resolve_shared_libs_inner(
+    binary: &Path,
+    extra_interp_hints: &[PathBuf],
+) -> Result<SharedLibs> {
+    // Cache results by canonical path AND extra-hint set — avoids
+    // re-resolving the same binary across concurrent initramfs builds
+    // (nextest parallelism). Hints are part of the key so a second
+    // call on the same binary with different hint sets does not return
+    // the prior result.
+    static CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, Vec<PathBuf>), SharedLibs>>> =
         LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
     let canon = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
+    let cache_key = (canon.clone(), extra_interp_hints.to_vec());
     if let Ok(cache) = CACHE.lock()
-        && let Some(cached) = cache.get(&canon)
+        && let Some(cached) = cache.get(&cache_key)
     {
         return Ok(cached.clone());
     }
@@ -174,7 +199,7 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     // Without this, the system libc gets resolved first, causing version
     // mismatches when the custom ld.so loads a libc that requires GLIBC
     // symbols the custom ld.so doesn't provide.
-    let interp_search_dirs: Vec<PathBuf> = match interpreter {
+    let mut interp_search_dirs: Vec<PathBuf> = match interpreter {
         Some(ref interp) if !is_standard_interpreter(interp) => {
             let interp_path = Path::new(interp);
             let mut dirs = Vec::new();
@@ -192,6 +217,18 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
         }
         _ => Vec::new(),
     };
+
+    // Caller-supplied hints (used when walking the linker itself: the
+    // linker has no PT_INTERP of its own, so the match arm above
+    // produces an empty set and the caller passes the toolchain dirs
+    // computed at the call site). Extras are appended after the
+    // auto-derived dirs so a binary's own PT_INTERP-derived hints take
+    // precedence; resolve_soname iterates in order.
+    for hint in extra_interp_hints {
+        if !interp_search_dirs.contains(hint) {
+            interp_search_dirs.push(hint.clone());
+        }
+    }
 
     // Resolve the full transitive closure via level-parallel BFS.
     // Each level's file reads (read + ELF parse) run in parallel via
@@ -279,7 +316,7 @@ pub(crate) fn resolve_shared_libs(binary: &Path) -> Result<SharedLibs> {
     };
 
     if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(canon, result.clone());
+        cache.insert(cache_key, result.clone());
     }
 
     Ok(result)
@@ -637,8 +674,9 @@ fn register_parent_dirs(dirs: &mut BTreeSet<String>, guest_path: &str) {
 /// `include_files` adds files verbatim to the archive (no strip_debug).
 /// Each entry is `(archive_path, host_path)`. ELF files get shared library
 /// resolution; non-ELF files are copied as-is. Only regular files are
-/// accepted; FIFOs, device nodes, and sockets are rejected. Archive paths
-/// must not contain `..` components. Callers expand directories into
+/// accepted; symlinks (rejected to prevent embedding files outside the
+/// explicit set), FIFOs, device nodes, and sockets are rejected. Archive
+/// paths must not contain `..` components. Callers expand directories into
 /// individual file entries before calling this function (see
 /// `cli::resolve_include_files`).
 ///
@@ -669,15 +707,28 @@ pub fn build_initramfs_base(
                 archive_path
             );
         }
-        // Reject non-regular files (FIFOs, device nodes, sockets block or
-        // produce garbage).
-        let meta = std::fs::metadata(host_path).with_context(|| {
+        // Reject symlinks before any other check. symlink_metadata is
+        // lstat — it returns metadata about the symlink itself rather
+        // than its target. Following symlinks would let an
+        // include_files entry pointing at a sensitive host file
+        // (e.g. /etc/passwd) silently embed that file into the guest
+        // initramfs.
+        let meta = std::fs::symlink_metadata(host_path).with_context(|| {
             format!(
-                "stat include file '{}': {}",
+                "lstat include file '{}': {}",
                 archive_path,
                 host_path.display()
             )
         })?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "include_files entry '{}' is a symlink (symlinks are rejected to prevent embedding files outside the explicit set): {}",
+                archive_path,
+                host_path.display()
+            );
+        }
+        // Reject non-regular files (FIFOs, device nodes, sockets block or
+        // produce garbage).
         if !meta.file_type().is_file() {
             anyhow::bail!(
                 "include_files entry '{}' is not a regular file: {}",
@@ -781,12 +832,30 @@ pub fn build_initramfs_base(
 
                 // Non-standard interpreters may have their own shared lib
                 // deps (custom toolchain linkers alongside their libs).
-                if !is_standard_interpreter(interp)
-                    && let Ok(interp_result) = resolve_shared_libs(interp_path)
-                {
-                    for (g, h) in interp_result.found {
-                        register_parent_dirs(&mut dirs, &g);
-                        shared_libs.push((g, h));
+                // The linker has no PT_INTERP itself, so calling
+                // resolve_shared_libs without extra hints would BFS its
+                // DT_NEEDED only against system search paths and miss
+                // toolchain-local libs (and their transitive deps). Feed
+                // the linker's parent and sibling lib dirs in as extra
+                // interp-relative hints so the linker's own libA→libB
+                // chain is discovered against the same toolchain dirs
+                // the parent binary's BFS already used.
+                if !is_standard_interpreter(interp) {
+                    let mut interp_hints: Vec<PathBuf> = Vec::new();
+                    if let Some(parent) = interp_path.parent() {
+                        interp_hints.push(parent.to_path_buf());
+                        if let Some(grandparent) = parent.parent() {
+                            interp_hints.push(grandparent.join("lib"));
+                            interp_hints.push(grandparent.join("lib64"));
+                        }
+                    }
+                    if let Ok(interp_result) =
+                        resolve_shared_libs_with_extra_interp_hints(interp_path, &interp_hints)
+                    {
+                        for (g, h) in interp_result.found {
+                            register_parent_dirs(&mut dirs, &g);
+                            shared_libs.push((g, h));
+                        }
                     }
                 }
             }

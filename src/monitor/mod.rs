@@ -309,6 +309,19 @@ pub struct MonitorReport {
     #[doc(hidden)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog_observation: Option<WatchdogObservation>,
+    /// Live `PAGE_OFFSET` value used by the monitor for KVA→PA
+    /// translation, captured at the moment the per-iteration
+    /// `DATA_VALID` latch fired. On KASLR-randomized kernels
+    /// (`CONFIG_RANDOMIZE_MEMORY`) the guest publishes a
+    /// randomized base into `page_offset_base` only after early
+    /// boot completes, so this records the value the monitor
+    /// actually used to read `struct rq` rather than the static
+    /// fallback (`0xffff_8880_0000_0000` on x86_64). 0 means the
+    /// latch never fired (guest never finished boot, or the
+    /// monitor was not started).
+    #[doc(hidden)]
+    #[serde(default)]
+    pub page_offset: u64,
 }
 
 /// Observation of the `scx_sched.watchdog_timeout` override,

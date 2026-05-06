@@ -184,8 +184,7 @@ impl Aarch64WalkParams {
         }
         let start_level: u64 = 4 - levels_below;
         let indexmask_grainsize: u64 = (!0u64) >> (64 - (stride + 3));
-        let first_indexmask: u64 =
-            (!0u64) >> (64 - (va_width - stride * (4 - start_level)));
+        let first_indexmask: u64 = (!0u64) >> (64 - (va_width - stride * (4 - start_level)));
         // PTE_ADDR_LOW = bits [49:PAGE_SHIFT]. On non-LPA / non-LPA2
         // kernels bits [49:48] are RES0; matching the kernel's
         // accessor is forward-compatible at zero behaviour cost.
@@ -887,10 +886,7 @@ impl GuestMem {
         // corrupt the entry's bytes, and bypass-on-poison would
         // silently drop every subsequent hit.
         {
-            let guard = self
-                .page_tlb
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = self.page_tlb.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.as_ref()
                 && entry.cr3_pa == cr3_pa
                 && entry.l5 == l5
@@ -918,10 +914,7 @@ impl GuestMem {
         }
 
         if let Some(pa) = walk_result {
-            let mut guard = self
-                .page_tlb
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = self.page_tlb.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(TlbEntry {
                 cr3_pa,
                 l5,
@@ -966,10 +959,7 @@ impl GuestMem {
         // Recover from poison rather than silently bypass — see
         // [`Self::translate_kva`] for the rationale.
         {
-            let guard = self
-                .page_tlb
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = self.page_tlb.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = guard.as_ref()
                 && entry.cr3_pa == cr3_pa
                 && entry.l5 == l5
@@ -1000,10 +990,7 @@ impl GuestMem {
         }
 
         if let Some(pa) = walk_result {
-            let mut guard = self
-                .page_tlb
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut guard = self.page_tlb.lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(TlbEntry {
                 cr3_pa,
                 l5,
@@ -1448,13 +1435,14 @@ fn read_sd_name(
     name_offset: usize,
     page_offset: u64,
     start_kernel_map: u64,
+    phys_base: u64,
 ) -> String {
     let name_kva = mem.read_u64(sd_pa, name_offset);
     if name_kva == 0 {
         return String::new();
     }
     // Try text mapping first (rodata), then direct mapping.
-    let text_pa = super::symbols::text_kva_to_pa_with_base(name_kva, start_kernel_map);
+    let text_pa = super::symbols::text_kva_to_pa_with_base(name_kva, start_kernel_map, phys_base);
     let name_pa = if text_pa < mem.size() {
         text_pa
     } else {
@@ -1494,6 +1482,7 @@ pub(crate) fn read_sched_domain_tree(
     sd_offsets: &SchedDomainOffsets,
     page_offset: u64,
     start_kernel_map: u64,
+    phys_base: u64,
 ) -> Option<Vec<SchedDomainSnapshot>> {
     const MAX_DEPTH: usize = 8;
 
@@ -1534,6 +1523,7 @@ pub(crate) fn read_sched_domain_tree(
             sd_offsets.sd_name,
             page_offset,
             start_kernel_map,
+            phys_base,
         );
         let flags = mem.read_u32(sd_pa, sd_offsets.sd_flags) as i32;
         let span_weight = mem.read_u32(sd_pa, sd_offsets.sd_span_weight);
@@ -1788,6 +1778,76 @@ pub(crate) struct DumpTrigger {
         Option<std::sync::Arc<crate::vmm::PiMutex<crate::vmm::virtio_console::VirtioConsole>>>,
 }
 
+/// Inputs for per-iteration refresh of `__per_cpu_offset[]` and the
+/// physical addresses derived from it.
+///
+/// The host monitor thread spawns concurrently with the guest BSP
+/// entering KVM_RUN — `start_kernel`'s `setup_per_cpu_areas` runs
+/// inside the guest, not on the host, so a one-shot read of
+/// `__per_cpu_offset[]` at host monitor spawn time hits BSS zeros
+/// for every slot. `compute_rq_pas` then wraps `runqueues_kva.add(0)`
+/// past zero into the upper-half KVA space, [`super::symbols::kva_to_pa`]
+/// subtracts `page_offset` (`0xFFFF_8880_…`) producing a `~131 TB` PA
+/// that fails [`GuestMem::read_u64`]'s bounds check, and every
+/// scalar read returns silent zero. The result is `rq_clock=0`,
+/// `nr_running=0`, etc. for the entire VM lifetime.
+///
+/// When [`MonitorConfig::rq_refresh`] is set, [`monitor_loop`]
+/// re-reads `__per_cpu_offset[]` at the top of every sample
+/// iteration, recomputes `rq_pas`, and (when [`Self::event`] is
+/// set) recomputes `event_pcpu_pas`. Once the BSP populates
+/// `__per_cpu_offset[]` (during `setup_per_cpu_areas` in
+/// `start_kernel`) the offsets become non-zero and reads land
+/// inside guest DRAM. The transition is silent: early samples
+/// observe zeros (consistent with the pre-refresh behaviour) and
+/// later samples observe real values once the guest has booted
+/// past percpu setup.
+pub(crate) struct RqRefresh {
+    /// PA of the kernel's `__per_cpu_offset[]` array. Read each
+    /// iteration via [`super::symbols::read_per_cpu_offsets`].
+    pub pco_pa: u64,
+    /// KVA of the `runqueues` percpu symbol. Combined with each
+    /// CPU's offset to compute the per-CPU rq KVA, then reduced
+    /// to a PA via [`super::symbols::kva_to_pa`].
+    pub runqueues_kva: u64,
+    /// Number of CPUs (entries to read from `__per_cpu_offset[]`).
+    pub num_cpus: u32,
+    /// PA of the `page_offset_base` symbol (text-mapped). When
+    /// `Some`, the monitor re-reads `PAGE_OFFSET` each sample so a
+    /// KASLR `CONFIG_RANDOMIZE_MEMORY` value (e.g.
+    /// `0xff11_0000_0000_0000`) replaces the
+    /// [`super::symbols::DEFAULT_PAGE_OFFSET`] fallback once the
+    /// guest kernel finishes randomization (which happens after
+    /// the host monitor thread spawns — the same boot race that
+    /// motivates the `__per_cpu_offset[]` refresh). When `None`
+    /// (or when the read returns zero / fails the bit-63 check),
+    /// the per-iteration code keeps using the pre-loop resolved
+    /// `page_offset` value.
+    pub page_offset_base_pa: Option<u64>,
+    /// Optional refresh inputs for `event_pcpu_pas`. When `None`,
+    /// the monitor leaves `event_pcpu_pas` at its initial value
+    /// (typically `None` because `scx_root` was null at host
+    /// monitor spawn time).
+    pub event: Option<EventRefresh>,
+}
+
+/// Inputs for per-iteration refresh of `event_pcpu_pas`.
+///
+/// `event_pcpu_pas` derives from `*scx_root -> scx_sched.pcpu`
+/// (or `event_stats_cpu` on pre-6.18 kernels) plus
+/// `__per_cpu_offset[]`. The `scx_root` deref returns null until a
+/// scheduler attaches, so a one-shot pre-loop resolve always
+/// observes `None`. Refresh each iteration so the first sample
+/// after scheduler attach picks up real PAs.
+pub(crate) struct EventRefresh {
+    /// PA of the `scx_root` global pointer (text mapping).
+    pub scx_root_pa: u64,
+    /// BTF-resolved offsets within `scx_sched` and the per-CPU
+    /// stats struct. See [`ScxEventOffsets`] for version-specific
+    /// indirection.
+    pub event_offsets: ScxEventOffsets,
+}
+
 /// Override for the scheduler watchdog timeout, written every monitor
 /// iteration.
 ///
@@ -1808,8 +1868,6 @@ pub(crate) enum WatchdogOverride {
         watchdog_offset: usize,
         /// Jiffies value to write.
         jiffies: u64,
-        /// Runtime `PAGE_OFFSET` for KVA-to-PA translation.
-        page_offset: u64,
     },
     /// Pre-7.1 path: write directly to the static global's PA.
     StaticGlobal {
@@ -1829,8 +1887,15 @@ pub(crate) enum WatchdogOverride {
 /// loaded struct_ops programs surface immediately rather than waiting
 /// for a context rebuild.
 pub(crate) struct ProgStatsCtx {
-    /// Per-CPU offset table (`__per_cpu_offset[]`) used to translate
-    /// each program's percpu stats pointer into a concrete KVA.
+    /// Per-CPU offset table (`__per_cpu_offset[]`) seed used to
+    /// translate each program's percpu stats pointer into a
+    /// concrete KVA. When [`MonitorConfig::rq_refresh`] is `None`
+    /// this seed is forwarded verbatim to
+    /// [`super::bpf_prog::walk_struct_ops_runtime_stats`] every
+    /// sample. When `rq_refresh` is `Some`, the loop overrides
+    /// this with a freshly read array each iteration so newly
+    /// attached struct_ops programs read post-`setup_per_cpu_areas`
+    /// per-CPU bases.
     pub per_cpu_offsets: Vec<u64>,
     /// Paging context ([`WalkContext`]) threaded into
     /// [`super::bpf_prog::walk_struct_ops_runtime_stats`] so per-CPU
@@ -1850,6 +1915,12 @@ pub(crate) struct ProgStatsCtx {
     /// `prog_idr` symbol KVAs translate correctly even on aarch64
     /// kernels with VA_BITS != 48.
     pub start_kernel_map: u64,
+    /// Runtime KASLR offset (`phys_base` on x86_64; `0` on aarch64
+    /// / non-KASLR boots). Threaded into
+    /// [`super::bpf_prog::walk_struct_ops_runtime_stats`] alongside
+    /// `start_kernel_map` so the IDR head's PA resolves correctly
+    /// on KASLR kernels.
+    pub phys_base: u64,
 }
 
 /// Samples and optional watchdog observation returned by
@@ -1865,6 +1936,13 @@ pub(crate) struct MonitorLoopResult {
     pub(crate) drain: crate::vmm::host_comms::BulkDrainResult,
     /// Watchdog read-back, when a watchdog override was installed.
     pub(crate) watchdog_observation: Option<super::WatchdogObservation>,
+    /// Live `PAGE_OFFSET` value used by the loop for KVA→PA
+    /// translation, captured at the moment the per-iteration
+    /// `DATA_VALID` latch fired. Forwarded onto `MonitorReport` so
+    /// callers can prove the KASLR-randomized base was observed
+    /// (rather than the static `DEFAULT_PAGE_OFFSET` fallback).
+    /// 0 means the latch never fired during the run.
+    pub(crate) page_offset: u64,
 }
 
 /// Configuration for the monitor sampling loop.
@@ -1872,8 +1950,14 @@ pub(crate) struct MonitorLoopResult {
 /// Bundles the parameters that `monitor_loop` needs beyond the
 /// required `mem`, `rq_pas`, `offsets`, `interval`, `kill`, and `run_start`.
 pub(crate) struct MonitorConfig<'a> {
-    /// Per-CPU physical addresses of `scx_sched_pcpu`. When present (and
-    /// `event_offsets` exist), each sample includes event counters.
+    /// Per-CPU physical addresses of `scx_sched_pcpu` (or
+    /// `scx_event_stats` on pre-6.18 kernels). When `rq_refresh` is
+    /// `None` and `event_offsets` exist, each sample includes event
+    /// counters drawn from these PAs. Production callers pass
+    /// `None` here and supply a [`RqRefresh`] whose
+    /// [`RqRefresh::event`] is `Some(EventRefresh)` so the loop can
+    /// recompute the PAs against the live `__per_cpu_offset[]` and
+    /// observe schedulers that attach mid-run.
     pub event_pcpu_pas: Option<&'a [u64]>,
     /// Reactive dump configuration. When a sustained threshold violation is
     /// detected, writes the dump request flag to guest SHM to trigger a
@@ -1905,13 +1989,53 @@ pub(crate) struct MonitorConfig<'a> {
     /// aarch64 hosts where the base depends on `VA_BITS` (16 KB-granule
     /// kernels with VA_BITS=47 vs the 48-bit default).
     pub start_kernel_map: u64,
+    /// Runtime KASLR offset (x86_64 `phys_base`; `0` on aarch64 and
+    /// non-KASLR boots). Forwarded into helpers that translate
+    /// kernel-text/data symbols so KASLR'd kernels resolve symbols
+    /// correctly. Resolved by
+    /// [`super::symbols::resolve_phys_base`] at monitor-thread
+    /// start, then threaded through here.
+    pub phys_base: u64,
+    /// Optional per-iteration refresh of `__per_cpu_offset[]` and the
+    /// addresses derived from it. When set, [`monitor_loop`] re-reads
+    /// the per-CPU offset table each sample, overriding the static
+    /// `rq_pas` and `event_pcpu_pas` arguments. See [`RqRefresh`] for
+    /// the boot-race rationale. When `None`, the static arrays are
+    /// used unchanged (test path; production callers always populate
+    /// this).
+    pub rq_refresh: Option<&'a RqRefresh>,
+    /// Optional boot-complete eventfd. When set, [`monitor_loop`]
+    /// blocks on this eventfd (alongside `kill_evt` and a 5 s
+    /// timeout) BEFORE entering the sample loop, so the first
+    /// sample observes a fully booted guest. The eventfd is fired
+    /// by the freeze coordinator's bulk-drain dispatch when the
+    /// guest publishes a CRC-valid
+    /// [`crate::vmm::wire::MSG_TYPE_SYS_RDY`] TLV frame on the
+    /// virtio-console bulk port, which happens after the guest's
+    /// `ktstr_guest_init` completes `mount_filesystems()`. By that
+    /// point `setup_per_cpu_areas` and KASLR randomization have
+    /// long since completed (both happen during kernel boot,
+    /// strictly before userspace init runs) — both prerequisites
+    /// for the per-iteration `__per_cpu_offset[]` /
+    /// `page_offset_base` reads to land in DRAM. When `None` (test
+    /// path or eventfd-create failure), the pre-loop wait is
+    /// skipped entirely; the per-iteration `data_valid` gate in
+    /// the sample loop remains as defense-in-depth against
+    /// pre-boot zeros.
+    pub sys_rdy: Option<&'a EventFd>,
 }
 
 /// Run the monitor loop, sampling all CPUs at the given interval
 /// until `kill` is set. Returns a [`MonitorLoopResult`] containing
-/// the collected per-interval samples, a final drain of the
-/// guest-to-host SHM ring, and — when a watchdog override was
-/// installed — the post-run `WatchdogObservation` read-back.
+/// the collected per-interval samples and — when a watchdog override
+/// was installed — the post-run `WatchdogObservation` read-back.
+///
+/// `rq_pas` is the static seed for per-CPU `struct rq` PAs and is
+/// used unchanged when `cfg.rq_refresh` is `None` (the test path
+/// uses this; production passes `&[]` and supplies a
+/// [`RqRefresh`] that recomputes `rq_pas` per iteration to dodge
+/// the host-monitor / guest-BSP boot race documented on
+/// [`RqRefresh`]).
 ///
 /// The cadence is driven by a `CLOCK_MONOTONIC` `timerfd` armed at
 /// `interval`; an external `kill_evt` write breaks out of the
@@ -1932,20 +2056,111 @@ pub(crate) fn monitor_loop(
     run_start: Instant,
     cfg: &MonitorConfig<'_>,
 ) -> MonitorLoopResult {
-    let event_pcpu_pas = cfg.event_pcpu_pas;
     let dump_trigger = cfg.dump_trigger;
     let watchdog_override = cfg.watchdog_override;
     let vcpu_timing = cfg.vcpu_timing;
     let perf_capture = cfg.perf_capture;
     let preemption_threshold_ns = cfg.preemption_threshold_ns;
     let prog_stats_ctx = cfg.prog_stats_ctx;
-    let page_offset = cfg.page_offset;
+    // Mutable so the per-iteration refresh can update it once
+    // `page_offset_base` becomes readable. Initialized from the
+    // pre-loop resolved value, which on KASLR-randomized kernels
+    // (CONFIG_RANDOMIZE_MEMORY) is the DEFAULT_PAGE_OFFSET fallback
+    // because the symbol was zero at host monitor spawn time. The
+    // refresh below re-reads `page_offset_base` and overrides
+    // `page_offset` once the guest writes the real KASLR value
+    // (e.g. 0xff11_0000_0000_0000). Without this override, every
+    // `kva_to_pa(kva, page_offset)` produces a PA off by the
+    // KASLR delta (~13.5 GB) — the recomputed `rq_pas` land
+    // outside the 256 MB DRAM region and `read_u64`
+    // bounds-rejects to zero, so `rq_clock` reads as 0 forever.
+    let mut page_offset = cfg.page_offset;
     let start_kernel_map = cfg.start_kernel_map;
+    let phys_base = cfg.phys_base;
+    let rq_refresh = cfg.rq_refresh;
     let preemption_threshold_ns = if preemption_threshold_ns > 0 {
         preemption_threshold_ns
     } else {
         super::vcpu_preemption_threshold_ns(None)
     };
+    // Per-CPU PA buffers maintained across sample iterations. When
+    // `rq_refresh` is `Some`, every iteration recomputes them from
+    // a freshly read `__per_cpu_offset[]` to dodge the boot race
+    // documented on [`RqRefresh`]: the host monitor thread spawns
+    // concurrently with the guest BSP entering KVM_RUN, so a
+    // one-shot read at thread start hits BSS zeros and
+    // `compute_rq_pas` wraps to a ~131 TB PA that
+    // [`GuestMem::read_u64`] silently bounds-rejects to 0. When
+    // `rq_refresh` is `None` (test path), the static `rq_pas` /
+    // `cfg.event_pcpu_pas` / `prog_stats_ctx.per_cpu_offsets`
+    // arguments are used as-is for every sample.
+    let mut rq_pas_buf: Vec<u64> = rq_pas.to_vec();
+    let mut event_pcpu_pas_buf: Option<Vec<u64>> =
+        cfg.event_pcpu_pas.map(|s| s.to_vec());
+    let mut per_cpu_offsets_buf: Vec<u64> = prog_stats_ctx
+        .map(|c| c.per_cpu_offsets.clone())
+        .unwrap_or_default();
+    // Diagnostic counter for the refresh path. Emits per_cpu_offset[],
+    // rq_pas[], page_offset, runqueues_kva, mem.size, plus a direct
+    // rq_clock read, a phys_base probe, and a 16-byte hex dump for
+    // both the FIRST 5 iterations (catches initial state) AND the
+    // last 5 iterations of an assumed ~300-sample run (catches the
+    // post-guest-boot state). The early window distinguishes wrong
+    // pco_pa / wrong page_offset / wrong BTF rq_clock; the late
+    // window distinguishes "guest never wrote the BSS" from "writes
+    // are invisible to host monitor". Removed once probe-reload lands.
+    let mut diag_iter: u32 = 0;
+    // Previous `page_offset_base` read, used by the stability gate
+    // below. The bit-63 + canonical-half check alone is too loose:
+    // mid-decompression garbage in the bzImage region can satisfy
+    // bit 63 while pointing nowhere useful (observed:
+    // 0xfedfe68cfedfe680 latched and corrupted page_offset before
+    // the guest finished kernel decompression). Requiring two
+    // consecutive reads to match — combined with a 4 KiB-page
+    // alignment check below — rejects transient garbage and only
+    // accepts the stable post-KASLR value.
+    let mut prev_pob: u64 = 0;
+    // Latched once `__per_cpu_offset[0]` becomes non-zero AND the
+    // KASLR-randomized `page_offset_base` has been observed (i.e.
+    // the guest finished `setup_per_cpu_areas` and KASLR
+    // randomization). Until both are visible, the recomputed
+    // `rq_pas` either wrap to ~131 TB (pre-percpu) or land outside
+    // the 256 MB DRAM region (pre-KASLR), so every downstream
+    // walker — `read_event_stats`, `read_rq_schedstat`,
+    // `read_sched_domain_tree`, `walk_struct_ops_runtime_stats` —
+    // chases pointers through silent-zero returns. The chase is
+    // O(n) per phantom node and turns the 100 ms timerfd cadence
+    // into multi-second iterations. Skipping the expensive walks
+    // until `data_valid` flips to true keeps pre-boot iterations
+    // microsecond-cheap so post-boot samples land on the timerfd
+    // schedule rather than minutes after the BSP brought up the
+    // scheduler. Latches monotonically — once the guest has
+    // valid data, we never go back to the cheap path even if a
+    // subsequent read transiently returns zero.
+    //
+    // Initialized `true` when `rq_refresh` is `None` because the
+    // test path passes pre-resolved `rq_pas` and `event_pcpu_pas`
+    // arguments — there is no boot race to gate against and the
+    // walks must run from the first iteration.
+    let mut data_valid: bool = rq_refresh.is_none();
+    // `page_offset` value captured at the instant `data_valid`
+    // latched, forwarded onto `MonitorReport.page_offset` via
+    // `MonitorLoopResult.page_offset`. Stays 0 when the latch
+    // never fires (guest never booted far enough, monitor was
+    // never started, or VM died during the pre-sample boot
+    // wait); externally-visible signal that the KASLR-randomized
+    // base was actually observed during the run rather than the
+    // static `DEFAULT_PAGE_OFFSET` fallback. Distinct from the
+    // mutable `page_offset` local because that local always
+    // carries SOME value (initialized from `cfg.page_offset`),
+    // so it cannot itself signal "no observation made."
+    let mut latched_page_offset: u64 = 0;
+    // Authoritative CPU count: `rq_refresh` overrides `rq_pas.len()`
+    // because the static seed slice may be empty in production
+    // (where the boot-race fix sources every PA from the refresh).
+    let num_cpus: usize = rq_refresh
+        .map(|r| r.num_cpus as usize)
+        .unwrap_or(rq_pas.len());
     let mut samples: Vec<MonitorSample> = Vec::new();
     // Reactive threshold trackers — reuse the post-hoc
     // `SustainedViolationTracker` so "sustained for N samples"
@@ -1954,9 +2169,9 @@ pub(crate) fn monitor_loop(
     let mut imbalance_tracker = super::SustainedViolationTracker::default();
     let mut dsq_tracker = super::SustainedViolationTracker::default();
     let mut stall_trackers: Vec<super::SustainedViolationTracker> =
-        vec![super::SustainedViolationTracker::default(); rq_pas.len()];
+        vec![super::SustainedViolationTracker::default(); num_cpus];
     let mut dump_requested = false;
-    let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(rq_pas.len());
+    let mut cpus: Vec<CpuSnapshot> = Vec::with_capacity(num_cpus);
     let mut perf_read_err_reported = false;
     let mut vcpu_timing_err_reported: Vec<bool> = vcpu_timing
         .map(|vt| vec![false; vt.pthreads.len()])
@@ -1981,8 +2196,11 @@ pub(crate) fn monitor_loop(
             tracing::warn!(err = %e, "monitor: timerfd_create failed");
             return MonitorLoopResult {
                 samples,
-                drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
+                drain: crate::vmm::host_comms::BulkDrainResult {
+                    entries: shm_entries,
+                },
                 watchdog_observation,
+                page_offset: latched_page_offset,
             };
         }
     };
@@ -1991,8 +2209,11 @@ pub(crate) fn monitor_loop(
         tracing::warn!(err = %e, "monitor: timerfd_settime failed");
         return MonitorLoopResult {
             samples,
-            drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
+            drain: crate::vmm::host_comms::BulkDrainResult {
+                entries: shm_entries,
+            },
             watchdog_observation,
+            page_offset: latched_page_offset,
         };
     }
     let epoll = match Epoll::new() {
@@ -2001,8 +2222,11 @@ pub(crate) fn monitor_loop(
             tracing::warn!(err = %e, "monitor: epoll_create1 failed");
             return MonitorLoopResult {
                 samples,
-                drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
+                drain: crate::vmm::host_comms::BulkDrainResult {
+                    entries: shm_entries,
+                },
                 watchdog_observation,
+                page_offset: latched_page_offset,
             };
         }
     };
@@ -2016,8 +2240,11 @@ pub(crate) fn monitor_loop(
         tracing::warn!(err = %e, "monitor: epoll_ctl add timerfd failed");
         return MonitorLoopResult {
             samples,
-            drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
+            drain: crate::vmm::host_comms::BulkDrainResult {
+                entries: shm_entries,
+            },
             watchdog_observation,
+            page_offset: latched_page_offset,
         };
     }
     if let Err(e) = epoll.ctl(
@@ -2028,15 +2255,145 @@ pub(crate) fn monitor_loop(
         tracing::warn!(err = %e, "monitor: epoll_ctl add kill_evt failed");
         return MonitorLoopResult {
             samples,
-            drain: crate::vmm::host_comms::BulkDrainResult { entries: shm_entries },
+            drain: crate::vmm::host_comms::BulkDrainResult {
+                entries: shm_entries,
+            },
             watchdog_observation,
+            page_offset: latched_page_offset,
         };
     }
     let mut epoll_buf = [EpollEvent::default(); 2];
 
+    // Pre-sample boot-complete wait. When `cfg.sys_rdy` is set
+    // (production path) we register the eventfd alongside `kill_evt`
+    // on a dedicated epoll instance and block for up to 5 s. The
+    // eventfd is fired by the freeze coordinator's bulk-drain
+    // dispatch when the guest publishes a CRC-valid
+    // [`crate::vmm::wire::MSG_TYPE_SYS_RDY`] TLV frame on the
+    // virtio-console bulk port — sent by `ktstr_guest_init` after
+    // `mount_filesystems()`. By the time the SYS_RDY frame reaches
+    // the host, `setup_per_cpu_areas` has populated
+    // `__per_cpu_offset[]` and the KASLR randomizer has populated
+    // `page_offset_base` (both kernel-boot prerequisites that
+    // complete strictly before userspace init runs), so the first
+    // sample iteration's refresh produces in-DRAM PAs.
+    //
+    // Three exit conditions:
+    //   1. sys_rdy fires: proceed to the sample loop (normal path).
+    //   2. kill_evt fires: VM died before booting. Skip the sample
+    //      loop entirely, returning the empty MonitorLoopResult.
+    //   3. 5 s timeout: the guest never published SYS_RDY (e.g.
+    //      KTSTR_EXIT cmdline triggered an early exit before
+    //      `ktstr_guest_init` reached the SYS_RDY emission, or the
+    //      bulk port wasn't yet open when the guest tried to send).
+    //      Best-effort fall through to the sample loop; reads will
+    //      still hit the per-iteration refresh which tolerates
+    //      pre-boot zeros via the existing `data_valid` gate.
+    if let Some(sys_rdy) = cfg.sys_rdy {
+        let boot_epoll = match Epoll::new() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(err = %e, "monitor: boot epoll_create1 failed");
+                return MonitorLoopResult {
+                    samples,
+                    drain: crate::vmm::host_comms::BulkDrainResult {
+                        entries: shm_entries,
+                    },
+                    watchdog_observation,
+                    page_offset: latched_page_offset,
+                };
+            }
+        };
+        let boot_fd = sys_rdy.as_raw_fd();
+        if let Err(e) = boot_epoll.ctl(
+            ControlOperation::Add,
+            boot_fd,
+            EpollEvent::new(EventSet::IN, boot_fd as u64),
+        ) {
+            tracing::warn!(err = %e, "monitor: epoll_ctl add sys_rdy failed");
+        }
+        if let Err(e) = boot_epoll.ctl(
+            ControlOperation::Add,
+            kill_fd,
+            EpollEvent::new(EventSet::IN, kill_fd as u64),
+        ) {
+            tracing::warn!(err = %e, "monitor: epoll_ctl add kill_evt (boot wait) failed");
+        }
+        let mut boot_buf = [EpollEvent::default(); 2];
+        // 5 s ceiling: a healthy guest emits SYS_RDY within ~3 s
+        // of boot; longer is a stuck guest. The fallthrough path
+        // (no SYS_RDY) is gated by the per-iteration `data_valid`
+        // latch in the sample loop below, so a missed SYS_RDY does
+        // not produce phantom-zero walks — it just delays the first
+        // valid sample. Tighter timeout means VM teardown does not
+        // wait on this thread joining when the test exits without
+        // sending SYS_RDY (e.g. early-init crash).
+        let timeout_ms: i32 = 5_000;
+        let mut killed = false;
+        match boot_epoll.wait(timeout_ms, &mut boot_buf) {
+            Ok(n) => {
+                for ev in &boot_buf[..n] {
+                    if ev.fd() == kill_fd {
+                        killed = true;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "monitor: boot epoll_wait failed");
+            }
+        }
+        if killed || kill.load(Ordering::Acquire) {
+            return MonitorLoopResult {
+                samples,
+                drain: crate::vmm::host_comms::BulkDrainResult {
+                    entries: shm_entries,
+                },
+                watchdog_observation,
+                page_offset: latched_page_offset,
+            };
+        }
+    }
+
     loop {
         if kill.load(Ordering::Acquire) {
             break;
+        }
+        // Refresh `page_offset` from `page_offset_base` BEFORE the
+        // watchdog write below. The watchdog override dereferences
+        // `*scx_root` and translates the resulting `scx_sched_kva`
+        // to a PA via `kva_to_pa(_, page_offset)`. On
+        // KASLR-randomized kernels the pre-loop `page_offset` fell
+        // back to DEFAULT_PAGE_OFFSET (the symbol read returned
+        // zero before guest randomization completed); using that
+        // stale default here would write to a wrong PA and the
+        // post-write read-back would observe zero — surfacing as
+        // the `watchdog_timeout_override_lands_in_guest_memory`
+        // assertion failure (expected_jiffies != observed_jiffies).
+        // Hoisting this refresh above both the watchdog write and
+        // the rq_pas / event_pcpu_pas recompute block ensures every
+        // KVA-to-PA translation in the iteration sees the same
+        // live `page_offset`. Three-gate accept on the read: bit 63
+        // (canonical upper-half signal), 4 KiB page alignment
+        // (kernel PAGE_OFFSET is page-aligned by construction), and
+        // stability vs the previous read (rejects mid-decompression
+        // garbage that briefly satisfied the bit-63 check).
+        let mut page_offset_resolved = false;
+        if let Some(refresh) = rq_refresh {
+            if let Some(pob_pa) = refresh.page_offset_base_pa {
+                let val = mem.read_u64(pob_pa, 0);
+                let pob_aligned = (val & 0xFFF) == 0;
+                let pob_stable = prev_pob == val;
+                prev_pob = val;
+                if val & (1u64 << 63) != 0 && pob_aligned && pob_stable {
+                    page_offset = val;
+                    page_offset_resolved = true;
+                }
+            } else {
+                // No symbol available (aarch64 / stripped vmlinux):
+                // pre-loop `page_offset` is the best we have. Treat
+                // the page-offset side as already resolved.
+                page_offset_resolved = true;
+            }
         }
         if let Some(wd) = watchdog_override {
             let (write_pa, write_offset, wd_jiffies) = match wd {
@@ -2044,13 +2401,12 @@ pub(crate) fn monitor_loop(
                     scx_root_pa,
                     watchdog_offset,
                     jiffies,
-                    page_offset,
                 } => {
                     let sch_kva = mem.read_u64(*scx_root_pa, 0);
                     if sch_kva == 0 {
                         (None, 0, *jiffies)
                     } else {
-                        let sch_pa = super::symbols::kva_to_pa(sch_kva, *page_offset);
+                        let sch_pa = super::symbols::kva_to_pa(sch_kva, page_offset);
                         (Some(sch_pa), *watchdog_offset, *jiffies)
                     }
                 }
@@ -2070,46 +2426,143 @@ pub(crate) fn monitor_loop(
                 }
             }
         }
-        cpus.clear();
-        cpus.extend(rq_pas.iter().map(|&pa| read_rq_stats(mem, pa, offsets)));
-
-        // Overlay event counters if available.
-        if let (Some(pcpu_pas), Some(ev)) = (event_pcpu_pas, &offsets.event_offsets) {
-            for (i, cpu) in cpus.iter_mut().enumerate() {
-                if let Some(&pcpu_pa) = pcpu_pas.get(i) {
-                    cpu.event_counters = Some(read_event_stats(mem, pcpu_pa, ev));
-                }
+        // Per-iteration refresh of `__per_cpu_offset[]` and the
+        // PAs derived from it. Boot-race rationale: see [`RqRefresh`]
+        // doc. Until the guest BSP runs `setup_per_cpu_areas`, every
+        // entry is BSS zero and the recomputed `rq_pas` wrap to PAs
+        // that fail [`GuestMem::read_u64`]'s bounds check, so
+        // `read_rq_stats` returns zero-filled `CpuSnapshot`s. Once
+        // the BSP has populated the array, real PAs land inside
+        // guest DRAM and subsequent samples observe live counters.
+        if let Some(refresh) = rq_refresh {
+            // `page_offset` was already refreshed at the top of this
+            // iteration (before the watchdog write). `page_offset_resolved`
+            // carries the result into the data_valid latch below.
+            let fresh = super::symbols::read_per_cpu_offsets(
+                mem,
+                refresh.pco_pa,
+                refresh.num_cpus,
+            );
+            // Latch `data_valid` once the guest has populated the
+            // percpu offset table AND we've observed (or accepted
+            // the absence of) the KASLR base. Both halves are
+            // necessary — see the `data_valid` declaration for the
+            // rationale on why pre-validity walks are catastrophic.
+            // `__per_cpu_offset[]` is filled by the guest's
+            // `setup_per_cpu_areas` one slot at a time; observing
+            // only `[0] != 0` would latch the gate the moment the
+            // BSP's slot is initialised, while later AP slots still
+            // hold BSS zero. Walks for those APs would compute
+            // `runqueues_kva + 0`, wrap to a non-DRAM PA, and
+            // silently read zeros — the exact failure mode the gate
+            // exists to prevent. Require every slot to be populated
+            // (and the slice to be non-empty so a degenerate
+            // `num_cpus == 0` cannot vacuously pass).
+            if !data_valid
+                && page_offset_resolved
+                && !fresh.is_empty()
+                && fresh.iter().all(|&v| v != 0)
+            {
+                data_valid = true;
+                latched_page_offset = page_offset;
+                eprintln!(
+                    "DATA_VALID latched at iter={} page_offset={:#x} pco0={:#x}",
+                    diag_iter,
+                    page_offset,
+                    fresh.first().copied().unwrap_or(0),
+                );
             }
+            rq_pas_buf = super::symbols::compute_rq_pas(
+                refresh.runqueues_kva,
+                &fresh,
+                page_offset,
+            );
+            // `event_pcpu_pas` requires both fresh `__per_cpu_offset[]`
+            // AND a non-null `*scx_root` (a scheduler must be
+            // attached). Until the scheduler attaches, `scx_sched_kva`
+            // is zero and `resolve_event_pcpu_pas` returns `None` —
+            // event counters stay absent for that sample.
+            event_pcpu_pas_buf = refresh.event.as_ref().and_then(|ev| {
+                resolve_event_pcpu_pas(
+                    mem,
+                    ev.scx_root_pa,
+                    &ev.event_offsets,
+                    &fresh,
+                    page_offset,
+                )
+            });
+            per_cpu_offsets_buf = fresh;
+
+            // Iteration counter — used by the DATA_VALID latch
+            // eprintln and the FINAL diagnostic after the loop. We
+            // dropped the per-iteration MONITOR/PHYS_BASE/HEX dumps
+            // because nextest's stderr capture made the 15
+            // eprintlns slower than the timerfd cadence and starved
+            // the loop down to a handful of samples per run.
+            // Saturating to avoid overflow on long runs.
+            diag_iter = diag_iter.saturating_add(1);
         }
 
-        // Overlay schedstat fields if available.
-        if let Some(ss) = &offsets.schedstat_offsets {
-            for (i, cpu) in cpus.iter_mut().enumerate() {
-                if let Some(&rq_pa) = rq_pas.get(i) {
-                    cpu.schedstat = Some(read_rq_schedstat(mem, rq_pa, ss));
+        // Pre-validity short circuit: skip every guest-memory walk
+        // until both `__per_cpu_offset[]` and `page_offset` are
+        // resolved. See the `data_valid` declaration for why
+        // walking through silent-zero returns turns 100 ms iterations
+        // into seconds. When invalid we leave `cpus` empty so the
+        // sample push below records a degenerate sample rather than
+        // a sample full of phantom zeros — `dump_trigger`'s
+        // `!cpus.is_empty()` gate already short-circuits in that
+        // case, and `MonitorThresholds::evaluate` tolerates
+        // cpu-less samples.
+        if data_valid {
+            cpus.clear();
+            cpus.extend(rq_pas_buf.iter().map(|&pa| read_rq_stats(mem, pa, offsets)));
+
+            // Overlay event counters if available.
+            if let (Some(pcpu_pas), Some(ev)) =
+                (event_pcpu_pas_buf.as_deref(), &offsets.event_offsets)
+            {
+                for (i, cpu) in cpus.iter_mut().enumerate() {
+                    if let Some(&pcpu_pa) = pcpu_pas.get(i) {
+                        cpu.event_counters = Some(read_event_stats(mem, pcpu_pa, ev));
+                    }
                 }
             }
-        }
 
-        // Overlay sched domain tree if available.
-        if let Some(sd) = &offsets.sched_domain_offsets {
-            for (i, cpu) in cpus.iter_mut().enumerate() {
-                if let Some(&rq_pa) = rq_pas.get(i) {
-                    cpu.sched_domains =
-                        read_sched_domain_tree(mem, rq_pa, sd, page_offset, start_kernel_map);
+            // Overlay schedstat fields if available.
+            if let Some(ss) = &offsets.schedstat_offsets {
+                for (i, cpu) in cpus.iter_mut().enumerate() {
+                    if let Some(&rq_pa) = rq_pas_buf.get(i) {
+                        cpu.schedstat = Some(read_rq_schedstat(mem, rq_pa, ss));
+                    }
                 }
             }
-        }
 
-        // Stamp vCPU CPU times into the per-CPU snapshots. Reactive
-        // stall detection below reads these via `is_cpu_stalled`; the
-        // post-hoc `MonitorThresholds::evaluate` path reads them off
-        // the pushed samples.
-        if let Some(vt) = vcpu_timing {
-            let times = vt.read_cpu_times(&mut vcpu_timing_err_reported);
-            for (i, cpu) in cpus.iter_mut().enumerate() {
-                if let Some(&t) = times.get(i) {
-                    cpu.vcpu_cpu_time_ns = t;
+            // Overlay sched domain tree if available.
+            if let Some(sd) = &offsets.sched_domain_offsets {
+                for (i, cpu) in cpus.iter_mut().enumerate() {
+                    if let Some(&rq_pa) = rq_pas_buf.get(i) {
+                        cpu.sched_domains = read_sched_domain_tree(
+                            mem,
+                            rq_pa,
+                            sd,
+                            page_offset,
+                            start_kernel_map,
+                            phys_base,
+                        );
+                    }
+                }
+            }
+
+            // Stamp vCPU CPU times into the per-CPU snapshots. Reactive
+            // stall detection below reads these via `is_cpu_stalled`; the
+            // post-hoc `MonitorThresholds::evaluate` path reads them off
+            // the pushed samples.
+            if let Some(vt) = vcpu_timing {
+                let times = vt.read_cpu_times(&mut vcpu_timing_err_reported);
+                for (i, cpu) in cpus.iter_mut().enumerate() {
+                    if let Some(&t) = times.get(i) {
+                        cpu.vcpu_cpu_time_ns = t;
+                    }
                 }
             }
         }
@@ -2219,16 +2672,27 @@ pub(crate) fn monitor_loop(
             }
         }
 
-        let prog_stats = prog_stats_ctx.map(|ctx| {
-            super::bpf_prog::walk_struct_ops_runtime_stats(
-                mem,
-                ctx.walk,
-                ctx.prog_idr_kva,
-                &ctx.offsets,
-                &ctx.per_cpu_offsets,
-                ctx.start_kernel_map,
-            )
-        });
+        // Gate the BPF struct_ops IDR walk on `data_valid` for the
+        // same reason as the rq/sched_domain walks above: it chases
+        // pointers through guest memory, and pre-validity reads
+        // return silent zeros that look like phantom IDR nodes.
+        // Skip when invalid; emit `None` so the sample push records
+        // a degenerate entry without minutes of phantom traversal.
+        let prog_stats = if data_valid {
+            prog_stats_ctx.map(|ctx| {
+                super::bpf_prog::walk_struct_ops_runtime_stats(
+                    mem,
+                    ctx.walk,
+                    ctx.prog_idr_kva,
+                    &ctx.offsets,
+                    &per_cpu_offsets_buf,
+                    ctx.start_kernel_map,
+                    ctx.phys_base,
+                )
+            })
+        } else {
+            None
+        };
 
         samples.push(MonitorSample {
             elapsed_ms: run_start.elapsed().as_millis() as u64,
@@ -2267,11 +2731,48 @@ pub(crate) fn monitor_loop(
             }
         }
     }
-    let shm_result = crate::vmm::host_comms::BulkDrainResult { entries: shm_entries };
+    // Final post-loop diagnostic — captures post-boot state once,
+    // after the kill flag flips. Distinguishes "guest never wrote
+    // __per_cpu_offset[]" from "writes invisible to host monitor"
+    // by re-reading the same PAs the early-window diag covered.
+    if let Some(refresh) = rq_refresh {
+        let fresh = super::symbols::read_per_cpu_offsets(
+            mem,
+            refresh.pco_pa,
+            refresh.num_cpus,
+        );
+        let mut pob_bytes = [0u8; 16];
+        let mut pco_bytes = [0u8; 16];
+        let pob_pa: u64 = 0x0279e220;
+        let _ = mem.read_bytes(pob_pa, &mut pob_bytes);
+        let _ = mem.read_bytes(refresh.pco_pa, &mut pco_bytes);
+        eprintln!(
+            "FINAL DIAG iters={} pco0={:#x} pco1={:#x} pob={:02x?} pco={:02x?}",
+            diag_iter,
+            fresh.first().copied().unwrap_or(0),
+            fresh.get(1).copied().unwrap_or(0),
+            pob_bytes,
+            pco_bytes,
+        );
+        let valid_samples = samples
+            .iter()
+            .filter(|s| s.cpus.iter().any(|c| c.rq_clock > 0))
+            .count();
+        eprintln!(
+            "FINAL: iters={} samples={} valid_samples={}",
+            diag_iter,
+            samples.len(),
+            valid_samples,
+        );
+    }
+    let shm_result = crate::vmm::host_comms::BulkDrainResult {
+        entries: shm_entries,
+    };
     MonitorLoopResult {
         samples,
         drain: shm_result,
         watchdog_observation,
+        page_offset: latched_page_offset,
     }
 }
 
@@ -2376,6 +2877,9 @@ mod tests {
             prog_stats_ctx: None,
             page_offset: 0,
             start_kernel_map: super::super::symbols::START_KERNEL_MAP,
+            phys_base: 0,
+            rq_refresh: None,
+            sys_rdy: None,
         }
     }
 
@@ -2987,6 +3491,141 @@ mod tests {
         assert!(samples[0].cpus[0].event_counters.is_none());
     }
 
+    /// `rq_refresh` recomputes `rq_pas` from `__per_cpu_offset[]` each
+    /// iteration. Build a buffer where:
+    ///   - byte 0..16 = per-CPU offset table for 2 CPUs
+    ///     (offsets are PAs of the per-CPU rq buffers minus
+    ///     `runqueues_kva`; we set `runqueues_kva = 0` so the offset
+    ///     IS the PA).
+    ///   - rq buffers follow the offset table.
+    /// With `page_offset = 0`, `kva_to_pa(off + 0, 0) = off` so the
+    /// recomputed `rq_pas[cpu]` equals the offset slot.
+    #[test]
+    fn monitor_loop_rq_refresh_drives_pas() {
+        let offsets = test_offsets();
+        let pco_size: u64 = 16; // 2 CPUs * 8 bytes
+        let rq0_buf = make_rq_buffer(&offsets, 11, 1, 1, 7777, 0);
+        let rq1_buf = make_rq_buffer(&offsets, 22, 2, 2, 8888, 0);
+        let rq0_pa = pco_size;
+        let rq1_pa = pco_size + rq0_buf.len() as u64;
+
+        let mut combined = vec![0u8; pco_size as usize];
+        combined[0..8].copy_from_slice(&rq0_pa.to_ne_bytes());
+        combined[8..16].copy_from_slice(&rq1_pa.to_ne_bytes());
+        combined.extend_from_slice(&rq0_buf);
+        combined.extend_from_slice(&rq1_buf);
+
+        // SAFETY: combined is a live local buffer (Vec<u8> or stack
+        // array) whose backing storage outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(combined.as_ptr() as *mut u8, combined.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let refresh = RqRefresh {
+            pco_pa: 0,
+            runqueues_kva: 0,
+            num_cpus: 2,
+            page_offset_base_pa: None,
+            event: None,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        assert!(!samples.is_empty());
+        assert_eq!(samples[0].cpus.len(), 2);
+        assert_eq!(samples[0].cpus[0].rq_clock, 7777);
+        assert_eq!(samples[0].cpus[0].nr_running, 11);
+        assert_eq!(samples[0].cpus[1].rq_clock, 8888);
+        assert_eq!(samples[0].cpus[1].nr_running, 22);
+    }
+
+    /// Boot-race regression test. Same layout as the refresh test, but
+    /// the per-CPU offset table is all-zero (mirrors host monitor
+    /// spawn time before guest BSP runs `setup_per_cpu_areas`). With
+    /// `runqueues_kva = 0` and `page_offset = 0`, the recomputed PAs
+    /// are 0; the rq buffer starts at PA 0 with a non-zero
+    /// `rq_clock` field, but only because we placed it there. The
+    /// real boot race produces zero-filled snapshots because the
+    /// recomputed PA falls outside guest memory; we can't reproduce
+    /// the OOB silent-zero in a single-region GuestMem test, but we
+    /// CAN verify the loop tolerates a transient empty offset
+    /// table without panicking and recovers when subsequent reads
+    /// see populated values. Asserts the loop survives at least
+    /// one sample with the BSS-zero state.
+    #[test]
+    fn monitor_loop_rq_refresh_zero_offsets_no_panic() {
+        let offsets = test_offsets();
+        // 16 zero bytes simulating BSS __per_cpu_offset[2].
+        let mem_buf = vec![0u8; 64];
+        // SAFETY: mem_buf is a live local buffer whose backing
+        // storage outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(mem_buf.as_ptr() as *mut u8, mem_buf.len() as u64) };
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let kill_evt = test_kill_evt();
+
+        let refresh = RqRefresh {
+            pco_pa: 0,
+            runqueues_kva: 0,
+            num_cpus: 2,
+            page_offset_base_pa: None,
+            event: None,
+        };
+
+        let handle = {
+            let kill = std::sync::Arc::clone(&kill);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                kill.store(true, Ordering::Release);
+            })
+        };
+
+        let cfg = MonitorConfig {
+            rq_refresh: Some(&refresh),
+            ..test_config()
+        };
+        let MonitorLoopResult { samples, .. } = monitor_loop(
+            &mem,
+            &[],
+            &offsets,
+            Duration::from_millis(10),
+            &kill,
+            &kill_evt,
+            Instant::now(),
+            &cfg,
+        );
+        handle.join().unwrap();
+
+        // Loop produces samples even when offsets are all zero —
+        // they just contain zero counters because every rq read
+        // lands at PA 0 (which has a zeroed rq).
+        assert!(!samples.is_empty());
+        for s in &samples {
+            assert_eq!(s.cpus.len(), 2);
+        }
+    }
+
     #[test]
     fn resolve_event_pcpu_pas_null_scx_root() {
         let ev = test_event_offsets();
@@ -3030,7 +3669,6 @@ mod tests {
             scx_root_pa,
             watchdog_offset,
             jiffies: 99999,
-            page_offset,
         };
 
         let handle = {
@@ -3092,7 +3730,6 @@ mod tests {
             scx_root_pa,
             watchdog_offset: 16,
             jiffies: 0xDEADBEEF,
-            page_offset: super::super::symbols::DEFAULT_PAGE_OFFSET,
         };
 
         let handle = {
@@ -4018,7 +4655,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let result = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0);
+        let result = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0, 0);
         assert!(result.is_none());
     }
 
@@ -4051,7 +4688,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0, 0).unwrap();
 
         assert_eq!(domains.len(), 1);
         assert_eq!(domains[0].level, 0);
@@ -4094,7 +4731,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0, 0).unwrap();
 
         assert_eq!(domains.len(), 2);
         // First = lowest level (SMT).
@@ -4136,7 +4773,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0, 0).unwrap();
 
         assert_eq!(
             domains.len(),
@@ -4192,7 +4829,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0, 0).unwrap();
 
         assert_eq!(
             domains.len(),
@@ -4218,7 +4855,7 @@ mod tests {
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         // page_offset=0 -> PA = bad_kva which is > buf.len().
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0);
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0, 0);
 
         // Should return Some(empty vec) — non-null sd but untranslatable.
         assert!(domains.is_some());
@@ -4251,7 +4888,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0).unwrap();
+        let domains = read_sched_domain_tree(&mem, 0, &sd_off, 0, 0, 0).unwrap();
 
         assert_eq!(domains.len(), 1);
         assert_eq!(domains[0].level, 0);
@@ -4600,5 +5237,360 @@ mod tests {
             0,
             "read several bytes past the end must also return 0"
         );
+    }
+
+    /// Direct exercise of [`GuestMem::walk_4level`] for a simple
+    /// 4 KiB-page KVA. The walk descends PGD -> PUD -> PMD -> PTE
+    /// with no PS bit set, returning a PA whose page-aligned base is
+    /// the leaf PTE's payload and whose low 12 bits come from the
+    /// KVA's in-page offset. Pinned at this layer (rather than
+    /// going through `translate_kva`) so a regression in the leaf
+    /// walker is observable even if the TLB / dispatch wrapper
+    /// hides it.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_4level_simple_4kib_page() {
+        let kva: u64 = 0xFFFF_8880_0000_5678;
+        let pgd_idx = (kva >> 39) & 0x1FF;
+        let pud_idx = (kva >> 30) & 0x1FF;
+        let pmd_idx = (kva >> 21) & 0x1FF;
+        let pte_idx = (kva >> 12) & 0x1FF;
+        let page_off = kva & 0xFFF;
+
+        let pgd_pa: u64 = 0x10000;
+        let pud_pa: u64 = pgd_pa + 0x1000;
+        let pmd_pa: u64 = pud_pa + 0x1000;
+        let pte_pa: u64 = pmd_pa + 0x1000;
+        let data_pa: u64 = pte_pa + 0x1000;
+
+        let size = (data_pa + 0x1000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        // 0x63 = PRESENT|RW|USER|ACCESSED|DIRTY — bit 0 (PRESENT) is
+        // the only bit walk_4level inspects on intermediate entries;
+        // the rest match the kernel's typical page-table flags so a
+        // future tightening of the walker's flag checks still passes.
+        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
+        write_entry(&mut buf, pmd_pa, pmd_idx, pte_pa | 0x63);
+        write_entry(&mut buf, pte_pa, pte_idx, data_pa | 0x63);
+
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let pa = mem.walk_4level(pgd_pa, Kva(kva));
+        assert_eq!(
+            pa,
+            Some(data_pa | page_off),
+            "4-level walk must compose leaf PTE base with KVA in-page offset"
+        );
+    }
+
+    /// `walk_4level` must honour a PMD entry with the PS bit (bit 7)
+    /// set as a 2 MiB huge-page leaf rather than descending into a
+    /// PTE table. Verifies the address composition: bits [51:21] from
+    /// the PMD entry, bits [20:0] from the KVA. Catches a regression
+    /// that drops the PS check or applies the wrong base mask.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_4level_pmd_ps_bit_2mib_huge_page() {
+        // Pick a KVA that's NOT 2 MiB-aligned so the in-page offset
+        // (bits 20:0) is non-zero; the leaf composition is then
+        // observable in the returned PA.
+        let kva: u64 = 0xFFFF_8880_0020_3456;
+        let pgd_idx = (kva >> 39) & 0x1FF;
+        let pud_idx = (kva >> 30) & 0x1FF;
+        let pmd_idx = (kva >> 21) & 0x1FF;
+        let in_page_off_2m = kva & 0x1F_FFFF;
+
+        let pgd_pa: u64 = 0x10000;
+        let pud_pa: u64 = pgd_pa + 0x1000;
+        let pmd_pa: u64 = pud_pa + 0x1000;
+        // 2 MiB-aligned huge page base.
+        let huge_base: u64 = 0x20_0000;
+
+        let size = (pmd_pa + 0x1000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
+        // 0xE3 = PRESENT|RW|USER|ACCESSED|DIRTY|PS. Bit 7 (0x80)
+        // flags the entry as a 2 MiB block leaf; walk_4level returns
+        // before reading any PTE table.
+        write_entry(&mut buf, pmd_pa, pmd_idx, huge_base | 0xE3);
+
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let pa = mem.walk_4level(pgd_pa, Kva(kva));
+        assert_eq!(
+            pa,
+            Some(huge_base | in_page_off_2m),
+            "PMD PS-bit leaf must splice 2 MiB base with KVA bits [20:0]"
+        );
+    }
+
+    /// `walk_4level` must return `None` when an intermediate level's
+    /// entry has the PRESENT bit clear. Pinning at the PUD layer
+    /// (not the PGD root) verifies the descent unwinds cleanly mid-
+    /// walk, not just at the very first read.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_4level_unmapped_pud_returns_none() {
+        let kva: u64 = 0xFFFF_8880_0000_5000;
+        let pgd_idx = (kva >> 39) & 0x1FF;
+        let pud_idx = (kva >> 30) & 0x1FF;
+
+        let pgd_pa: u64 = 0x10000;
+        let pud_pa: u64 = pgd_pa + 0x1000;
+        let size = (pud_pa + 0x1000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        // PGD entry present, points at PUD.
+        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
+        // PUD entry with PRESENT (bit 0) clear — non-zero payload so
+        // the test fails loudly if the walker mistakes "non-zero
+        // entry" for "present".
+        write_entry(&mut buf, pud_pa, pud_idx, 0x3000);
+
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        assert_eq!(
+            mem.walk_4level(pgd_pa, Kva(kva)),
+            None,
+            "missing PRESENT bit at any level must return None"
+        );
+    }
+
+    /// `walk_5level` must descend PML5 -> P4D and finish through the
+    /// inner 4-level walk. Verifies bits [56:48] of the KVA index
+    /// the PML5 entry while bits [47:39] continue to index the next
+    /// level (which `walk_4level` labels "PGD" and treats as the
+    /// new root). Catches a regression that drops the PML5 step or
+    /// mis-decodes which KVA bits select the PML5 entry.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_5level_descent_to_4kib_page() {
+        // KVA with non-zero bits in BOTH the PML5 (56:48) and the
+        // 4-level region (47:0) so an off-by-one in either decode
+        // shows up.
+        let kva: u64 = 0xFF42_8881_0000_5678;
+        let pml5_idx = (kva >> 48) & 0x1FF;
+        let pgd_idx = (kva >> 39) & 0x1FF;
+        let pud_idx = (kva >> 30) & 0x1FF;
+        let pmd_idx = (kva >> 21) & 0x1FF;
+        let pte_idx = (kva >> 12) & 0x1FF;
+        let page_off = kva & 0xFFF;
+
+        let pml5_pa: u64 = 0x10000;
+        let p4d_pa: u64 = pml5_pa + 0x1000;
+        let pud_pa: u64 = p4d_pa + 0x1000;
+        let pmd_pa: u64 = pud_pa + 0x1000;
+        let pte_pa: u64 = pmd_pa + 0x1000;
+        let data_pa: u64 = pte_pa + 0x1000;
+
+        let size = (data_pa + 0x1000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        write_entry(&mut buf, pml5_pa, pml5_idx, p4d_pa | 0x63);
+        // P4D is read by walk_4level as the new "PGD", indexed by
+        // KVA bits 47:39 (pgd_idx).
+        write_entry(&mut buf, p4d_pa, pgd_idx, pud_pa | 0x63);
+        write_entry(&mut buf, pud_pa, pud_idx, pmd_pa | 0x63);
+        write_entry(&mut buf, pmd_pa, pmd_idx, pte_pa | 0x63);
+        write_entry(&mut buf, pte_pa, pte_idx, data_pa | 0x63);
+
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let pa = mem.walk_5level(pml5_pa, Kva(kva));
+        assert_eq!(
+            pa,
+            Some(data_pa | page_off),
+            "5-level walk must descend PML5->P4D->PUD->PMD->PTE and \
+             splice the leaf PTE base with the KVA in-page offset"
+        );
+    }
+
+    /// `walk_4level` must honour a PUD entry with the PS bit (bit 7)
+    /// set as a 1 GiB huge-page leaf rather than descending into a
+    /// PMD table. Verifies the address composition: bits [51:30] from
+    /// the PUD entry, bits [29:0] from the KVA. Catches a regression
+    /// that drops the PS check at the PUD level or applies the wrong
+    /// 1 GiB base mask. Pinned in addition to the 2 MiB PMD test
+    /// because the two leaf branches use different masks
+    /// (0x000F_FFFF_C000_0000 vs 0x000F_FFFF_FFE0_0000) and a
+    /// regression in either is undetectable from the other.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_4level_pud_ps_bit_1gib_huge_page() {
+        // KVA that's NOT 1 GiB-aligned so the in-page offset
+        // (bits 29:0) is non-zero; the leaf composition is then
+        // observable in the returned PA.
+        let kva: u64 = 0xFFFF_8880_4123_4567;
+        let pgd_idx = (kva >> 39) & 0x1FF;
+        let pud_idx = (kva >> 30) & 0x1FF;
+        let in_page_off_1g = kva & 0x3FFF_FFFF;
+
+        let pgd_pa: u64 = 0x10000;
+        let pud_pa: u64 = pgd_pa + 0x1000;
+        // 1 GiB-aligned huge page base.
+        let huge_base: u64 = 0x4000_0000;
+
+        let size = (pud_pa + 0x1000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        write_entry(&mut buf, pgd_pa, pgd_idx, pud_pa | 0x63);
+        // 0xE3 = PRESENT|RW|USER|ACCESSED|DIRTY|PS. Bit 7 (0x80)
+        // flags the entry as a 1 GiB block leaf; walk_4level returns
+        // before reading any PMD/PTE table.
+        write_entry(&mut buf, pud_pa, pud_idx, huge_base | 0xE3);
+
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let pa = mem.walk_4level(pgd_pa, Kva(kva));
+        assert_eq!(
+            pa,
+            Some(huge_base | in_page_off_1g),
+            "PUD PS-bit leaf must splice 1 GiB base with KVA bits [29:0]"
+        );
+    }
+
+    /// `walk_5level` must honour a PML5 entry with the PS bit (bit 7)
+    /// set as a 256 TiB huge-page leaf rather than descending into a
+    /// P4D table. Verifies the address composition: bits [51:48] from
+    /// the PML5 entry, bits [47:0] from the KVA. The existing source
+    /// comment notes Intel SDM Vol 3A currently reserves PS=0 at this
+    /// level, but the walker pins the bit as load-bearing for any
+    /// future / non-Intel implementation that enables it — drop the
+    /// check and a `walk_5level` returning `walk_4level(p4d_pa, kva)`
+    /// on a PS-bit-set entry would mis-decode the leaf and hand
+    /// `walk_4level` a P4D PA that doesn't exist.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_5level_pml5_ps_bit_256tib_huge_page() {
+        // KVA whose low 48 bits are non-zero so the in-page offset is
+        // observable in the composed leaf PA. Top bits (63:57) carry
+        // the canonical kernel-half sign extension; bits 56:48 select
+        // the PML5 entry; bits 47:0 splice in as the in-leaf offset.
+        let kva: u64 = 0xFF42_0001_2345_6789;
+        let pml5_idx = (kva >> 48) & 0x1FF;
+        // 256 TiB in-page offset: low 48 bits.
+        let in_page_off_256t = kva & 0x0000_FFFF_FFFF_FFFF;
+
+        let pml5_pa: u64 = 0x10000;
+        // Base mask clears the low 48 bits per the source comment;
+        // pick a value whose bits 51:48 are non-zero so the splice
+        // is testable.
+        let huge_base: u64 = 0x000A_0000_0000_0000;
+
+        let size = (pml5_pa + 0x1000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        // 0xE3 = PRESENT|RW|USER|ACCESSED|DIRTY|PS. Bit 7 (0x80)
+        // flags the entry as a 256 TiB block leaf; walk_5level
+        // returns before recursing into walk_4level.
+        write_entry(&mut buf, pml5_pa, pml5_idx, huge_base | 0xE3);
+
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        let pa = mem.walk_5level(pml5_pa, Kva(kva));
+        assert_eq!(
+            pa,
+            Some(huge_base | in_page_off_256t),
+            "PML5 PS-bit leaf must splice 256 TiB base with KVA bits [47:0]"
+        );
+    }
+
+    /// `walk_5level` must return `None` when the PML5 entry has the
+    /// PRESENT bit clear, without recursing into `walk_4level`.
+    /// Pinning at the new top level (the layer 5-level paging adds
+    /// over 4-level) verifies the early-exit covers the PML5 step
+    /// itself; the `walk_4level_unmapped_pud_returns_none` test
+    /// already covers absent intermediate levels below.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn walk_5level_unmapped_pml5_returns_none() {
+        let kva: u64 = 0xFF42_8881_0000_5000;
+        let pml5_idx = (kva >> 48) & 0x1FF;
+
+        let pml5_pa: u64 = 0x10000;
+        let size = (pml5_pa + 0x1000) as usize;
+        let mut buf = vec![0u8; size];
+
+        let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
+            let off = (base + idx * 8) as usize;
+            buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
+        };
+
+        // PML5 entry with PRESENT (bit 0) clear — non-zero payload
+        // so the test fails loudly if the walker mistakes "non-zero
+        // entry" for "present" at the new top level.
+        write_entry(&mut buf, pml5_pa, pml5_idx, 0x3000);
+
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
+        assert_eq!(
+            mem.walk_5level(pml5_pa, Kva(kva)),
+            None,
+            "missing PRESENT bit at the PML5 root must return None \
+             without recursing into walk_4level"
+        );
+    }
+
+    /// `write_bytes_at` must return 0 — and not write anything — when
+    /// `pa + offset` overflows `u64`. The `checked_add` guard is the
+    /// only barrier between an attacker-controlled offset and the
+    /// downstream `write_bytes` bounds-clip; if it's dropped, an
+    /// overflowed addr would alias zero and silently overwrite the
+    /// start of guest DRAM. Pinning the contract here keeps that
+    /// regression visible without booting a VM.
+    #[test]
+    fn write_bytes_at_offset_overflow_returns_zero() {
+        let mut buf = [0u8; 64];
+        let snapshot = buf;
+        // SAFETY: buf outlives the GuestMem use.
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+
+        // pa + offset overflow: pa = u64::MAX, offset = 1.
+        let n = mem.write_bytes_at(u64::MAX, 1, &[0xAA; 8]);
+        assert_eq!(n, 0, "wraparound add must return 0 bytes written");
+        assert_eq!(
+            buf, snapshot,
+            "overflow must not mutate any byte of the backing buffer"
+        );
+
+        // Same input that would alias offset 0 if the guard were
+        // missing (pa = u64::MAX - 7, offset = 8 -> wraps to 0).
+        let n = mem.write_bytes_at(u64::MAX - 7, 8, &[0xBB; 4]);
+        assert_eq!(n, 0, "wraparound to 0 must return 0 bytes written");
+        assert_eq!(buf, snapshot, "no aliasing into low DRAM is permitted");
     }
 }

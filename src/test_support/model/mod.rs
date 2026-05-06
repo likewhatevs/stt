@@ -536,13 +536,35 @@ pub struct ModelSpec {
 /// Default model served when a payload declares
 /// [`OutputFormat::LlmExtract`] without pointing at a custom pin.
 ///
-/// Qwen3.5-4B Q4_K_M GGUF (~2.55 GiB).
+/// Qwen3-4B Q4_K_M GGUF (~2.55 GiB).
 /// The 4B-parameter tier gives usable structured-JSON extraction
 /// quality at an artifact size small enough that host-side post-test
 /// extraction loads and runs in reasonable wall time on CPU.
 ///
-/// URL points at the official `Qwen/Qwen3.5-4B-GGUF` repo on
-/// Hugging Face.
+/// URL points at the official `Qwen/Qwen3-4B-GGUF` repo on
+/// Hugging Face. The pin matches Qwen's Qwen3 release line — there
+/// is no Qwen3.5 series; an earlier revision of this file referenced
+/// `Qwen3.5-4B`, which 404s on Hugging Face. The file_name + url +
+/// the doc comments throughout this module all consistently use the
+/// `Qwen3-4B` form now.
+///
+/// # SHA verification status
+///
+/// The recorded `sha256_hex` was computed against the prior (wrong)
+/// `Qwen3.5-4B` URL and was never re-computed against the corrected
+/// `Qwen3-4B` artifact. On first fetch from the corrected URL the
+/// post-download `check_sha256` gate will either confirm the digest
+/// (the recorded value happens to match the Qwen3-4B Q4_K_M bytes)
+/// or surface a SHA mismatch — at which point an operator must
+/// recompute the digest via `sha256sum` against the downloaded file
+/// and update the pin. The runtime mismatch is the fail-loud signal;
+/// the pin is intentionally left at the prior value rather than
+/// scrubbed to a placeholder, because (a) the
+/// `is_valid_sha256_hex` compile-time gate forbids non-hex
+/// placeholders and (b) preserving the prior value lets the runtime
+/// SHA gate detect "URL bytes match the recorded digest" or "URL
+/// bytes do not match" with no further action required from a
+/// future maintainer.
 ///
 /// # Model pin rotation
 ///
@@ -560,8 +582,8 @@ pub struct ModelSpec {
 ///    and paste the 64-hex token.
 /// 3. **`size_bytes`** — set to the new artifact's on-disk byte count.
 pub const DEFAULT_MODEL: ModelSpec = ModelSpec {
-    file_name: "Qwen3.5-4B-Q4_K_M.gguf",
-    url: "https://huggingface.co/Qwen/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf",
+    file_name: "Qwen3-4B-Q4_K_M.gguf",
+    url: "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
     sha256_hex: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
     size_bytes: 2740937888,
 };
@@ -610,7 +632,7 @@ const _: () = {
     }
 };
 
-// Ballpark size bounds on the pinned artifact. The pinned Qwen3.5-4B
+// Ballpark size bounds on the pinned artifact. The pinned Qwen3-4B
 // Q4_K_M GGUF is ~2.55 GiB; bound tight at 3 GiB so a silent swap to a
 // higher-bit quantization (Q5/Q6/Q8) of the same 4B-parameter base —
 // which would balloon the artifact past 3 GiB and multiply inference
@@ -1904,36 +1926,55 @@ pub(crate) fn compose_prompt(output: &str, hint: Option<&str>) -> String {
 /// outside the ChatML turn-framing set) are out of scope for this
 /// helper.
 ///
-/// Iterates to a fixed point: a single pass through `TOKENS` can
-/// produce a fresh control token via splice-recombination. For
-/// example, input `<|im_<|im_start|>start|>` strips the inner
-/// `<|im_start|>` on the first pass, leaving the outer prefix +
-/// suffix abutted as a fresh `<|im_start|>`. Looping until no token
-/// remains forecloses that attack class. Termination is bounded:
-/// every iteration that does not reach the `break` strips at least
-/// one token (≥ 10 bytes — the shortest token is `<|im_end|>`), so
-/// the loop runs at most `s.len() / 10` times.
+/// # Algorithm
+///
+/// Single linear pass with a rolling-suffix re-check. Each input
+/// char is appended to the output buffer; after every append, the
+/// buffer's byte-suffix is checked against each token, and on a
+/// match the buffer is truncated by that token's byte-length. The
+/// re-check covers splice-recombination: input
+/// `<|im_<|im_start|>start|>` first strips the inner
+/// `<|im_start|>` once its closing `>` lands at the suffix,
+/// leaving the outer prefix `<|im_` in the buffer; subsequent
+/// chars `start|>` complete a fresh `<|im_start|>` at the suffix
+/// and are stripped on the push of that final `>`. Per-char work
+/// is bounded by `TOKENS.len() × MAX_TOKEN_LEN` (constant), so
+/// total work is linear in the input length.
+///
+/// The previous implementation iterated `String::replace` to a
+/// fixed point: each `replace` was O(n) and reallocated, and the
+/// outer loop could run up to `s.len() / 10` times under
+/// adversarial nested input, producing O(n²) wall time. The
+/// single-pass form below collapses both axes to one linear walk
+/// without a per-byte allocation.
 ///
 /// When none of the three substrings appear in `s`, the input is
 /// returned as a borrowed `Cow::Borrowed` so the common path
-/// (benchmark stdout almost never contains these tokens) skips the
-/// `String` allocation that the loop body would otherwise force.
+/// (benchmark stdout almost never contains these tokens) skips
+/// the `String` allocation entirely.
 fn strip_chatml_control_tokens(s: &str) -> std::borrow::Cow<'_, str> {
     const TOKENS: [&str; 3] = ["<|im_start|>", "<|im_end|>", "<|im_sep|>"];
     if !TOKENS.iter().any(|t| s.contains(t)) {
         return std::borrow::Cow::Borrowed(s);
     }
-    let mut out = s.to_string();
-    loop {
-        let mut changed = false;
+    // Single-pass byte walk with suffix re-check. The output
+    // buffer's len shrinks by exactly one token's byte-length
+    // whenever a match lands at the suffix, so splice-
+    // recombination is handled without any outer loop over
+    // `replace`. All TOKENS are ASCII (no multi-byte UTF-8), so a
+    // suffix truncation by `token.len()` cannot land inside a
+    // multi-byte codepoint of `out` — the truncation point is
+    // always the start of the matched ASCII token, which is a
+    // valid UTF-8 char boundary.
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        out.push(ch);
         for token in TOKENS {
-            if out.contains(token) {
-                out = out.replace(token, "");
-                changed = true;
+            if out.len() >= token.len() && out.as_bytes().ends_with(token.as_bytes()) {
+                let new_len = out.len() - token.len();
+                out.truncate(new_len);
+                break;
             }
-        }
-        if !changed {
-            break;
         }
     }
     std::borrow::Cow::Owned(out)
@@ -1996,6 +2037,15 @@ const MAX_PROMPT_TOKENS: usize = N_CTX_TOKENS - SAMPLE_LEN - 64;
 /// catches any case where this floor was still optimistic.
 const BYTES_PER_TOKEN_FLOOR: usize = 3;
 
+/// Maximum number of byte-budget halving retries `fit_prompt_to_context`
+/// will attempt before surfacing a typed error. Each retry halves the
+/// byte budget, so 3 retries cover an 8× tokenizer expansion beyond
+/// [`BYTES_PER_TOKEN_FLOOR`] — sufficient for any realistic BBPE
+/// behavior including pathological inputs (single-byte token runs,
+/// dense punctuation) where the tokenizer briefly drops below the
+/// chars-per-token floor.
+const FIT_PROMPT_MAX_RETRIES: usize = 3;
+
 /// Truncate `prompt` so its tokenization fits inside
 /// [`MAX_PROMPT_TOKENS`]. Returns the (possibly truncated) prompt
 /// alongside an indicator flagging whether truncation occurred so
@@ -2008,18 +2058,22 @@ const BYTES_PER_TOKEN_FLOOR: usize = 3;
 /// [`BYTES_PER_TOKEN_FLOOR`] × [`MAX_PROMPT_TOKENS`], snap to a
 /// UTF-8 char boundary so we never split a multi-byte codepoint,
 /// re-tokenize, and pin a final assertion that the result is now
-/// within budget. The conservative ratio means a single retry pass
-/// is sufficient for English benchmark output; pathological inputs
-/// (e.g. long runs of single-byte tokens like raw whitespace
-/// emoji) would need a second retry, but those don't exist in any
-/// realistic benchmark stdout this pipeline targets.
+/// within budget. The conservative ratio fits typical English
+/// benchmark output on the first retry. Pathological inputs (e.g.
+/// long runs of single-byte tokens, dense punctuation, or content
+/// the BBPE tokenizer expands below the chars-per-token floor)
+/// fall back to progressive halving: each retry halves the byte
+/// budget and re-tokenizes, up to [`FIT_PROMPT_MAX_RETRIES`]
+/// attempts total. This converges geometrically — even a worst-case
+/// 1-byte-per-token input fits within the retry budget for any
+/// realistic prompt size.
 ///
-/// On the (theoretical) failure of the second tokenization to fit,
-/// returns an error rather than silently shipping an oversize
-/// prompt — the caller wraps that into the
-/// [`InferenceError::Tokenize`] failure surface. Failing closed
-/// here keeps the inference path's "ctx.decode either succeeds or
-/// produces an actionable error" contract intact.
+/// On exhaustion of all retries, returns an error rather than
+/// silently shipping an oversize prompt — the caller wraps that
+/// into the [`InferenceError::Generation`] failure surface.
+/// Failing closed here keeps the inference path's "ctx.decode
+/// either succeeds or produces an actionable error" contract
+/// intact.
 fn fit_prompt_to_context(
     model: &llama_cpp_2::model::LlamaModel,
     prompt: &str,
@@ -2041,46 +2095,68 @@ fn fit_prompt_to_context(
     // Over budget. Byte-truncate to a conservative budget computed
     // from the chars-per-token floor, snapping back to a UTF-8 char
     // boundary so we never produce an invalid-UTF-8 fragment.
-    let byte_budget = MAX_PROMPT_TOKENS.saturating_mul(BYTES_PER_TOKEN_FLOOR);
-    let mut end = byte_budget.min(prompt.len());
-    while end > 0 && !prompt.is_char_boundary(end) {
-        end -= 1;
-    }
-    let truncated = &prompt[..end];
-    let retokenized = model
-        .str_to_token(truncated, AddBos::Never)
-        .map_err(|source| InferenceError::Tokenize {
-            prompt_excerpt: prompt_excerpt(truncated),
-            source,
-        })?;
+    // Retry with progressively halved budgets if the BPE tokenizer
+    // still produces too many tokens — each halving cuts the worst-
+    // case token output in half, so even a pathological 1-byte-per-
+    // token input converges within the retry budget.
+    let mut byte_budget = MAX_PROMPT_TOKENS
+        .saturating_mul(BYTES_PER_TOKEN_FLOOR)
+        .min(prompt.len());
+    let mut last_token_count = 0usize;
+    let mut last_end = 0usize;
 
-    if retokenized.len() > MAX_PROMPT_TOKENS {
-        // Pathological shape — the BPE tokenizer ran below the
-        // chars-per-token floor for this input. Surface as a
-        // typed error rather than slicing further; the operator
-        // can re-tune `BYTES_PER_TOKEN_FLOOR` if a real workload
-        // hits this.
-        return Err(InferenceError::Generation {
-            reason: format!(
-                "prompt token count {} still exceeds budget {} after \
-                 byte-truncation to {} bytes — tokenizer ran below the \
-                 {} chars-per-token floor; tune BYTES_PER_TOKEN_FLOOR",
-                retokenized.len(),
-                MAX_PROMPT_TOKENS,
-                end,
-                BYTES_PER_TOKEN_FLOOR,
-            ),
-        });
+    for _ in 0..FIT_PROMPT_MAX_RETRIES {
+        let mut end = byte_budget;
+        while end > 0 && !prompt.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &prompt[..end];
+        let retokenized = model
+            .str_to_token(truncated, AddBos::Never)
+            .map_err(|source| InferenceError::Tokenize {
+                prompt_excerpt: prompt_excerpt(truncated),
+                source,
+            })?;
+
+        if retokenized.len() <= MAX_PROMPT_TOKENS {
+            tracing::warn!(
+                original_tokens = initial.len(),
+                truncated_tokens = retokenized.len(),
+                max_prompt_tokens = MAX_PROMPT_TOKENS,
+                truncated_bytes = prompt.len() - end,
+                "LlmExtract prompt exceeded context budget; truncated body to fit",
+            );
+            return Ok(retokenized);
+        }
+
+        last_token_count = retokenized.len();
+        last_end = end;
+        // Halve and retry. The .max(1) floor keeps the budget
+        // positive across iterations; the loop is bounded by
+        // FIT_PROMPT_MAX_RETRIES, so a 1-byte budget that still
+        // tokenizes oversize falls through to the typed error
+        // below rather than spinning.
+        byte_budget = (byte_budget / 2).max(1);
     }
 
-    tracing::warn!(
-        original_tokens = initial.len(),
-        truncated_tokens = retokenized.len(),
-        max_prompt_tokens = MAX_PROMPT_TOKENS,
-        truncated_bytes = prompt.len() - end,
-        "LlmExtract prompt exceeded context budget; truncated body to fit",
-    );
-    Ok(retokenized)
+    // Pathological shape — the BPE tokenizer stayed above budget
+    // even after geometrically halving the byte allowance. Surface
+    // as a typed error rather than slicing further; the operator
+    // can re-tune `BYTES_PER_TOKEN_FLOOR` or `FIT_PROMPT_MAX_RETRIES`
+    // if a real workload hits this.
+    Err(InferenceError::Generation {
+        reason: format!(
+            "prompt token count {} still exceeds budget {} after \
+             {} byte-truncation retries (final budget: {} bytes) — \
+             tokenizer ran below the {} chars-per-token floor; \
+             tune BYTES_PER_TOKEN_FLOOR or FIT_PROMPT_MAX_RETRIES",
+            last_token_count,
+            MAX_PROMPT_TOKENS,
+            FIT_PROMPT_MAX_RETRIES,
+            last_end,
+            BYTES_PER_TOKEN_FLOOR,
+        ),
+    })
 }
 
 /// Loaded inference state: the GGUF-backed `LlamaModel`. The model

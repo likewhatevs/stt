@@ -203,6 +203,74 @@ fn spawn_thread_with_forkexit_rejected_at_spawn_time() {
          alternative: {msg}"
     );
 }
+/// `CloneMode::Thread + WorkType::CgroupChurn` MUST bail at spawn
+/// time. CgroupChurn writes the worker tid to `cgroup.procs`,
+/// which the kernel resolves to the whole tgid and migrates every
+/// sibling thread to the target cgroup; under Thread mode the
+/// "tgid" includes the test harness itself. Pin the diagnostic so
+/// a future change to the admission gate cannot silently regress
+/// to letting the rejection through. Mirrors
+/// `spawn_thread_with_forkexit_rejected_at_spawn_time` — both
+/// tests guard CloneMode/WorkType pair rejections at the same
+/// admission site.
+#[test]
+fn spawn_thread_with_cgroupchurn_rejected_at_spawn_time() {
+    let config = WorkloadConfig {
+        num_workers: 1,
+        clone_mode: CloneMode::Thread,
+        work_type: WorkType::CgroupChurn {
+            groups: 2,
+            cycle_ms: 100,
+        },
+        ..Default::default()
+    };
+    let result = WorkloadHandle::spawn(&config);
+    let err = match result {
+        Ok(_) => panic!("Thread + CgroupChurn must bail at spawn"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("CloneMode::Thread")
+            && msg.contains("WorkType::CgroupChurn")
+            && msg.contains("CloneMode::Fork"),
+        "diagnostic must name both incompatible variants and the safe \
+         alternative: {msg}"
+    );
+}
+/// `CloneMode::Fork + WorkType::EpollStorm` MUST bail at spawn
+/// time. EpollStorm publishes eventfd / epoll fd numbers through
+/// a shared mmap region for siblings to consume, but forked
+/// children hold independent fd tables that never contain those
+/// post-fork descriptors. Pin the diagnostic. Sibling of the two
+/// rejection tests above — kept here so the entire CloneMode /
+/// WorkType admission matrix is exercised in one cluster.
+#[test]
+fn spawn_fork_with_epollstorm_rejected_at_spawn_time() {
+    let config = WorkloadConfig {
+        num_workers: 2,
+        clone_mode: CloneMode::Fork,
+        work_type: WorkType::EpollStorm {
+            producers: 1,
+            consumers: 1,
+            events_per_burst: 1,
+        },
+        ..Default::default()
+    };
+    let result = WorkloadHandle::spawn(&config);
+    let err = match result {
+        Ok(_) => panic!("Fork + EpollStorm must bail at spawn"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("CloneMode::Fork")
+            && msg.contains("WorkType::EpollStorm")
+            && msg.contains("CloneMode::Thread"),
+        "diagnostic must name both incompatible variants and the safe \
+         alternative: {msg}"
+    );
+}
 /// Thread-mode worker that panics on first iteration must
 /// surface a [`WorkerExitInfo::Panicked`] sentinel with the
 /// panic message extracted from the join Err payload. Uses a

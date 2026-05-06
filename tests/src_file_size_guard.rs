@@ -75,27 +75,26 @@ const DEFAULT_MAX_LINES: usize = 3000;
 /// entry must reference the queued split task in a `// queued: ...`
 /// comment so the deferral is auditable.
 ///
-/// Counts pinned 2026-05-04; refresh per the drain protocol.
+/// Counts pinned 2026-05-05; refresh per the drain protocol.
 const EXCEPTIONS: &[(&str, usize)] = &[
-    ("stats.rs", 9541),
-    ("assert.rs", 8232),
-    ("test_support/model.rs", 7841),
-    ("test_support/sidecar.rs", 7411),
-    ("scenario/ops/mod.rs", 7051),
-    ("test_support/eval.rs", 5327),
-    ("scenario/payload_run.rs", 5200),
-    ("vmm/virtio_blk/device.rs", 4988),
-    ("vmm/host_topology.rs", 4906),
-    ("monitor/mod.rs", 4361),
-    ("monitor/dump/tests.rs", 4131),
-    ("monitor/reader.rs", 3655),
-    ("cache/cache_dir.rs", 3650),
-    ("ctprof/mod.rs", 3485),
-    ("bin/cargo_ktstr/parse_tests.rs", 3440),
-    ("monitor/btf_render.rs", 3332),
-    ("workload/worker/mod.rs", 3274),
-    ("vmm/initramfs.rs", 3058),
-    ("workload/spawn/mod.rs", 3044),
+    ("stats.rs", 9805),
+    ("scenario/ops/mod.rs", 7422),
+    ("vmm/freeze_coord.rs", 6632), // queued: split into submodules
+    ("scenario/payload_run.rs", 5634),
+    ("test_support/eval.rs", 5362),
+    ("monitor/dump/tests.rs", 4645),
+    ("monitor/reader.rs", 4604),
+    ("monitor/bpf_map/tests.rs", 4011), // queued: split into submodules
+    ("vmm/virtio_blk/device.rs", 3636),
+    ("ctprof/mod.rs", 3556),
+    ("workload/worker/mod.rs", 3538),
+    ("workload/spawn/mod.rs", 3454),
+    ("fetch.rs", 3406), // queued: split into submodules
+    ("bin/cargo_ktstr/parse_tests.rs", 3351),
+    ("vmm/host_topology/tests.rs", 3180), // queued: split into submodules
+    ("host_context.rs", 3042),            // queued: split into submodules
+    ("vmm/initramfs.rs", 3014),
+    ("monitor/tests.rs", 3013), // queued: split into submodules
 ];
 
 /// Resolve `<repo>/src` from `CARGO_MANIFEST_DIR`. Cargo always

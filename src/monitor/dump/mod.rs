@@ -466,19 +466,42 @@ impl EventCounterSample {
         for cpu in &sample.cpus {
             if let Some(ev) = &cpu.event_counters {
                 any = true;
-                out.select_cpu_fallback += ev.select_cpu_fallback;
-                out.dispatch_local_dsq_offline += ev.dispatch_local_dsq_offline;
-                out.dispatch_keep_last += ev.dispatch_keep_last;
-                out.enq_skip_exiting += ev.enq_skip_exiting;
-                out.enq_skip_migration_disabled += ev.enq_skip_migration_disabled;
-                out.reenq_immed += ev.reenq_immed;
-                out.reenq_local_repeat += ev.reenq_local_repeat;
-                out.refill_slice_dfl += ev.refill_slice_dfl;
-                out.bypass_duration += ev.bypass_duration;
-                out.bypass_dispatch += ev.bypass_dispatch;
-                out.bypass_activate += ev.bypass_activate;
-                out.insert_not_owned += ev.insert_not_owned;
-                out.sub_bypass_dispatch += ev.sub_bypass_dispatch;
+                // Per-CPU SCX event counters are s64 in the kernel
+                // and originate from BPF map reads of guest memory.
+                // A corrupt counter could trip i64 addition overflow
+                // when summed across many CPUs; saturating_add pins
+                // the sum at i64::{MIN,MAX} rather than panicking
+                // (debug) or wrapping (release) into a misleading
+                // value.
+                out.select_cpu_fallback = out
+                    .select_cpu_fallback
+                    .saturating_add(ev.select_cpu_fallback);
+                out.dispatch_local_dsq_offline = out
+                    .dispatch_local_dsq_offline
+                    .saturating_add(ev.dispatch_local_dsq_offline);
+                out.dispatch_keep_last = out
+                    .dispatch_keep_last
+                    .saturating_add(ev.dispatch_keep_last);
+                out.enq_skip_exiting = out
+                    .enq_skip_exiting
+                    .saturating_add(ev.enq_skip_exiting);
+                out.enq_skip_migration_disabled = out
+                    .enq_skip_migration_disabled
+                    .saturating_add(ev.enq_skip_migration_disabled);
+                out.reenq_immed = out.reenq_immed.saturating_add(ev.reenq_immed);
+                out.reenq_local_repeat = out
+                    .reenq_local_repeat
+                    .saturating_add(ev.reenq_local_repeat);
+                out.refill_slice_dfl = out
+                    .refill_slice_dfl
+                    .saturating_add(ev.refill_slice_dfl);
+                out.bypass_duration = out.bypass_duration.saturating_add(ev.bypass_duration);
+                out.bypass_dispatch = out.bypass_dispatch.saturating_add(ev.bypass_dispatch);
+                out.bypass_activate = out.bypass_activate.saturating_add(ev.bypass_activate);
+                out.insert_not_owned = out.insert_not_owned.saturating_add(ev.insert_not_owned);
+                out.sub_bypass_dispatch = out
+                    .sub_bypass_dispatch
+                    .saturating_add(ev.sub_bypass_dispatch);
             }
         }
         if any { Some(out) } else { None }
@@ -647,12 +670,6 @@ pub struct ProbeBssCounters {
     /// `KTSTR_PCPU_RINGBUF_DROPS` summed across CPUs — failed
     /// `bpf_ringbuf_reserve` calls inside the trigger handler.
     pub ringbuf_drops: u64,
-    /// `KTSTR_PCPU_EVENT_TP_COUNT` summed across CPUs —
-    /// `tp_btf/sched_ext_event` fires.
-    pub event_tp_count: u64,
-    /// `KTSTR_PCPU_EVENT_RINGBUF_DROPS` summed across CPUs —
-    /// failed `bpf_ringbuf_reserve` calls inside `ktstr_event_tp`.
-    pub event_ringbuf_drops: u64,
     /// `KTSTR_PCPU_TIMELINE_COUNT` summed across CPUs — successful
     /// timeline-event submissions across the three timeline
     /// tracepoints (sched_switch + sched_migrate_task + sched_wakeup).
@@ -909,8 +926,11 @@ pub struct FailureDumpReport {
     /// dump started any heavy phase. A `Some(us)` value means the dump
     /// truncated remaining work (skipped further maps / tasks /
     /// walkers) at that elapsed offset to keep the freeze window
-    /// bounded — see the freeze coordinator's vCPU-blocking-budget
-    /// invariant in CLAUDE.md.
+    /// bounded — the freeze coordinator's parked vCPUs cannot
+    /// service guest IRQs or MMIO traps while the dump is running,
+    /// so unbounded dump latency stretches every guest's KVM_RUN
+    /// pause and risks the freeze rendezvous timeout firing on the
+    /// next iteration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dump_truncated_at_us: Option<u64>,
     /// Probe BPF program's per-CPU diagnostic counter snapshot
@@ -1609,20 +1629,18 @@ fn decode_probe_counters_snapshot(
     const PCPU_KPROBE_RETURNS: usize = 1;
     const PCPU_META_MISS: usize = 2;
     const PCPU_RINGBUF_DROPS: usize = 3;
-    const PCPU_EVENT_TP_COUNT: usize = 4;
-    const PCPU_EVENT_RINGBUF_DROPS: usize = 5;
-    const PCPU_TIMELINE_COUNT: usize = 6;
-    const PCPU_TIMELINE_DROPS: usize = 7;
-    const PCPU_PI_COUNT: usize = 8;
-    const PCPU_PI_ORPHAN_FEXITS: usize = 9;
-    const PCPU_PI_CLASS_CHANGE_COUNT: usize = 10;
-    const PCPU_PI_DROPS: usize = 11;
-    const PCPU_LOCK_CONTEND_COUNT: usize = 12;
-    const PCPU_LOCK_CONTEND_DROPS: usize = 13;
-    const PCPU_PREEMPT_DISABLE_COUNT: usize = 14;
-    const PCPU_PREEMPT_ENABLE_COUNT: usize = 15;
-    const PCPU_TRIGGER_COUNT: usize = 16;
-    const PCPU_NR: usize = 17;
+    const PCPU_TIMELINE_COUNT: usize = 4;
+    const PCPU_TIMELINE_DROPS: usize = 5;
+    const PCPU_PI_COUNT: usize = 6;
+    const PCPU_PI_ORPHAN_FEXITS: usize = 7;
+    const PCPU_PI_CLASS_CHANGE_COUNT: usize = 8;
+    const PCPU_PI_DROPS: usize = 9;
+    const PCPU_LOCK_CONTEND_COUNT: usize = 10;
+    const PCPU_LOCK_CONTEND_DROPS: usize = 11;
+    const PCPU_PREEMPT_DISABLE_COUNT: usize = 12;
+    const PCPU_PREEMPT_ENABLE_COUNT: usize = 13;
+    const PCPU_TRIGGER_COUNT: usize = 14;
+    const PCPU_NR: usize = 15;
     /// Per-CPU slot stride in bytes — `pcpu_counter` is forced to
     /// 128-byte alignment in the BPF source so each slot occupies
     /// one cacheline. Mirroring the alignment here keeps the
@@ -1631,7 +1649,7 @@ fn decode_probe_counters_snapshot(
     const PCPU_SLOT_STRIDE: usize = 128;
     /// Per-CPU dimension. Matches `MAX_CPUS` in `src/bpf/probe.bpf.c`
     /// (CPU_MASK + 1 = 256). Walking every CPU slot is cheap (256
-    /// CPUs × 17 slots × 8 bytes = 34 KB of reads); slots beyond
+    /// CPUs × 15 slots × 8 bytes = 30 KB of reads); slots beyond
     /// the actual `nr_cpus` are zero-init `.bss` and contribute
     /// nothing to the sum.
     const MAX_CPUS: usize = 256;
@@ -1709,8 +1727,6 @@ fn decode_probe_counters_snapshot(
         kprobe_returns: sum_slot(PCPU_KPROBE_RETURNS),
         meta_miss: sum_slot(PCPU_META_MISS),
         ringbuf_drops: sum_slot(PCPU_RINGBUF_DROPS),
-        event_tp_count: sum_slot(PCPU_EVENT_TP_COUNT),
-        event_ringbuf_drops: sum_slot(PCPU_EVENT_RINGBUF_DROPS),
         timeline_count: sum_slot(PCPU_TIMELINE_COUNT),
         timeline_drops: sum_slot(PCPU_TIMELINE_DROPS),
         pi_count: sum_slot(PCPU_PI_COUNT),

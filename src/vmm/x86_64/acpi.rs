@@ -479,8 +479,7 @@ fn write_srat(
     }
 
     // Memory affinity from NumaMemoryLayout regions. The layout covers
-    // the full guest memory including the SHM region at the top of
-    // DRAM. SHM is reserved via E820/memblock, not excluded from SRAT.
+    // the full guest DRAM.
     let regions = numa_layout.regions();
     for region in regions {
         let length = region.size;

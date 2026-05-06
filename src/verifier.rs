@@ -46,6 +46,34 @@ pub(crate) fn parse_sched_output(output: &str) -> Option<&str> {
     Some(content)
 }
 
+/// Concatenate every CRC-valid `MSG_TYPE_SCHED_LOG` chunk in the
+/// bulk-port drain into one `String`, in arrival order.
+///
+/// The guest's `dump_sched_output` emits the `SCHED_OUTPUT_START`
+/// and `SCHED_OUTPUT_END` markers as their own
+/// [`crate::vmm::wire::MsgType::SchedLog`] frames, with the file
+/// content split across one or more intermediate frames. Replaying
+/// the chunks back-to-back reproduces the byte-for-byte stream the
+/// prior COM2 path appended to `output`, so [`parse_sched_output`]
+/// runs unchanged on the result.
+///
+/// Empty / `None` drain yields an empty string.
+pub(crate) fn concat_sched_log_chunks(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+) -> String {
+    let Some(drain) = drain else {
+        return String::new();
+    };
+    let mut acc = String::new();
+    for e in &drain.entries {
+        if e.msg_type != crate::vmm::wire::MSG_TYPE_SCHED_LOG || !e.crc_ok {
+            continue;
+        }
+        acc.push_str(&String::from_utf8_lossy(&e.payload));
+    }
+    acc
+}
+
 /// Extract scheduler log content even when the closing delimiter is
 /// absent. Tries [`parse_sched_output`] first (well-formed
 /// open+close); on failure, returns the slice from
@@ -562,7 +590,19 @@ pub fn collect_verifier_output(
 
     let result = vm.run().context("run verifier VM")?;
 
-    let scheduler_log = parse_sched_output(&result.output).unwrap_or("").to_string();
+    // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks, then run
+    // the marker-pair extractor on the merged stream — the
+    // SCHED_OUTPUT_START/END markers travel verbatim inside chunk
+    // bytes so the existing parser slices the same content the
+    // prior COM2 dump produced. Falls back to `result.output` when
+    // the bulk-port drain has no SchedLog frames (verifier VM
+    // running on a kernel without the bulk port, for instance).
+    let merged = concat_sched_log_chunks(result.guest_messages.as_ref());
+    let scheduler_log = if !merged.is_empty() {
+        parse_sched_output(&merged).unwrap_or("").to_string()
+    } else {
+        parse_sched_output(&result.output).unwrap_or("").to_string()
+    };
 
     // Build ProgStats from host-side ProgVerifierStats. Each program
     // that loaded successfully is visible in prog_idr with its

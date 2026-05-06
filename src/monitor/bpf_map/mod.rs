@@ -61,6 +61,12 @@ pub(crate) struct AccessorCtx<'a> {
     /// kernel-text/data symbols (e.g. `map_idr`) to physical
     /// addresses. Mirrors [`super::guest::GuestKernel::start_kernel_map`].
     pub start_kernel_map: u64,
+    /// Runtime KASLR offset (`phys_base` on x86_64; `0` on aarch64
+    /// and on non-KASLR x86_64 boots). Threaded through every
+    /// `text_kva_to_pa_with_base` call so KASLR'd kernels resolve
+    /// text/data symbols correctly. See
+    /// [`super::guest::GuestKernel::phys_base`].
+    pub phys_base: u64,
 }
 
 // Map type discriminants from `enum bpf_map_type` in
@@ -424,7 +430,7 @@ impl<'a> MapMetadata<'a> {
 /// ([`iter_htab_entries`] for HASH, [`super::arena::snapshot_arena`]
 /// for ARENA, …).
 pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<BpfMapInfo> {
-    let idr_pa = text_kva_to_pa_with_base(map_idr_kva, ctx.start_kernel_map);
+    let idr_pa = text_kva_to_pa_with_base(map_idr_kva, ctx.start_kernel_map, ctx.phys_base);
     let offsets = ctx.offsets;
 
     let xa_head = ctx.mem.read_u64(idr_pa, offsets.idr_xa_head);
@@ -570,7 +576,7 @@ pub(crate) fn find_bpf_map(
     map_idr_kva: u64,
     name_suffix: &str,
 ) -> Option<BpfMapInfo> {
-    let idr_pa = text_kva_to_pa_with_base(map_idr_kva, ctx.start_kernel_map);
+    let idr_pa = text_kva_to_pa_with_base(map_idr_kva, ctx.start_kernel_map, ctx.phys_base);
     let offsets = ctx.offsets;
 
     let xa_head = ctx.mem.read_u64(idr_pa, offsets.idr_xa_head);
@@ -773,7 +779,9 @@ pub(crate) fn write_bpf_map_value(
         // `bytes_filled != len` returns `None`. Without this guard a
         // half-landed write would silently report success.
         let src_off = src_off as usize;
-        let n = ctx.mem.write_bytes_at(pa, 0, &data[src_off..src_off + chunk_len]);
+        let n = ctx
+            .mem
+            .write_bytes_at(pa, 0, &data[src_off..src_off + chunk_len]);
         bytes_written = bytes_written.saturating_add(n);
     });
     walked && bytes_written == data.len()
@@ -984,9 +992,7 @@ fn read_percpu_array_value(
                 // SAFETY: capacity == value_size; we set_len only
                 // after `read_bytes` returns value_size, mirroring
                 // the htab walker's invariant.
-                let slice = unsafe {
-                    std::slice::from_raw_parts_mut(buf.as_mut_ptr(), value_size)
-                };
+                let slice = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), value_size) };
                 let n = ctx.mem.read_bytes(cpu_pa, slice);
                 if n == value_size {
                     // SAFETY: read_bytes filled value_size bytes.
@@ -1386,6 +1392,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             l5: self.kernel.l5(),
             tcr_el1: self.kernel.tcr_el1(),
             start_kernel_map: self.kernel.start_kernel_map(),
+            phys_base: self.kernel.phys_base(),
         }
     }
 
@@ -1412,10 +1419,7 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// Goes through the per-accessor maps cache so repeat
     /// `find_map` calls within one dump amortize the IDR walk.
     pub fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
-        let mut guard = self
-            .maps_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.maps_cache.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             *guard = Some(std::sync::Arc::new(find_all_bpf_maps(
                 &self.ctx(),
@@ -1486,10 +1490,7 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
     /// cannot return stale entries for maps the guest kernel
     /// created / destroyed between dumps.
     fn maps(&self) -> Vec<BpfMapInfo> {
-        let mut guard = self
-            .maps_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.maps_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.as_ref() {
             return (**cached).clone();
         }
@@ -1507,10 +1508,7 @@ impl BpfMapAccessor for GuestMemMapAccessor<'_> {
     /// returned a clone-and-drop of the full `Vec<BpfMapInfo>`
     /// from the cache only to scan it linearly.
     fn find_map(&self, name_suffix: &str) -> Option<BpfMapInfo> {
-        let mut guard = self
-            .maps_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.maps_cache.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             *guard = Some(std::sync::Arc::new(find_all_bpf_maps(
                 &self.ctx(),
@@ -1626,8 +1624,13 @@ impl<'a> GuestMemMapAccessorOwned<'a> {
     /// accessor to own its offsets.
     ///
     /// [`GuestKernel`]: super::guest::GuestKernel
-    pub fn new(mem: &'a GuestMem, vmlinux: &std::path::Path, tcr_el1: u64) -> anyhow::Result<Self> {
-        let kernel = super::guest::GuestKernel::new(mem, vmlinux, tcr_el1)?;
+    pub fn new(
+        mem: &'a GuestMem,
+        vmlinux: &std::path::Path,
+        tcr_el1: u64,
+        cr3_pa: u64,
+    ) -> anyhow::Result<Self> {
+        let kernel = super::guest::GuestKernel::new(mem, vmlinux, tcr_el1, cr3_pa)?;
         let offsets = BpfMapOffsets::from_vmlinux(vmlinux)?;
 
         let map_idr_kva = kernel

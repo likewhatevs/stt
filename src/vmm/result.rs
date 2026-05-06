@@ -396,6 +396,29 @@ pub(crate) struct VmRunState {
     /// pattern (broadcast + per-vCPU ACK) covers both shutdown and
     /// freeze rendezvous.
     pub(crate) freeze: Arc<AtomicBool>,
+    /// Hardware-watchpoint arming state Arc, forwarded so
+    /// [`super::KtstrVm::collect_results`] can invalidate the
+    /// `kind_host_ptr` and `request_kva` slots after every vCPU
+    /// thread joins but BEFORE `vm` drops.
+    ///
+    /// Without the invalidation, the slots' published values
+    /// continue to address (a) a host pointer into `vm.guest_mem`'s
+    /// mapping that becomes unmapped when `vm` drops and (b) a
+    /// guest KVA whose translation goes through the same mapping.
+    /// The freeze coordinator joins before `vm` drops in
+    /// `run_vm`, and AP threads join inside `collect_results` —
+    /// but defense-in-depth says we zero the slots once every
+    /// reader is gone so any future restructuring (a stray Arc
+    /// clone surviving past teardown, a follow-up that adds a
+    /// new reader path) cannot trip a use-after-free.
+    ///
+    /// Declared before `vm` so the implicit drop order on
+    /// `VmRunState` teardown drops `watchpoint` first: any Arc
+    /// clone outliving the struct can no longer dereference its
+    /// `kind_host_ptr` after `vm.guest_mem` has unmapped, even if
+    /// a future caller forgets the explicit pre-drop
+    /// invalidation in `collect_results`.
+    pub(crate) watchpoint: Arc<WatchpointArm>,
     pub(crate) vm: kvm::KtstrKvm,
     /// Captured immediately after the BSP exits its run loop. Subtracted
     /// from `Instant::now()` in [`super::KtstrVm::collect_results`]
@@ -447,6 +470,14 @@ pub(crate) struct VmRunState {
     /// MMU bring-up yet"; the walker's T1SZ=0 gate rejects walks in
     /// that state and the affected lookup returns `None` cleanly.
     pub(crate) tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Cached BSP CR3 (x86_64) / TTBR1_EL1 (aarch64), populated lazily
+    /// by the BSP loop after initial page-table setup. Used by
+    /// post-exit `GuestKernel` constructions to walk the live page
+    /// tables for `phys_base` resolution. `0` means the cache wasn't
+    /// populated (early boot crash); the walk fails and `phys_base`
+    /// falls back to `0`, which produces correct translations on
+    /// non-KASLR boots.
+    pub(crate) cr3: Arc<std::sync::atomic::AtomicU64>,
     /// Virtio-console device shared with vCPU threads. Carries the
     /// port-1 (`/dev/vport0p1`) bulk TLV stream from guest to host;
     /// `collect_results` calls `drain_bulk()` after the run to feed
@@ -466,22 +497,6 @@ pub(crate) struct VmRunState {
     /// `port1_tx_buf` after the coord exited would reach the
     /// verdict, and a typical run would surface no metrics.
     pub(crate) bulk_messages: Arc<std::sync::Mutex<Vec<crate::vmm::wire::ShmEntry>>>,
-    /// Hardware-watchpoint arming state Arc, forwarded so
-    /// [`super::KtstrVm::collect_results`] can invalidate the
-    /// `kind_host_ptr` and `request_kva` slots after every vCPU
-    /// thread joins but BEFORE `vm` drops.
-    ///
-    /// Without the invalidation, the slots' published values
-    /// continue to address (a) a host pointer into `vm.guest_mem`'s
-    /// mapping that becomes unmapped when `vm` drops and (b) a
-    /// guest KVA whose translation goes through the same mapping.
-    /// The freeze coordinator joins before `vm` drops in
-    /// `run_vm`, and AP threads join inside `collect_results` —
-    /// but defense-in-depth says we zero the slots once every
-    /// reader is gone so any future restructuring (a stray Arc
-    /// clone surviving past teardown, a follow-up that adds a
-    /// new reader path) cannot trip a use-after-free.
-    pub(crate) watchpoint: Arc<WatchpointArm>,
 }
 #[cfg(test)]
 mod tests {

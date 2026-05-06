@@ -79,7 +79,7 @@ pub fn custom_nested_cgroup_task_move(ctx: &Ctx) -> Result<AssertResult> {
 /// Rapid nested cgroup create/destroy with dynamic names. Custom logic
 /// for dynamic naming.
 pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
-    let (handles, _guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
+    let (handles, mut guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
     let deadline = Instant::now() + ctx.duration;
     let mut i = 0usize;
     // Cap on the number of distinct ephemeral cgroup names. The
@@ -99,13 +99,24 @@ pub fn custom_nested_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     // re-create rather than an error. Mirrors the cap in the
     // single-level sibling `custom_cgroup_rapid_churn` in
     // `scenario/dynamic.rs`.
+    //
+    // Each parent (and 'deep' child on every-3rd iterations) is
+    // registered in the `setup_cgroups` guard via
+    // `add_cgroup_no_cpuset` so its Drop reaps any cgroup whose
+    // best-effort remove_cgroup below failed. The reverse-iterate
+    // contract in `CgroupGroup::drop` removes children before
+    // parents (matters here: a `deep` push always happens after
+    // its parent's push within the same iteration, so reverse
+    // iteration tears down the child first — preventing the
+    // ENOTEMPTY that an already-leaked deep would otherwise
+    // produce when the guard tries to remove its parent).
     const MAX_EPHEMERAL_NAMES: usize = 100;
     while Instant::now() < deadline {
         let path = format!("cg_0/churn_{}", i % MAX_EPHEMERAL_NAMES);
-        ctx.cgroups.create_cgroup(&path)?;
-        if i % 3 == 0 {
+        guard.add_cgroup_no_cpuset(&path)?;
+        if i.is_multiple_of(3) {
             let deep = format!("{path}/deep");
-            ctx.cgroups.create_cgroup(&deep)?;
+            guard.add_cgroup_no_cpuset(&deep)?;
             thread::sleep(Duration::from_millis(50));
             // Best-effort teardown of the nested 'deep' child
             // before its parent: a transient EBUSY from the

@@ -120,7 +120,9 @@ pub(super) fn worker_main(
     // set_sched_policy sites later in this function follow the
     // same policy.
     let affinity_error: Option<String> = if let Some(ref cpus) = affinity {
-        set_thread_affinity(tid, cpus).err().map(|e| format!("{e:#}"))
+        set_thread_affinity(tid, cpus)
+            .err()
+            .map(|e| format!("{e:#}"))
     } else {
         None
     };
@@ -218,11 +220,14 @@ pub(super) fn worker_main(
     let mut page_fault_region: Option<(*mut libc::c_void, usize)> = None;
     let mut page_fault_rng_state: u64 = 0;
     // One-shot guard for per-position policy overrides (AsymmetricWaker
-    // applies waker_class to pos == 0 / wakee_class to pos == 1; future
-    // variants like RtStarvation use the same flag). The override must
-    // run AFTER the WorkloadConfig-supplied `set_sched_policy` above so
+    // applies waker_class to pos == 0 / wakee_class to pos == 1;
+    // PriorityInversion, RtStarvation, and PreemptStorm use the same
+    // flag for their per-pos FIFO promotions). The override must run
+    // AFTER the WorkloadConfig-supplied `set_sched_policy` above so
     // it's the last word on the worker's class, and ONCE so we don't
     // hammer sched_setattr/sched_setscheduler every outer iteration.
+    // Stack-local because Thread mode would race a process-wide static
+    // across multiple per-pos workers in the same group cohort.
     let mut per_pos_policy_applied = false;
     // One-shot guard for IdleChurn's `precise_timing` opt-in.
     // When set, the IdleChurn dispatch arm calls
@@ -335,15 +340,14 @@ pub(super) fn worker_main(
     // dispatch arm therefore opens on demand and invalidates the
     // cached fd on any write/open error, so a recreate is picked up
     // on the next iteration.
-    let cgroup_churn_paths: Vec<String> =
-        if let WorkType::CgroupChurn { groups, .. } = &work_type {
-            let groups_count = (*groups).max(1);
-            (0..groups_count)
-                .map(|i| format!("/sys/fs/cgroup/wt-cgroup-churn-{i}/cgroup.procs"))
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let cgroup_churn_paths: Vec<String> = if let WorkType::CgroupChurn { groups, .. } = &work_type {
+        let groups_count = (*groups).max(1);
+        (0..groups_count)
+            .map(|i| format!("/sys/fs/cgroup/wt-cgroup-churn-{i}/cgroup.procs"))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let cgroup_churn_tid_bytes: Vec<u8> = if matches!(work_type, WorkType::CgroupChurn { .. }) {
         format!("{tid}\n").into_bytes()
     } else {
@@ -353,12 +357,11 @@ pub(super) fn worker_main(
     // and cleared on write/open failure so the next iteration retries
     // the open. Sized to match `cgroup_churn_paths.len()` so the
     // dispatch arm's index-by-`target_idx` is always in-bounds.
-    let mut cgroup_churn_files: Vec<Option<std::fs::File>> =
-        if cgroup_churn_paths.is_empty() {
-            Vec::new()
-        } else {
-            (0..cgroup_churn_paths.len()).map(|_| None).collect()
-        };
+    let mut cgroup_churn_files: Vec<Option<std::fs::File>> = if cgroup_churn_paths.is_empty() {
+        Vec::new()
+    } else {
+        (0..cgroup_churn_paths.len()).map(|_| None).collect()
+    };
 
     // NumaWorkingSetSweep: pre-compute one (nodemask, maxnode) pair
     // per entry in `target_nodes`. The dispatch arm rotates through
@@ -368,7 +371,10 @@ pub(super) fn worker_main(
     // invariant across iterations because `target_nodes` is
     // captured by reference at worker entry.
     let numa_sweep_masks: Vec<(Vec<libc::c_ulong>, libc::c_ulong)> =
-        if let WorkType::NumaWorkingSetSweep { ref target_nodes, .. } = work_type {
+        if let WorkType::NumaWorkingSetSweep {
+            ref target_nodes, ..
+        } = work_type
+        {
             target_nodes
                 .iter()
                 .map(|&node| build_nodemask(&[node].into_iter().collect::<BTreeSet<usize>>()))
@@ -1872,36 +1878,65 @@ pub(super) fn worker_main(
                 consume_iters,
                 queue_depth_target,
             } => {
-                // SPMC-ish ring queue in shared memory. Layout:
-                //   offset 0  : head (producer write idx, u64)
-                //   offset 8  : tail (consumer read idx, u64)
+                // MPMC ring queue in shared memory. Layout:
+                //   offset 0  : head     (producer reserve idx, u64)
+                //   offset 8  : tail     (consumer read idx, u64)
                 //   offset 16 : prod_wake (consumers' "queue drained" futex, u32)
                 //   offset 20 : cons_wake (producers' "items available" futex, u32)
-                //   offset 24 : ring[Q] of u64 slots
+                //   offset 24 : pub_head (producer publish idx, u64)
+                //   offset 32 : ring[Q] of u64 slots
                 // pos < producers → producer; else consumer.
                 //
-                // Producer paces with nanosleep(1s/produce_rate_hz)
-                // between pushes. On full queue (head - tail == Q):
-                // FUTEX_WAIT on prod_wake (consumers wake it when
-                // tail advances). Producer tags items with
-                // monotonic counter — content opaque to the
-                // workload, only its sequencing matters.
+                // Two producer counters split the MPMC protocol:
                 //
-                // Consumer pops one item per loop: if head == tail,
-                // FUTEX_WAIT on cons_wake (producers wake it when
-                // head advances). Then spin consume_iters of CPU.
+                //  - `head` (reserve): producers CAS-advance head
+                //    from N to N+1 to claim slot N. Two producers
+                //    that observed head=N race the CAS; only one
+                //    succeeds, the other reloads and re-checks
+                //    capacity. The CAS is the atomic capacity check
+                //    + reservation, closing the load-then-add
+                //    TOCTOU that a separate `head < tail+q` check
+                //    + `fetch_add` opens.
+                //
+                //  - `pub_head` (publish): after writing its slot,
+                //    each producer spin-waits for `pub_head ==
+                //    slot_avail` (its own reservation index) and
+                //    then Release-stores `slot_avail+1`. This
+                //    serialises publication into reservation order
+                //    — slot N is announced strictly before slot
+                //    N+1 — so the Release on the publish store
+                //    synchronises-with the consumer's Acquire load
+                //    on `pub_head`, making the slot data
+                //    happens-before the consumer's read. Without
+                //    this serialisation, a producer that reserved
+                //    a high slot but hasn't written it yet could
+                //    see its head advance be observed by a
+                //    consumer that then reads stale memory at the
+                //    older tail slot.
+                //
+                // Consumer reads `pub_head` (not `head`) so an
+                // unwritten reservation never appears. Tail uses
+                // Acquire/Release for the producer side's
+                // queue-not-full check.
+                //
+                // Producer paces with nanosleep(1s/produce_rate_hz)
+                // between pushes. On full queue
+                // (head - tail == Q): FUTEX_WAIT on prod_wake
+                // (consumers wake it when tail advances). Producer
+                // tags items with monotonic counter — content
+                // opaque to the workload, only its sequencing
+                // matters.
+                //
+                // Consumer pops one item per loop: if pub_head ==
+                // tail, FUTEX_WAIT on cons_wake (producers wake it
+                // after pub_head advances). Then spin consume_iters
+                // of CPU.
                 //
                 // Imbalance: when producers * rate > consumers * /
                 // (consume_iters work-time), the queue grows toward
                 // Q and producers eventually block — pressure-
                 // testing scheduler fairness under sustained
                 // backpressure (DSQ unbounded growth in scx).
-                //
-                // Atomic ordering: head/tail are accessed via
-                // AtomicU64::{load,store} with Acquire/Release.
-                // The Release on producer's head store pairs with
-                // the consumer's Acquire on head — once consumer
-                // observes head > tail, the slot write is visible.
                 let (futex_ptr, pos) = match futex {
                     Some(f) => f,
                     None => break,
@@ -1910,7 +1945,10 @@ pub(super) fn worker_main(
                 if pos >= total || queue_depth_target == 0 {
                     break;
                 }
-                let q_target_usize = std::cmp::min(queue_depth_target as usize, usize::MAX / 8 - 3);
+                // Clamp matches the spawn-side
+                // `futex_region_size_for` clamp so worker and
+                // mmap agree on the slot count.
+                let q_target_usize = std::cmp::min(queue_depth_target as usize, usize::MAX / 8 - 4);
                 let q = q_target_usize as u64;
                 if q == 0 {
                     break;
@@ -1920,7 +1958,9 @@ pub(super) fn worker_main(
                 let tail_atom = unsafe { &*(base.add(8) as *const std::sync::atomic::AtomicU64) };
                 let prod_wake_ptr = unsafe { base.add(16) as *mut u32 };
                 let cons_wake_ptr = unsafe { base.add(20) as *mut u32 };
-                let ring_base = unsafe { base.add(24) as *mut u64 };
+                let pub_head_atom =
+                    unsafe { &*(base.add(24) as *const std::sync::atomic::AtomicU64) };
+                let ring_base = unsafe { base.add(32) as *mut u64 };
                 if pos < producers {
                     // Producer.
                     let mut next_seq: u64 = 0;
@@ -1933,13 +1973,19 @@ pub(super) fn worker_main(
                         1_000_000_000u64 / produce_rate_hz
                     };
                     while !stop_requested(stop) {
-                        // Block on full queue: FUTEX_WAIT on
-                        // prod_wake until tail advances. The inner
-                        // loop either sets slot_avail and breaks
-                        // with reservation or breaks via STOP — the
-                        // post-loop STOP check below short-circuits
-                        // before reading slot_avail in the latter
-                        // case.
+                        // CAS-reserve a slot. Each iteration
+                        // reloads head and tail; if the queue is
+                        // full, FUTEX_WAIT and re-evaluate. When
+                        // capacity is available, attempt
+                        // `compare_exchange_weak(head, head+1)` —
+                        // success means we exclusively own slot
+                        // index `head`; failure means another
+                        // producer raced ahead (or a spurious
+                        // weak-CAS failure) so reload and retry.
+                        // The CAS is the atomic capacity-check +
+                        // reservation, so two producers cannot
+                        // both claim the same slot index nor
+                        // overshoot tail+q.
                         let mut slot_avail: u64 = 0;
                         let mut got_slot = false;
                         loop {
@@ -1948,35 +1994,80 @@ pub(super) fn worker_main(
                             }
                             let head = head_atom.load(Ordering::Relaxed);
                             let tail = tail_atom.load(Ordering::Acquire);
-                            if head.wrapping_sub(tail) < q {
-                                slot_avail = head;
-                                got_slot = true;
-                                break;
+                            if head.wrapping_sub(tail) >= q {
+                                let prod_wake_atom = unsafe {
+                                    &*(prod_wake_ptr as *const std::sync::atomic::AtomicU32)
+                                };
+                                let expected = prod_wake_atom.load(Ordering::Relaxed);
+                                let before_block = Instant::now();
+                                unsafe {
+                                    futex_wait(prod_wake_ptr, expected, &FUTEX_WAIT_TIMEOUT)
+                                };
+                                reservoir_push(
+                                    &mut resume_latencies_ns,
+                                    &mut wake_sample_count,
+                                    before_block.elapsed().as_nanos() as u64,
+                                    MAX_WAKE_SAMPLES,
+                                );
+                                continue;
                             }
-                            let prod_wake_atom =
-                                unsafe { &*(prod_wake_ptr as *const std::sync::atomic::AtomicU32) };
-                            let expected = prod_wake_atom.load(Ordering::Relaxed);
-                            let before_block = Instant::now();
-                            unsafe { futex_wait(prod_wake_ptr, expected, &FUTEX_WAIT_TIMEOUT) };
-                            reservoir_push(
-                                &mut resume_latencies_ns,
-                                &mut wake_sample_count,
-                                before_block.elapsed().as_nanos() as u64,
-                                MAX_WAKE_SAMPLES,
-                            );
+                            // Try to reserve slot `head`. Acquire
+                            // on success orders subsequent slot
+                            // write after the CAS; failure path is
+                            // Relaxed because we discard the loaded
+                            // value and reload from the top.
+                            match head_atom.compare_exchange_weak(
+                                head,
+                                head.wrapping_add(1),
+                                Ordering::Acquire,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => {
+                                    slot_avail = head;
+                                    got_slot = true;
+                                    break;
+                                }
+                                Err(_) => continue,
+                            }
                         }
                         if !got_slot || stop_requested(stop) {
                             break;
                         }
-                        // Write slot at head % q. The Release on
-                        // head_atom.store() publishes both the slot
-                        // contents and the head advance to consumers.
+                        // Write the reserved slot.
                         let slot_idx = (slot_avail % q) as usize;
                         unsafe {
                             std::ptr::write_volatile(ring_base.add(slot_idx), next_seq);
                         }
-                        head_atom.store(slot_avail.wrapping_add(1), Ordering::Release);
                         next_seq = next_seq.wrapping_add(1);
+                        // Publish in reservation order. Spin until
+                        // every prior reservation has published
+                        // (pub_head == slot_avail), then Release-
+                        // store slot_avail+1. The serialisation
+                        // guarantees consumers observing pub_head >
+                        // K see slot K's data: producer J's
+                        // Acquire-load of pub_head synchronises-with
+                        // producer J-1's Release-store, transitively
+                        // chaining producer K's slot write
+                        // happens-before producer J's pub_head
+                        // Release, and the consumer's Acquire-load
+                        // on pub_head synchronises-with the latest
+                        // Release. The spin load MUST be Acquire,
+                        // not Relaxed: a Relaxed load would break
+                        // the transitive happens-before chain
+                        // because producer J would not synchronise-
+                        // with producer K, leaving producer K's
+                        // slot write potentially invisible at
+                        // consumer side.
+                        while pub_head_atom.load(Ordering::Acquire) != slot_avail {
+                            if stop_requested(stop) {
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                        if stop_requested(stop) {
+                            break;
+                        }
+                        pub_head_atom.store(slot_avail.wrapping_add(1), Ordering::Release);
                         // Wake one consumer (advance cons_wake counter).
                         let cons_wake_atom =
                             unsafe { &*(cons_wake_ptr as *const std::sync::atomic::AtomicU32) };
@@ -2002,7 +2093,10 @@ pub(super) fn worker_main(
                         // Block on empty queue. Same init/got
                         // pattern as the producer half so the
                         // borrow checker can prove item_idx is
-                        // initialized when read.
+                        // initialized when read. Read pub_head
+                        // (publication counter), not head
+                        // (reservation counter), so an in-flight
+                        // unwritten reservation is invisible.
                         let mut item_idx: u64 = 0;
                         let mut got_item = false;
                         loop {
@@ -2010,8 +2104,8 @@ pub(super) fn worker_main(
                                 break;
                             }
                             let tail = tail_atom.load(Ordering::Relaxed);
-                            let head = head_atom.load(Ordering::Acquire);
-                            if head != tail {
+                            let pub_head = pub_head_atom.load(Ordering::Acquire);
+                            if pub_head != tail {
                                 item_idx = tail;
                                 got_item = true;
                                 break;
@@ -2246,9 +2340,9 @@ pub(super) fn worker_main(
                 let path_count = cgroup_churn_paths.len();
                 if path_count == 0 {
                     let _ = groups; // pattern-binding only; pre-compute
-                    // is gated on this same field so emptiness here
-                    // means a programmer bug bypassed the gate. Skip
-                    // the IO step rather than panicking.
+                // is gated on this same field so emptiness here
+                // means a programmer bug bypassed the gate. Skip
+                // the IO step rather than panicking.
                 } else {
                     let target_idx = (iterations as usize) % path_count;
                     if cgroup_churn_files[target_idx].is_none() {
@@ -2368,9 +2462,15 @@ pub(super) fn worker_main(
                 // 1..=cfs_workers stay on SCHED_NORMAL and spin.
                 // Each RT wake (post-nanosleep) hits
                 // `wakeup_preempt` → `resched_curr` against the
-                // CFS sibling on the same CPU. The PER_POS_RT_APPLIED
-                // latch is per-process so the FIFO promotion runs
-                // exactly once per worker.
+                // CFS sibling on the same CPU. The
+                // `per_pos_policy_applied` stack-local latch (shared
+                // with AsymmetricWaker / PriorityInversion) ensures
+                // the FIFO promotion runs once per worker. A
+                // process-wide static would race in Thread mode where
+                // multiple PreemptStorm groups share one process: the
+                // first pos==0 thread to swap the static would block
+                // every subsequent group's pos==0 thread from
+                // applying RT, silently inerting their storm.
                 let pos = match futex {
                     Some((_, p)) => p,
                     // Without the per-pos shared region we cannot
@@ -2379,10 +2479,8 @@ pub(super) fn worker_main(
                     // even if spawn-side wiring drops the futex.
                     None => 1,
                 };
-                static PER_POS_RT_APPLIED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
                 let is_rt = pos == 0;
-                if is_rt && !PER_POS_RT_APPLIED.swap(true, Ordering::Relaxed) {
+                if is_rt && !per_pos_policy_applied {
                     let param = libc::sched_param { sched_priority: 1 };
                     let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
                     if rc != 0 {
@@ -2392,6 +2490,7 @@ pub(super) fn worker_main(
                              (need CAP_SYS_NICE / RLIMIT_RTPRIO)"
                         );
                     }
+                    per_pos_policy_applied = true;
                 }
                 spin_burst(&mut work_units, rt_burst_iters);
                 if is_rt && rt_sleep_us > 0 && !stop_requested(stop) {

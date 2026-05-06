@@ -648,8 +648,21 @@ impl CgroupManager {
     /// method can wrap the unfreeze/drain/rmdir result in the
     /// outstanding-counter bookkeeping without duplicating the
     /// sequence in success and failure arms.
+    ///
+    /// Gates the pre-drain unfreeze on `cgroup.freeze` existence to
+    /// match [`cleanup_recursive`]'s same-file gate. `set_freeze`
+    /// goes through `fs::write` which CREATES the file when it does
+    /// not exist (open(O_WRONLY | O_CREAT | O_TRUNC)), so an
+    /// unconditional call would plant a stray 1-byte file under any
+    /// non-cgroupfs directory and cause the subsequent
+    /// `fs::remove_dir(p)` to fail with ENOTEMPTY. On a real cgroup
+    /// v2 tree the file is always present (cgroup-core, ungated by
+    /// controllers); on a legacy kernel without `CONFIG_CGROUP_FREEZE`
+    /// or on a non-cgroup directory entry the file is absent and the
+    /// unfreeze step is a no-op.
     fn remove_cgroup_inner(&self, name: &str, p: &Path) -> Result<()> {
-        if let Err(err) = self.set_freeze(name, false)
+        if p.join("cgroup.freeze").exists()
+            && let Err(err) = self.set_freeze(name, false)
             && anyhow_first_io_errno(&err) != Some(libc::ENOENT)
         {
             tracing::warn!(
@@ -2405,8 +2418,7 @@ mod tests {
     /// rises monotonically as failures accumulate.
     #[test]
     fn remove_cgroup_increments_outstanding_on_failure() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-cg-outstanding-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-outstanding-{}", std::process::id()));
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         // Seed cgroup.procs so drain_tasks succeeds; rmdir will then
@@ -2524,8 +2536,7 @@ mod tests {
     /// readback surfaces here.
     #[test]
     fn move_task_refuses_when_cpuset_cpus_set_but_effective_mems_empty() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-cg-cpuset-gate-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-cpuset-gate-{}", std::process::id()));
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         // Configured: cpuset.cpus has bits; cpuset.mems.effective
@@ -2558,8 +2569,7 @@ mod tests {
     /// `cgroup.procs` without bailing.
     #[test]
     fn move_task_admits_when_cpus_set_and_effective_mems_non_empty() {
-        let dir =
-            std::env::temp_dir().join(format!("ktstr-cg-cpuset-ok-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ktstr-cg-cpuset-ok-{}", std::process::id()));
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
@@ -2584,8 +2594,10 @@ mod tests {
     /// to reading the local file fails this test.
     #[test]
     fn move_task_admits_when_local_mems_empty_but_effective_inherited() {
-        let dir = std::env::temp_dir()
-            .join(format!("ktstr-cg-cpuset-inherit-mems-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ktstr-cg-cpuset-inherit-mems-{}",
+            std::process::id()
+        ));
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();
@@ -2650,10 +2662,8 @@ mod tests {
     /// [`CgroupManager::move_task`].
     #[test]
     fn move_task_admits_when_effective_mems_file_absent() {
-        let dir = std::env::temp_dir().join(format!(
-            "ktstr-cg-no-effective-mems-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ktstr-cg-no-effective-mems-{}", std::process::id()));
         let inner = dir.join("cg_x");
         fs::create_dir_all(&inner).unwrap();
         fs::write(inner.join("cpuset.cpus"), "0-1").unwrap();

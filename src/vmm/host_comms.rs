@@ -107,6 +107,21 @@ pub fn parse_tlv_stream(buf: &[u8]) -> BulkDrainResult {
             // an infinite loop if the invariant is ever violated.
             break;
         };
+        // Hostile-guest covert-channel guard: `_pad` is reserved
+        // and writers MUST set it to 0 (see `ShmMessage` doc).
+        // A non-zero value cannot come from a legitimate guest
+        // producer — surface it for diagnostics rather than
+        // silently ignoring potential covert-channel bytes. The
+        // walk continues; the field is not load-bearing for frame
+        // dispatch so a malformed value does not corrupt parsing.
+        if msg._pad != 0 {
+            tracing::warn!(
+                msg_type = msg.msg_type,
+                length = msg.length,
+                pad = msg._pad,
+                "parse_tlv_stream: non-zero _pad in frame header; possible hostile guest covert channel"
+            );
+        }
         // Hostile-input guard: a `length` above the per-frame cap
         // cannot come from any legitimate producer (every real
         // payload sits well below 256 KiB) and would trigger an
@@ -383,5 +398,107 @@ mod tests {
         );
         assert_eq!(r.entries[0].payload, b"valid");
         assert!(r.entries[0].crc_ok);
+    }
+
+    /// An oversized header followed by a fully-valid frame: the
+    /// walk stops at the oversized header and the trailing valid
+    /// frame is NOT returned. The bogus `length` cannot be trusted
+    /// to advance the cursor past its claimed payload, so any
+    /// bytes that follow are unparseable — even when those bytes
+    /// happen to encode a structurally legitimate frame.
+    #[test]
+    fn parse_stops_at_oversized_does_not_return_subsequent_valid() {
+        use zerocopy::IntoBytes;
+        let bad = ShmMessage {
+            msg_type: MSG_TYPE_STIMULUS,
+            length: u32::MAX,
+            crc32: 0,
+            _pad: 0,
+        };
+        let mut combined = Vec::new();
+        combined.extend_from_slice(bad.as_bytes());
+        // A perfectly-formed frame after the bogus header. If the
+        // parser were to skip past the oversized header instead of
+        // stopping, this frame would be picked up.
+        combined.extend_from_slice(&frame_bytes(MSG_TYPE_EXIT, b"valid"));
+        let r = parse_tlv_stream(&combined);
+        assert!(
+            r.entries.is_empty(),
+            "no entries: parser must stop at the oversized header and not resume on the trailing valid frame"
+        );
+    }
+
+    /// Every new bincode-migration MsgType variant round-trips
+    /// through frame-bytes → `parse_tlv_stream` → `MsgType::from_wire`
+    /// without dropping the payload. A regression that diverged the
+    /// guest writer's tag from the host parser's recogniser would
+    /// trip the `from_wire` lookup and surface as `None`.
+    #[test]
+    fn parse_recognises_all_new_msg_type_variants() {
+        use super::super::wire::{
+            MSG_TYPE_DMESG, MSG_TYPE_EXEC_EXIT, MSG_TYPE_LIFECYCLE, MSG_TYPE_PROBE_OUTPUT,
+            MSG_TYPE_SCHED_LOG, MSG_TYPE_STDERR, MSG_TYPE_STDOUT, MsgType,
+        };
+        let cases: &[(u32, MsgType, &[u8])] = &[
+            (MSG_TYPE_STDOUT, MsgType::Stdout, b"hello\n"),
+            (MSG_TYPE_STDERR, MsgType::Stderr, b"error\n"),
+            (MSG_TYPE_SCHED_LOG, MsgType::SchedLog, b"---SCHED---\n"),
+            // Lifecycle payload layout: 1-byte phase + reason
+            // bytes. Use the InitStarted phase (=1) here.
+            (MSG_TYPE_LIFECYCLE, MsgType::Lifecycle, &[1u8]),
+            (MSG_TYPE_EXEC_EXIT, MsgType::ExecExit, &0i32.to_le_bytes()),
+            (MSG_TYPE_DMESG, MsgType::Dmesg, b"[    0.000000] Linux\n"),
+            (MSG_TYPE_PROBE_OUTPUT, MsgType::ProbeOutput, b"{\"k\":1}\n"),
+        ];
+        for (raw, typed, payload) in cases {
+            let bytes = frame_bytes(*raw, payload);
+            let r = parse_tlv_stream(&bytes);
+            assert_eq!(
+                r.entries.len(),
+                1,
+                "single-frame parse failed for {typed:?}",
+            );
+            assert!(r.entries[0].crc_ok, "CRC must round-trip for {typed:?}");
+            assert_eq!(
+                r.entries[0].payload, *payload,
+                "payload byte mismatch for {typed:?}",
+            );
+            assert_eq!(
+                MsgType::from_wire(r.entries[0].msg_type),
+                Some(*typed),
+                "from_wire decode mismatch for {typed:?}",
+            );
+        }
+    }
+
+    /// `is_coordinator_internal` flips on for the two control frames
+    /// every host-side bucketing path filters out. This is a
+    /// classifier-level test (mirrors the one in `wire::tests`) but
+    /// pinning it here too guards the host_comms consumer from a
+    /// future MsgType variant addition that silently joined the
+    /// internal set.
+    #[test]
+    fn parsed_entries_match_is_coordinator_internal_classifier() {
+        use super::super::wire::{
+            MSG_TYPE_SNAPSHOT_REQUEST, MSG_TYPE_SYS_RDY, MSG_TYPE_TEST_RESULT, MsgType,
+        };
+        let internal_raw = frame_bytes(MSG_TYPE_SNAPSHOT_REQUEST, &[0u8; 72]);
+        let r = parse_tlv_stream(&internal_raw);
+        assert_eq!(r.entries.len(), 1);
+        let typed = MsgType::from_wire(r.entries[0].msg_type).unwrap();
+        assert!(typed.is_coordinator_internal());
+
+        let internal_sys_rdy = frame_bytes(MSG_TYPE_SYS_RDY, b"");
+        let r = parse_tlv_stream(&internal_sys_rdy);
+        assert_eq!(r.entries.len(), 1);
+        let typed = MsgType::from_wire(r.entries[0].msg_type).unwrap();
+        assert!(typed.is_coordinator_internal());
+
+        // Verdict-bearing — must NOT be classified as internal.
+        let verdict = frame_bytes(MSG_TYPE_TEST_RESULT, b"\x00");
+        let r = parse_tlv_stream(&verdict);
+        assert_eq!(r.entries.len(), 1);
+        let typed = MsgType::from_wire(r.entries[0].msg_type).unwrap();
+        assert!(!typed.is_coordinator_internal());
     }
 }

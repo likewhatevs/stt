@@ -629,6 +629,47 @@ pub(crate) fn worker_thread_main(
                     }
                 }
                 WorkerDispatchAction::Pause => {
+                    // Drain the pause eventfd counter BEFORE
+                    // entering the rendezvous. Counter-mode
+                    // semantics (eventfd(2)): a single `read`
+                    // returns the accumulated counter value and
+                    // resets it to 0. Draining here, at the start
+                    // of the PAUSE arm, makes the next
+                    // pause() — issued by the coordinator AFTER
+                    // resume() returns control of this rendezvous
+                    // cycle — produce a fresh epoll readiness
+                    // that the next iteration's `epoll_wait`
+                    // observes as a new PAUSE_TOKEN.
+                    //
+                    // Draining AFTER park exit (the prior design)
+                    // races: between park-exit and the post-park
+                    // drain, the coordinator can complete cycle N
+                    // (resume()) and start cycle N+1 (pause()).
+                    // The pause_fd.read at the bottom of this arm
+                    // would then collapse both N and N+1's
+                    // counter increments into a single drained
+                    // value, leaving epoll readiness cleared —
+                    // and cycle N+1's PAUSE_TOKEN would never
+                    // fire. The coordinator's subsequent
+                    // `paused.load(Acquire)` rendezvous poll
+                    // would spin until FREEZE_RENDEZVOUS_TIMEOUT.
+                    //
+                    // Cloud-hypervisor's epoll_helper.rs drains
+                    // its pause-side fd before parking too —
+                    // this matches that pattern. EAGAIN under
+                    // EFD_NONBLOCK from a saturated counter is
+                    // benign (counter saturation requires
+                    // u64::MAX-1 unobserved writes — implausible).
+                    match pause_fd.read() {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                %e,
+                                "virtio-blk worker: pause_fd read failed at PAUSE entry",
+                            );
+                        }
+                    }
                     // Signal the freeze coordinator we are parked.
                     // Release ordering pairs with the coordinator's
                     // `paused.load(Acquire)` rendezvous poll: the
@@ -688,35 +729,12 @@ pub(crate) fn worker_thread_main(
                     while paused.load(Ordering::Acquire) {
                         std::thread::park_timeout(std::time::Duration::from_millis(10));
                     }
-                    // Drain the pause eventfd counter AFTER the
-                    // park completes so a multi-coordinator race —
-                    // a second `pause()` write that lands between
-                    // a hypothetical drain-before-park and the
-                    // `paused.store(true)` — cannot leave a stale
-                    // `1` in the counter. By the time we reach this
-                    // read, the rendezvous has cleared `paused`
-                    // (Release-store from `resume()`), so any new
-                    // pause-side write would have already produced
-                    // a fresh PAUSE_TOKEN that we'll observe on the
-                    // next `epoll_wait` — which only matters if a
-                    // counter is left readable. Reading here drains
-                    // every coalesced `1` accumulated during the
-                    // park (counter mode: single read returns the
-                    // accumulated value and resets to 0), so the
-                    // next iteration's `epoll_wait` blocks
-                    // correctly until a fresh pause/kick/stop
-                    // arrives. Cloud-hypervisor's epoll_helper.rs
-                    // uses the same drain-after-resume ordering.
-                    match pause_fd.read() {
-                        Ok(_) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                %e,
-                                "virtio-blk worker: pause_fd read failed",
-                            );
-                        }
-                    }
+                    // No post-park pause_fd drain: the entry-side
+                    // drain above already consumed cycle N's
+                    // counter, and any pause() that lands AFTER
+                    // resume() (cycle N+1 from the same or a
+                    // different coordinator) must produce a
+                    // fresh PAUSE_TOKEN on the next epoll_wait.
                     // Resume: continue the outer loop iteration.
                     // We do NOT set should_drain here; if a kick
                     // landed during the pause window, KICK_TOKEN
@@ -1272,7 +1290,7 @@ mod tests {
     /// EPOLLERR | IN on PAUSE_TOKEN still pauses. eventfd EPOLLERR
     /// fires only on counter saturation (count == ULLONG_MAX), which
     /// is implausible for the pause path because every `pause()` is
-    /// paired with a `resume()`-side counter drain. Mirrors the
+    /// paired with a worker-side entry drain. Mirrors the
     /// KICK/STOP/THROTTLE EPOLLERR sibling tests so a future change
     /// that short-circuits on EPOLLERR before reaching the token
     /// match would break this test before it broke the rendezvous.
@@ -1283,7 +1301,7 @@ mod tests {
             worker_dispatch_event(event_set, PAUSE_TOKEN),
             WorkerDispatchAction::Pause,
             "EPOLLERR on pause_fd must fall through to the pause arm \
-             so the post-park drain clears the saturated counter",
+             so the entry-side drain clears the saturated counter",
         );
     }
 

@@ -16,8 +16,10 @@
 //! the host and per-test reflink-clones it via the `FICLONE` ioctl.
 //! The host never execs `mkfs.btrfs` against a real backing file —
 //! the kernel inside a one-off template VM is the on-disk-format
-//! authority (see the project CLAUDE.md "disk template lifecycle"
-//! section).
+//! authority. Driving the actual formatting through a guest kernel
+//! keeps the produced layout aligned with the kernel under test
+//! (so a btrfs feature regression in the guest kernel surfaces as
+//! a test failure, not as a host/guest mkfs disagreement).
 //!
 //! # Lifecycle
 //!

@@ -71,23 +71,17 @@ pub struct PhaseBInput {
 }
 
 /// Ring buffer event type for the trigger (matches `EVENT_TRIGGER`
-/// in `intf.h`).
+/// in `intf.h`). Currently the only record type emitted on the
+/// `ktstr_events` ringbuf — `EVENT_SCX_EVENT` was removed alongside
+/// the `tp_btf/sched_ext_event` BPF handler.
 const EVENT_TRIGGER: u32 = 2;
 
-/// Ring buffer event type for an SCX_EV_* counter delta event from
-/// the `tp_btf/sched_ext_event` kernel tracepoint (matches
-/// `EVENT_SCX_EVENT` in `intf.h`).
-///
-/// `dead_code` allow: the BPF C side pushes these entries; the
-/// Rust ring-buffer callback currently dispatches only
-/// `EVENT_TRIGGER`. Kept here so the dispatch path can match this
-/// type once the SCX_EV_* delta consumer ships.
-#[allow(dead_code)]
-const EVENT_SCX_EVENT: u32 = 3;
-
 /// Maximum string length carried in a probe_event entry (matches
-/// `MAX_STR_LEN` in `intf.h`). Used to bound the SCX_EV_* counter
-/// name read from `EVENT_SCX_EVENT` ringbuf entries.
+/// `MAX_STR_LEN` in `intf.h`). Used to size the `RbEvent.str_val`
+/// field for byte-level wire compatibility with `struct probe_event`
+/// in `intf.h`; the Rust dispatch path leaves it zeroed because
+/// the only producer that populated it (the removed
+/// `tp_btf/sched_ext_event` handler) is gone.
 const MAX_STR_LEN: usize = 64;
 
 /// Pipeline diagnostics from a probe run.
@@ -125,6 +119,19 @@ pub struct ProbeDiagnostics {
     /// Error from tp_btf/sched_ext_exit attach failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_attach_error: Option<String>,
+    /// Panic payload from the guest-side probe-collection thread
+    /// when its `JoinHandle::join()` returned `Err`. `None` on a
+    /// clean run (thread exited normally — events may still be
+    /// empty if the trigger never fired). `Some(payload)`
+    /// distinguishes "the probe thread crashed before producing
+    /// events" from "the probe thread ran cleanly and observed no
+    /// trigger" — the COM2 payload's `events: []` is otherwise
+    /// indistinguishable between those two cases. Any consumer of
+    /// the payload (host harness, render layer, downstream test
+    /// verdict) MUST treat `Some(_)` as a failure even when
+    /// `trigger.fired == false` and `events` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_thread_panic: Option<String>,
     /// BPF-side kprobe fire count (cross-CPU sum of the
     /// `KTSTR_PCPU_PROBE_COUNT` slot in `ktstr_pcpu_counters`).
     pub bpf_kprobe_fires: u64,
@@ -155,24 +162,6 @@ pub struct ProbeDiagnostics {
     /// ktstr_last_trigger_ts). 0 when no error-class exit fired.
     #[serde(default)]
     pub bpf_first_trigger_ns: u64,
-    /// Cumulative count of `tp_btf/sched_ext_event` tracepoint
-    /// fires observed by the probe BPF program (cross-CPU sum of
-    /// the `KTSTR_PCPU_EVENT_TP_COUNT` slot). Zero on a kernel
-    /// without `tp_btf/sched_ext_event` (pre-6.16) or when the
-    /// tracepoint never fired during the run. Distinguishes
-    /// "tracepoint available but quiet" (zero) from "tracepoint
-    /// missing" (attach failure recorded elsewhere).
-    #[serde(default)]
-    pub bpf_scx_event_tp_count: u64,
-    /// `bpf_ringbuf_reserve` failures inside the
-    /// `tp_btf/sched_ext_event` handler (cross-CPU sum of
-    /// `KTSTR_PCPU_EVENT_RINGBUF_DROPS`). Non-zero means the
-    /// userspace consumer fell behind on the events ringbuf
-    /// during a hot SCX_EV_* fire — auto-repro will see fewer
-    /// per-event timeline entries than the kernel actually
-    /// produced.
-    #[serde(default)]
-    pub bpf_scx_event_drops: u64,
     /// Cumulative count of `tp_btf/sched_switch +
     /// sched_migrate_task + sched_wakeup` records committed into
     /// the dedicated `timeline_events` ringbuf by the timeline
@@ -782,7 +771,6 @@ pub fn run_probe_skeleton(
             if let Some(rodata) = open_skel2.maps.rodata_data.as_mut() {
                 rodata.ktstr_enabled = true;
             }
-            open_skel2.progs.ktstr_event_tp.set_autoload(false);
             open_skel2.progs.ktstr_pi_fentry.set_autoload(false);
             open_skel2.progs.ktstr_pi_fexit.set_autoload(false);
             open_skel2.progs.ktstr_lock_contend.set_autoload(false);
@@ -1152,6 +1140,31 @@ pub fn run_probe_skeleton(
                     meta.str_param_idx = detect_str_param(btf_func);
                 }
 
+                let Some(result) = attach_fentry_by_slot(&fentry_skel, t.slot) else {
+                    continue;
+                };
+                let link = match result {
+                    Ok(link) => {
+                        tracing::debug!(func = t.name, "fentry attached");
+                        link
+                    }
+                    Err(e) => {
+                        tracing::warn!(%e, func = t.name, "fentry attach failed");
+                        diag.fentry_attach_failed
+                            .push((t.name.to_string(), e.to_string()));
+                        continue;
+                    }
+                };
+
+                // func_meta_map.update + func_ips.push run AFTER the
+                // fentry attach succeeds. Reversing the order would
+                // orphan map entries and func_ip tuples on attach
+                // failure — downstream reporting ("successfully
+                // probed N funcs") would then show false-positive
+                // successes for probes that never fired. If the
+                // map update fails after the attach succeeded, drop
+                // the Link (which detaches the program) so the
+                // post-attach state matches what func_ips reports.
                 let key_bytes = sentinel_ip.to_ne_bytes();
                 let meta_bytes = unsafe {
                     std::slice::from_raw_parts(
@@ -1164,25 +1177,12 @@ pub fn run_probe_skeleton(
                         .func_meta_map
                         .update(&key_bytes, meta_bytes, MapFlags::ANY)
                 {
-                    tracing::warn!(%e, func = t.name, "fentry: failed to update func_meta_map");
+                    tracing::warn!(%e, func = t.name, "fentry: failed to update func_meta_map; dropping attached link");
+                    drop(link);
                     continue;
                 }
+                fentry_links.push(link);
                 func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
-
-                let Some(result) = attach_fentry_by_slot(&fentry_skel, t.slot) else {
-                    continue;
-                };
-                match result {
-                    Ok(link) => {
-                        tracing::debug!(func = t.name, "fentry attached");
-                        fentry_links.push(link);
-                    }
-                    Err(e) => {
-                        tracing::warn!(%e, func = t.name, "fentry attach failed");
-                        diag.fentry_attach_failed
-                            .push((t.name.to_string(), e.to_string()));
-                    }
-                }
                 // Attach fexit for exit-side capture.
                 let Some(fexit_result) = attach_fexit_by_slot(&fentry_skel, t.slot) else {
                     continue;
@@ -1383,9 +1383,6 @@ pub fn run_probe_skeleton(
     // When the fallback path ran, they were not loaded — attach
     // returns an error that we silently absorb.
     if optional_programs_loaded {
-        if let Ok(link) = skel.progs.ktstr_event_tp.attach_trace() {
-            links.push((link, "tp_btf/sched_ext_event".to_string()));
-        }
         if let Ok(link) = skel.progs.ktstr_pi_fentry.attach_trace() {
             links.push((link, "fentry/rt_mutex_setprio".to_string()));
         }
@@ -1411,9 +1408,10 @@ pub fn run_probe_skeleton(
     let triggered_clone = triggered.clone();
 
     // Ring buffer event layout matching probe_event in intf.h.
-    // `str_val` + `has_str` + `str_param_idx` carry the counter
-    // name + populated marker for `EVENT_SCX_EVENT` entries; the
-    // EVENT_TRIGGER path leaves them zeroed.
+    // `str_val` + `has_str` + `str_param_idx` are kept in the wire
+    // layout for ABI symmetry with `struct probe_entry` (the
+    // kprobe-side hash map shares the field names) — the
+    // EVENT_TRIGGER producer leaves them zeroed.
     #[repr(C)]
     struct RbEvent {
         type_: u32,
@@ -1565,8 +1563,13 @@ pub fn run_probe_skeleton(
         let bss_triggered = skel.maps.bss_data.as_ref().is_some_and(|bss| unsafe {
             std::ptr::read_volatile(&bss.ktstr_err_exit_detected as *const u32) != 0
         });
-        if triggered.load(Ordering::Acquire) || bss_triggered || stop.load(Ordering::Acquire) {
-            diag.trigger_fired = triggered.load(Ordering::Acquire) || bss_triggered;
+        // Snapshot `triggered` once: a second `triggered.load` for the
+        // diag assignment would observe an unrelated state if a racing
+        // trigger fires between the two reads, so the gate decision
+        // and the recorded `trigger_fired` could disagree.
+        let triggered_snapshot = triggered.load(Ordering::Acquire);
+        if triggered_snapshot || bss_triggered || stop.load(Ordering::Acquire) {
+            diag.trigger_fired = triggered_snapshot || bss_triggered;
 
             // Read BPF-side diagnostic counters from BSS. The hot
             // counters live in the per-CPU `ktstr_pcpu_counters`
@@ -1575,6 +1578,22 @@ pub fn run_probe_skeleton(
             // value; }`. Sum across CPUs to recover the cumulative
             // count — see `enum ktstr_pcpu_idx` in
             // src/bpf/probe.bpf.c for the slot indices.
+            //
+            // Every read below uses [`std::ptr::read_volatile`].
+            // The BSS struct is mapped to userspace via the BPF
+            // map's mmap region; the BPF program writes through
+            // its own kernel-side mapping concurrently with these
+            // reads. Without `read_volatile`, the userspace
+            // compiler is free to hoist the loads (Rust's
+            // aliasing rules: the compiler does not know a
+            // `&types::bss` reference is shared with a kernel
+            // writer through an unrelated mapping), miss the
+            // post-trigger updates, and leave the diagnostic
+            // counters / miss log / first-trigger timestamp
+            // showing pre-trigger zeroes. Mirrors the existing
+            // `ktstr_err_exit_detected` `read_volatile` site
+            // upstream — same hazard, same fix, applied to every
+            // BPF-mutated field the diag block reads.
             if let Some(bss) = skel.maps.bss_data.as_ref() {
                 // Slot indices must match `enum ktstr_pcpu_idx`. A
                 // reorder in the BPF source breaks every reader; the
@@ -1585,28 +1604,90 @@ pub fn run_probe_skeleton(
                 const PCPU_KPROBE_RETURNS: usize = 1;
                 const PCPU_META_MISS: usize = 2;
                 const PCPU_RINGBUF_DROPS: usize = 3;
-                const PCPU_EVENT_TP_COUNT: usize = 4;
-                const PCPU_EVENT_RINGBUF_DROPS: usize = 5;
-                const PCPU_TIMELINE_COUNT: usize = 6;
-                const PCPU_TIMELINE_DROPS: usize = 7;
-                const PCPU_TRIGGER_COUNT: usize = 16;
+                const PCPU_TIMELINE_COUNT: usize = 4;
+                const PCPU_TIMELINE_DROPS: usize = 5;
+                const PCPU_TRIGGER_COUNT: usize = 14;
                 let counters = &bss.ktstr_pcpu_counters;
+                // SAFETY: each `pcpu_counter::value` is a plain
+                // 64-bit integer at a stable BSS offset; the BPF
+                // side updates it via `__sync_add_and_fetch`
+                // (atomic add). A volatile load reads whatever
+                // the kernel-side mmap currently shows — torn
+                // reads are impossible because aligned 64-bit
+                // loads are atomic on every supported arch
+                // (x86_64, aarch64). The volatile qualifier is
+                // what prevents the compiler from hoisting the
+                // load out of the `sum` reduction across the
+                // outer poll loop.
                 let sum_pcpu = |idx: usize| -> u64 {
                     counters
                         .iter()
-                        .map(|cpu_slots| cpu_slots[idx].value as u64)
+                        .map(|cpu_slots| unsafe {
+                            std::ptr::read_volatile(&cpu_slots[idx].value as *const _) as u64
+                        })
                         .sum()
                 };
                 diag.bpf_kprobe_fires = sum_pcpu(PCPU_PROBE_COUNT);
                 diag.bpf_kprobe_returns = sum_pcpu(PCPU_KPROBE_RETURNS);
                 diag.bpf_trigger_fires = sum_pcpu(PCPU_TRIGGER_COUNT);
                 diag.bpf_meta_misses = sum_pcpu(PCPU_META_MISS);
-                let n = (bss.ktstr_miss_log_idx as usize).min(bss.ktstr_miss_log.len());
-                diag.bpf_miss_ips = bss.ktstr_miss_log[..n].to_vec();
+                // SAFETY: `ktstr_miss_log_idx` is a `u32` written
+                // via `__sync_fetch_and_add` from the BPF side
+                // (see `src/bpf/probe.bpf.c` near the
+                // `ktstr_miss_log[idx] = ip;` line). Aligned u32
+                // loads are atomic on x86_64/aarch64. The BPF
+                // writer increments-then-stores; a volatile read
+                // observes either the pre- or post-update value
+                // — both are bounded by the array length, so the
+                // subsequent `.min(ktstr_miss_log.len())` keeps
+                // the slice safe even if the kernel-side write
+                // races this read.
+                let miss_idx = unsafe {
+                    std::ptr::read_volatile(&bss.ktstr_miss_log_idx as *const u32) as usize
+                };
+                let n = miss_idx.min(bss.ktstr_miss_log.len());
+                // Element-wise volatile reads of the miss-log
+                // entries that fall within `n`. A bulk
+                // `to_vec()` over the `bss.ktstr_miss_log[..n]`
+                // slice would let the compiler vectorise the
+                // copy and elide the volatile semantics; pulling
+                // each `u64` through `read_volatile` keeps every
+                // load ordered against the BPF-side write.
+                //
+                // SAFETY: each entry is a 64-bit IP value the
+                // BPF writer stores after its CAS-like
+                // increment of `ktstr_miss_log_idx`. Aligned
+                // u64 loads are atomic on every supported
+                // arch; the BPF write order
+                // (`ktstr_miss_log[idx] = ip` BEFORE the
+                // increment of `ktstr_miss_log_idx`) means a
+                // volatile read of `[..miss_idx]` covers
+                // entries that were already written, modulo a
+                // race where the BPF writer fills slot `n`
+                // and the userspace reader re-reads
+                // `miss_idx` ahead of the write. We tolerate
+                // that race: a stale-zero entry is harmless
+                // diagnostic noise compared with the
+                // alternative (compiler-hoisted loads of
+                // pre-trigger zeroes).
+                diag.bpf_miss_ips = (0..n)
+                    .map(|i| unsafe {
+                        std::ptr::read_volatile(&bss.ktstr_miss_log[i] as *const u64)
+                    })
+                    .collect();
                 diag.bpf_ringbuf_drops = sum_pcpu(PCPU_RINGBUF_DROPS);
-                diag.bpf_first_trigger_ns = bss.ktstr_last_trigger_ts;
-                diag.bpf_scx_event_tp_count = sum_pcpu(PCPU_EVENT_TP_COUNT);
-                diag.bpf_scx_event_drops = sum_pcpu(PCPU_EVENT_RINGBUF_DROPS);
+                // SAFETY: `ktstr_last_trigger_ts` is a `u64`
+                // written by the BPF trigger handler via
+                // `bpf_ktime_get_ns()` (see
+                // `src/bpf/probe.bpf.c::ktstr_last_trigger_ts`).
+                // Aligned u64 loads are atomic; the volatile
+                // qualifier prevents hoisting across the outer
+                // poll loop so the userspace reader observes the
+                // post-trigger timestamp instead of a cached
+                // pre-trigger zero.
+                diag.bpf_first_trigger_ns = unsafe {
+                    std::ptr::read_volatile(&bss.ktstr_last_trigger_ts as *const u64)
+                };
                 diag.bpf_timeline_count = sum_pcpu(PCPU_TIMELINE_COUNT);
                 diag.bpf_timeline_drops = sum_pcpu(PCPU_TIMELINE_DROPS);
             }
@@ -1757,8 +1838,7 @@ pub fn run_probe_skeleton(
             // The filter below therefore drops args[0] == 0 to
             // suppress non-causal probe output: no causal task
             // means no useful stitch chain.
-            let task_param_idx =
-                build_task_param_idx(&func_ips, btf_funcs, &phase_b_btf);
+            let task_param_idx = build_task_param_idx(&func_ips, btf_funcs, &phase_b_btf);
 
             // Extract tptr and kstack from the trigger event in one
             // lock acquisition. When the trigger did not fire (stop-
@@ -2231,6 +2311,29 @@ fn attach_phase_b_fentry(
                 meta.str_param_idx = detect_str_param(btf_func);
             }
 
+            let Some(result) = attach_fentry_by_slot(&fentry_skel, t.slot) else {
+                continue;
+            };
+            let link = match result {
+                Ok(link) => {
+                    tracing::debug!(func = t.name, "phase_b fentry attached");
+                    link
+                }
+                Err(e) => {
+                    tracing::warn!(%e, func = t.name, "phase_b fentry attach failed");
+                    diag.fentry_attach_failed
+                        .push((t.name.to_string(), e.to_string()));
+                    continue;
+                }
+            };
+
+            // func_meta_map.update + func_ips.push run AFTER the
+            // fentry attach succeeds. See the matching ordering
+            // rationale at the phase A site above: reversing the
+            // order would orphan map entries and func_ip tuples on
+            // attach failure. If the map update fails after the
+            // attach succeeded, drop the Link so post-attach state
+            // matches what func_ips reports.
             let key_bytes = sentinel_ip.to_ne_bytes();
             let meta_bytes = unsafe {
                 std::slice::from_raw_parts(
@@ -2243,25 +2346,12 @@ fn attach_phase_b_fentry(
                 .func_meta_map
                 .update(&key_bytes, meta_bytes, MapFlags::ANY)
             {
-                tracing::warn!(%e, func = t.name, "phase_b fentry: failed to update func_meta_map");
+                tracing::warn!(%e, func = t.name, "phase_b fentry: failed to update func_meta_map; dropping attached link");
+                drop(link);
                 continue;
             }
+            fentry_links.push(link);
             func_ips.push((t.idx, sentinel_ip, t.name.to_string()));
-
-            let Some(result) = attach_fentry_by_slot(&fentry_skel, t.slot) else {
-                continue;
-            };
-            match result {
-                Ok(link) => {
-                    tracing::debug!(func = t.name, "phase_b fentry attached");
-                    fentry_links.push(link);
-                }
-                Err(e) => {
-                    tracing::warn!(%e, func = t.name, "phase_b fentry attach failed");
-                    diag.fentry_attach_failed
-                        .push((t.name.to_string(), e.to_string()));
-                }
-            }
             let Some(fexit_result) = attach_fexit_by_slot(&fentry_skel, t.slot) else {
                 continue;
             };
@@ -2809,11 +2899,15 @@ mod tests {
         // BPF probe never recorded that arg. Storing pidx=6 in
         // the stitch map would panic on `e.args[pidx]`, so the
         // builder MUST drop the entry rather than admit it.
-        let func_ips = vec![(42u32, 0xffff_ffff_8100_0000u64, "novel_callback".to_string())];
+        let func_ips = vec![(
+            42u32,
+            0xffff_ffff_8100_0000u64,
+            "novel_callback".to_string(),
+        )];
         let btf = vec![make_btf_with_task_at("novel_callback", 6)];
         let map = build_task_param_idx(&func_ips, &btf, &[]);
         assert!(
-            map.get(&42).is_none(),
+            !map.contains_key(&42),
             "pidx==6 must be dropped (args[6] is out of bounds for [u64; 6])",
         );
     }
@@ -2826,7 +2920,7 @@ mod tests {
         let func_ips = vec![(7u32, 0xffff_ffff_8100_0000u64, "wide_signature".to_string())];
         let btf = vec![make_btf_with_task_at("wide_signature", 9)];
         let map = build_task_param_idx(&func_ips, &btf, &[]);
-        assert!(map.get(&7).is_none(), "pidx==9 must be dropped");
+        assert!(!map.contains_key(&7), "pidx==9 must be dropped");
     }
 
     #[test]
@@ -2849,7 +2943,11 @@ mod tests {
         // is registered with task_arg_idx=1 in the table; the
         // builder must return 1 even when the BTF (synthesized
         // here at task_pos=3) would say otherwise.
-        let func_ips = vec![(0u32, 0xffff_ffff_8100_0000u64, "do_enqueue_task".to_string())];
+        let func_ips = vec![(
+            0u32,
+            0xffff_ffff_8100_0000u64,
+            "do_enqueue_task".to_string(),
+        )];
         let btf = vec![make_btf_with_task_at("do_enqueue_task", 3)];
         let map = build_task_param_idx(&func_ips, &btf, &[]);
         assert_eq!(
@@ -2891,6 +2989,6 @@ mod tests {
             ..Default::default()
         }];
         let map = build_task_param_idx(&func_ips, &btf, &[]);
-        assert!(map.get(&99).is_none());
+        assert!(!map.contains_key(&99));
     }
 }

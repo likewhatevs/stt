@@ -12,7 +12,7 @@
 //! pids, cpu ids, cgroup names, and process comms are not sensitive
 //! per se — they are just noisy when fed to an LLM that does not
 //! need them. Replacing them with `swift-otter`-style names lets
-//! Claude reason about "swift-otter migrated from CPU 3 to CPU 7"
+//! the reader reason about "swift-otter migrated from CPU 3 to CPU 7"
 //! without learning anything internal about whatever pid that
 //! actually was.
 //!

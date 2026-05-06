@@ -25,7 +25,7 @@ use virtio_bindings::virtio_mmio::{
 };
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_queue::{Error as VirtioQueueError, Queue, QueueOwnedT, QueueT};
-use vm_memory::{Address, ByteValued, Bytes, GuestMemoryMmap};
+use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::vmm::net_config::NetConfig;
@@ -1487,6 +1487,22 @@ impl VirtioNet {
         let mut bytes_written: u32 = 0;
         let mut hdr_remaining: usize = VIRTIO_NET_HDR_LEN;
         let mut frame_pos: usize = 0;
+        // Track every (GPA, len) the header bytes landed at while
+        // walking descriptors. On `WriteFailed` (a frame-bytes
+        // `write_slice` returned Err after the header had already
+        // been placed) we zero these bytes before `add_used(head, 0)`
+        // so the guest cannot observe a stale `num_buffers=1` header
+        // claiming a frame is present when in fact the recycle path
+        // recorded zero used bytes. The cap is `VIRTIO_NET_HDR_LEN`
+        // because the worst-case split is one header byte per
+        // descriptor (12 entries). `count` is the number of valid
+        // entries in `slots`. cloud-hypervisor avoids this entirely
+        // by deferring `num_buffers` to a single post-readv write
+        // (`net_util/src/queue_pair.rs::process_desc_chain`); we
+        // copy bytes inline so we must roll back instead.
+        let mut hdr_write_slots: [(GuestAddress, usize); VIRTIO_NET_HDR_LEN] =
+            [(GuestAddress(0), 0); VIRTIO_NET_HDR_LEN];
+        let mut hdr_write_count: usize = 0;
         // `InvalidReason` distinguishes chain-shape rejection
         // (read-only descriptor, address overflow on the
         // descriptor's GPA) from guest-memory `write_slice` failure
@@ -1553,6 +1569,16 @@ impl VirtioNet {
                     chain_invalid = Some(InvalidReason::WriteFailed);
                     break;
                 }
+                // Record the (GPA, len) where the header just
+                // landed. The post-walk WriteFailed branch zeros
+                // these bytes before `add_used(head, 0)` so the
+                // guest never observes a stale `num_buffers=1`
+                // header for a chain we're recycling with len=0.
+                // `take <= hdr_remaining <= VIRTIO_NET_HDR_LEN` and
+                // each iteration consumes >= 1 byte of header, so
+                // `hdr_write_count` never exceeds the slot array.
+                hdr_write_slots[hdr_write_count] = (desc_addr, take);
+                hdr_write_count += 1;
                 let Some(new_addr) = desc_addr.checked_add(take as u64) else {
                     // Descriptor's `addr + take` overflows u64 —
                     // an attacker-controlled malformed address.
@@ -1620,6 +1646,35 @@ impl VirtioNet {
             match reason {
                 InvalidReason::Shape => self.counters.record_rx_chain_invalid(),
                 InvalidReason::WriteFailed => self.counters.record_rx_write_failed(),
+            }
+            // Roll back the header bytes we already placed in guest
+            // memory. The pre-1.2-baked header carries
+            // `num_buffers=1` (LE u16 at offset 10-11); leaving
+            // those bytes intact while we hand the chain back with
+            // `add_used(head, 0)` would let the guest observe a
+            // header that claims a frame is present in a chain
+            // we're recycling as empty. The non-mergeable RX path
+            // (`drivers/net/virtio_net.c::receive_small`) ignores
+            // `num_buffers` for `len=0` short-packet drops, but
+            // the kernel's page pool can re-arm the same backing
+            // page for a future receive without zeroing it; in
+            // mergeable-rxbuf builds (which we don't currently
+            // negotiate) the same stale byte would steer
+            // `receive_mergeable`'s `--num_buf` loop. Zero
+            // unconditionally — a write_slice that fails here
+            // means we just leave whatever bytes were already in
+            // place; we have no better recovery and the counter
+            // (`rx_write_failed` / `rx_chain_invalid`) already
+            // covered the original failure. Ignoring the rollback
+            // result mirrors `let _` over the already-counted
+            // failure path. Both `Shape` (addr-overflow can fire
+            // after a successful header write) and `WriteFailed`
+            // need this rollback; only the read-only-descriptor
+            // form of `Shape` enters with `hdr_write_count == 0`,
+            // in which case the loop is a no-op.
+            const ZEROS: [u8; VIRTIO_NET_HDR_LEN] = [0u8; VIRTIO_NET_HDR_LEN];
+            for &(addr, len) in &hdr_write_slots[..hdr_write_count] {
+                let _ = mem.write_slice(&ZEROS[..len], addr);
             }
             // If `add_used` itself fails after a chain-direction
             // violation, the guest's used-ring is broken at the
@@ -1763,7 +1818,7 @@ impl VirtioNet {
 ///       failure (chain shape was fine but the descriptor's GPA
 ///       is unmapped — header or frame `write_slice` returned
 ///       Err).
-///     The recycle `add_used(head, 0)` was attempted:
+///       The recycle `add_used(head, 0)` was attempted:
 ///     - If `add_used_ok = true`, the used-ring advanced —
 ///       caller must kick.
 ///     - If `add_used_ok = false`, the recycle add_used itself

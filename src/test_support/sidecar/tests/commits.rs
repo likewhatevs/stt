@@ -18,9 +18,11 @@ use anyhow::Result;
 #[test]
 fn write_skip_sidecar_records_passed_true_skipped_true() {
     let _lock = lock_env();
-    let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-writes-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-skip-writes-test-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp.path());
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -34,7 +36,7 @@ fn write_skip_sidecar_records_passed_true_skipped_true() {
     let active_flags: Vec<String> = vec!["llc".to_string()];
     write_skip_sidecar(&entry, &active_flags).expect("skip sidecar must write");
 
-    let path = find_single_sidecar_by_prefix(&tmp, "__skip_sidecar_test__-");
+    let path = find_single_sidecar_by_prefix(tmp.path(), "__skip_sidecar_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
     assert_eq!(loaded.test_name, "__skip_sidecar_test__");
@@ -77,8 +79,6 @@ fn write_skip_sidecar_records_passed_true_skipped_true() {
         host.kernel_release.is_some(),
         "write_skip_sidecar must capture kernel_release (syscall-sourced)",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// When the sidecar directory cannot be created (path collision
@@ -92,12 +92,13 @@ fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
 
     // Create a regular file, then try to use it as the sidecar
     // directory. `create_dir_all` fails because the path exists
-    // but is not a directory.
-    let blocker = std::env::temp_dir().join("ktstr-sidecar-skip-blocker");
-    let _ = std::fs::remove_file(&blocker);
-    let _ = std::fs::remove_dir_all(&blocker);
-    std::fs::write(&blocker, b"not a dir").unwrap();
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &blocker);
+    // but is not a directory. NamedTempFile gives us an existing
+    // regular file with RAII cleanup that survives test panics.
+    let blocker = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-skip-blocker-")
+        .tempfile()
+        .expect("create blocker tempfile");
+    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", blocker.path());
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -113,8 +114,6 @@ fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
         result.is_err(),
         "skip sidecar write must return Err when the target is a regular file",
     );
-
-    let _ = std::fs::remove_file(&blocker);
 }
 
 // -- sidecar payload + metrics fields --
@@ -269,9 +268,11 @@ fn write_sidecar_records_entry_payload_name() {
     use crate::test_support::{OutputFormat, Payload, PayloadKind};
 
     let _lock = lock_env();
-    let tmp = std::env::temp_dir().join("ktstr-sidecar-payload-name-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-payload-name-test-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp.path());
 
     static FIO: Payload = Payload {
         name: "fio",
@@ -300,7 +301,7 @@ fn write_sidecar_records_entry_payload_name() {
     let ok = AssertResult::pass();
     write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
 
-    let path = find_single_sidecar_by_prefix(&tmp, "__payload_name_test__-");
+    let path = find_single_sidecar_by_prefix(tmp.path(), "__payload_name_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
     assert_eq!(loaded.payload.as_deref(), Some("fio"));
@@ -308,8 +309,6 @@ fn write_sidecar_records_entry_payload_name() {
         loaded.metrics.is_empty(),
         "metrics stay empty until a Ctx-level accumulator lands",
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// `write_sidecar` must forward the `payload_metrics` slice
@@ -321,9 +320,11 @@ fn write_sidecar_forwards_payload_metrics_slice() {
     use crate::test_support::{Metric, MetricSource, MetricStream, PayloadMetrics, Polarity};
 
     let _lock = lock_env();
-    let tmp = std::env::temp_dir().join("ktstr-sidecar-metrics-slice-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-metrics-slice-test-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp.path());
 
     fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
         Ok(AssertResult::pass())
@@ -357,7 +358,7 @@ fn write_sidecar_forwards_payload_metrics_slice() {
     ];
     write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &metrics).unwrap();
 
-    let path = find_single_sidecar_by_prefix(&tmp, "__metrics_slice_test__-");
+    let path = find_single_sidecar_by_prefix(tmp.path(), "__metrics_slice_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
     assert_eq!(loaded.metrics.len(), 2);
@@ -366,8 +367,6 @@ fn write_sidecar_forwards_payload_metrics_slice() {
     assert_eq!(loaded.metrics[0].metrics[0].name, "iops");
     assert_eq!(loaded.metrics[1].exit_code, 2);
     assert!(loaded.metrics[1].metrics.is_empty());
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// `write_skip_sidecar` must also carry `entry.payload` through
@@ -379,9 +378,11 @@ fn write_skip_sidecar_records_entry_payload_name() {
     use crate::test_support::{OutputFormat, Payload, PayloadKind};
 
     let _lock = lock_env();
-    let tmp = std::env::temp_dir().join("ktstr-sidecar-skip-payload-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", &tmp);
+    let tmp = tempfile::Builder::new()
+        .prefix("ktstr-sidecar-skip-payload-test-")
+        .tempdir()
+        .expect("create tempdir");
+    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp.path());
 
     static STRESS: Payload = Payload {
         name: "stress-ng",
@@ -408,7 +409,7 @@ fn write_skip_sidecar_records_entry_payload_name() {
     };
     write_skip_sidecar(&entry, &[]).unwrap();
 
-    let path = find_single_sidecar_by_prefix(&tmp, "__skip_payload_name_test__-");
+    let path = find_single_sidecar_by_prefix(tmp.path(), "__skip_payload_name_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
     let loaded: SidecarResult = serde_json::from_str(&data).unwrap();
     assert_eq!(loaded.payload.as_deref(), Some("stress-ng"));
@@ -417,8 +418,6 @@ fn write_skip_sidecar_records_entry_payload_name() {
         loaded.metrics.is_empty(),
         "skip path never accumulates metrics"
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 /// `host` is deliberately excluded from `sidecar_variant_hash`:

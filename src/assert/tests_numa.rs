@@ -4,6 +4,7 @@
 //! the `Assert` builder/merge plumbing for the NUMA-related
 //! threshold fields and the `ScenarioStats` cross-node merge.
 
+use super::tests_common::rpt;
 use super::*;
 
 // -- numa_maps parsing tests --
@@ -102,9 +103,14 @@ fn page_locality_multi_expected_nodes() {
 
 #[test]
 fn page_locality_empty_entries() {
+    // Zero-allocation workloads are NOT vacuously local — a 1.0
+    // return would let `min_page_locality` thresholds silently pass
+    // on broken runs that produced no NUMA signal. Returning 0.0
+    // forces the threshold to surface the missing data as a
+    // failure.
     let expected: BTreeSet<usize> = [0].into_iter().collect();
     let loc = page_locality(&[], &expected);
-    assert!((loc - 1.0).abs() < f64::EPSILON);
+    assert!((loc - 0.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -395,6 +401,28 @@ fn assert_cross_node_migration_zero_pages() {
     assert!(r.passed, "zero total pages should pass");
 }
 
+#[test]
+fn assert_cross_node_migration_inconsistent_zero_total_nonzero_migrated() {
+    // vmstat reported migrations but numa_maps shows zero pages —
+    // inconsistent measurement that must surface as a failure
+    // rather than silently coercing to ratio=0.0.
+    let r = assert_cross_node_migration(5, 0, Some(0.1));
+    assert!(!r.passed, "inconsistent input must fail loudly");
+    let detail = r
+        .details
+        .iter()
+        .find(|d| d.contains("inconsistent"))
+        .unwrap_or_else(|| panic!("expected inconsistent diagnostic, got {:?}", r.details));
+    assert!(
+        detail.contains("5 pages migrated"),
+        "must surface migrated count: {detail}"
+    );
+    assert!(
+        detail.contains("0 pages observed"),
+        "must surface total=0: {detail}"
+    );
+}
+
 // -- Assert cross-node migration builder/merge --
 
 #[test]
@@ -456,4 +484,160 @@ fn assert_result_merge_worst_cross_node_migration() {
     b.stats.worst_cross_node_migration_ratio = 0.15;
     a.merge(b);
     assert!((a.stats.worst_cross_node_migration_ratio - 0.15).abs() < f64::EPSILON);
+}
+
+// -- AssertPlan: cross-node migration aggregation --
+
+#[test]
+fn plan_cross_node_migration_aggregates_cgroup_total() {
+    // `vmstat_numa_pages_migrated` is system-wide and per-worker
+    // observations of the same time window overlap heavily. The
+    // per-worker loop previously divided each worker's vmstat
+    // delta by that worker's own page total, producing N inflated
+    // ratios. Verify the new behavior: max of per-worker vmstat
+    // deltas (closest to total system migrations during the run)
+    // divided by the SUM of per-worker numa_pages totals.
+    let mut a = rpt(1, 1000, 1_000_000_000, 0, &[0], 0);
+    let mut b = rpt(2, 1000, 1_000_000_000, 0, &[1], 0);
+    a.numa_pages = [(0, 50), (1, 50)].into_iter().collect();
+    b.numa_pages = [(0, 50), (1, 50)].into_iter().collect();
+    // Each worker observed the same system-wide delta of 5
+    // (overlapping windows). Per-worker calc would compute
+    // 5/100 = 0.05 twice. Aggregated calc: max(5, 5) / (100+100)
+    // = 5/200 = 0.025.
+    a.vmstat_numa_pages_migrated = 5;
+    b.vmstat_numa_pages_migrated = 5;
+    let plan = AssertPlan {
+        not_starved: false,
+        isolation: false,
+        max_gap_ms: None,
+        max_spread_pct: None,
+        max_throughput_cv: None,
+        min_work_rate: None,
+        max_p99_wake_latency_ns: None,
+        max_wake_latency_cv: None,
+        min_iteration_rate: None,
+        max_migration_ratio: None,
+        min_page_locality: None,
+        max_cross_node_migration_ratio: Some(0.03),
+        max_slow_tier_ratio: None,
+    };
+    let r = plan.assert_cgroup(&[a, b], None, None);
+    assert!(
+        r.passed,
+        "0.025 < 0.03 must pass under aggregated calc; per-worker would have failed at 0.05: {:?}",
+        r.details
+    );
+}
+
+#[test]
+fn plan_cross_node_migration_emits_one_failure_not_per_worker() {
+    // Failure surfaces once for the cgroup, not N times per
+    // worker. The per-worker loop emitted one failure per worker;
+    // the aggregated calc emits at most one.
+    let mut a = rpt(1, 1000, 1_000_000_000, 0, &[0], 0);
+    let mut b = rpt(2, 1000, 1_000_000_000, 0, &[1], 0);
+    a.numa_pages = [(0, 50)].into_iter().collect();
+    b.numa_pages = [(0, 50)].into_iter().collect();
+    a.vmstat_numa_pages_migrated = 50;
+    b.vmstat_numa_pages_migrated = 50;
+    let plan = AssertPlan {
+        not_starved: false,
+        isolation: false,
+        max_gap_ms: None,
+        max_spread_pct: None,
+        max_throughput_cv: None,
+        min_work_rate: None,
+        max_p99_wake_latency_ns: None,
+        max_wake_latency_cv: None,
+        min_iteration_rate: None,
+        max_migration_ratio: None,
+        min_page_locality: None,
+        max_cross_node_migration_ratio: Some(0.1),
+        max_slow_tier_ratio: None,
+    };
+    let r = plan.assert_cgroup(&[a, b], None, None);
+    assert!(!r.passed);
+    let cross_node_failures = r
+        .details
+        .iter()
+        .filter(|d| matches!(d.kind, DetailKind::CrossNodeMigration))
+        .count();
+    assert_eq!(
+        cross_node_failures, 1,
+        "exactly one cross-node migration failure for the cgroup (not per-worker): {:?}",
+        r.details
+    );
+}
+
+// -- AssertPlan: min_page_locality on zero-allocation workloads --
+
+#[test]
+fn plan_min_page_locality_fails_on_zero_allocation_cgroup() {
+    // Workers that produced no NUMA signal (empty numa_pages)
+    // previously got skipped, letting `min_page_locality` look
+    // green on broken runs. The aggregated calc treats zero
+    // observed pages as zero locality, surfacing the missing
+    // signal as a failure.
+    let a = rpt(1, 1000, 1_000_000_000, 0, &[0], 0);
+    let b = rpt(2, 1000, 1_000_000_000, 0, &[0], 0);
+    let plan = AssertPlan {
+        not_starved: false,
+        isolation: false,
+        max_gap_ms: None,
+        max_spread_pct: None,
+        max_throughput_cv: None,
+        min_work_rate: None,
+        max_p99_wake_latency_ns: None,
+        max_wake_latency_cv: None,
+        min_iteration_rate: None,
+        max_migration_ratio: None,
+        min_page_locality: Some(0.8),
+        max_cross_node_migration_ratio: None,
+        max_slow_tier_ratio: None,
+    };
+    let nodes: BTreeSet<usize> = [0].into_iter().collect();
+    let r = plan.assert_cgroup(&[a, b], None, Some(&nodes));
+    assert!(
+        !r.passed,
+        "zero-allocation cgroup must fail min_page_locality, not silently pass: {:?}",
+        r.details
+    );
+    assert!(
+        r.details
+            .iter()
+            .any(|d| matches!(d.kind, DetailKind::PageLocality)),
+        "must surface a PageLocality detail: {:?}",
+        r.details
+    );
+}
+
+#[test]
+fn plan_min_page_locality_aggregates_across_cgroup() {
+    // Aggregated calc: (sum of local pages) / (sum of total
+    // pages) across the cgroup. Two workers each with 100 pages
+    // (one all-local, one all-remote) yield 100/200 = 0.5
+    // locality, below a 0.8 floor.
+    let mut a = rpt(1, 1000, 1_000_000_000, 0, &[0], 0);
+    let mut b = rpt(2, 1000, 1_000_000_000, 0, &[1], 0);
+    a.numa_pages = [(0, 100)].into_iter().collect();
+    b.numa_pages = [(1, 100)].into_iter().collect();
+    let plan = AssertPlan {
+        not_starved: false,
+        isolation: false,
+        max_gap_ms: None,
+        max_spread_pct: None,
+        max_throughput_cv: None,
+        min_work_rate: None,
+        max_p99_wake_latency_ns: None,
+        max_wake_latency_cv: None,
+        min_iteration_rate: None,
+        max_migration_ratio: None,
+        min_page_locality: Some(0.8),
+        max_cross_node_migration_ratio: None,
+        max_slow_tier_ratio: None,
+    };
+    let nodes: BTreeSet<usize> = [0].into_iter().collect();
+    let r = plan.assert_cgroup(&[a, b], None, Some(&nodes));
+    assert!(!r.passed, "cgroup-aggregate locality 0.5 < 0.8 must fail");
 }

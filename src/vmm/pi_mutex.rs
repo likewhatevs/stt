@@ -90,6 +90,19 @@ impl<T> PiMutex<T> {
                     "PTHREAD_PRIO_INHERIT unsupported by libc (errno {}); PiMutex degrading to non-PI protocol",
                     rc
                 );
+                // Make the fallback explicit: a libc that rejected
+                // PRIO_INHERIT may have left the attr's protocol field
+                // in an unspecified state. Force PRIO_NONE so the
+                // resulting mutex has a well-defined protocol. PRIO_NONE
+                // is the POSIX default and is required to be supported
+                // by every conforming pthread implementation, so this
+                // setprotocol call cannot itself return ENOTSUP.
+                let rc_none =
+                    libc::pthread_mutexattr_setprotocol(&mut attr, libc::PTHREAD_PRIO_NONE);
+                assert_eq!(
+                    rc_none, 0,
+                    "pthread_mutexattr_setprotocol(PTHREAD_PRIO_NONE) failed: {rc_none}"
+                );
             } else {
                 assert_eq!(
                     rc, 0,

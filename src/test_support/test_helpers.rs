@@ -266,29 +266,67 @@ pub(crate) fn make_vm_result(
     }
 }
 
-/// Build a JSON-encoded [`AssertResult`] with a default (all-zero)
+/// Build an [`AssertResult`] with a default (all-zero)
 /// [`ScenarioStats`] payload. Centralizes the 16-field zero-stats
 /// skeleton that previously had to be hand-typed at every
-/// `evaluate_vm_result` / `parse_assert_result` call site, and keeps
-/// the produced JSON automatically in step with any future
-/// `AssertResult` / `ScenarioStats` field addition — the helper goes
-/// through `serde_json::to_string`, so adding or removing a field
-/// flows through without parallel edits at each test.
+/// `evaluate_vm_result` call site.
 ///
-/// Byte layout of the emitted JSON is irrelevant to the consumers
-/// (which round-trip through `serde_json::from_str` back into an
-/// `AssertResult`); what matters is that the helper produces a
-/// JSON body identical in semantic content to what the old
-/// hand-written literal encoded.
-pub(crate) fn build_assert_result_json(passed: bool, details: Vec<AssertDetail>) -> String {
-    let result = AssertResult {
+/// Pre-bincode migration: every call site used to wrap this
+/// in `serde_json::to_string` and embed the JSON between
+/// `RESULT_START` / `RESULT_END` delimiters in `output`. The
+/// fallback decoder is gone — call sites now build the full
+/// [`crate::vmm::host_comms::BulkDrainResult`] via
+/// [`make_vm_result_with_assert`] (or hand-roll a `BulkDrainResult`
+/// when they need extra entries beyond the test result).
+pub(crate) fn build_assert_result(passed: bool, details: Vec<AssertDetail>) -> AssertResult {
+    AssertResult {
         passed,
         skipped: false,
         details,
         stats: ScenarioStats::default(),
         measurements: std::collections::BTreeMap::new(),
-    };
-    serde_json::to_string(&result).expect("AssertResult must always serialize")
+    }
+}
+
+/// Frame an [`AssertResult`] as a bincode-encoded
+/// `MSG_TYPE_TEST_RESULT` TLV entry, ready to drop into
+/// [`crate::vmm::host_comms::BulkDrainResult::entries`].
+///
+/// Mirrors what the guest's
+/// [`crate::vmm::guest_comms::send_test_result`] writes onto the
+/// wire (modulo the framing header — `BulkDrainResult` carries
+/// already-parsed entries, not raw bytes), so a test fixture's
+/// entry round-trips through `parse_assert_result_from_drain`'s
+/// `bincode::serde::decode_from_slice` exactly as a real guest
+/// emission would.
+pub(crate) fn assert_result_tlv_entry(result: &AssertResult) -> crate::vmm::wire::ShmEntry {
+    let payload = bincode::serde::encode_to_vec(result, bincode::config::standard())
+        .expect("AssertResult bincode encode must not fail");
+    crate::vmm::wire::ShmEntry {
+        msg_type: crate::vmm::wire::MSG_TYPE_TEST_RESULT,
+        payload,
+        crc_ok: true,
+    }
+}
+
+/// Construct a [`crate::vmm::VmResult`] whose `guest_messages`
+/// carries a single bincode-encoded `MSG_TYPE_TEST_RESULT` TLV
+/// entry produced from `assert`. Otherwise identical to
+/// [`make_vm_result`]; the explicit `output` / `stderr` / `exit_code`
+/// / `timed_out` arguments still drive the COM2-style fields the
+/// host-side panic / sched-log scrapers consume.
+pub(crate) fn make_vm_result_with_assert(
+    output: &str,
+    stderr: &str,
+    exit_code: i32,
+    timed_out: bool,
+    assert: &AssertResult,
+) -> crate::vmm::VmResult {
+    let mut r = make_vm_result(output, stderr, exit_code, timed_out);
+    r.guest_messages = Some(crate::vmm::host_comms::BulkDrainResult {
+        entries: vec![assert_result_tlv_entry(assert)],
+    });
+    r
 }
 
 /// Build a `KtstrTestEntry` with overridden memory/duration/workers

@@ -21,8 +21,8 @@
 //! [`super::rust_init`] follows this discipline.
 
 use crate::vmm::wire::{
-    MSG_TYPE_SNAPSHOT_REPLY, MsgType, SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR, SNAPSHOT_STATUS_OK,
-    SNAPSHOT_TAG_MAX, ShmMessage, SnapshotReplyPayload, SnapshotRequestPayload,
+    LifecyclePhase, MSG_TYPE_SNAPSHOT_REPLY, MsgType, SNAPSHOT_REASON_MAX, SNAPSHOT_STATUS_ERR,
+    SNAPSHOT_STATUS_OK, SNAPSHOT_TAG_MAX, ShmMessage, SnapshotReplyPayload, SnapshotRequestPayload,
     SnapshotRequestResult,
 };
 use zerocopy::{FromBytes, IntoBytes};
@@ -159,6 +159,15 @@ fn try_open_bulk_port() -> Option<std::fs::File> {
 /// 16-byte [`ShmMessage`] header + `payload.len()` bytes; the host
 /// parses the same byte stream via [`super::host_comms::parse_tlv_stream`].
 ///
+/// Returns `true` when the frame was fully written, `false` when the
+/// bulk port is not yet open (multiport handshake still in flight),
+/// the writev failed, or the call originated from host context. The
+/// existing fire-and-forget callers (Exit, TestResult, PayloadMetrics,
+/// Profraw, Stimulus, RawPayloadOutput, SchedExit, ScenarioStart,
+/// ScenarioEnd, SnapshotRequest) discard the return at statement
+/// position — only [`send_sys_rdy`]'s retry loop in `ktstr_guest_init`
+/// observes it.
+///
 /// Backpressure: the kernel's virtio_console TX path (`hvc_push` /
 /// `port_fops_write`) blocks the writer until the host's
 /// `add_used` rate catches up. There is no drop path; callers that
@@ -168,12 +177,12 @@ fn try_open_bulk_port() -> Option<std::fs::File> {
 /// `assert_guest_context` rejects host-context invocations with a
 /// `tracing::warn` so a host-side caller surfaces in the log instead
 /// of silently no-op'ing.
-fn write_msg(msg_type: u32, payload: &[u8]) {
+fn write_msg(msg_type: u32, payload: &[u8]) -> bool {
     if !assert_guest_context("write_msg", msg_type) {
-        return;
+        return false;
     }
     let _guard = GUEST_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    write_to_bulk_port(msg_type, payload);
+    write_to_bulk_port(msg_type, payload)
 }
 
 /// Try to write a TLV-framed message to `/dev/vport0p1`. Returns
@@ -288,21 +297,45 @@ pub fn send_exit(code: i32) {
     write_msg(MsgType::Exit.wire_value(), &code.to_le_bytes());
 }
 
-/// Send a JSON-encoded test result to the host. Payload: opaque bytes
-/// (the framework's serialised [`crate::test_support::AssertResult`]
-/// — the wire is type-agnostic).
+/// Send a test result to the host. Payload: bincode-encoded
+/// [`crate::assert::AssertResult`] using the standard config
+/// (little-endian, variable-int).
 ///
-/// Frames with [`MsgType::TestResult`].
-pub fn send_test_result(result: &[u8]) {
-    write_msg(MsgType::TestResult.wire_value(), result);
+/// Frames with [`MsgType::TestResult`]. Bincode encoding is
+/// guest-host paired through `bincode::config::standard()`; the
+/// host's [`crate::test_support::output::parse_assert_result_from_drain`]
+/// uses the same config so layout never diverges.
+///
+/// Required: `result` MUST round-trip through bincode without
+/// erroring — every field is owned `String` / `bool` / nested
+/// `serde::Serialize` derives, so the only failure path is OOM
+/// during the `Vec<u8>` allocation, which the surrounding eprintln
+/// guards against silent loss.
+pub fn send_test_result(result: &crate::assert::AssertResult) {
+    match bincode::serde::encode_to_vec(result, bincode::config::standard()) {
+        Ok(bytes) => {
+            write_msg(MsgType::TestResult.wire_value(), &bytes);
+        }
+        Err(e) => {
+            eprintln!("ktstr: bincode-encode AssertResult for bulk-port emit: {e}");
+        }
+    }
 }
 
-/// Send per-payload-invocation metrics. Payload: JSON-encoded
-/// [`crate::test_support::PayloadMetrics`].
+/// Send per-payload-invocation metrics to the host. Payload:
+/// bincode-encoded [`crate::test_support::PayloadMetrics`] using
+/// `bincode::config::standard()`.
 ///
 /// Frames with [`MsgType::PayloadMetrics`].
-pub fn send_metrics(payload: &[u8]) {
-    write_msg(MsgType::PayloadMetrics.wire_value(), payload);
+pub fn send_payload_metrics(metrics: &crate::test_support::PayloadMetrics) {
+    match bincode::serde::encode_to_vec(metrics, bincode::config::standard()) {
+        Ok(bytes) => {
+            write_msg(MsgType::PayloadMetrics.wire_value(), &bytes);
+        }
+        Err(e) => {
+            eprintln!("ktstr: bincode-encode PayloadMetrics for bulk-port emit: {e}");
+        }
+    }
 }
 
 /// Send a coverage profraw blob to the host. Payload: raw `.profraw`
@@ -323,11 +356,19 @@ pub fn send_stimulus(payload: &[u8]) {
 }
 
 /// Send raw stdout/stderr from an LlmExtract payload. Payload:
-/// JSON-encoded [`crate::test_support::RawPayloadOutput`].
+/// bincode-encoded [`crate::test_support::RawPayloadOutput`] using
+/// `bincode::config::standard()`.
 ///
 /// Frames with [`MsgType::RawPayloadOutput`].
-pub fn send_raw_output(payload: &[u8]) {
-    write_msg(MsgType::RawPayloadOutput.wire_value(), payload);
+pub(crate) fn send_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
+    match bincode::serde::encode_to_vec(raw, bincode::config::standard()) {
+        Ok(bytes) => {
+            write_msg(MsgType::RawPayloadOutput.wire_value(), &bytes);
+        }
+        Err(e) => {
+            eprintln!("ktstr: bincode-encode RawPayloadOutput for bulk-port emit: {e}");
+        }
+    }
 }
 
 /// Send a scheduler-process exit notification. Payload: 4-byte LE i32
@@ -349,6 +390,139 @@ pub fn send_scenario_start() {
 /// milliseconds since scenario start.
 pub fn send_scenario_end(elapsed_ms: u64) {
     write_msg(MsgType::ScenarioEnd.wire_value(), &elapsed_ms.to_le_bytes());
+}
+
+/// Send the boot-complete signal to the host. Payload: empty.
+/// Returns `true` when the frame was fully written, `false` when the
+/// bulk port is not yet open (the multiport handshake completes
+/// asynchronously during kernel virtio_console init, so
+/// `/dev/vport0p1` may not exist on the first call after
+/// `mount_filesystems()` returns) or the write failed.
+///
+/// Frames an empty payload with [`MsgType::SysRdy`] and routes
+/// through the bulk port. The host's freeze coordinator promotes
+/// a CRC-valid SYS_RDY frame into the monitor's boot-complete
+/// eventfd, releasing the monitor's pre-sample epoll wait. Called
+/// from the guest's `ktstr_guest_init` after `mount_filesystems`
+/// completes, so the host's first sample observes a fully-booted
+/// guest with `setup_per_cpu_areas` and KASLR randomization
+/// already done.
+///
+/// The boolean return lets the caller retry on transient
+/// not-yet-open failures: the multiport handshake completes
+/// independently of `mount_filesystems`'s devtmpfs mount, so a
+/// single call right after the mount can race the handshake. The
+/// retry loop in `ktstr_guest_init` polls until success or budget
+/// exhaustion, ensuring the host eventually observes the signal
+/// rather than silently dropping the boot-complete event.
+pub fn send_sys_rdy() -> bool {
+    write_msg(MsgType::SysRdy.wire_value(), &[])
+}
+
+/// Send a stdout chunk to the host. Payload: opaque UTF-8 bytes.
+///
+/// Frames with [`MsgType::Stdout`]. Replaces the prior COM2
+/// stdout redirect: the guest's stdout pipe forwarder (set up in
+/// `redirect_stdio_to_bulk_port`) reads chunks from the pipe
+/// read-end and feeds them through this sender. The host
+/// concatenates chunks in arrival order to reconstruct the
+/// stream. Each chunk SHOULD fit comfortably under
+/// [`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`]; oversized chunks
+/// are rejected by `write_to_bulk_port`'s `u32::try_from` length
+/// guard plus the host-side per-frame cap and are logged.
+///
+/// Required: caller MUST split chunks at sub-cap boundaries. The
+/// pipe forwarder uses 4 KiB reads which is well under the cap.
+///
+/// Optional: a not-yet-open bulk port returns `false` and the
+/// chunk is dropped. The forwarder thread continues reading the
+/// pipe — early-init bytes (before the multiport handshake
+/// completes) are lost, mirroring the existing COM2 fallback's
+/// "first bytes may not reach the host" caveat.
+pub fn send_stdout_chunk(buf: &[u8]) -> bool {
+    write_msg(MsgType::Stdout.wire_value(), buf)
+}
+
+/// Send a stderr chunk to the host. Payload: opaque UTF-8 bytes.
+///
+/// Frames with [`MsgType::Stderr`]. Same chunked semantics as
+/// [`send_stdout_chunk`].
+pub fn send_stderr_chunk(buf: &[u8]) -> bool {
+    write_msg(MsgType::Stderr.wire_value(), buf)
+}
+
+/// Send a scheduler-log chunk to the host. Payload: opaque UTF-8
+/// bytes from the scheduler child process's captured log.
+///
+/// Frames with [`MsgType::SchedLog`]. The host concatenates
+/// chunks in arrival order and the embedded `SCHED_OUTPUT_START` /
+/// `SCHED_OUTPUT_END` delimiters travel verbatim inside the chunk
+/// bytes, so the existing `parse_sched_output` walker (verifier
+/// module) keeps slicing the log without changes. Replaces the
+/// prior COM2 dump path in `dump_sched_output`.
+///
+/// Required: caller chunks at sub-cap boundaries; same constraint
+/// as [`send_stdout_chunk`].
+#[allow(dead_code)]
+pub fn send_sched_log(buf: &[u8]) {
+    write_msg(MsgType::SchedLog.wire_value(), buf);
+}
+
+/// Send a lifecycle phase event to the host. Payload: 1-byte
+/// [`LifecyclePhase`] discriminant followed by a UTF-8 reason
+/// suffix (only `SchedulerNotAttached` populates `reason`; every
+/// other phase passes `""`).
+///
+/// Frames with [`MsgType::Lifecycle`]. Replaces the prior
+/// `KTSTR_INIT_STARTED` / `KTSTR_PAYLOAD_STARTING` /
+/// `SCHEDULER_DIED` / `SCHEDULER_NOT_ATTACHED` COM2 sentinel
+/// strings. Host classifies init failure stages by walking the
+/// per-VM lifecycle bucket instead of substring-matching on COM2
+/// output.
+///
+/// Required: phase wire value MUST be in 1..=4. The 0 byte is
+/// reserved as the host-side "unknown" sentinel and is rejected
+/// by [`LifecyclePhase::from_wire`].
+pub fn send_lifecycle(phase: LifecyclePhase, reason: &str) {
+    let mut buf = Vec::with_capacity(1 + reason.len());
+    buf.push(phase.wire_value());
+    buf.extend_from_slice(reason.as_bytes());
+    write_msg(MsgType::Lifecycle.wire_value(), &buf);
+}
+
+/// Send a shell-exec exit code to the host. Payload: 4-byte LE
+/// i32 carrying the exec'd process's exit code.
+///
+/// Frames with [`MsgType::ExecExit`]. Replaces the prior COM2
+/// `KTSTR_EXEC_EXIT=N` sentinel line emitted by `cargo ktstr
+/// shell --exec <cmd>`.
+pub fn send_exec_exit(code: i32) {
+    write_msg(MsgType::ExecExit.wire_value(), &code.to_le_bytes());
+}
+
+/// Send a kernel ring-buffer dump to the host. Payload: opaque
+/// UTF-8 bytes from `rmesg::logs_raw`.
+///
+/// Frames with [`MsgType::Dmesg`]. Sent on the
+/// initramfs-extraction failure path so the host sees the kernel
+/// OOM messages without scraping COM2.
+#[allow(dead_code)]
+pub fn send_dmesg(buf: &[u8]) {
+    write_msg(MsgType::Dmesg.wire_value(), buf);
+}
+
+/// Send a probe-pipeline JSON output chunk to the host. Payload:
+/// opaque UTF-8 bytes from the probe output stream.
+///
+/// Frames with [`MsgType::ProbeOutput`]. Replaces the prior COM2
+/// ProbeDrain path so probe output and scheduler-log dumps stop
+/// interleaving on the same serial port.
+///
+/// Required: caller chunks at sub-cap boundaries; same constraint
+/// as [`send_stdout_chunk`].
+#[allow(dead_code)]
+pub fn send_probe_output(buf: &[u8]) {
+    write_msg(MsgType::ProbeOutput.wire_value(), buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,14 +577,12 @@ const SNAPSHOT_FAST_POLL_ITERS: u32 = 4;
 /// [`SNAPSHOT_FAST_POLL_ITERS`] iterations (100µs). Sub-millisecond
 /// granularity is the reason this path uses `ppoll` rather than
 /// `poll(2)` (which only takes millisecond timeouts).
-const SNAPSHOT_FAST_POLL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_micros(100);
+const SNAPSHOT_FAST_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_micros(100);
 /// Per-iteration ppoll timeout after the fast-poll preamble (5ms).
 /// Bounds the worst-case extra latency when virtio_console's
 /// `port_fops_poll` does not deliver an early wake, while keeping
 /// vCPU-thread wake-up cost low across the full snapshot deadline.
-const SNAPSHOT_SLOW_POLL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(5);
+const SNAPSHOT_SLOW_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Read exactly `buf.len()` bytes from `f`, bounded by `deadline`.
 /// Uses `ppoll(POLLIN)` between reads to wait without blocking past
@@ -530,7 +702,25 @@ fn read_bulk_port_frame(
             "ShmMessage::read_from_bytes failed (header underflow)",
         )
     })?;
+    // Cap payload allocation at the largest frame this transport can
+    // legitimately deliver. The only producer on port-1 RX is the
+    // host's snapshot-reply path which writes exactly
+    // `size_of::<SnapshotReplyPayload>()` bytes. A host that frames
+    // an oversized length (corruption or hostile) would otherwise
+    // cause `vec![0u8; u32::MAX]` to OOM the guest before the
+    // post-read length check at the caller has a chance to reject
+    // the frame.
     let length = msg.length as usize;
+    if length > std::mem::size_of::<SnapshotReplyPayload>() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "TLV length {length} exceeds max payload {} for port-1 RX; \
+                 rejecting before allocation to avoid guest OOM",
+                std::mem::size_of::<SnapshotReplyPayload>()
+            ),
+        ));
+    }
     let mut payload = vec![0u8; length];
     if length > 0 {
         bounded_read_exact(f, &mut payload, deadline)?;
@@ -582,8 +772,7 @@ pub fn request_snapshot(
     // Allocate a request id. Skip 0 so the wait loop's `reply.request_id
     // == request_id` check cannot accidentally match a zero-initialised
     // reply payload from an earlier protocol version.
-    let mut request_id =
-        SNAPSHOT_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let mut request_id = SNAPSHOT_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     if request_id == 0 {
         request_id = SNAPSHOT_REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -655,9 +844,7 @@ pub fn request_snapshot(
                 // surface the failure to the caller.
                 *read_guard = None;
                 return SnapshotRequestResult::TransportError {
-                    reason: format!(
-                        "snapshot reply read failed (request_id={request_id}): {e}"
-                    ),
+                    reason: format!("snapshot reply read failed (request_id={request_id}): {e}"),
                 };
             }
         };
@@ -749,14 +936,19 @@ mod tests {
     #[test]
     fn send_test_result_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_test_result(b"{\"ok\":true}");
+        send_test_result(&crate::assert::AssertResult::pass());
     }
 
-    /// `send_metrics` from host context is a no-op.
+    /// `send_payload_metrics` from host context is a no-op.
     #[test]
-    fn send_metrics_from_host_context_is_noop() {
+    fn send_payload_metrics_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_metrics(b"{}");
+        let pm = crate::test_support::PayloadMetrics {
+            payload_index: 0,
+            metrics: vec![],
+            exit_code: 0,
+        };
+        send_payload_metrics(&pm);
     }
 
     /// `send_profraw` from host context is a no-op.
@@ -773,11 +965,19 @@ mod tests {
         send_stimulus(&[0u8; 24]);
     }
 
-    /// `send_raw_output` from host context is a no-op.
+    /// `send_raw_payload_output` from host context is a no-op.
     #[test]
-    fn send_raw_output_from_host_context_is_noop() {
+    fn send_raw_payload_output_from_host_context_is_noop() {
         let _g = IsGuestOverrideGuard::new(false);
-        send_raw_output(b"{\"stdout\":\"\"}");
+        let raw = crate::test_support::RawPayloadOutput {
+            payload_index: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            hint: None,
+            metric_hints: vec![],
+            metric_bounds: None,
+        };
+        send_raw_payload_output(&raw);
     }
 
     /// `send_sched_exit` from host context is a no-op.
@@ -803,6 +1003,73 @@ mod tests {
         send_scenario_end(u64::MAX);
     }
 
+    /// `send_sys_rdy` from host context returns false (no-op +
+    /// failure indicator for the retry caller).
+    #[test]
+    fn send_sys_rdy_from_host_context_returns_false() {
+        let _g = IsGuestOverrideGuard::new(false);
+        assert!(
+            !send_sys_rdy(),
+            "host-context call must return false so the guest's \
+             retry loop can distinguish 'wrote' from 'noop'"
+        );
+    }
+
+    /// `send_stdout_chunk` from host context returns false
+    /// (no-op + failure indicator), mirroring `send_sys_rdy`.
+    #[test]
+    fn send_stdout_chunk_from_host_context_returns_false() {
+        let _g = IsGuestOverrideGuard::new(false);
+        assert!(!send_stdout_chunk(b"hello"));
+    }
+
+    /// `send_stderr_chunk` from host context returns false.
+    #[test]
+    fn send_stderr_chunk_from_host_context_returns_false() {
+        let _g = IsGuestOverrideGuard::new(false);
+        assert!(!send_stderr_chunk(b"oops"));
+    }
+
+    /// `send_sched_log` from host context is a no-op.
+    #[test]
+    fn send_sched_log_from_host_context_is_noop() {
+        let _g = IsGuestOverrideGuard::new(false);
+        send_sched_log(b"---SCHED_OUTPUT_START---\n");
+    }
+
+    /// `send_lifecycle` from host context is a no-op for every
+    /// phase, including the reason-bearing variant.
+    #[test]
+    fn send_lifecycle_from_host_context_is_noop() {
+        let _g = IsGuestOverrideGuard::new(false);
+        send_lifecycle(LifecyclePhase::InitStarted, "");
+        send_lifecycle(LifecyclePhase::PayloadStarting, "");
+        send_lifecycle(LifecyclePhase::SchedulerDied, "");
+        send_lifecycle(LifecyclePhase::SchedulerNotAttached, "verifier rejected");
+    }
+
+    /// `send_exec_exit` from host context is a no-op.
+    #[test]
+    fn send_exec_exit_from_host_context_is_noop() {
+        let _g = IsGuestOverrideGuard::new(false);
+        send_exec_exit(0);
+        send_exec_exit(-1);
+    }
+
+    /// `send_dmesg` from host context is a no-op.
+    #[test]
+    fn send_dmesg_from_host_context_is_noop() {
+        let _g = IsGuestOverrideGuard::new(false);
+        send_dmesg(b"[    0.000000] Linux version 6.16.0\n");
+    }
+
+    /// `send_probe_output` from host context is a no-op.
+    #[test]
+    fn send_probe_output_from_host_context_is_noop() {
+        let _g = IsGuestOverrideGuard::new(false);
+        send_probe_output(b"{}\n");
+    }
+
     /// `request_snapshot` from host context returns `TransportError`.
     #[test]
     fn request_snapshot_from_host_context_returns_transport_error() {
@@ -812,6 +1079,91 @@ mod tests {
             SnapshotRequestResult::TransportError { .. } => {}
             other => panic!("expected TransportError from host context, got {other:?}"),
         }
+    }
+
+    /// `read_bulk_port_frame` must reject a header whose `length`
+    /// exceeds `size_of::<SnapshotReplyPayload>()` BEFORE allocating
+    /// the payload buffer. A hostile or corrupted host could otherwise
+    /// frame `length = u32::MAX` and cause `vec![0u8; u32::MAX]` to
+    /// OOM the guest's PID 1 init, panicking the kernel.
+    #[test]
+    fn read_bulk_port_frame_rejects_oversized_length_before_alloc() {
+        use std::os::unix::io::FromRawFd;
+        // Build a pipe, write a forged 16-byte header with
+        // length = u32::MAX, then call read_bulk_port_frame on the
+        // read side. The function must return InvalidData without
+        // attempting to read or allocate the (huge) payload.
+        let mut fds = [0i32; 2];
+        // SAFETY: standard pipe(2) call; fds is a valid &mut to a
+        // 2-element i32 array. Returning <0 indicates failure.
+        let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(r, 0, "pipe(2) failed: {}", std::io::Error::last_os_error());
+        // SAFETY: pipe(2) just returned the fds; both are open and
+        // owned by this scope. From_raw_fd takes ownership so the
+        // File closes them on drop.
+        let mut read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        let header = ShmMessage {
+            msg_type: MSG_TYPE_SNAPSHOT_REPLY,
+            length: u32::MAX,
+            crc32: 0,
+            _pad: 0,
+        };
+        use std::io::Write;
+        write_end
+            .write_all(header.as_bytes())
+            .expect("write forged header");
+        // Drop the writer so the reader observes EOF after the
+        // header rather than blocking forever on the missing payload.
+        drop(write_end);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let err = read_bulk_port_frame(&mut read_end, deadline)
+            .expect_err("oversized length must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds max payload"),
+            "error must explain the cap, got: {msg}"
+        );
+    }
+
+    /// `read_bulk_port_frame` must accept a length that exactly
+    /// matches `size_of::<SnapshotReplyPayload>()` — the cap is an
+    /// upper bound, not a strict-less-than check. This pins the
+    /// boundary so a future tightening of the cap would force a
+    /// deliberate test update rather than silently breaking the
+    /// snapshot-reply path.
+    #[test]
+    fn read_bulk_port_frame_accepts_exact_max_payload() {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SAFETY: pipe(2) on a freshly-zeroed 2-element i32 array.
+        let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(r, 0, "pipe(2) failed: {}", std::io::Error::last_os_error());
+        // SAFETY: pipe just returned both fds; ownership transfers
+        // to the File handles which close on drop.
+        let mut read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+
+        let payload = vec![0u8; std::mem::size_of::<SnapshotReplyPayload>()];
+        let header = ShmMessage {
+            msg_type: MSG_TYPE_SNAPSHOT_REPLY,
+            length: payload.len() as u32,
+            crc32: crc32fast::hash(&payload),
+            _pad: 0,
+        };
+        use std::io::Write;
+        write_end.write_all(header.as_bytes()).expect("header");
+        write_end.write_all(&payload).expect("payload");
+        drop(write_end);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (msg_type, body) = read_bulk_port_frame(&mut read_end, deadline)
+            .expect("exact-size payload must succeed");
+        assert_eq!(msg_type, MSG_TYPE_SNAPSHOT_REPLY);
+        assert_eq!(body.len(), std::mem::size_of::<SnapshotReplyPayload>());
     }
 
     #[test]

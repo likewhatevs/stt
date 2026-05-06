@@ -1151,17 +1151,21 @@ impl RowFilter {
             // field carried.
             //
             // Match shape: a filter value with two dot-separated
-            // segments (e.g. `6.12`) is a major.minor PREFIX —
-            // the row matches if its `kernel_version` starts with
-            // `6.12.` OR equals `6.12` exactly. A filter with three
-            // or more segments (e.g. `6.14.2`, `6.15-rc3`) is
-            // strict equality. The two-segment cutoff matches the
-            // shape of `MAJOR.MINOR` versus `MAJOR.MINOR.PATCH` /
-            // `MAJOR.MINOR-rcN` — there is no shorter form on the
-            // sidecar producer side worth treating as a prefix
-            // (`6` alone would match every 6.x release, which is
-            // a less useful cohort than the per-stable-series
-            // narrowing the operator usually wants).
+            // digit segments (e.g. `6.12`) is a major.minor PREFIX —
+            // the row matches if its `kernel_version` equals
+            // `6.12` exactly, starts with `6.12.` (patch releases
+            // including the `6.12.0-rcN+` kernel banner shape),
+            // or starts with `6.12-` (the no-patch `6.12-rcN`
+            // shape `kernel_path::KernelId::Version` admits). A
+            // filter with three or more segments (e.g. `6.14.2`,
+            // `6.15-rc3`) is strict equality. The two-segment
+            // cutoff matches the shape of `MAJOR.MINOR` versus
+            // `MAJOR.MINOR.PATCH` / `MAJOR.MINOR-rcN` — there is
+            // no shorter form on the sidecar producer side worth
+            // treating as a prefix (`6` alone would match every
+            // 6.x release, which is a less useful cohort than the
+            // per-stable-series narrowing the operator usually
+            // wants).
             let row_kernel = row.kernel_version.as_deref();
             let any = self.kernels.iter().any(|want| match row_kernel {
                 Some(rk) => kernel_filter_matches(want, rk),
@@ -1283,6 +1287,14 @@ pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<Gauntl
 /// - `kernel_filter_matches("6.12", "6.12.5")` → true (prefix)
 /// - `kernel_filter_matches("6.12", "6.12")` → true (exact equal)
 /// - `kernel_filter_matches("6.12", "6.13.0")` → false
+/// - `kernel_filter_matches("6.14", "6.14-rc3")` → true (prefix
+///   admits the `-rcN` pre-release of the same series; per
+///   `kernel_path::decompose_version_for_compare`, `6.14-rc3`
+///   shares the `(major=6, minor=14, patch=0)` tuple with the
+///   `6.14` release, and the operator filtering on the series
+///   wants both)
+/// - `kernel_filter_matches("6.14", "6.14.0-rc3+")` → true
+///   (kernel banner shape — patch=0 plus `-rcN` plus `EXTRAVERSION`)
 /// - `kernel_filter_matches("6.14.2", "6.14.2")` → true
 /// - `kernel_filter_matches("6.14.2", "6.14.20")` → false
 ///   (strict equality on three-segment filter — without the
@@ -1290,14 +1302,33 @@ pub fn apply_row_filters(rows: &[GauntletRow], filter: &RowFilter) -> Vec<Gauntl
 ///   `6.14.21`, ..., which is not what the operator asked for)
 pub(crate) fn kernel_filter_matches(want: &str, row_kernel: &str) -> bool {
     if is_major_minor_prefix(want) {
-        // Exact match OR prefix-with-trailing-dot match. The
-        // trailing dot prevents `6.1` from spuriously matching
-        // `6.10.0` (`6.10.0`.starts_with("6.1") is true; the
-        // trailing-dot variant rejects it because `6.10` does not
-        // start with `6.1.`). The exact-equal arm covers the case
-        // where the row's recorded version IS the major.minor
-        // string itself (no patch component).
-        row_kernel == want || row_kernel.starts_with(&format!("{want}."))
+        // Three accepted shapes for a major.minor (`MAJOR.MINOR`)
+        // prefix filter, all designed so the prefix is bounded by
+        // a non-digit separator that disambiguates the series:
+        //
+        //   1. Exact equal: `row_kernel == "6.14"`. The row's
+        //      recorded version IS the major.minor string itself
+        //      (no patch, no rc).
+        //   2. Trailing-dot prefix: `row_kernel.starts_with("6.14.")`.
+        //      Covers patch releases (`6.14.0`, `6.14.5`) and
+        //      kernel banner shapes (`6.14.0-rc3+`).
+        //   3. Trailing-dash prefix: `row_kernel.starts_with("6.14-")`.
+        //      Covers the no-patch pre-release shape (`6.14-rc3`).
+        //      Per `kernel_path` (KernelId::Version doc), this is a
+        //      valid emitted shape; per
+        //      `decompose_version_for_compare` it shares the
+        //      `(major, minor, patch=0)` triple with the `6.14`
+        //      release and the operator filtering on the series
+        //      wants both.
+        //
+        // The non-digit separator after `want` (`.` or `-`)
+        // prevents `6.1` from spuriously matching `6.10.0` or
+        // `6.10-rc3` — both fail because the next character after
+        // `6.1` is `0`, which is neither separator. The `6.140`
+        // case is also rejected for the same reason.
+        row_kernel == want
+            || row_kernel.starts_with(&format!("{want}."))
+            || row_kernel.starts_with(&format!("{want}-"))
     } else {
         row_kernel == want
     }
@@ -3233,8 +3264,7 @@ pub(crate) fn compare_rows_by(
     // averaging path produces unique keys; the `--no-average` path
     // bails earlier via `check_no_duplicate_pairing_keys`), the
     // earlier-iterated row wins.
-    let mut a_by_key: HashMap<PairingKey, &GauntletRow> =
-        HashMap::with_capacity(rows_a.len());
+    let mut a_by_key: HashMap<PairingKey, &GauntletRow> = HashMap::with_capacity(rows_a.len());
     for row_a in rows_a {
         let key = PairingKey::from_row(row_a, pairing_dims);
         a_by_key.entry(key).or_insert(row_a);
@@ -5017,13 +5047,7 @@ mod tests {
         // higher-is-worse. The fold keeps the max — which surfaces
         // an unexpectedly high reading rather than masking it under
         // a min collapse.
-        for name in &[
-            "unrelated_field",
-            "random_thing",
-            "metric",
-            "x",
-            "a.b.c",
-        ] {
+        for name in &["unrelated_field", "random_thing", "metric", "x", "a.b.c"] {
             assert!(
                 infer_higher_is_worse(name),
                 "unknown metric `{name}` must fall back to \
@@ -8872,6 +8896,33 @@ mod tests {
         // trailing-dot in the prefix path prevents the
         // accidental wildcard.
         assert!(!kernel_filter_matches("6.1", "6.10.0"));
+    }
+
+    /// `kernel_filter_matches`: major.minor prefix admits the
+    /// `MAJOR.MINOR-rcN` pre-release shape via the
+    /// `starts_with("MAJOR.MINOR-")` arm. The rcN kernel shares
+    /// the `(major, minor, patch=0)` tuple with the eventual
+    /// release per `kernel_path::decompose_version_for_compare`,
+    /// and the operator filtering on `6.14` wants the whole
+    /// series — release AND pre-releases. This complements the
+    /// `6.14.0-rc3` (kernel-banner) shape which already matched
+    /// via the trailing-dot prefix.
+    #[test]
+    fn kernel_filter_matches_major_minor_admits_rc_pre_release() {
+        // No-patch pre-release shape (kernel_path KernelId::Version
+        // doc cites `6.15-rc3` as a valid version string).
+        assert!(kernel_filter_matches("6.14", "6.14-rc3"));
+        assert!(kernel_filter_matches("6.14", "6.14-rc1"));
+        // Patch+rc shape (kernel banner from a kernel.org
+        // `v6.14-rc3` tag is `Linux version 6.14.0-rc3+`).
+        assert!(kernel_filter_matches("6.14", "6.14.0-rc3"));
+        assert!(kernel_filter_matches("6.14", "6.14.0-rc3+"));
+        // The dash-prefix arm must NOT wildcard across series:
+        // `6.1` filtering must reject `6.14-rc3` for the same
+        // reason `6.1` rejects `6.10.0`.
+        assert!(!kernel_filter_matches("6.1", "6.14-rc3"));
+        // Cross-minor rc rejection.
+        assert!(!kernel_filter_matches("6.14", "6.15-rc3"));
     }
 
     /// `kernel_filter_matches`: three-segment+ filters are strict

@@ -378,5 +378,4 @@ mod tests {
         let result = read_kernel_init_size(f.path());
         assert!(result.is_err(), "truncated file must fail; got: {result:?}",);
     }
-
 }

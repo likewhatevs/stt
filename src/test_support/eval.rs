@@ -25,11 +25,11 @@ use crate::vmm;
 
 use super::output::{
     classify_init_stage, extract_kernel_version, extract_panic_message, extract_sched_ext_dump,
-    format_console_diagnostics, parse_assert_result, parse_assert_result_from_drain,
+    format_console_diagnostics, parse_assert_result_from_drain,
     sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
-use super::profraw::{MSG_TYPE_PROFRAW, write_profraw};
+use super::profraw::write_profraw;
 use super::sidecar::{write_sidecar, write_skip_sidecar};
 use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
@@ -736,15 +736,21 @@ pub(crate) fn run_ktstr_test_inner(
 ) -> Result<AssertResult> {
     let result = run_ktstr_test_inner_impl(entry, topo, active_flags);
     if let Err(ref e) = result
-        && e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
-            .is_some()
+        && super::is_resource_contention(e)
     {
         // Late catch-all for ResourceContention from any early-
         // bail path before the existing per-site `record_skip_sidecar`
-        // calls in builder.build()/vm.run() arms below. Not strictly
-        // idempotent — a second write refreshes run_id and timestamp
-        // — but the skip classification round-trips identically, so
-        // stats tooling sees the same outcome.
+        // calls in builder.build()/vm.run() arms below. Walks the
+        // FULL `anyhow::Error` chain via `is_resource_contention`
+        // (which uses `e.chain().any(...)`) so a contention wrapped
+        // in `.context(...)` (e.g. the `"build ktstr_test VM"` and
+        // `"run ktstr_test VM"` wrappers in `evaluate_vm_result`)
+        // is still recognised — without the chain walk, a wrapped
+        // contention would skip the catch-all and the run would
+        // not record a skip sidecar. Not strictly idempotent — a
+        // second write refreshes run_id and timestamp — but the
+        // skip classification round-trips identically, so stats
+        // tooling sees the same outcome.
         record_skip_sidecar(entry, active_flags);
     }
     result
@@ -813,7 +819,7 @@ fn run_ktstr_test_inner_impl(
             );
         }
     }
-    if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
+    if entry.performance_mode && super::runtime::no_perf_mode_active() {
         // One canonical reason string for both the stderr banner
         // (prefixed with the entry name for multi-test context)
         // and the structured AssertResult::skip payload (test-name
@@ -864,7 +870,7 @@ fn run_ktstr_test_inner_impl(
 
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
-    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
+    let no_perf_mode = super::runtime::no_perf_mode_active();
 
     // Pre-clear stale failure-dump files before the primary VM
     // boots. A passing rerun after a prior failed invocation must
@@ -1412,54 +1418,123 @@ fn run_ktstr_test_inner_impl(
     let mut stimulus_events = Vec::new();
     let mut payload_metrics: Vec<crate::test_support::PayloadMetrics> = Vec::new();
     let mut raw_outputs: Vec<crate::test_support::RawPayloadOutput> = Vec::new();
-    if let Some(ref shm) = result.guest_messages {
-        for entry in &shm.entries {
-            if entry.msg_type == MSG_TYPE_PROFRAW
-                && entry.crc_ok
-                && !entry.payload.is_empty()
-                && let Err(e) = write_profraw(&entry.payload)
-            {
-                eprintln!("ktstr_test: write guest profraw: {e}");
-            }
-            if entry.msg_type == crate::vmm::wire::MSG_TYPE_STIMULUS
-                && entry.crc_ok
-                && let Some(ev) = crate::vmm::wire::StimulusEvent::from_payload(&entry.payload)
-            {
-                stimulus_events.push(crate::timeline::StimulusEvent {
-                    elapsed_ms: ev.elapsed_ms as u64,
-                    label: format!("StepStart[{}]", ev.step_index),
-                    op_kind: Some(format!("ops={}", ev.op_count)),
-                    detail: Some(format!(
-                        "{} cgroups, {} workers",
-                        ev.cgroup_count, ev.worker_count,
-                    )),
-                    total_iterations: if ev.total_iterations > 0 {
-                        Some(ev.total_iterations)
-                    } else {
-                        None
-                    },
-                });
-            }
-            if entry.msg_type == crate::vmm::wire::MSG_TYPE_PAYLOAD_METRICS && entry.crc_ok {
-                match serde_json::from_slice::<crate::test_support::PayloadMetrics>(&entry.payload)
-                {
-                    Ok(pm) => payload_metrics.push(pm),
-                    Err(e) => eprintln!("ktstr_test: decode payload metrics from SHM: {e}"),
+    if let Some(ref bulk) = result.guest_messages {
+        // Per-frame typed dispatch on the bucketed bulk drain.
+        // Mirrors the freeze coord's TOKEN_TX exhaustive match —
+        // adding a new MsgType variant is a compile error here, so
+        // the host either decodes it explicitly or silently
+        // ignores it via the catch-all arm with intent. CRC
+        // failures gate decode for every variant whose semantics
+        // depend on payload integrity.
+        for bulk_entry in &bulk.entries {
+            let kind = crate::vmm::wire::MsgType::from_wire(bulk_entry.msg_type);
+            match kind {
+                Some(crate::vmm::wire::MsgType::Profraw) => {
+                    if bulk_entry.crc_ok
+                        && !bulk_entry.payload.is_empty()
+                        && let Err(e) = write_profraw(&bulk_entry.payload)
+                    {
+                        eprintln!("ktstr_test: write guest profraw: {e}");
+                    }
                 }
-            }
-            if entry.msg_type == crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT && entry.crc_ok {
-                match serde_json::from_slice::<crate::test_support::RawPayloadOutput>(
-                    &entry.payload,
-                ) {
-                    Ok(raw) => raw_outputs.push(raw),
-                    Err(e) => eprintln!("ktstr_test: decode raw payload output from SHM: {e}"),
+                Some(crate::vmm::wire::MsgType::Stimulus) => {
+                    if bulk_entry.crc_ok
+                        && let Some(ev) = crate::vmm::wire::StimulusEvent::from_payload(
+                            &bulk_entry.payload,
+                        )
+                    {
+                        stimulus_events.push(crate::timeline::StimulusEvent {
+                            elapsed_ms: ev.elapsed_ms as u64,
+                            label: format!("StepStart[{}]", ev.step_index),
+                            op_kind: Some(format!("ops={}", ev.op_count)),
+                            detail: Some(format!(
+                                "{} cgroups, {} workers",
+                                ev.cgroup_count, ev.worker_count,
+                            )),
+                            total_iterations: if ev.total_iterations > 0 {
+                                Some(ev.total_iterations)
+                            } else {
+                                None
+                            },
+                        });
+                    }
+                }
+                Some(crate::vmm::wire::MsgType::PayloadMetrics) => {
+                    if bulk_entry.crc_ok {
+                        match bincode::serde::decode_from_slice::<
+                            crate::test_support::PayloadMetrics,
+                            _,
+                        >(&bulk_entry.payload, bincode::config::standard())
+                        {
+                            Ok((pm, _)) => payload_metrics.push(pm),
+                            Err(e) => eprintln!(
+                                "ktstr_test: decode payload metrics from bulk port: {e}"
+                            ),
+                        }
+                    }
+                }
+                Some(crate::vmm::wire::MsgType::RawPayloadOutput) => {
+                    if bulk_entry.crc_ok {
+                        match bincode::serde::decode_from_slice::<
+                            crate::test_support::RawPayloadOutput,
+                            _,
+                        >(&bulk_entry.payload, bincode::config::standard())
+                        {
+                            Ok((raw, _)) => raw_outputs.push(raw),
+                            Err(e) => eprintln!(
+                                "ktstr_test: decode raw payload output from bulk port: {e}"
+                            ),
+                        }
+                    }
+                }
+                // The remaining verdict-bearing variants
+                // (TestResult, Exit, SchedExit, ScenarioStart,
+                // ScenarioEnd, Stdout, Stderr, SchedLog, Lifecycle,
+                // ExecExit, Dmesg, ProbeOutput, SnapshotReply,
+                // Crash) are consumed by other walkers further down
+                // the pipeline (parse_assert_result_from_drain,
+                // bulk_exit lookup in collect_results, lifecycle
+                // classifier, sched_log concatenator, etc.). No
+                // per-entry side effect here.
+                Some(
+                    crate::vmm::wire::MsgType::TestResult
+                    | crate::vmm::wire::MsgType::Exit
+                    | crate::vmm::wire::MsgType::SchedExit
+                    | crate::vmm::wire::MsgType::ScenarioStart
+                    | crate::vmm::wire::MsgType::ScenarioEnd
+                    | crate::vmm::wire::MsgType::Stdout
+                    | crate::vmm::wire::MsgType::Stderr
+                    | crate::vmm::wire::MsgType::SchedLog
+                    | crate::vmm::wire::MsgType::Lifecycle
+                    | crate::vmm::wire::MsgType::ExecExit
+                    | crate::vmm::wire::MsgType::Dmesg
+                    | crate::vmm::wire::MsgType::ProbeOutput
+                    | crate::vmm::wire::MsgType::SnapshotReply
+                    | crate::vmm::wire::MsgType::Crash,
+                ) => {}
+                // Coordinator-internal frames are stripped before
+                // they reach this loop (see the `is_coordinator_internal`
+                // filter in `collect_results`'s post-run drain plus
+                // the freeze coord's mid-run TOKEN_TX bucketing).
+                // Defensively no-op rather than panic so a future
+                // is_coordinator_internal expansion does not
+                // require a parallel update here.
+                Some(crate::vmm::wire::MsgType::SnapshotRequest)
+                | Some(crate::vmm::wire::MsgType::SysRdy) => {}
+                None => {
+                    tracing::warn!(
+                        msg_type = bulk_entry.msg_type,
+                        len = bulk_entry.payload.len(),
+                        crc_ok = bulk_entry.crc_ok,
+                        "ktstr_test: unknown MSG_TYPE_* on bulk port; dropping"
+                    );
                 }
             }
         }
     }
 
     // Host-side `OutputFormat::LlmExtract` resolution. For every
-    // RawPayloadOutput drained from SHM, look up its
+    // RawPayloadOutput drained from the bulk port, look up its
     // `payload_index` in the PayloadMetrics slice, run the
     // LLM-backed extraction on the host, and replace the empty
     // `metrics` vec on the matched slot with the extracted result.
@@ -1561,13 +1636,25 @@ fn evaluate_vm_result(
     let dump_section = extract_sched_ext_dump(&result.stderr)
         .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
         .unwrap_or_default();
-    let sched_log_section = parse_sched_output(output)
+    // Concatenate bulk-port `MSG_TYPE_SCHED_LOG` chunks then run
+    // the marker-pair extractor on the merged stream — pre-bincode
+    // migration the markers travelled in `output` (COM2). Either
+    // source feeds `parse_sched_output` byte-for-byte; falling back
+    // to `output` when the bulk-port drain has no SchedLog frames
+    // covers verifier-only paths.
+    let sched_log_merged = crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
+    let sched_log_input: &str = if !sched_log_merged.is_empty() {
+        &sched_log_merged
+    } else {
+        output
+    };
+    let sched_log_section = parse_sched_output(sched_log_input)
         .map(|s| {
             let collapsed = crate::verifier::collapse_cycles(s);
             format!("\n\n--- scheduler log ---\n{collapsed}")
         })
         .unwrap_or_default();
-    let fingerprint_line = sched_log_fingerprint(output)
+    let fingerprint_line = sched_log_fingerprint(sched_log_input)
         .map(|fp| {
             if crate::cli::stderr_color() {
                 format!("\x1b[1;31m{fp}\x1b[0m\n")
@@ -1605,9 +1692,7 @@ fn evaluate_vm_result(
         }
     };
 
-    if let Ok(mut check_result) =
-        parse_assert_result_from_drain(result.guest_messages.as_ref()).or_else(|_| parse_assert_result(output))
-    {
+    if let Ok(mut check_result) = parse_assert_result_from_drain(result.guest_messages.as_ref()) {
         // Fold host-side LlmExtract failures into the guest's
         // AssertResult before the sidecar write so per-run stats
         // tooling sees the host-extracted verdict, not the guest's
@@ -1743,7 +1828,7 @@ fn evaluate_vm_result(
                 .any(|d| d.kind == crate::assert::DetailKind::SchedulerDied)
                 || verbose()
             {
-                let init_stage = classify_init_stage(output);
+                let init_stage = classify_init_stage(result.guest_messages.as_ref());
                 format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
             } else {
                 String::new()
@@ -1804,18 +1889,18 @@ fn evaluate_vm_result(
         return Ok(check_result);
     }
 
-    // No parseable result — no AssertResult found in SHM or COM2.
-    // With an scx scheduler under test this typically means the
-    // scheduler exited (crash, BPF verifier reject, scx_bpf_error()
-    // exit, sched_ext disablement); on the kernel-default scheduler
-    // it means the payload itself failed. Attempt auto-repro if
-    // enabled and a scheduler was running.
+    // No parseable result — no AssertResult found via the bulk port
+    // or COM2. With an scx scheduler under test this typically
+    // means the scheduler exited (crash, BPF verifier reject,
+    // scx_bpf_error() exit, sched_ext disablement); on the kernel-
+    // default scheduler it means the payload itself failed. Attempt
+    // auto-repro if enabled and a scheduler was running.
     // Any scheduler failure that prevents producing a test result
     // warrants repro — BPF verifier failures, scx_bpf_error() exits,
     // crashes, and stalls all land here. Previous code required
     // specific string patterns (`SENTINEL_SCHEDULER_DIED`,
     // "sched_ext:" + "disabled") which missed mid-test exits where
-    // the sched_exit_monitor writes to SHM but not COM2.
+    // the sched_exit_monitor writes guest messages but not COM2.
     let repro_section = if entry.scheduler.has_active_scheduling() {
         repro_fn(output)
             .map(|r| format!("\n\n--- auto-repro ---\n{r}"))
@@ -1829,9 +1914,25 @@ fn evaluate_vm_result(
     // carry the diagnostics and the kernel console is noise (BIOS, ACPI boot).
     // When COM2 has NO scheduler output (crash before writing), the kernel console
     // is the ONLY source of crash info — include it unconditionally as a fallback.
-    let has_sched_output = output.contains(SCHED_OUTPUT_START);
-    let console_section = if !has_sched_output || verbose() {
-        let init_stage = classify_init_stage(output);
+    // When a scheduler is active and we landed in the no-parseable-
+    // result path, force the console section on regardless of
+    // SCHED_OUTPUT_START presence: the init-stage classification it
+    // carries is the only signal of where the boot got stuck (BPF
+    // verifier reject vs. scheduler attach vs. test-fn launch), and
+    // dropping it leaves the operator without that locator.
+    // Pre-bincode-migration: scheduler logs travelled in COM2
+    // bracketed by `SCHED_OUTPUT_START`. The marker now lives
+    // inside `MSG_TYPE_SCHED_LOG` chunk bytes, so check both the
+    // bulk-port drain and the legacy COM2 fallback (still useful
+    // when a path emits SCHED_OUTPUT to neither).
+    let bulk_sched_log = crate::verifier::concat_sched_log_chunks(result.guest_messages.as_ref());
+    let has_sched_output =
+        output.contains(SCHED_OUTPUT_START) || bulk_sched_log.contains(SCHED_OUTPUT_START);
+    let console_section = if !has_sched_output
+        || verbose()
+        || entry.scheduler.has_active_scheduling()
+    {
+        let init_stage = classify_init_stage(result.guest_messages.as_ref());
         format_console_diagnostics(&result.stderr, result.exit_code, init_stage)
     } else {
         String::new()
@@ -1839,16 +1940,31 @@ fn evaluate_vm_result(
 
     let timeline_section = build_timeline_section();
 
-    // Build monitor section for error paths where neither SHM nor COM2 had a parseable result.
+    // Build monitor section for error paths where neither the bulk
+    // port nor COM2 had a parseable result.
     let monitor_section = build_monitor_section();
 
+    // When both timed_out and crash_message fire, the prior behavior
+    // bailed with the timeout reason and silently dropped the crash
+    // backtrace from the freeze coordinator's
+    // `extract_panic_message` capture. Render both: timeout stays the
+    // primary classification (the host watchdog is what halted the
+    // run) but the crash backtrace appends as a `guest crashed:`
+    // section so the operator sees the panic frames the guest
+    // emitted before the watchdog fired.
     if result.timed_out {
+        let crash_section = if let Some(ref guest_crash) = result.crash_message {
+            format!("\n\n{ERR_GUEST_CRASHED_PREFIX}\n{guest_crash}")
+        } else {
+            String::new()
+        };
         let msg = format!(
-            "{}ktstr_test '{}'{} [topo={}] {ERR_TIMED_OUT_NO_RESULT}{}{}{}{}{}{}",
+            "{}ktstr_test '{}'{} [topo={}] {ERR_TIMED_OUT_NO_RESULT}{}{}{}{}{}{}{}",
             fingerprint_line,
             entry.name,
             sched_label,
             topo,
+            crash_section,
             console_section,
             timeline_section,
             sched_log_section,
@@ -1859,8 +1975,8 @@ fn evaluate_vm_result(
         anyhow::bail!("{msg}");
     }
 
-    let reason = if let Some(ref shm_crash) = result.crash_message {
-        format!("{ERR_GUEST_CRASHED_PREFIX}\n{shm_crash}")
+    let reason = if let Some(ref guest_crash) = result.crash_message {
+        format!("{ERR_GUEST_CRASHED_PREFIX}\n{guest_crash}")
     } else if let Some(crash_msg) = extract_panic_message(output) {
         format!("{ERR_GUEST_CRASHED_PREFIX} {crash_msg}")
     } else if entry.scheduler.has_active_scheduling() {
@@ -2021,6 +2137,7 @@ pub(crate) fn trim_settle_samples(
         summary,
         preemption_threshold_ns: report.preemption_threshold_ns,
         watchdog_observation: report.watchdog_observation,
+        page_offset: report.page_offset,
     }
 }
 
@@ -2481,12 +2598,11 @@ pub(crate) fn acquire_test_kernel_lock_if_cached(
 #[cfg(test)]
 mod tests {
     use super::super::output::{
-        RESULT_END, RESULT_START, STAGE_INIT_NOT_STARTED, STAGE_INIT_STARTED_NO_PAYLOAD,
-        STAGE_PAYLOAD_STARTED_NO_RESULT,
+        STAGE_INIT_NOT_STARTED, STAGE_INIT_STARTED_NO_PAYLOAD, STAGE_PAYLOAD_STARTED_NO_RESULT,
     };
     use super::super::test_helpers::{
-        EVAL_TOPO, EnvVarGuard, build_assert_result_json, eevdf_entry, isolated_cache_dir,
-        lock_env, make_vm_result, no_repro, sched_entry,
+        EVAL_TOPO, EnvVarGuard, build_assert_result, eevdf_entry, isolated_cache_dir, lock_env,
+        make_vm_result, make_vm_result_with_assert, no_repro, sched_entry,
     };
     use super::*;
     use crate::assert::{AssertDetail, DetailKind};
@@ -3219,10 +3335,9 @@ mod tests {
 
     #[test]
     fn eval_check_result_passed_returns_ok() {
-        let json = build_assert_result_json(true, vec![]);
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let assert = build_assert_result(true, vec![]);
         let entry = eevdf_entry("__eval_pass__");
-        let result = make_vm_result(&output, "", 0, false);
+        let result = make_vm_result_with_assert("", "", 0, false, &assert);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         assert!(
             evaluate_vm_result(
@@ -3243,16 +3358,15 @@ mod tests {
 
     #[test]
     fn eval_check_result_failed_includes_details() {
-        let json = build_assert_result_json(
+        let assert = build_assert_result(
             false,
             vec![
                 AssertDetail::new(DetailKind::Stuck, "stuck 3000ms"),
                 AssertDetail::new(DetailKind::Unfair, "spread 45%"),
             ],
         );
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = eevdf_entry("__eval_fail_details__");
-        let result = make_vm_result(&output, "", 0, false);
+        let result = make_vm_result_with_assert("", "", 0, false, &assert);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
@@ -3286,11 +3400,10 @@ mod tests {
     /// `bail!` error string downstream.
     #[test]
     fn eval_cleanup_budget_overshoot_folds_failing_detail() {
-        let json = build_assert_result_json(true, vec![]);
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let assert = build_assert_result(true, vec![]);
         let mut entry = eevdf_entry("__eval_cleanup_overshoot__");
         entry.cleanup_budget = Some(std::time::Duration::from_secs(1));
-        let mut result = make_vm_result(&output, "", 0, false);
+        let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
         result.cleanup_duration = Some(std::time::Duration::from_secs(10));
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
@@ -3331,11 +3444,10 @@ mod tests {
     /// [`eval_cleanup_budget_equal_passes`].
     #[test]
     fn eval_cleanup_budget_under_passes() {
-        let json = build_assert_result_json(true, vec![]);
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let assert = build_assert_result(true, vec![]);
         let mut entry = eevdf_entry("__eval_cleanup_under__");
         entry.cleanup_budget = Some(std::time::Duration::from_secs(5));
-        let mut result = make_vm_result(&output, "", 0, false);
+        let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
         result.cleanup_duration = Some(std::time::Duration::from_millis(500));
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         assert!(
@@ -3365,11 +3477,10 @@ mod tests {
     /// {<, ==, >} comparator triplet.
     #[test]
     fn eval_cleanup_budget_equal_passes() {
-        let json = build_assert_result_json(true, vec![]);
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let assert = build_assert_result(true, vec![]);
         let mut entry = eevdf_entry("__eval_cleanup_equal__");
         entry.cleanup_budget = Some(std::time::Duration::from_secs(5));
-        let mut result = make_vm_result(&output, "", 0, false);
+        let mut result = make_vm_result_with_assert("", "", 0, false, &assert);
         result.cleanup_duration = Some(std::time::Duration::from_secs(5));
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         assert!(
@@ -3392,18 +3503,23 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_includes_sched_log() {
-        let json = build_assert_result_json(
+        let assert = build_assert_result(
             false,
             vec![AssertDetail::new(
                 DetailKind::Stuck,
                 "worker 0 stuck 5000ms",
             )],
         );
+        // Sched log section still travels via COM2 in this fixture
+        // — it's the host's `parse_sched_output` that the assert
+        // failure renderer reads, and the bulk-port migration of
+        // SCHED_OUTPUT happens in a sibling task. The assert verdict
+        // is the part that moved to bincode-over-bulk-port.
         let output = format!(
-            "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
+            "{SCHED_OUTPUT_START}\nscheduler noise line\n{SCHED_OUTPUT_END}",
         );
         let entry = sched_entry("__eval_fail_sched_log__");
-        let result = make_vm_result(&output, "", 0, false);
+        let result = make_vm_result_with_assert(&output, "", 0, false, &assert);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
@@ -3427,16 +3543,16 @@ mod tests {
 
     #[test]
     fn eval_assert_failure_has_fingerprint() {
-        let json = build_assert_result_json(
+        let assert = build_assert_result(
             false,
             vec![AssertDetail::new(DetailKind::Stuck, "stuck 3000ms")],
         );
         let error_line = "Error: apply_cell_config BPF program returned error -2";
         let output = format!(
-            "{RESULT_START}\n{json}\n{RESULT_END}\n{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
+            "{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",
         );
         let entry = sched_entry("__eval_fingerprint__");
-        let result = make_vm_result(&output, "", 0, false);
+        let result = make_vm_result_with_assert(&output, "", 0, false, &assert);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
@@ -3526,11 +3642,10 @@ mod tests {
 
     #[test]
     fn eval_no_sched_output_no_fingerprint() {
-        let json =
-            build_assert_result_json(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
+        let assert =
+            build_assert_result(false, vec![AssertDetail::new(DetailKind::Stuck, "stuck")]);
         let entry = eevdf_entry("__eval_no_fp__");
-        let result = make_vm_result(&output, "", 0, false);
+        let result = make_vm_result_with_assert("", "", 0, false, &assert);
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
@@ -3552,11 +3667,9 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_has_fingerprint() {
-        let pass_json = build_assert_result_json(true, vec![]);
+        let pass_assert = build_assert_result(true, vec![]);
         let error_line = "Error: imbalance detected internally";
-        let sched_log =
-            format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
-        let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");
+        let output = format!("{SCHED_OUTPUT_START}\nstarting\n{error_line}\n{SCHED_OUTPUT_END}",);
         let entry = sched_entry("__eval_monitor_fp__");
         let imbalance_samples: Vec<crate::monitor::MonitorSample> = (0..30)
             .map(|i| {
@@ -3605,8 +3718,13 @@ mod tests {
                 summary,
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
+                page_offset: 0,
             }),
-            guest_messages: None,
+            guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+                entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                    &pass_assert,
+                )],
+            }),
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -3867,16 +3985,21 @@ mod tests {
 
     #[test]
     fn eval_sched_exit_includes_console() {
-        let json = build_assert_result_json(
+        let assert = build_assert_result(
             false,
             vec![AssertDetail::new(
                 DetailKind::SchedulerDied,
                 "scheduler process died unexpectedly after completing step 1 of 2 (0.5s into test)",
             )],
         );
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_exit_console__");
-        let result = make_vm_result(&output, "kernel panic\nsched_ext: disabled", 1, false);
+        let result = make_vm_result_with_assert(
+            "",
+            "kernel panic\nsched_ext: disabled",
+            1,
+            false,
+            &assert,
+        );
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
             "{}",
@@ -3899,21 +4022,20 @@ mod tests {
 
     #[test]
     fn eval_sched_exit_includes_monitor() {
-        let json = build_assert_result_json(
+        let assert = build_assert_result(
             false,
             vec![AssertDetail::new(
                 DetailKind::SchedulerDied,
                 "scheduler process died unexpectedly during workload (2.0s into test)",
             )],
         );
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
         let entry = sched_entry("__eval_sched_exit_monitor__");
         let result = crate::vmm::VmResult {
             success: false,
             exit_code: 1,
             duration: std::time::Duration::from_secs(1),
             timed_out: false,
-            output: output.to_string(),
+            output: String::new(),
             stderr: String::new(),
             monitor: Some(crate::monitor::MonitorReport {
                 samples: vec![],
@@ -3929,8 +4051,13 @@ mod tests {
                 },
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
+                page_offset: 0,
             }),
-            guest_messages: None,
+            guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+                entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                    &assert,
+                )],
+            }),
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -3965,10 +4092,9 @@ mod tests {
 
     #[test]
     fn eval_monitor_fail_includes_sched_log() {
-        let pass_json = build_assert_result_json(true, vec![]);
-        let sched_log =
+        let pass_assert = build_assert_result(true, vec![]);
+        let output =
             format!("{SCHED_OUTPUT_START}\nscheduler debug output here\n{SCHED_OUTPUT_END}",);
-        let output = format!("{RESULT_START}\n{pass_json}\n{RESULT_END}\n{sched_log}");
         let entry = sched_entry("__eval_monitor_fail_sched__");
         // Imbalance ratio 10.0 exceeds default threshold of 4.0,
         // sustained for 5+ samples past the 20-sample warmup window.
@@ -4019,8 +4145,13 @@ mod tests {
                 summary,
                 preemption_threshold_ns: 0,
                 watchdog_observation: None,
+                page_offset: 0,
             }),
-            guest_messages: None,
+            guest_messages: Some(crate::vmm::host_comms::BulkDrainResult {
+                entries: vec![crate::test_support::test_helpers::assert_result_tlv_entry(
+                    &pass_assert,
+                )],
+            }),
             stimulus_events: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
@@ -4896,8 +5027,8 @@ mod tests {
     /// An empty-metrics `PayloadMetrics` whose
     /// `payload_index` has no matching `RawPayloadOutput` is
     /// surfaced by the post-pairing scan. Most likely cause is a
-    /// CRC-bad RawPayloadOutput silently dropped during SHM
-    /// drain. Without this surfacing, an LlmExtract test whose
+    /// CRC-bad RawPayloadOutput silently dropped during the bulk-
+    /// port drain. Without this surfacing, an LlmExtract test whose
     /// raw-output bytes arrived corrupted would fail downstream
     /// `MetricCheck::Min` / `MetricCheck::Exists` evaluations with a
     /// "metric not found" message that hides the real cause.
@@ -5323,7 +5454,8 @@ mod tests {
             metric_hints: Vec::new(),
             metric_bounds: None,
         };
-        let payload = serde_json::to_vec(&original).expect("serialize RawPayloadOutput");
+        let payload = bincode::serde::encode_to_vec(&original, bincode::config::standard())
+            .expect("bincode-encode RawPayloadOutput");
 
         // Build a single TLV frame in the same format the guest
         // writer emits to /dev/vport0p1: 16-byte ShmMessage header
@@ -5350,8 +5482,9 @@ mod tests {
         assert_eq!(entry.msg_type, wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT,);
         assert!(entry.crc_ok, "bulk CRC must match");
 
-        let restored: crate::test_support::RawPayloadOutput =
-            serde_json::from_slice(&entry.payload).expect("decode RawPayloadOutput from bulk");
+        let (restored, _consumed): (crate::test_support::RawPayloadOutput, _) =
+            bincode::serde::decode_from_slice(&entry.payload, bincode::config::standard())
+                .expect("decode RawPayloadOutput from bulk");
         assert_eq!(restored.stdout, STDOUT_MARKER);
         assert_eq!(restored.stderr, STDERR_MARKER);
         assert!(!restored.stdout.contains(STDERR_MARKER));

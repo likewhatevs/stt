@@ -169,12 +169,16 @@ fn is_shared_client(client: &Client) -> bool {
 /// the URL-injectable form preserves identical routing
 /// semantics. This wrapper is the production entry point and
 /// pins the URL to [`RELEASES_URL`]; production code MUST go
-/// through this wrapper rather than calling
-/// [`cached_releases_with_url`] with a non-production URL on
-/// the singleton path (which would populate [`RELEASES_CACHE`]
-/// with non-production data and corrupt every later production
-/// call). Caching, race semantics, and the bypass-vs-cache
-/// routing are fully documented on [`cached_releases_with_url`].
+/// through this wrapper. A singleton call with a non-RELEASES_URL
+/// would otherwise populate [`RELEASES_CACHE`] with
+/// non-production data and corrupt every later production
+/// call — the singleton-path branch in
+/// [`cached_releases_with_url`] guards against this in both
+/// dev (`debug_assert!`) and release builds (fall back to
+/// bypass), but routing every production call through this
+/// wrapper makes the misuse impossible by construction.
+/// Caching, race semantics, and the bypass-vs-cache routing
+/// are fully documented on [`cached_releases_with_url`].
 fn cached_releases_with(client: &Client) -> Result<Vec<Release>> {
     cached_releases_with_url(client, RELEASES_URL)
 }
@@ -194,11 +198,15 @@ fn cached_releases_with(client: &Client) -> Result<Vec<Release>> {
 /// Cache contract is identical to [`cached_releases_with`]:
 /// non-singleton clients bypass [`RELEASES_CACHE`] and call
 /// [`fetch_releases`] with `url`; the singleton routes through
-/// the cache (consulting via `OnceLock::get`, populating via
-/// `OnceLock::set` on miss). The cache only ever stores data
-/// fetched from the singleton path — bypass-branch fetches are
-/// never cached, so a test that injects a mock URL on the bypass
-/// path cannot pollute the production cache.
+/// the cache only when `url == RELEASES_URL` (consulting via
+/// `OnceLock::get`, populating via `OnceLock::set` on miss). A
+/// singleton call with a non-RELEASES_URL trips the
+/// `debug_assert!` in dev builds and falls back to the bypass
+/// behavior in release builds — fetches directly via `url`,
+/// returns the result, never touches [`RELEASES_CACHE`]. The
+/// cache only ever stores data fetched from the singleton +
+/// RELEASES_URL combination, so a test that injects a mock URL
+/// on either branch cannot pollute the production cache.
 ///
 /// Failures are propagated without populating [`RELEASES_CACHE`],
 /// so a transient kernel.org outage on the first call lets the
@@ -240,6 +248,19 @@ fn cached_releases_with_url(client: &Client, url: &str) -> Result<Vec<Release>> 
          must pass a non-singleton Client (which takes the bypass branch \
          above and never touches the cache).",
     );
+    // Release-build guard: `debug_assert!` is stripped in
+    // optimized builds, so a non-RELEASES_URL on the singleton
+    // path would otherwise reach the populate-on-miss path below
+    // and persistently poison RELEASES_CACHE for every later
+    // production caller. Mirror the bypass-branch behavior
+    // (fetch directly, do not touch the cache) so the misuse
+    // degrades to a slow per-call fetch instead of a permanently
+    // wrong cache. The debug_assert above still fires loudly in
+    // dev builds; this branch only catches the misuse that
+    // slipped through to release.
+    if url != RELEASES_URL {
+        return fetch_releases(client, url);
+    }
     if let Some(cached) = RELEASES_CACHE.get() {
         return Ok(cached.clone());
     }
@@ -606,6 +627,24 @@ impl<R: Read> Read for DownloadStream<R> {
 /// chunk; the watchdog provides the tighter 60s no-progress bound.
 const DOWNLOAD_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Total request timeout for [`fetch_stable_sha256sums`]: bounds
+/// the wall-clock window for the single small-body GET that
+/// retrieves the cleartext-signed checksum manifest. The body is
+/// the `sha256sums.asc` cleartext block — typically a few KiB of
+/// `<hash>  <filename>` lines plus a PGP signature trailer — so a
+/// tight 30 s ceiling fits the realistic case (sub-second on a
+/// healthy CDN edge) while still bounding the failure mode this
+/// guards against: a stalled CDN that accepts the connection but
+/// never delivers bytes. Without a per-request timeout the
+/// shared client only carries [`SHARED_CLIENT_CONNECT_TIMEOUT`]
+/// (handshake-only), so a stalled body read would hang the build
+/// indefinitely. The caller treats any error from this function
+/// as "no expected hash available" and downgrades verification
+/// to a warning, so a 30 s timeout that fires on a hung CDN
+/// surfaces as an unverified-but-progressing download rather
+/// than a wedged build.
+const SHA256SUMS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Fetch the cleartext SHA-256 manifest published alongside stable
 /// kernel tarballs at
 /// `https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc`.
@@ -618,6 +657,7 @@ fn fetch_stable_sha256sums(client: &Client, major: u32) -> Result<String> {
     let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc");
     let response = client
         .get(&url)
+        .timeout(SHA256SUMS_REQUEST_TIMEOUT)
         .send()
         .with_context(|| format!("fetch {url}"))?;
     if !response.status().is_success() {
@@ -750,11 +790,20 @@ fn download_stable_tarball(
     print_download_size(&response, &url, cli_label);
 
     eprintln!("{cli_label}: extracting tarball (xz)");
+    // Stage extraction inside `dest_dir` (same filesystem) so the
+    // final `fs::rename` into place is atomic and a verification
+    // failure leaves `dest_dir` untouched. A bad mirror that serves
+    // a wrong-version archive — or sneaks stray top-level entries
+    // alongside `linux-{version}/` — gets caught after extraction
+    // but before anything lands in `dest_dir`. The TempDir's Drop
+    // sweeps every entry the malicious archive deposited.
+    let staging = tempfile::TempDir::new_in(dest_dir)
+        .with_context(|| "create extraction staging dir")?;
     let stream = DownloadStream::new(response);
     let decoder = xz2::read::XzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
     archive
-        .unpack(dest_dir)
+        .unpack(staging.path())
         .with_context(|| "extract tarball")?;
 
     // Recover the watchdog wrapper from inside the decoder/archive
@@ -765,9 +814,7 @@ fn download_stable_tarball(
     let (actual_hex, bytes_total) = stream.finalize();
     if let Some(expected) = expected_sha256.as_deref() {
         verify_sha256(&actual_hex, expected, &url)?;
-        eprintln!(
-            "{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})"
-        );
+        eprintln!("{cli_label}: sha256 verified ({bytes_total} bytes, hash {actual_hex})");
     } else {
         tracing::warn!(
             url = %url,
@@ -778,10 +825,50 @@ fn download_stable_tarball(
         );
     }
 
-    let source_dir = dest_dir.join(format!("linux-{version}"));
-    if !source_dir.is_dir() {
-        anyhow::bail!("expected directory linux-{version} after extraction");
+    let source_dir = promote_staged_kernel_tree(&staging, dest_dir, version)?;
+    Ok(source_dir)
+}
+
+/// Verify a kernel tarball's staged extraction contains exactly one
+/// top-level entry named `linux-{version}/` and atomically rename it
+/// into `dest_dir/linux-{version}`. Bails — leaving `dest_dir`
+/// untouched — when the staging dir holds a stray entry, when the
+/// expected inner directory is missing, or when the rename fails.
+/// The caller's `TempDir` outlives this helper, so its Drop sweeps
+/// any residual staging contents whether this returns Ok or Err.
+fn promote_staged_kernel_tree(
+    staging: &tempfile::TempDir,
+    dest_dir: &Path,
+    version: &str,
+) -> Result<PathBuf> {
+    let expected_name = format!("linux-{version}");
+    let mut found_inner = false;
+    for entry in std::fs::read_dir(staging.path())
+        .with_context(|| "read staging dir entries")?
+    {
+        let entry = entry.with_context(|| "iterate staging dir entry")?;
+        let name = entry.file_name();
+        if name == std::ffi::OsStr::new(&expected_name) {
+            found_inner = true;
+        } else {
+            anyhow::bail!(
+                "tarball contains unexpected top-level entry {name:?}; \
+                 expected only {expected_name}/"
+            );
+        }
     }
+    if !found_inner {
+        anyhow::bail!("expected directory {expected_name} after extraction");
+    }
+    let inner = staging.path().join(&expected_name);
+    let source_dir = dest_dir.join(&expected_name);
+    std::fs::rename(&inner, &source_dir).with_context(|| {
+        format!(
+            "rename {} -> {}",
+            inner.display(),
+            source_dir.display()
+        )
+    })?;
     Ok(source_dir)
 }
 
@@ -820,11 +907,19 @@ fn download_rc_tarball(
     print_download_size(&response, &url, cli_label);
 
     eprintln!("{cli_label}: extracting tarball (gzip)");
+    // Stage extraction inside `dest_dir` (same filesystem) so the
+    // final atomic rename keeps `dest_dir` clean when a bad mirror
+    // serves a wrong-version archive or sneaks stray top-level
+    // entries past the archive boundary. RC tarballs have no
+    // upstream sha256 manifest, so structural verification is the
+    // only defence against a hostile gitweb response.
+    let staging = tempfile::TempDir::new_in(dest_dir)
+        .with_context(|| "create extraction staging dir")?;
     let stream = DownloadStream::new(response);
     let decoder = flate2::read::GzDecoder::new(stream);
     let mut archive = tar::Archive::new(decoder);
     archive
-        .unpack(dest_dir)
+        .unpack(staging.path())
         .with_context(|| "extract tarball")?;
 
     // Surface the streamed digest as a warning. RC tarballs have
@@ -844,10 +939,7 @@ fn download_rc_tarball(
          {bytes_total} bytes is unverified",
     );
 
-    let source_dir = dest_dir.join(format!("linux-{version}"));
-    if !source_dir.is_dir() {
-        anyhow::bail!("expected directory linux-{version} after extraction");
-    }
+    let source_dir = promote_staged_kernel_tree(&staging, dest_dir, version)?;
     Ok(source_dir)
 }
 
@@ -1148,14 +1240,36 @@ fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<
     let mut window: u32 = PROBE_PATCH_INITIAL_BATCH.min(pool_cap);
     'expand: loop {
         let hi = (lo + window - 1).min(PROBE_PATCH_MAX);
-        // HEAD the entire window concurrently. Any transport error
-        // short-circuits via `collect::<Result<_, _>>()`.
+        // HEAD the entire window concurrently. A transient per-probe
+        // transport error (DNS hiccup, connection reset, single 5xx
+        // from the CDN) is treated as "patch absent" rather than
+        // aborting the whole search: a single blip in a 16/32/64-wide
+        // window would otherwise terminate EOL discovery and report
+        // "no tarball found" for a series that actually has one. The
+        // worst-case mis-classification — calling a real patch absent
+        // — produces a strictly conservative `last_good`, never a
+        // higher version than the CDN actually serves. Persistent
+        // outage degrades gracefully into the existing
+        // `last_good == 0` bail below (no tarball found at all).
+        // Per-probe errors are logged via `tracing::warn!` so total
+        // outage is not silent.
         let results: Vec<(u32, bool)> = (lo..=hi)
             .into_par_iter()
-            .map(|patch| probe_patch_exists(client, major, prefix, patch).map(|ok| (patch, ok)))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|patch| match probe_patch_exists(client, major, prefix, patch) {
+                Ok(ok) => (patch, ok),
+                Err(e) => {
+                    tracing::warn!(
+                        major, prefix, patch, error = %e,
+                        "probe_latest_patch: HEAD failed; treating patch as \
+                         absent and continuing search",
+                    );
+                    (patch, false)
+                }
+            })
+            .collect();
         // rayon preserves input order, so iterating advances `last_good`
-        // through increasing patch numbers and stops at the first 404.
+        // through increasing patch numbers and stops at the first 404
+        // (or treated-as-404 transport error).
         for (patch, ok) in results {
             if !ok {
                 break 'expand;
@@ -1612,6 +1726,77 @@ mod tests {
         assert_eq!(
             url,
             "https://git.kernel.org/torvalds/t/linux-6.15-rc3.tar.gz"
+        );
+    }
+
+    // -- promote_staged_kernel_tree --
+
+    #[test]
+    fn promote_staged_renames_well_formed_archive() {
+        let dest = tempfile::TempDir::new().unwrap();
+        let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+        std::fs::create_dir(staging.path().join("linux-6.14.2")).unwrap();
+        std::fs::write(
+            staging.path().join("linux-6.14.2").join("Makefile"),
+            b"# fake",
+        )
+        .unwrap();
+        let source_dir =
+            promote_staged_kernel_tree(&staging, dest.path(), "6.14.2").unwrap();
+        assert_eq!(source_dir, dest.path().join("linux-6.14.2"));
+        assert!(source_dir.is_dir());
+        assert!(source_dir.join("Makefile").is_file());
+        // Inner dir was renamed out of staging.
+        assert!(!staging.path().join("linux-6.14.2").exists());
+    }
+
+    #[test]
+    fn promote_staged_rejects_stray_top_level_entry() {
+        let dest = tempfile::TempDir::new().unwrap();
+        let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+        std::fs::create_dir(staging.path().join("linux-6.14.2")).unwrap();
+        std::fs::write(staging.path().join("evil"), b"backdoor").unwrap();
+        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unexpected top-level entry"),
+            "diagnostic must cite stray entry: {msg}"
+        );
+        // Nothing landed in dest_dir.
+        assert!(!dest.path().join("linux-6.14.2").exists());
+    }
+
+    #[test]
+    fn promote_staged_bails_on_missing_inner_dir() {
+        let dest = tempfile::TempDir::new().unwrap();
+        let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+        // Wrong-version inner directory: archive was for 6.14.3 but
+        // we're expecting 6.14.2. The mismatch surfaces as a stray
+        // top-level entry rather than a missing-inner-dir, since
+        // the helper rejects any name that doesn't match the
+        // expected one before checking for absence.
+        std::fs::create_dir(staging.path().join("linux-6.14.3")).unwrap();
+        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unexpected top-level entry"),
+            "wrong-version dir surfaces as stray: {msg}"
+        );
+        assert!(!dest.path().join("linux-6.14.2").exists());
+    }
+
+    #[test]
+    fn promote_staged_bails_on_empty_staging() {
+        let dest = tempfile::TempDir::new().unwrap();
+        let staging = tempfile::TempDir::new_in(dest.path()).unwrap();
+        let err = promote_staged_kernel_tree(&staging, dest.path(), "6.14.2")
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expected directory linux-6.14.2"),
+            "empty staging surfaces as missing-dir: {msg}"
         );
     }
 
@@ -3131,8 +3316,7 @@ mod tests {
             // Simulate "last byte received an hour ago" — the
             // elapsed comparison against `no_progress_timeout`
             // is the only branch that can produce TimedOut.
-            last_progress: std::time::Instant::now()
-                - std::time::Duration::from_secs(3600),
+            last_progress: std::time::Instant::now() - std::time::Duration::from_secs(3600),
             no_progress_timeout: std::time::Duration::from_millis(1),
         };
         let mut buf = [0u8; 16];
@@ -3165,8 +3349,7 @@ mod tests {
             inner: std::io::Cursor::new(payload.clone()),
             hasher: sha2::Sha256::new(),
             bytes_total: 0,
-            last_progress: std::time::Instant::now()
-                - std::time::Duration::from_secs(30),
+            last_progress: std::time::Instant::now() - std::time::Duration::from_secs(30),
             // Generous timeout: the test's wall-clock between the
             // watchdog check and the `inner.read()` call cannot
             // exceed 1s on any sane machine.
@@ -3199,8 +3382,7 @@ mod tests {
             // 30 minutes ago — well outside any reasonable timeout
             // but still finite so the test can observe whether
             // the EOF path updated it.
-            last_progress: std::time::Instant::now()
-                - std::time::Duration::from_secs(1800),
+            last_progress: std::time::Instant::now() - std::time::Duration::from_secs(1800),
             no_progress_timeout: std::time::Duration::from_secs(7200),
         };
         let pre_progress = stream.last_progress;

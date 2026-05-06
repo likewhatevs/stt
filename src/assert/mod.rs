@@ -88,10 +88,12 @@ pub fn parse_numa_maps(content: &str) -> Vec<NumaMapsEntry> {
 /// Compute page locality fraction from parsed numa_maps entries.
 ///
 /// Returns the fraction of pages residing on any node in
-/// `expected_nodes` (0.0-1.0). Returns 1.0 when no pages are observed
-/// (vacuously local). The expected node set is derived from the
-/// worker's [`MemPolicy`](crate::workload::MemPolicy) at evaluation
-/// time.
+/// `expected_nodes` (0.0-1.0). Returns 0.0 when no pages are observed
+/// — a zero-allocation workload is not vacuously local; reporting 1.0
+/// would let `min_page_locality` thresholds silently pass on broken
+/// runs that produced no NUMA signal. The expected node set is
+/// derived from the worker's
+/// [`MemPolicy`](crate::workload::MemPolicy) at evaluation time.
 pub fn page_locality(entries: &[NumaMapsEntry], expected_nodes: &BTreeSet<usize>) -> f64 {
     let mut total: u64 = 0;
     let mut local: u64 = 0;
@@ -106,7 +108,7 @@ pub fn page_locality(entries: &[NumaMapsEntry], expected_nodes: &BTreeSet<usize>
     if total > 0 {
         local as f64 / total as f64
     } else {
-        1.0
+        0.0
     }
 }
 
@@ -534,16 +536,6 @@ pub struct AssertResult {
     /// triage, `measurements` carries typed `(key, NoteValue)` pairs
     /// for programmatic consumption (sidecar parsers, `stats
     /// compare`, regression dashboards).
-    ///
-    /// `#[serde(default, skip_serializing_if = ...)]` so old sidecars
-    /// (pre-`note_value`) deserialize cleanly with an empty map and
-    /// the wire format stays compact when nothing was measured.
-    /// Schema-strict policy is intentionally relaxed for this field
-    /// — the strict-schema test pins the four required keys
-    /// (`passed`, `skipped`, `details`, `stats`) and explicitly
-    /// excludes `measurements`, mirroring how `ScenarioStats::ext_metrics`
-    /// is also tolerated.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub measurements: std::collections::BTreeMap<String, NoteValue>,
 }
 
@@ -642,7 +634,6 @@ pub struct CgroupStats {
     /// `numa_pages_migrated` delta divided by total allocated pages.
     pub cross_node_migration_ratio: f64,
     /// Extensible metrics for the generic comparison pipeline.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
@@ -761,7 +752,6 @@ pub struct ScenarioStats {
     pub worst_iterations_per_worker: f64,
     /// Extensible metrics for the generic comparison pipeline.
     /// Populated from per-cgroup ext_metrics (worst value across cgroups).
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ext_metrics: BTreeMap<String, f64>,
 }
 
@@ -1334,39 +1324,59 @@ impl AssertPlan {
         if let Some(min_locality) = self.min_page_locality
             && let Some(nodes) = numa_nodes
         {
+            // Aggregate NUMA pages across the cgroup so the locality
+            // check evaluates the cgroup as a whole rather than
+            // skipping workers with empty numa_pages or summing
+            // misleading per-worker fractions. Skipping zero-page
+            // workers lets a cgroup with no NUMA signal silently
+            // pass `min_page_locality`.
+            let mut total: u64 = 0;
+            let mut local: u64 = 0;
             for w in reports {
-                if w.numa_pages.is_empty() {
-                    continue;
-                }
-                let total: u64 = w.numa_pages.values().sum();
-                let local: u64 = w
-                    .numa_pages
-                    .iter()
-                    .filter(|(node, _)| nodes.contains(node))
-                    .map(|(_, count)| count)
-                    .sum();
-                if total > 0 {
-                    let locality = local as f64 / total as f64;
-                    r.merge(assert_page_locality(
-                        locality,
-                        Some(min_locality),
-                        total,
-                        local,
-                    ));
+                for (&node, &count) in &w.numa_pages {
+                    total += count;
+                    if nodes.contains(&node) {
+                        local += count;
+                    }
                 }
             }
+            let locality = if total > 0 {
+                local as f64 / total as f64
+            } else {
+                // Zero observed pages across the cgroup is treated
+                // as zero locality so the threshold surfaces a
+                // workload that produced no NUMA allocations.
+                0.0
+            };
+            r.merge(assert_page_locality(
+                locality,
+                Some(min_locality),
+                total,
+                local,
+            ));
         }
         if let Some(max_ratio) = self.max_cross_node_migration_ratio {
-            for w in reports {
-                let total: u64 = w.numa_pages.values().sum();
-                if total > 0 {
-                    r.merge(assert_cross_node_migration(
-                        w.vmstat_numa_pages_migrated,
-                        total,
-                        Some(max_ratio),
-                    ));
-                }
-            }
+            // `vmstat_numa_pages_migrated` is the delta of the
+            // system-wide `/proc/vmstat numa_pages_migrated` counter
+            // captured by each worker over its own work loop. With
+            // concurrent workers the deltas overlap heavily — every
+            // worker observes roughly the same system-wide migration
+            // count, so summing them inflates the numerator by the
+            // worker count. Take the maximum delta across the cgroup
+            // as the closest approximation of total migrations
+            // observed during the run, then divide once by the
+            // cgroup-wide total of allocated pages.
+            let total_pages: u64 = reports.iter().map(|w| w.numa_pages.values().sum::<u64>()).sum();
+            let migrated_pages: u64 = reports
+                .iter()
+                .map(|w| w.vmstat_numa_pages_migrated)
+                .max()
+                .unwrap_or(0);
+            r.merge(assert_cross_node_migration(
+                migrated_pages,
+                total_pages,
+                Some(max_ratio),
+            ));
         }
         if let Some(max_ratio) = self.max_slow_tier_ratio
             && numa_nodes.is_some()
@@ -1457,6 +1467,12 @@ pub fn assert_page_locality(
 /// `migrated_pages` is the delta of `/proc/vmstat` `numa_pages_migrated`
 /// between pre- and post-workload snapshots. `total_pages` is the total
 /// allocated pages from numa_maps.
+///
+/// Inconsistent inputs (`migrated_pages > 0` while `total_pages == 0`)
+/// fail loudly: vmstat saw migrations the workload's numa_maps did not
+/// account for, which is either a measurement gap or an instrumentation
+/// bug, and silently coercing the ratio to 0.0 would let the assertion
+/// pass on data the operator should not trust.
 pub fn assert_cross_node_migration(
     migrated_pages: u64,
     total_pages: u64,
@@ -1464,11 +1480,19 @@ pub fn assert_cross_node_migration(
 ) -> AssertResult {
     let mut r = AssertResult::pass();
     if let Some(threshold) = max_ratio {
-        let ratio = if total_pages > 0 {
-            migrated_pages as f64 / total_pages as f64
-        } else {
-            0.0
-        };
+        if total_pages == 0 {
+            if migrated_pages > 0 {
+                r.passed = false;
+                r.details.push(AssertDetail::new(
+                    DetailKind::CrossNodeMigration,
+                    format!(
+                        "cross-node migration inconsistent: {migrated_pages} pages migrated but 0 pages observed in numa_maps (threshold {threshold:.4})",
+                    ),
+                ));
+            }
+            return r;
+        }
+        let ratio = migrated_pages as f64 / total_pages as f64;
         if ratio > threshold {
             r.passed = false;
             r.details.push(AssertDetail::new(
@@ -2451,21 +2475,36 @@ pub fn assert_throughput_parity(
     let n = rates.len() as f64;
     let mean = rates.iter().sum::<f64>() / n;
 
-    if let Some(cv_limit) = max_cv
-        && mean > 0.0
-        && rates.len() >= 2
-    {
-        let variance = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
-        let stddev = variance.sqrt();
-        let cv = stddev / mean;
-        if cv > cv_limit {
+    if let Some(cv_limit) = max_cv {
+        // Guard zero-mean explicitly: a CV is undefined when every
+        // rate is zero, and silently passing the check would let a
+        // run where every worker recorded zero cpu_time look "in
+        // parity" when in fact no worker accumulated any CPU time
+        // at all. Surface the broken state so the operator sees it
+        // instead of letting `max_throughput_cv` look green.
+        let all_zero_cpu = reports.iter().all(|w| w.cpu_time_ns == 0);
+        if all_zero_cpu {
             r.passed = false;
             r.details.push(AssertDetail::new(
                 DetailKind::Benchmark,
                 format!(
-                    "throughput CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0} work/cpu_s)"
+                    "throughput CV undefined: all {} workers recorded zero cpu_time_ns (limit {cv_limit:.3})",
+                    reports.len()
                 ),
             ));
+        } else if mean > 0.0 && rates.len() >= 2 {
+            let variance = rates.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+            let stddev = variance.sqrt();
+            let cv = stddev / mean;
+            if cv > cv_limit {
+                r.passed = false;
+                r.details.push(AssertDetail::new(
+                    DetailKind::Benchmark,
+                    format!(
+                        "throughput CV {cv:.3} exceeds limit {cv_limit:.3} (mean={mean:.0} work/cpu_s)"
+                    ),
+                ));
+            }
         }
     }
 

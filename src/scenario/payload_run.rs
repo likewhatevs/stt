@@ -431,48 +431,29 @@ fn evaluate(
     (result, payload_metrics)
 }
 
-/// Serialize a [`PayloadMetrics`] to JSON and emit it on the
-/// guest-to-host bulk data channel (virtio-console port 1) under
+/// Emit a [`PayloadMetrics`] on the guest-to-host bulk data channel
+/// (virtio-console port 1) under
 /// [`MSG_TYPE_PAYLOAD_METRICS`](crate::vmm::wire::MSG_TYPE_PAYLOAD_METRICS).
 ///
-/// The `serde_json::to_vec` call is infallible in practice for
-/// `PayloadMetrics`: every field is an owned, serde-trivial value
-/// (`Vec<Metric>` of `{ name: String, value: f64, polarity, unit:
-/// String, source }` plus an `i32` exit code). None of these can
-/// fail serialization for any inhabited `PayloadMetrics` value —
-/// the Err arm exists only to satisfy `serde_json::to_vec`'s
-/// `Result` signature. The defensive `eprintln!` guards against a
-/// future struct change that introduces a fallible field (e.g. a
-/// `#[serde(with = "...")]` custom serializer) rather than any
-/// currently-reachable failure path.
-///
-/// Backpressure is handled inside `write_msg`: a busy port-1
-/// virtqueue blocks the writer until the host's `add_used` rate
-/// catches up. The pre-port-open SHM ring fallback drops on a full
-/// ring; this function does not re-handle that pressure here, it
-/// only handles the serialize step.
+/// The encoding (bincode v2 with `bincode::config::standard()`) and
+/// the bulk-port fire-and-forget semantics live inside
+/// [`crate::vmm::guest_comms::send_payload_metrics`]; this thin
+/// wrapper exists only so the call site reads as the post-extraction
+/// emit step rather than reaching across modules. Backpressure is
+/// handled inside `write_msg`: a busy port-1 virtqueue blocks the
+/// writer until the host's `add_used` rate catches up.
 fn emit_payload_metrics(pm: &PayloadMetrics) {
-    match serde_json::to_vec(pm) {
-        Ok(bytes) => crate::vmm::guest_comms::send_metrics(&bytes),
-        Err(e) => eprintln!("ktstr: serialize PayloadMetrics for SHM emit: {e}"),
-    }
+    crate::vmm::guest_comms::send_payload_metrics(pm);
 }
 
-/// Serialize a [`RawPayloadOutput`] and emit it on the guest-to-host
-/// bulk data channel (virtio-console port 1) under
+/// Emit a [`RawPayloadOutput`] on the guest-to-host bulk data
+/// channel (virtio-console port 1) under
 /// [`MSG_TYPE_RAW_PAYLOAD_OUTPUT`](crate::vmm::wire::MSG_TYPE_RAW_PAYLOAD_OUTPUT).
 ///
-/// Mirrors [`emit_payload_metrics`]'s shape: the same
-/// `serde_json::to_vec` infallibility argument applies (all fields
-/// owned `String` / `Option<String>` / `i32`), the defensive
-/// `eprintln!` guards a future fallible-serializer addition, and
-/// backpressure is handled inside `write_msg` (port-1 blocks; the
-/// pre-port-open SHM ring fallback drops).
+/// Mirrors [`emit_payload_metrics`]'s shape — bincode encoding and
+/// backpressure live inside the typed sender.
 fn emit_raw_payload_output(raw: &crate::test_support::RawPayloadOutput) {
-    match serde_json::to_vec(raw) {
-        Ok(bytes) => crate::vmm::guest_comms::send_raw_output(&bytes),
-        Err(e) => eprintln!("ktstr: serialize RawPayloadOutput for SHM emit: {e}"),
-    }
+    crate::vmm::guest_comms::send_raw_payload_output(raw);
 }
 
 /// Guest-side post-exit pipeline for `OutputFormat::LlmExtract`
@@ -708,20 +689,33 @@ impl PayloadHandle {
             .child
             .take()
             .ok_or_else(|| already_consumed(self.payload))?;
+        // Block until the leader exits naturally first, BEFORE
+        // spawning reader threads inside `wait_and_capture`. Then
+        // killpg the group to reap any descendants (stress-ng workers,
+        // schbench worker mode, fio --numjobs threads) that survived
+        // the leader and still hold the inherited stdout/stderr pipes
+        // open. Without this killpg-before-drain step the reader
+        // threads would block forever waiting for descendants to
+        // release the pipes — the same blocking-pipe failure mode
+        // that try_wait at line 798-802 guards against. `Child::wait`
+        // caches the exit status so the second call inside
+        // `wait_and_capture` returns immediately without a syscall.
+        if let Err(e) = child.wait() {
+            kill_payload_process_group(
+                &child,
+                self.payload.name,
+                self.payload.uses_parent_pgrp,
+            );
+            let _ = child.wait();
+            return Err(e).with_context(|| format!("wait payload '{}'", self.payload.name));
+        }
+        kill_payload_process_group(&child, self.payload.name, self.payload.uses_parent_pgrp);
         match wait_and_capture(&mut child) {
             Ok(output) => Ok(evaluate(self.payload, &self.checks, output)),
             Err(e) => {
-                // Reader-thread panic or wait-syscall failure left
-                // the child (and any fork descendants holding the
-                // pipes open) alive. `kill_payload_process_group`
-                // sends killpg + single-pid SIGKILL to close the
-                // pipes and guarantee the leader exits; the
-                // trailing `wait` reaps it so the pid slot is freed.
-                kill_payload_process_group(
-                    &child,
-                    self.payload.name,
-                    self.payload.uses_parent_pgrp,
-                );
+                // killpg already ran above; one more `wait` clears
+                // the zombie so the pid slot is freed regardless of
+                // the capture error.
                 let _ = child.wait();
                 Err(e).with_context(|| format!("wait payload '{}'", self.payload.name))
             }
@@ -1158,7 +1152,9 @@ fn evaluate_checks(checks: &[MetricCheck], pm: &PayloadMetrics, stderr: &str) ->
                     } else if actual > *value {
                         Some(AssertDetail {
                             kind: DetailKind::Other,
-                            message: format!("metric '{metric}' = {actual} exceeds maximum {value}"),
+                            message: format!(
+                                "metric '{metric}' = {actual} exceeds maximum {value}"
+                            ),
                         })
                     } else {
                         None
@@ -2752,44 +2748,17 @@ mod tests {
         );
     }
 
-    /// `MetricCheck::Range { lo: 100, hi: 50 }` — reversed bounds that make
-    /// `lo > hi` — currently fails EVERY finite metric value because
-    /// the evaluator tests `(actual < lo) || (actual > hi)` and both
-    /// halves are always true for an empty interval. No up-front
-    /// validation rejects the reversed construction. Pin the current
-    /// behavior so a future constructor-level validation (which
-    /// SHOULD exist, since a reversed range is almost certainly a
-    /// user error) flips this assertion visibly instead of silently
-    /// changing the failure mode.
+    /// Reversed bounds (`lo > hi`) cannot reach the evaluator —
+    /// `MetricCheck::range` panics at construction (see
+    /// `check_range_reversed_bounds_panics_at_construction` in
+    /// `test_support::payload`). Pin the constructor-side panic
+    /// here so a future relaxation that lets reversed ranges flow
+    /// into the evaluator (and silently fail every metric) trips
+    /// this guard instead of slipping past CI.
     #[test]
-    fn evaluate_checks_range_reversed_bounds_fails_every_finite_value() {
-        use crate::test_support::{Metric, MetricSource, MetricStream, Polarity};
-        let reversed = MetricCheck::range("iops", 100.0, 50.0);
-        for actual in &[0.0, 50.0, 75.0, 100.0, 200.0, -1000.0, 1e9] {
-            let pm = PayloadMetrics {
-                payload_index: 0,
-                metrics: vec![Metric {
-                    name: "iops".to_string(),
-                    value: *actual,
-                    polarity: Polarity::HigherBetter,
-                    unit: String::new(),
-                    source: MetricSource::Json,
-                    stream: MetricStream::Stdout,
-                }],
-                exit_code: 0,
-            };
-            let r = evaluate_checks(&[reversed], &pm, "");
-            assert!(
-                !r.passed,
-                "reversed range must fail for value {actual}: {:?}",
-                r.details,
-            );
-            assert!(
-                r.details[0].message.contains("outside [100, 50]"),
-                "detail must cite the (reversed) declared bounds verbatim, got: {:?}",
-                r.details,
-            );
-        }
+    #[should_panic(expected = "lo must be <= hi")]
+    fn evaluate_checks_range_reversed_bounds_panics_at_construction() {
+        let _ = MetricCheck::range("iops", 100.0, 50.0);
     }
 
     #[test]
@@ -5630,5 +5599,4 @@ mod tests {
             libc::SIG_DFL,
         );
     }
-
 }

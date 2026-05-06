@@ -790,7 +790,8 @@ fn run_scenario(
             // nothing — but collect defensively so a partial-failure
             // path that leaks a non-backdrop write surfaces here
             // rather than disappearing into `StepState::drop`.
-            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+            let mut r =
+                collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             let staging_result =
                 collect_step(&mut step_staging, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(staging_result);
@@ -827,7 +828,8 @@ fn run_scenario(
             // Collect backdrop-owned workload handles into the
             // result before reporting the crash so whatever the
             // persistent workers produced is still assertable.
-            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+            let mut r =
+                collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
@@ -877,7 +879,8 @@ fn run_scenario(
             // emission) on the error path. Ordering mirrors the
             // scheduler-crash path above so detail order is
             // consistent across both Ok(failed) returns.
-            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+            let mut r =
+                collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
@@ -896,7 +899,8 @@ fn run_scenario(
         // time. Same Backdrop-then-step merge order as the
         // inter-step path above so detail ordering stays consistent.
         if sched_died_during_hold {
-            let mut r = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+            let mut r =
+                collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
             r.merge(result);
             r.passed = false;
             r.details.push(crate::assert::AssertDetail::new(
@@ -921,7 +925,8 @@ fn run_scenario(
     let sched_dead = ctx.sched_pid.is_some_and(|pid| !process_alive(pid));
 
     // --- Backdrop teardown ---
-    let backdrop_result = collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
+    let backdrop_result =
+        collect_backdrop(&mut backdrop_state, effective_checks, ctx.topo, ctx.cgroups);
     result.merge(backdrop_result);
 
     if sched_dead {
@@ -2084,12 +2089,22 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                         "failed to clear subtree_control before task move"
                     );
                 }
-                // Perform the cgroup.procs writes for every handle
-                // currently keyed under `from` (step-local and backdrop).
-                for (name, handle) in state.all_handles() {
-                    if name.as_str() == *from {
-                        ctx.cgroups.move_tasks(to, &handle.worker_pids())?;
-                    }
+                // Collect every matching handle's pid list first so
+                // partial-failure semantics are bounded: if any per-pid
+                // cgroup.procs write fails, we have not yet mutated
+                // `state`, so handles remain keyed under `from`. The
+                // kernel side may still be partially migrated (writes
+                // before the failing pid succeeded), but the in-process
+                // tracking does not also drift — subsequent ops looking
+                // up by `from` find the same set they would have found
+                // before this op ran.
+                let pid_batches: Vec<Vec<libc::pid_t>> = state
+                    .all_handles()
+                    .filter(|(name, _)| name.as_str() == *from)
+                    .map(|(_, handle)| handle.worker_pids())
+                    .collect();
+                for pids in &pid_batches {
+                    ctx.cgroups.move_tasks(to, pids)?;
                 }
                 // Re-key handles under `to` and transfer ownership
                 // when required. A step-local handle whose `to`
@@ -2102,6 +2117,8 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                 // regardless of `to`; "Backdrop is persistent" does
                 // not degrade to step-local ownership because a
                 // later MoveAllTasks targets a step-local cgroup.
+                // Only run after every kernel write succeeded —
+                // partial failure leaves `state` un-renamed.
                 state.rename_handles(from, to);
             }
             Op::RunPayload {
@@ -2558,16 +2575,30 @@ fn collect_backdrop(
 /// likewise route through `drain_all_payload_handles` for the
 /// same reason. Preserve `.kill()` on every path that claims to
 /// drain handles for metric capture.
+///
+/// Drop order across matched entries is LIFO (last pushed, first
+/// dropped) — the loop walks indices from the tail toward index 0
+/// using `Vec::remove` so newer matched entries' embedded
+/// `SigchldScope`s restore the SIGCHLD disposition before older
+/// matches do, matching the save-and-restore chain documented on
+/// `PayloadHandle` in `payload_run.rs`. `Vec::swap_remove` would
+/// rotate the tail into the freed slot and break LIFO across
+/// matches; `Vec::remove` preserves the relative order of the
+/// remaining (unmatched) survivors. Note: SIGCHLD scope LIFO across
+/// the FULL vec is structurally unsalvageable in any partial-drain
+/// helper — unmatched entries that stay alive in `handles` outlive
+/// their younger matched siblings whose scopes already restored.
+/// The full-vec LIFO contract holds only when every handle is
+/// dropped together via [`drain_all_payload_handles`].
 fn drain_payload_handles_for_cgroup(handles: &mut Vec<PayloadEntry>, cgroup: &str) {
-    let mut i = 0;
-    while i < handles.len() {
+    let mut i = handles.len();
+    while i > 0 {
+        i -= 1;
         if handles[i].cgroup.as_str() == cgroup {
-            let entry = handles.swap_remove(i);
+            let entry = handles.remove(i);
             if let Err(e) = entry.handle.kill() {
                 eprintln!("ktstr: kill payload in cgroup '{cgroup}': {e:#}");
             }
-        } else {
-            i += 1;
         }
     }
 }
@@ -2576,8 +2607,18 @@ fn drain_payload_handles_for_cgroup(handles: &mut Vec<PayloadEntry>, cgroup: &st
 /// vector. Called at step-sequence teardown so every handle gets a
 /// terminal `.kill()` (and therefore a sidecar metric emission) even
 /// when no explicit `RemoveCgroup`/`StopCgroup` op targeted it.
+///
+/// Drop order is LIFO (last pushed, first dropped) — `Vec::pop`
+/// returns the tail first, so `PayloadHandle::drop` runs in reverse
+/// creation order. Each handle's embedded `SigchldScope` captured the
+/// `SIGCHLD` disposition that was live at construction time (the
+/// previous scope's installed `SIG_DFL`). Restoring in LIFO unwinds
+/// the save-and-restore chain back to the original disposition; FIFO
+/// drop (e.g. `Vec::drain(..)`) restores intermediate `SIG_DFL` values
+/// out of order and leaks `SIG_DFL` past the outermost scope. See the
+/// DROP-ORDER-CRITICAL note on `PayloadHandle` in `payload_run.rs`.
 fn drain_all_payload_handles(handles: &mut Vec<PayloadEntry>) {
-    for entry in handles.drain(..) {
+    while let Some(entry) = handles.pop() {
         if let Err(e) = entry.handle.kill() {
             eprintln!(
                 "ktstr: teardown kill payload in cgroup {}: {e:#}",

@@ -116,7 +116,7 @@ impl KernelId {
             };
         }
         if s.contains('/') || s.starts_with('.') || s.starts_with('~') {
-            return KernelId::Path(std::path::PathBuf::from(s));
+            return KernelId::Path(expand_tilde(s));
         }
         if _is_version_string(s) {
             return KernelId::Version(s.to_string());
@@ -298,6 +298,76 @@ pub(crate) fn decompose_version_for_compare(s: &str) -> Option<(u64, u64, u64, u
         return None;
     }
     Some((major, minor, patch, rc))
+}
+
+/// Expand a leading `~` or `~/...` in `s` against `$HOME` and
+/// return the resulting [`PathBuf`]. Any other shape (no leading
+/// `~`, `~user/...` for a different user, `$HOME` unset or empty)
+/// passes through verbatim — the caller's downstream `is_dir()`
+/// surfaces a regular "no such directory" error instead of being
+/// silently rewritten.
+///
+/// Cases handled:
+/// - `"~"` → `$HOME`
+/// - `"~/"` → `$HOME/`
+/// - `"~/linux"` → `$HOME/linux`
+/// - `"~user/..."` → unchanged (std has no `getpwnam`; a
+///   different-user expansion would require shelling out, which
+///   the file's "no non-std imports outside cfg(test)" rule
+///   forbids; the operator who wants a peer's home dir can spell
+///   it absolutely)
+/// - any input not starting with `~` → unchanged
+/// - `~`-prefix with `$HOME` unset / empty → unchanged (the
+///   downstream `is_dir()` failure is the clearest error path
+///   we can produce without a logging dep)
+///
+/// Pure with respect to filesystem writes; reads `$HOME` once. Env
+/// reads are consistent with the existing
+/// [`kernel_release_from_procfs`] pattern (FS read at resolve time)
+/// and explicitly outside the file-header `std::env::set_var` ban.
+///
+/// Called from [`KernelId::parse`]'s Path arm so the Path variant
+/// stores an absolute (or filesystem-resolvable) path. Without this,
+/// `KernelId::parse("~/linux")` stores the literal `"~/linux"`,
+/// which `is_dir()` rejects unconditionally — there is no shell to
+/// perform the standard tilde expansion on the operator's behalf at
+/// CLI invocation time.
+fn expand_tilde(s: &str) -> std::path::PathBuf {
+    // Bare `~` and `~/...` are the only shapes we expand. Anything
+    // else falls through verbatim.
+    if s != "~" && !s.starts_with("~/") {
+        return std::path::PathBuf::from(s);
+    }
+    // `$HOME` empty or unset is treated identically to "no
+    // expansion possible" — the caller's `is_dir()` check will
+    // surface the missing-path error normally. We do NOT panic
+    // here because `KernelId::parse` is `pub` and on a hot CLI
+    // path; failing to expand a single arg is not a fatal
+    // condition for the whole CLI.
+    let home = match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => return std::path::PathBuf::from(s),
+    };
+    if s == "~" {
+        return std::path::PathBuf::from(home);
+    }
+    // s starts with "~/", so the suffix we want to splice on is
+    // the slice starting AFTER the `/` separator. Joining `home`
+    // with `&s[1..]` would land an absolute path inside `home`
+    // (PathBuf::push of an absolute path RESETS the buffer to that
+    // absolute path), so we strip the leading `/` first. Doubled
+    // separators in the rest portion (`~//foo` → `s[2..] = "/foo"`)
+    // would also reset the buffer; loop the strip so any run of
+    // leading `/`s is consumed before the push.
+    let mut rest = &s[2..]; // skip "~/"
+    while let Some(stripped) = rest.strip_prefix('/') {
+        rest = stripped;
+    }
+    let mut p = std::path::PathBuf::from(home);
+    if !rest.is_empty() {
+        p.push(rest);
+    }
+    p
 }
 
 /// Read the running kernel release from `/proc/sys/kernel/osrelease`.
@@ -999,11 +1069,72 @@ mod tests {
         assert_eq!(KernelId::parse("."), KernelId::Path(PathBuf::from(".")));
     }
 
+    /// `~`-prefixed paths are expanded against `$HOME` at parse
+    /// time so a downstream `is_dir()` sees the resolved path
+    /// rather than the literal `~/...` (which the libc / Rust
+    /// path APIs do not interpret — only shells do). Pins the
+    /// expansion against an explicit `HOME` value so the test is
+    /// independent of the running operator's environment.
+    ///
+    /// Uses the env-mutation `lock_env` helper to serialise the
+    /// `HOME` write against any sibling test that reads
+    /// `$HOME` — see `crate::test_support::test_helpers::lock_env`
+    /// for the locking rationale. `EnvVarGuard::set` restores the
+    /// prior value when the guard drops so the test does not leak
+    /// the override into peers.
     #[test]
-    fn kernel_id_parse_path_tilde_prefix() {
+    fn kernel_id_parse_path_tilde_prefix_expands() {
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let _home_guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("HOME", "/home/fixture-user");
         assert_eq!(
             KernelId::parse("~/linux"),
-            KernelId::Path(PathBuf::from("~/linux"))
+            KernelId::Path(PathBuf::from("/home/fixture-user/linux")),
+        );
+    }
+
+    /// Bare `~` (no slash) expands to `$HOME` exactly. Pins the
+    /// degenerate single-character case so a future regression
+    /// that special-cased "must contain `/` after `~`" lands
+    /// here instead of silently leaving the literal `~`.
+    #[test]
+    fn kernel_id_parse_path_bare_tilde_expands() {
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let _home_guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("HOME", "/home/fixture-user");
+        assert_eq!(
+            KernelId::parse("~"),
+            KernelId::Path(PathBuf::from("/home/fixture-user")),
+        );
+    }
+
+    /// `$HOME` unset → no expansion possible. The literal `~/...`
+    /// passes through verbatim. Downstream `is_dir()` will reject
+    /// it normally, surfacing the missing-directory error rather
+    /// than panicking inside the parser.
+    #[test]
+    fn kernel_id_parse_path_tilde_with_home_unset_passes_through() {
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let _home_guard = crate::test_support::test_helpers::EnvVarGuard::remove("HOME");
+        assert_eq!(
+            KernelId::parse("~/linux"),
+            KernelId::Path(PathBuf::from("~/linux")),
+        );
+    }
+
+    /// `~user/...` (different user) is NOT expanded because std
+    /// has no `getpwnam`. Operator who wants a peer's home dir
+    /// can spell it absolutely. Pin the no-op behavior so a
+    /// future "shell out to getpwnam" addition has to update
+    /// this test deliberately.
+    #[test]
+    fn kernel_id_parse_path_tilde_user_passes_through() {
+        let _lock = crate::test_support::test_helpers::lock_env();
+        let _home_guard =
+            crate::test_support::test_helpers::EnvVarGuard::set("HOME", "/home/fixture-user");
+        assert_eq!(
+            KernelId::parse("~peer/linux"),
+            KernelId::Path(PathBuf::from("~peer/linux")),
         );
     }
 
@@ -1541,10 +1672,34 @@ mod tests {
         /// round-trip is defined (Path / Version / CacheKey). Bumped
         /// the input range from 30 to 120 characters to exercise long
         /// paths and pathological multi-dot strings.
+        ///
+        /// Path payload round-trip is conditional on the leading
+        /// `~`-expansion path: a `~`- or `~/...`-prefixed input
+        /// that resolves against `$HOME` lands in `Path` with the
+        /// expanded form, NOT the literal `~`-prefix the input
+        /// carried. The proptest detects that case and asserts the
+        /// expanded equivalence instead of the literal one. Other
+        /// `~`-prefix shapes (`~user/...`, or any prefix when
+        /// `$HOME` is empty/unset) pass through verbatim and the
+        /// strict round-trip assertion still holds — see
+        /// [`super::expand_tilde`] for the case table.
         #[test]
         fn prop_kernel_id_parse_never_panics(s in "\\PC{0,120}") {
+            // Hold the env lock for each proptest iteration so a
+            // parallel test that mutates `HOME` cannot race the
+            // two `expand_tilde` reads (one inside `parse`, one
+            // for the expected value below) and produce a
+            // false-positive payload-drift failure on a
+            // `~`-prefixed input.
+            let _env_lock = crate::test_support::test_helpers::lock_env();
             match KernelId::parse(&s) {
-                KernelId::Path(p) => prop_assert!(p == s, "Path payload drift for {s:?}"),
+                KernelId::Path(p) => {
+                    let expected = expand_tilde(&s);
+                    prop_assert!(
+                        p == expected,
+                        "Path payload drift for {s:?}: got {p:?}, expected {expected:?}",
+                    );
+                }
                 KernelId::Version(v) => prop_assert!(v == s, "Version payload drift for {s:?}"),
                 KernelId::CacheKey(k) => prop_assert!(k == s, "CacheKey payload drift for {s:?}"),
                 KernelId::Range { start, end } => {

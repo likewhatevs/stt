@@ -332,7 +332,7 @@ fn display_anonymous_member_uses_anon_marker() {
 }
 
 #[test]
-fn display_nested_struct_indents_correctly() {
+fn display_nested_struct_renders_inline_when_small() {
     // Outer struct with one nested-Struct field — both small
     // enough to fit inline. Nested-struct value renders via
     // `try_render_inline_string`, packed into the outer's
@@ -352,6 +352,62 @@ fn display_nested_struct_indents_correctly() {
         }],
     };
     assert_eq!(format!("{outer}"), "outer{child=inner{a=1}}");
+}
+
+#[test]
+fn display_nested_struct_breaks_to_multiline_past_inline_budget() {
+    // Boundary partner of `display_nested_struct_renders_inline_when_small`:
+    // when the inner struct's inline form exceeds
+    // STRUCT_INLINE_WIDTH_BUDGET (120), `try_inline_from_rendered`
+    // returns None and `write_struct` falls through to the
+    // breadcrumb form. The outer wrapping then sees `\n` in the
+    // child's pre-rendered string (line ~601 in mod.rs) and also
+    // bails to multi-line, so the rendered output must contain
+    // newlines.
+    //
+    // 20 u64 members named `field_NN` with value 3735928559
+    // (0xdeadbeef as decimal — `RenderedValue::Uint` renders as
+    // decimal regardless of magnitude) produces an inline form
+    // around 400+ chars, well past the 120-char budget.
+    let inner_members: Vec<RenderedMember> = (0..20)
+        .map(|i| RenderedMember {
+            name: format!("field_{i:02}"),
+            value: RenderedValue::Uint {
+                bits: 64,
+                value: 0xdeadbeef,
+            },
+        })
+        .collect();
+    let inner = RenderedValue::Struct {
+        type_name: Some("inner".into()),
+        members: inner_members,
+    };
+    let outer = RenderedValue::Struct {
+        type_name: Some("outer".into()),
+        members: vec![RenderedMember {
+            name: "child".into(),
+            value: inner,
+        }],
+    };
+    let rendered = format!("{outer}");
+    assert!(
+        rendered.contains('\n'),
+        "over-budget nested struct must break to multi-line; got: {rendered:?}",
+    );
+    // The breadcrumb form starts with the outer type name followed
+    // by `:` (not `{`) — pin that shape so a regression that
+    // re-routes back through the inline path with a wider budget
+    // would be caught.
+    assert!(
+        rendered.starts_with("outer:"),
+        "multi-line form must lead with `outer:` breadcrumb, got: {rendered:?}",
+    );
+    // And the inner field's value must appear at least once so
+    // the test isn't satisfied by the breadcrumb header alone.
+    assert!(
+        rendered.contains("3735928559"),
+        "inner-member values must still surface in multi-line form: {rendered:?}",
+    );
 }
 
 #[test]

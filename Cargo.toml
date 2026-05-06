@@ -26,6 +26,17 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crc32fast = "1.5"
+# Binary serialization for bulk-port TLV payloads (AssertResult,
+# PayloadMetrics, RawPayloadOutput). Replaces the prior JSON-over-TLV
+# encoding so the host parses test verdicts and per-payload metrics
+# without serde_json's text-form overhead. `serde` feature pipes the
+# existing `#[derive(Serialize, Deserialize)]` types through bincode's
+# `bincode::serde::encode_to_vec` / `decode_from_slice` entry points
+# (`features/serde/ser.rs` + `de_owned.rs`); the wire format pin uses
+# `bincode::config::standard()` (little-endian, variable-int) for both
+# guest and host so layout never diverges. Pre-1.0 — old sidecar /
+# baseline data is disposable per project policy.
+bincode = { version = "2", features = ["serde"] }
 itoa = "1"
 gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision"] }
 reqwest = { version = "0.13", features = ["blocking"] }

@@ -973,6 +973,9 @@ impl KtstrVm {
             // for monitor / BPF map writes, so no TCR_EL1 cache
             // is needed.
             None,
+            // CR3 cache: unused in interactive shell (no monitor
+            // thread, no phys_base resolution).
+            &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         );
 
         // Shutdown.
@@ -1021,11 +1024,15 @@ impl KtstrVm {
             if !app_output.is_empty() {
                 use std::io::Write;
                 let mut stdout = std::io::stdout().lock();
-                for line in app_output.lines() {
-                    if !line.starts_with(crate::test_support::SENTINEL_EXEC_EXIT_PREFIX) {
-                        let _ = writeln!(stdout, "{line}");
-                    }
-                }
+                // Pre-bincode-migration the guest emitted a
+                // `KTSTR_EXEC_EXIT=N` sentinel line on COM2 that
+                // needed filtering out of this stdout copy. The
+                // exec exit is now a typed `MSG_TYPE_EXEC_EXIT`
+                // frame on the bulk data port (see
+                // `crate::vmm::guest_comms::send_exec_exit`), so
+                // the sentinel never appears in COM2 — no filter
+                // needed. Write the captured bytes verbatim.
+                let _ = stdout.write_all(app_output.as_bytes());
                 let _ = stdout.flush();
             }
         }
@@ -1198,12 +1205,17 @@ mod tests {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
 
+        // 5s timeout, 2s watchdog: monitor-only test. The in-monitor
+        // 5s sys_rdy ceiling caps the worst case; 2s watchdog gives
+        // the host-write override a tight observable value while
+        // staying well above the kernel's per-tick granularity.
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(5))
+                .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
         let result = vm.run().unwrap();
@@ -1214,19 +1226,29 @@ mod tests {
             report.summary.total_samples > 0,
             "monitor should have collected at least one sample"
         );
-        let last = report.samples.last().unwrap();
+
+        // Scan samples in reverse for the first one where ANY CPU
+        // reports rq_clock past the early-boot noise floor.
+        let populated = report
+            .samples
+            .iter()
+            .rev()
+            .find(|s| s.cpus.iter().any(|c| c.rq_clock > 1_000_000))
+            .expect(
+                "no monitor sample showed populated runqueue data — every sample \
+                 had all CPUs at rq_clock <= 1ms, \
+                 or the monitor is reading the wrong rq offsets",
+            );
         assert_eq!(
-            last.cpus.len(),
+            populated.cpus.len(),
             2,
             "topology requested 2 CPUs but monitor saw {}",
-            last.cpus.len()
+            populated.cpus.len()
         );
-        for (i, cpu) in last.cpus.iter().enumerate() {
-            assert!(
-                cpu.rq_clock > 1_000_000,
-                "cpu {i}: rq_clock must be > 1ms (ns), got {}",
-                cpu.rq_clock
-            );
+        for (i, cpu) in populated.cpus.iter().enumerate() {
+            if cpu.rq_clock <= 1_000_000 {
+                continue;
+            }
             assert!(
                 cpu.rq_clock < 300_000_000_000,
                 "cpu {i}: rq_clock must be < 300s (ns), got {}",
@@ -1240,7 +1262,7 @@ mod tests {
                 obs.expected_jiffies, obs.observed_jiffies
             );
         }
-        for (i, cpu) in last.cpus.iter().enumerate() {
+        for (i, cpu) in populated.cpus.iter().enumerate() {
             assert!(
                 cpu.event_counters.is_none(),
                 "cpu {i}: event_counters must be None when no scheduler is loaded"
@@ -1248,9 +1270,281 @@ mod tests {
         }
     }
 
+    /// Asserts the monitor's `DATA_VALID` latch fires before the run
+    /// ends and records the live KASLR-randomized `page_offset`. The
+    /// per-iteration refresh in `monitor_loop` reads
+    /// `page_offset_base` from guest memory once the guest BSP has
+    /// completed `setup_per_cpu_areas` and KASLR randomization, then
+    /// latches `page_offset` for every subsequent KVA→PA translation.
+    /// This test fails if the latch never fires (`page_offset == 0`),
+    /// proving the boot signal + refresh pipeline reaches the
+    /// `__per_cpu_offset[0]` populated && `page_offset_resolved`
+    /// AND condition before the run closes.
+    ///
+    /// Rationale: the same wrong `page_offset` would make every
+    /// `kva_to_pa` translation off by the KASLR delta and zero out
+    /// every monitor read. `boot_kernel_with_monitor`'s
+    /// `rq_clock > 1ms` assertion only fires when the read landed in
+    /// DRAM — but the test does not distinguish "latch never fired"
+    /// (page_offset stays at 0 here) from "latch fired but data still
+    /// pre-boot." Probing the latched value directly closes that gap.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn monitor_data_valid_latch_records_live_page_offset() {
+        let kernel = crate::test_support::require_kernel();
+        let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(5))
+                .watchdog_timeout(Duration::from_secs(2))
+                .build()
+        );
+        let result = vm.run().unwrap();
+        let Some(ref report) = result.monitor else {
+            return;
+        };
+        assert!(
+            report.summary.total_samples > 0,
+            "monitor produced no samples — DATA_VALID latch \
+             observability cannot be evaluated"
+        );
+
+        // x86_64: DATA_VALID requires page_offset_resolved (bit 63 +
+        // 4 KiB alignment + stability gate) AND
+        // __per_cpu_offset[0] != 0. A non-zero `report.page_offset`
+        // proves both conjuncts held during at least one iteration.
+        assert_ne!(
+            report.page_offset, 0,
+            "DATA_VALID latch never fired during the run — \
+             monitor.page_offset stayed at the initial 0 sentinel. \
+             page_offset_base was never resolved or \
+             __per_cpu_offset[0] never became non-zero before the \
+             run closed",
+        );
+
+        // Bit 63 set: kernel half on x86_64 (canonical addresses
+        // with VA_BITS=48 occupy 0xffff_8000_0000_0000 and above).
+        // The latch's own gate enforces this same bit, so any
+        // value here that lacks bit 63 means the assertion suite
+        // is reading garbage rather than a live latch capture.
+        assert!(
+            report.page_offset & (1u64 << 63) != 0,
+            "monitor.page_offset {:#x} is not in the canonical \
+             upper half — page_offset_resolved gate accepted a \
+             user-space address",
+            report.page_offset,
+        );
+
+        // 4 KiB page alignment: kernel PAGE_OFFSET is page-aligned
+        // by construction. The latch gate also enforces this; a
+        // misaligned value here would be a regression in either
+        // the gate or the field plumbing.
+        assert_eq!(
+            report.page_offset & 0xFFF,
+            0,
+            "monitor.page_offset {:#x} is not 4 KiB aligned",
+            report.page_offset,
+        );
+    }
+
+    /// End-to-end check that the SYS_RDY eventfd actually unblocks
+    /// the monitor's pre-sample boot wait — the failure mode that
+    /// motivated this test. With sys_rdy wired correctly, the guest
+    /// publishes [`crate::vmm::wire::MSG_TYPE_SYS_RDY`] after
+    /// `mount_filesystems()` and the monitor advances into the
+    /// sample loop within seconds of boot — well under the
+    /// in-monitor 5 s `boot_epoll.wait` ceiling.
+    ///
+    /// The first emitted sample's `elapsed_ms` therefore must land
+    /// well below the in-monitor 5 s ceiling — anything ≥ 4 s
+    /// here means a sys_rdy regression let the wait time out and
+    /// the sample loop only started after the fall-through, which
+    /// is exactly the regression this test is meant to surface.
+    ///
+    /// Returns silently (test-skip-equivalent) when the host has
+    /// no kernel / no vmlinux / no scx_root etc.; the assertions
+    /// only fire on a real run that produced a `MonitorReport`.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sys_rdy_releases_monitor_before_5s_timeout() {
+        let kernel = crate::test_support::require_kernel();
+        let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(5))
+                .build()
+        );
+        let result = vm.run().unwrap();
+        let Some(ref report) = result.monitor else {
+            return;
+        };
+        assert!(
+            report.summary.total_samples > 0,
+            "monitor produced no samples within 5 s — sys_rdy never \
+             unblocked the boot wait, or the boot wait never woke on \
+             kill_evt either. Run wall time: {:?}",
+            result.duration,
+        );
+        let first = report
+            .samples
+            .first()
+            .expect("total_samples > 0 but samples list empty");
+        assert!(
+            first.elapsed_ms < 4_000,
+            "first monitor sample landed at {} ms — that is past the \
+             4 s budget and within the in-monitor 5 s sys_rdy \
+             timeout window. The sys_rdy eventfd is not actually \
+             unblocking the boot wait; the loop fell through on the \
+             5 s ceiling. Total samples: {}, run duration: {:?}",
+            first.elapsed_ms,
+            report.summary.total_samples,
+            result.duration,
+        );
+    }
+
+    /// Pins the monitor's clean-exit path when the guest never
+    /// reaches `send_sys_rdy`. With `init=/nonexistent` and
+    /// `panic=-1`, the kernel panics on its `run_init_process`
+    /// failure, the guest reboots immediately, and the host VM
+    /// loop sees the reboot and shuts down. The monitor's
+    /// pre-sample boot wait MUST observe the kill eventfd and
+    /// fall through — not block until the 5 s sys_rdy ceiling.
+    ///
+    /// Wallclock budget: 8 s. The path to a kill_evt-driven
+    /// monitor wakeup is "kernel panic → reboot exit → BSP loop
+    /// sets kill → freeze coordinator writes kill_evt → monitor
+    /// boot wait wakes". A regression that left the monitor
+    /// blocked on sys_rdy alone (no kill_evt registration) would
+    /// hold the VM open for the full 5 s ceiling — still under
+    /// the 8 s budget, but a kill_evt regression that blocks
+    /// indefinitely on a different fd would still surface here.
+    ///
+    /// `init=/nonexistent` rides on the kernel cmdline ahead of
+    /// the builder's own `rdinit=/init` token; the kernel's
+    /// `init/main.c::run_init_process` tries every `init=` path
+    /// in order and panics when none succeeds, regardless of
+    /// `rdinit` (which only fires for ramdisk-style discovery).
+    /// `panic=-1` is the existing default in
+    /// `KtstrVm::setup_memory`'s cmdline composition; setting it
+    /// again via `cmdline_extra` is a no-op for the kernel parser
+    /// (last token wins, and both tokens specify the same value).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn monitor_exits_cleanly_when_guest_panics_before_sys_rdy() {
+        let kernel = crate::test_support::require_kernel();
+        let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(10))
+                .cmdline("init=/nonexistent panic=-1")
+                .build()
+        );
+        let result = vm.run().unwrap();
+        // The VM loop must shut down via the kernel's reboot exit
+        // path, not via the builder's 10 s timeout.
+        assert!(
+            !result.timed_out,
+            "guest never panicked / rebooted within 10 s — the test's \
+             premise (panic-before-sys_rdy → kernel reboot → VM exit) \
+             is not holding. Stderr tail: {:?}",
+            result
+                .stderr
+                .lines()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>(),
+        );
+        // Wallclock budget: 8 s. With the monitor's 5 s
+        // sys_rdy ceiling, a healthy run should finish well
+        // under this. A regression that blocks the boot wait
+        // indefinitely (e.g. kill_evt unregistered, sys_rdy
+        // not promoted to the eventfd) would blow the budget.
+        assert!(
+            result.duration < Duration::from_secs(8),
+            "VM ran for {:?} — past the 8 s budget. The monitor's \
+             boot wait did not wake on kill_evt; the loop sat on the \
+             sys_rdy ceiling instead. timed_out={}, exit_code={}",
+            result.duration,
+            result.timed_out,
+            result.exit_code,
+        );
+    }
+
+    /// Asserts the FIRST monitor sample (no reverse scan) has
+    /// `rq_clock > 1ms` on at least one CPU. This pins the SYS_RDY
+    /// → DATA_VALID pipeline's load-bearing semantics: when
+    /// `send_sys_rdy` fires, the guest BSP has already completed
+    /// `setup_per_cpu_areas` AND KASLR randomization AND
+    /// `mount_filesystems()`, so the first per-iteration refresh in
+    /// `monitor_loop` produces in-DRAM PAs and `read_rq_stats`
+    /// returns live counters — no zero-pad sentinel period and no
+    /// reverse scan needed to find a populated sample.
+    ///
+    /// Distinct from `boot_kernel_with_monitor`'s reverse-scan
+    /// assertion: that test passes if ANY sample (even the last
+    /// one, after seconds of pre-boot zeros) is populated. This
+    /// test fails if the FIRST sample is empty — which would
+    /// indicate the monitor started sampling before the guest had
+    /// the rq fields written, defeating the whole point of the
+    /// SYS_RDY gate.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn first_sample_has_valid_rq_clock_thanks_to_sys_rdy() {
+        let kernel = crate::test_support::require_kernel();
+        let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+
+        let vm = skip_on_contention!(
+            KtstrVm::builder()
+                .kernel(&kernel)
+                .topology(1, 1, 2, 1)
+                .memory_mb(256)
+                .timeout(Duration::from_secs(5))
+                .watchdog_timeout(Duration::from_secs(2))
+                .build()
+        );
+        let result = vm.run().unwrap();
+        let Some(ref report) = result.monitor else {
+            return;
+        };
+        assert!(
+            report.summary.total_samples > 0,
+            "monitor produced no samples — cannot evaluate \
+             FIRST-sample semantics"
+        );
+        let first = report
+            .samples
+            .first()
+            .expect("total_samples > 0 but samples list empty");
+        let any_populated = first.cpus.iter().any(|c| c.rq_clock > 1_000_000);
+        assert!(
+            any_populated,
+            "FIRST monitor sample at elapsed_ms={} had every CPU at \
+             rq_clock <= 1ms — SYS_RDY did not actually wait for the \
+             guest's runqueue fields to be populated, or the \
+             per-iteration refresh ran against pre-boot zeros. \
+             cpus.rq_clock: {:?}, total_samples: {}, run duration: {:?}",
+            first.elapsed_ms,
+            first.cpus.iter().map(|c| c.rq_clock).collect::<Vec<_>>(),
+            report.summary.total_samples,
+            result.duration,
+        );
+    }
+
     /// Regression guard for the `scx_sched.watchdog_timeout` host-write
     /// mechanism. Boots a VM with scx-ktstr loaded plus a distinctive
-    /// 7-second watchdog override, then asserts the monitor loop
+    /// 2-second watchdog override, then asserts the monitor loop
     /// observed the expected jiffies value in guest memory.
     ///
     /// Skips gracefully when: no host kernel available, no vmlinux for
@@ -1285,7 +1579,7 @@ mod tests {
             );
         }
 
-        const TIMEOUT_SECS: u64 = 7;
+        const TIMEOUT_SECS: u64 = 2;
         let hz = crate::monitor::guest_kernel_hz(Some(&kernel));
         let expected_jiffies = TIMEOUT_SECS * hz;
 
@@ -1296,7 +1590,7 @@ mod tests {
                 .kernel(&kernel)
                 .topology(1, 1, 1, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(5))
                 .scheduler_binary(&sched_bin)
                 .watchdog_timeout(Duration::from_secs(TIMEOUT_SECS))
                 .build()
@@ -1369,9 +1663,11 @@ mod tests {
             "no crash expected with 300s watchdog: {:?}",
             result.crash_message
         );
-        // SCHEDULER_DIED / SCHEDULER_NOT_ATTACHED sentinels are
+        // SchedulerDied / SchedulerNotAttached lifecycle frames are
         // written by start_scheduler in rust_init on attach failure
-        // or scheduler exit. "sched_ext: disabled" is the kernel's
+        // or scheduler exit (now via `send_lifecycle` on the bulk
+        // data port — pre-bincode-migration these were COM2
+        // sentinel strings). "sched_ext: disabled" is the kernel's
         // own disable message when scx tears down a scheduler (e.g.
         // on watchdog stall). Any of these appearing proves the
         // watchdog either fired or the scheduler exited for another
@@ -1379,15 +1675,24 @@ mod tests {
         // is broken.
         let output = &result.output;
         let stderr = &result.stderr;
+        let lifecycle_phase_seen = |phase: crate::vmm::wire::LifecyclePhase| -> bool {
+            let Some(ref drain) = result.guest_messages else {
+                return false;
+            };
+            drain.entries.iter().any(|e| {
+                e.msg_type == crate::vmm::wire::MSG_TYPE_LIFECYCLE
+                    && e.crc_ok
+                    && !e.payload.is_empty()
+                    && crate::vmm::wire::LifecyclePhase::from_wire(e.payload[0]) == Some(phase)
+            })
+        };
         assert!(
-            !output.contains(crate::test_support::SENTINEL_SCHEDULER_DIED)
-                && !stderr.contains(crate::test_support::SENTINEL_SCHEDULER_DIED),
+            !lifecycle_phase_seen(crate::vmm::wire::LifecyclePhase::SchedulerDied),
             "scheduler no longer running after 15s — either the watchdog fired or the \
              scheduler exited for another reason. output: {output:?}, stderr: {stderr:?}",
         );
         assert!(
-            !output.contains(crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED)
-                && !stderr.contains(crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED),
+            !lifecycle_phase_seen(crate::vmm::wire::LifecyclePhase::SchedulerNotAttached),
             "scheduler did not attach — no watchdog override to evaluate. \
              output: {output:?}, stderr: {stderr:?}",
         );
@@ -1437,7 +1742,8 @@ mod tests {
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(12))
+                .watchdog_timeout(Duration::from_secs(5))
                 .scheduler_binary(&sched_bin)
                 .build()
         );
@@ -1458,10 +1764,8 @@ mod tests {
         // first sample where ANY CPU reports a rq_clock past the
         // early-boot noise floor (1 ms in ns). `all` flaked on CI
         // where one vCPU can remain near rq_clock=0 throughout
-        // a short run; coverage-instrumented builds compound this
-        // by slowing every code path ~10x. The 30s timeout gives
-        // the VM enough time to boot, load the scheduler, and emit
-        // multiple monitor samples even under coverage. A single
+        // a short run. The 12s timeout covers boot + scheduler
+        // attach (~1-2s) + several monitor samples; a single
         // populated CPU proves the monitor reads real rq data —
         // the code path is identical per-CPU.
         let populated = report
@@ -1539,7 +1843,8 @@ mod tests {
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(12))
+                .watchdog_timeout(Duration::from_secs(5))
                 .scheduler_binary(&sched_bin)
                 .build()
         );
@@ -1632,12 +1937,18 @@ mod tests {
             );
         }
 
+        // 5s timeout, 2s watchdog: monitor-only test, no scheduler.
+        // Kernel threads (`sched_setup_smp` work) build the sched
+        // domain tree during boot and finish before sys_rdy fires;
+        // the first valid sample after boot already sees the
+        // populated tree.
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(5))
+                .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
         let result = vm.run().unwrap();

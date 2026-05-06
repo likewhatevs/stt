@@ -823,12 +823,27 @@ pub fn find_kernel() -> anyhow::Result<Option<std::path::PathBuf>> {
     // matches every other reader in the crate.
     if let Some(val) = ktstr_kernel_env() {
         match KernelId::parse(&val) {
-            KernelId::Path(_) => match kernel_path::find_image(Some(&val), release_ref) {
-                Some(p) => return Ok(Some(p)),
-                None => anyhow::bail!(
-                    "KTSTR_KERNEL={val} does not contain a kernel image. {KTSTR_KERNEL_HINT}"
-                ),
-            },
+            KernelId::Path(ref p) => {
+                // `KernelId::parse` already routed `val` through
+                // `expand_tilde`, producing the resolved `PathBuf`
+                // here. Pass that — not the raw `val` — into
+                // `find_image` so a `~/...` env value resolves
+                // against `$HOME`. Lossy `to_str` would silently
+                // mishandle non-UTF-8 paths; bail explicitly with
+                // the same hint shape as the not-found arm.
+                let Some(s) = p.to_str() else {
+                    anyhow::bail!(
+                        "KTSTR_KERNEL={val} expands to a non-UTF-8 path. \
+                         {KTSTR_KERNEL_HINT}"
+                    );
+                };
+                match kernel_path::find_image(Some(s), release_ref) {
+                    Some(found) => return Ok(Some(found)),
+                    None => anyhow::bail!(
+                        "KTSTR_KERNEL={val} does not contain a kernel image. {KTSTR_KERNEL_HINT}"
+                    ),
+                }
+            }
             KernelId::Version(ref ver) => {
                 // Only tarball keys use the {ver}-tarball-{arch}-kc{suffix} pattern.
                 // Git keys are {ref}-git-{hash}-{arch}-kc{suffix} and local keys

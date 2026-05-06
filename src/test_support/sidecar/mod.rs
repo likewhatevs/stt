@@ -647,7 +647,14 @@ pub(crate) fn collect_sidecars_with_errors(
     let mut io_errors: Vec<SidecarIoError> = Vec::new();
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return (sidecars, parse_errors, io_errors),
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "ktstr_test: collect_sidecars_with_errors cannot read root dir",
+            );
+            return (sidecars, parse_errors, io_errors);
+        }
     };
     let mut subdirs = Vec::new();
     let try_load = |path: &std::path::Path,
@@ -690,7 +697,18 @@ pub(crate) fn collect_sidecars_with_errors(
             }
         }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "ktstr_test: skipping unreadable DirEntry while collecting sidecars",
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         if path.is_dir() {
             subdirs.push(path);
@@ -699,15 +717,35 @@ pub(crate) fn collect_sidecars_with_errors(
         try_load(&path, &mut sidecars, &mut parse_errors, &mut io_errors);
     }
     for sub in subdirs {
-        if let Ok(entries) = std::fs::read_dir(&sub) {
-            for entry in entries.flatten() {
-                try_load(
-                    &entry.path(),
-                    &mut sidecars,
-                    &mut parse_errors,
-                    &mut io_errors,
+        let sub_entries = match std::fs::read_dir(&sub) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    subdir = %sub.display(),
+                    error = %e,
+                    "ktstr_test: skipping unreadable subdirectory while collecting sidecars",
                 );
+                continue;
             }
+        };
+        for entry in sub_entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        subdir = %sub.display(),
+                        error = %e,
+                        "ktstr_test: skipping unreadable DirEntry in sidecar subdirectory",
+                    );
+                    continue;
+                }
+            };
+            try_load(
+                &entry.path(),
+                &mut sidecars,
+                &mut parse_errors,
+                &mut io_errors,
+            );
         }
     }
     (sidecars, parse_errors, io_errors)
@@ -747,10 +785,28 @@ pub(crate) fn collect_sidecars_with_errors(
 pub fn collect_pool(root: &std::path::Path) -> Vec<SidecarResult> {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(
+                root = %root.display(),
+                error = %e,
+                "ktstr_test: collect_pool cannot read root; returning empty pool",
+            );
+            return Vec::new();
+        }
     };
     let mut pool = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    root = %root.display(),
+                    error = %e,
+                    "ktstr_test: skipping unreadable DirEntry while collecting pool",
+                );
+                continue;
+            }
+        };
         let path = entry.path();
         if path.is_dir() {
             // `collect_sidecars` already handles "one level of
@@ -1254,7 +1310,7 @@ pub(crate) fn detect_project_commit() -> Option<String> {
     // CACHE DOES NOT INVALIDATE on success: a user who commits /
     // amends / resets the project tree mid-run and expects the
     // new HEAD to surface in subsequent sidecars will see stale
-    // values. This is acceptable per CLAUDE.md guidance — the
+    // values. This is acceptable — the
     // project tree is treated as stable-enough for a single suite
     // run; callers mutating the tree during a run own the
     // consequences.
@@ -2273,7 +2329,7 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
     let cache_key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let cache = PRE_CLEARED.get_or_init(|| Mutex::new(HashSet::new()));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if !guard.insert(cache_key) {
+    if guard.contains(&cache_key) {
         return;
     }
     // First time this directory has been seen — wipe sidecars while
@@ -2287,8 +2343,14 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
     // it is brief; concurrent calls against DIFFERENT directories
     // serialize through this critical section but each does a small,
     // bounded amount of I/O, which is acceptable for a metadata
-    // probe call pattern. `guard` is dropped at end-of-scope so the
-    // lock release happens after the loop completes.
+    // probe call pattern. The cache insert happens AFTER the wipe
+    // completes (rather than before) so a panic mid-wipe does not
+    // poison the cache with an entry whose wipe never actually ran.
+    // The mutex itself enforces serialization across threads; the
+    // entry only records "wipe completed for this dir" and must
+    // never be observed without the wipe having succeeded. `guard`
+    // is dropped at end-of-scope so the lock release happens after
+    // the loop completes.
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -2319,6 +2381,11 @@ fn pre_clear_run_dir_once(dir: &std::path::Path) {
             }
         }
     }
+    // Record completion AFTER the wipe finishes, not before. If a
+    // panic interrupts the loop above, the cache remains empty so
+    // a subsequent call retries the wipe rather than skipping it
+    // on the assumption that a prior call already cleared the dir.
+    guard.insert(cache_key);
     drop(guard);
 }
 

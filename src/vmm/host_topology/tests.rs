@@ -538,8 +538,13 @@ fn mbind_to_nodes_empty_is_noop() {
     // reaches the kernel. Guards against a regression where a
     // caller passing `&[]` would either fault on the null ptr
     // or silently mbind the "all nodes" default set.
-    mbind_to_nodes(std::ptr::null_mut(), 0, &[]);
-    mbind_to_nodes(std::ptr::null_mut(), 4096, &[]);
+    // SAFETY: both calls hit the `nodes.is_empty()` short-circuit
+    // before `addr` is dereferenced, so the null pointer is never
+    // passed to the syscall.
+    unsafe {
+        mbind_to_nodes(std::ptr::null_mut(), 0, &[]);
+        mbind_to_nodes(std::ptr::null_mut(), 4096, &[]);
+    }
 }
 
 // -- NUMA-aware pinning tests --

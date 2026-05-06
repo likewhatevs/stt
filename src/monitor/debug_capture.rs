@@ -906,7 +906,10 @@ mod tests {
         let fp = project_fingerprint(&[], Some(&dump));
         assert_eq!(fp.sched_policy_hints.len(), 4);
         assert!(
-            matches!(fp.sched_policy_hints[0], SchedPolicyHint::Fifo { priority: 75 }),
+            matches!(
+                fp.sched_policy_hints[0],
+                SchedPolicyHint::Fifo { priority: 75 }
+            ),
             "short name 'rt' must project to Fifo, got {:?}",
             fp.sched_policy_hints[0],
         );

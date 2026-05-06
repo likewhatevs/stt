@@ -87,20 +87,12 @@ coverage data (`MSG_TYPE_PROFRAW`), per-payload-invocation metrics
 (`MSG_TYPE_RAW_PAYLOAD_OUTPUT`). Each TLV frame has a CRC32 for
 integrity checking.
 
-**SHM ring buffer** -- the early-boot fallback for the TLV stream.
-When `/dev/vport0p1` is not yet available (multiport handshake in
-progress), `shm_ring::write_msg` falls back to the SHM ring; the
-host's bulk drain merges port-1 bytes with the SHM ring drain so
-messages emitted before the port came up still reach the test
-verdict. The SHM region also hosts the snapshot doorbell and
-signal-slot control plane.
-
 ## Virtio devices
 
 The VMM implements three virtio-MMIO devices in addition to the
-serial console + SHM channels above. All three speak the virtio
-1.x MMIO transport (virtio-v1.2 §4.2.2) with `VIRTIO_F_VERSION_1`
-and use irqfd (eventfd → KVM GSI) for interrupt delivery.
+serial console above. All three speak the virtio 1.x MMIO transport
+(virtio-v1.2 §4.2.2) with `VIRTIO_F_VERSION_1` and use irqfd
+(eventfd → KVM GSI) for interrupt delivery.
 
 - **virtio-blk** (`vmm::virtio_blk`) -- file-backed block device
   with a single request virtqueue and a token-bucket throttle.

@@ -312,9 +312,26 @@ fn write_cpus(
             let first_phandle = CACHE_PHANDLE_BASE + llc_id * chain_depth as u32;
             fdt.property_u32("next-level-cache", first_phandle)
                 .context("cpu next-level-cache")?;
+            // L1 cache properties live on the CPU node, NOT on a
+            // separate cache node. The kernel's cacheinfo parser
+            // (drivers/base/cacheinfo.c) walks `next-level-cache`
+            // only for `level != 1`; for L1 it reads cache-unified,
+            // {i,d,}-cache-size, etc. directly off the CPU node.
+            // Specifically:
+            //   * `init_of_cache_level` calls `of_count_cache_leaves(np)`
+            //     where np is the CPU node — that helper reads
+            //     `cache-unified` to decide L1 leaf count
+            //     (unified=1 leaf vs. split=2 leaves).
+            //   * `cache_setup_of_node` only walks
+            //     `of_find_next_cache_node` once `this_leaf->level != 1`;
+            //     L1 leaves keep np pointing at the CPU node.
             // When the host L1 is unified (single leaf in CLIDR),
-            // of_count_cache_leaves defaults to 2 (separate I/D).
-            // cache-unified reduces the OF count to 1 to match CLIDR.
+            // of_count_cache_leaves's default would otherwise be 2
+            // (separate I/D); emitting `cache-unified` on the CPU
+            // node reduces the OF count to 1 to match CLIDR. This is
+            // the canonical placement for L1 metadata; moving it to
+            // a sibling cache node would not be picked up because
+            // the parser does not walk for L1.
             if guest_l1_unified {
                 fdt.property_null("cache-unified")
                     .context("cpu cache-unified")?;
@@ -592,16 +609,7 @@ mod tests {
     fn create_fdt_minimal() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            256,
-            "console=ttyS0",
-            None,
-            None,
-            0,
-            false,
-        );
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false);
         assert!(dtb.is_ok(), "FDT creation failed: {:?}", dtb.err());
         let dtb = dtb.unwrap();
         assert_eq!(&dtb[..4], &[0xd0, 0x0d, 0xfe, 0xed]);
@@ -619,7 +627,6 @@ mod tests {
             Some(0x4020_0000),
             Some(0x10_0000),
             0,
-            0,
             false,
         );
         assert!(dtb.is_ok());
@@ -636,16 +643,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            1024,
-            "console=ttyS0",
-            None,
-            None,
-            2,
-            false,
-        );
+        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false);
         assert!(dtb.is_ok());
     }
 
@@ -660,16 +658,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            512,
-            "console=ttyS0",
-            None,
-            None,
-            2,
-            false,
-        );
+        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 2, false);
         assert!(dtb.is_ok(), "FDT creation failed: {:?}", dtb.err());
     }
 
@@ -684,16 +673,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            1024,
-            "console=ttyS0",
-            None,
-            None,
-            2,
-            false,
-        );
+        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false);
         assert!(dtb.is_ok());
     }
 
@@ -824,17 +804,7 @@ mod tests {
     fn parse_dtb_props_paths_no_leading_slash() {
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            256,
-            "console=ttyS0",
-            None,
-            None,
-            0,
-            false,
-        )
-        .unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // Top-level node paths must not start with "/".
@@ -887,17 +857,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            512,
-            "console=ttyS0",
-            None,
-            None,
-            2,
-            false,
-        )
-        .unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 512, "console=ttyS0", None, None, 2, false).unwrap();
         check_cpu_numa_node_ids(&topo, &parse_dtb_props(&dtb));
 
         // SMT variant: sibling threads share the same LLC and must get
@@ -936,17 +896,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            256,
-            "console=ttyS0",
-            None,
-            None,
-            2,
-            false,
-        )
-        .unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 2, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         // CPU nodes must NOT have numa-node-id when numa_nodes == 1.
@@ -969,11 +919,7 @@ mod tests {
     }
 
     /// Check multi-NUMA memory nodes: numa-node-id, reg, contiguity, total size.
-    fn check_memory_nodes(
-        topo: &Topology,
-        props: &[(String, String, Vec<u8>)],
-        memory_mb: u32,
-    ) {
+    fn check_memory_nodes(topo: &Topology, props: &[(String, String, Vec<u8>)], memory_mb: u32) {
         let mem_size = (memory_mb as u64) << 20;
         let layout = NumaMemoryLayout::compute(topo, memory_mb, DRAM_START).unwrap();
         let regions = layout.regions();
@@ -1057,17 +1003,7 @@ mod tests {
             distances: None,
         };
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            1024,
-            "console=ttyS0",
-            None,
-            None,
-            2,
-            false,
-        )
-        .unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 1024, "console=ttyS0", None, None, 2, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         let matrix = prop_u32_array(&props, "distance-map", "distance-matrix")
@@ -1119,7 +1055,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             3,
             false,
         )
@@ -1204,7 +1139,6 @@ mod tests {
             "console=ttyS0",
             None,
             None,
-            0,
             3,
             false,
         )
@@ -1231,17 +1165,7 @@ mod tests {
         // pmuv3 driver attaches to so BPF perf-event syscalls succeed.
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            256,
-            "console=ttyS0",
-            None,
-            None,
-            0,
-            false,
-        )
-        .unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false).unwrap();
         let props = parse_dtb_props(&dtb);
 
         let compat = props
@@ -1354,17 +1278,7 @@ mod tests {
         use crate::vmm::aarch64::kvm::PMU_INTID;
         let topo = default_topo();
         let mpidrs = fake_mpidrs(topo.total_cpus());
-        let dtb = test_fdt(
-            &topo,
-            &mpidrs,
-            256,
-            "console=ttyS0",
-            None,
-            None,
-            0,
-            false,
-        )
-        .unwrap();
+        let dtb = test_fdt(&topo, &mpidrs, 256, "console=ttyS0", None, None, 0, false).unwrap();
         let props = parse_dtb_props(&dtb);
         let irq = prop_u32_array(&props, "pmu", "interrupts").expect("pmu interrupts must exist");
         assert_eq!(

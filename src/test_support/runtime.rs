@@ -23,6 +23,28 @@ pub(crate) fn verbose() -> bool {
         .unwrap_or(false)
 }
 
+/// True when `KTSTR_NO_PERF_MODE` is set to a NON-EMPTY value.
+///
+/// Centralises the perf-mode-disabled check used by the dispatch
+/// gauntlet routes (`run_named_test`, `run_gauntlet_test` in
+/// `super::dispatch`) and the eval entry path
+/// (`super::eval::run_ktstr_test_inner_impl`). All four sites
+/// previously called `std::env::var("KTSTR_NO_PERF_MODE").is_ok()`
+/// directly, which returned true for `KTSTR_NO_PERF_MODE=` (empty
+/// string set, e.g. via `unset`/`set` interplay in CI shells, or a
+/// `--env KTSTR_NO_PERF_MODE` Docker pass-through with no value) —
+/// silently skipping every `performance_mode` test. Requiring a
+/// non-empty value matches operator intent ("set it to something to
+/// disable perf mode") and rejects the empty-string accident.
+///
+/// `cargo ktstr test --no-perf-mode` exports `KTSTR_NO_PERF_MODE=1`
+/// (a non-empty value), so the existing CLI surface is unaffected.
+pub(crate) fn no_perf_mode_active() -> bool {
+    std::env::var("KTSTR_NO_PERF_MODE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Derive initramfs archive path, host path, and guest path from a
 /// scheduler's `config_file`. Returns `None` when no config file is set.
 pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {

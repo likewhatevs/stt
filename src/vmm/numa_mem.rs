@@ -347,7 +347,12 @@ impl NumaMemoryLayout {
             };
 
             // Step 3: Per-node mbind (before any page faults).
-            super::host_topology::mbind_to_nodes(ptr, region.size as usize, nodes);
+            // SAFETY: `ptr` was obtained from `guest_mem.get_host_address` for
+            // an mmap'd region of `region.size` bytes (validated by
+            // GuestMemoryMmap), so the (ptr, len) pair is a valid mapped range.
+            unsafe {
+                super::host_topology::mbind_to_nodes(ptr, region.size as usize, nodes);
+            }
 
             // Step 4: Pre-fault after mbind.
             let ret = unsafe {

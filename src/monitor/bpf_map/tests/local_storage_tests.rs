@@ -680,10 +680,7 @@ fn iter_local_storage_owner_zero_surfaces_zero_for_shared_entries() {
     let mut scene = build_storage_scene(
         1,
         0,
-        &[vec![
-            (v1.clone(), 0u64, None),
-            (v2.clone(), 0u64, None),
-        ]],
+        &[vec![(v1.clone(), 0u64, None), (v2.clone(), 0u64, None)]],
         4,
         BPF_MAP_TYPE_TASK_STORAGE,
     );
@@ -704,22 +701,18 @@ fn iter_local_storage_owner_zero_surfaces_zero_for_shared_entries() {
     // explicitly so the test's premise survives a future change to
     // the helper's default fill.
     let owner_pa = ls_start + ts.ls_owner as u64;
-    scene.buf[owner_pa as usize..owner_pa as usize + 8]
-        .copy_from_slice(&0u64.to_ne_bytes());
+    scene.buf[owner_pa as usize..owner_pa as usize + 8].copy_from_slice(&0u64.to_ne_bytes());
 
     // Elem 1's `elem_local_storage` field lives at
     // `elem_pas[1] + ts.elem_local_storage`.
-    let elem1_ls_off =
-        scene.elem_pas[1] as usize + ts.elem_local_storage;
-    scene.buf[elem1_ls_off..elem1_ls_off + 8]
-        .copy_from_slice(&shared_ls_kva.to_ne_bytes());
+    let elem1_ls_off = scene.elem_pas[1] as usize + ts.elem_local_storage;
+    scene.buf[elem1_ls_off..elem1_ls_off + 8].copy_from_slice(&shared_ls_kva.to_ne_bytes());
     // Sanity: elem 0's ls KVA must already point at the shared
     // block (the scene helper writes
     // `pa_to_kva(ls_start + 0 * ls_size)`, which equals
     // `shared_ls_kva` by construction). Read it back to make the
     // shared-cache premise explicit.
-    let elem0_ls_off =
-        scene.elem_pas[0] as usize + ts.elem_local_storage;
+    let elem0_ls_off = scene.elem_pas[0] as usize + ts.elem_local_storage;
     let elem0_ls_kva = u64::from_ne_bytes(
         scene.buf[elem0_ls_off..elem0_ls_off + 8]
             .try_into()

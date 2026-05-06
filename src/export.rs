@@ -1411,13 +1411,13 @@ mod tests {
 
         // Preamble half (positive content checks): operator-visible
         // identifiers must reflect the entry name and the test's
-        // duration default (DEFAULT.duration is 2s).
+        // duration default (DEFAULT.duration is 12s).
         assert!(
             raw[..split_at].contains("KTSTR_TEST_NAME=export_smoke"),
             "preamble must name the entry",
         );
         assert!(
-            raw[..split_at].contains("TEST_DURATION_SECS=2"),
+            raw[..split_at].contains("TEST_DURATION_SECS=12"),
             "preamble must reflect the entry's duration",
         );
     }

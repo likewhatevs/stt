@@ -1846,7 +1846,7 @@ fn store_in_lock_recheck_bypasses_when_content_actually_differs() {
 ///  collapse-fired observation as a softer informational
 ///  check that can fail under adversarial scheduling without
 ///  bricking the test — pinning the WEAKER invariant is the
-///  correct trade per CLAUDE.md (probabilistic flakes mask
+///  correct trade (probabilistic flakes mask
 ///  real regressions).
 ///
 /// Sibling of `store_in_lock_recheck_serialises_concurrent_peers`

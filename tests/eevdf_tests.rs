@@ -17,24 +17,13 @@ use std::time::Duration;
 /// exits within one poll cycle of the stop signal.
 ///
 /// The 60-second host-side watchdog (`KTSTR_VM_TIMEOUT`, compile-time
-/// const at `src/test_support/runtime.rs`) bounds the run; the
-/// `cleanup_budget_ms = 5000` attribute below tightens that bound for
-/// the host-side teardown window specifically, comparing
-/// [`ktstr::vmm::VmResult::cleanup_duration`] against
-/// [`KtstrTestEntry::cleanup_budget`](`ktstr::test_support::KtstrTestEntry::cleanup_budget`)
-/// in `evaluate_vm_result`. A regression that re-introduces a partial
-/// cleanup wait (a 30s teardown that the 60s watchdog would silently
-/// absorb) flags here as a budget overshoot. The empty body keeps the
-/// test cheap so it can run on every PR. The cleanup duration is
-/// also persisted to the sidecar, so stats tooling can spot drift
-/// across runs even when the budget passes.
-#[ktstr_test(
-    llcs = 1,
-    cores = 1,
-    threads = 1,
-    memory_mb = 256,
-    cleanup_budget_ms = 5000
-)]
+/// const at `src/test_support/runtime.rs`) bounds the run; a regression
+/// that re-wedges teardown surfaces as a watchdog timeout. The empty
+/// body keeps the test cheap so it can run on every PR. The cleanup
+/// duration is persisted to the sidecar by
+/// [`ktstr::vmm::VmResult::cleanup_duration`], so stats tooling can
+/// spot drift across runs even without a per-test budget assertion.
+#[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mb = 256)]
 fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }

@@ -133,9 +133,9 @@ impl Default for KtstrVmBuilder {
             memory_mb: Some(256),
             memory_min_mb: 0,
             cmdline_extra: String::new(),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(12),
             monitor_thresholds: None,
-            watchdog_timeout: Some(Duration::from_secs(4)),
+            watchdog_timeout: Some(Duration::from_secs(5)),
             bpf_map_writes: Vec::new(),
             performance_mode: false,
             no_perf_mode: false,
@@ -266,6 +266,14 @@ impl KtstrVmBuilder {
     pub fn cmdline(mut self, extra: &str) -> Self {
         self.cmdline_extra = extra.to_string();
         self
+    }
+
+    /// Alias for [`Self::cmdline`]. The field is named
+    /// `cmdline_extra` internally; the alias matches the field name
+    /// for callers that prefer the longer form.
+    #[allow(dead_code)]
+    pub fn cmdline_extra(self, extra: &str) -> Self {
+        self.cmdline(extra)
     }
 
     /// Host-side watchdog timeout. The VM is killed if it has not
@@ -1032,7 +1040,7 @@ mod tests {
     #[test]
     fn builder_watchdog_timeout_default() {
         let b = KtstrVmBuilder::default();
-        assert_eq!(b.watchdog_timeout, Some(Duration::from_secs(4)));
+        assert_eq!(b.watchdog_timeout, Some(Duration::from_secs(5)));
     }
 
     #[test]

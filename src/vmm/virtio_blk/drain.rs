@@ -375,6 +375,19 @@ pub(crate) fn drain_bracket_impl(
                     // retry loop spin indefinitely as the
                     // snapshot re-enters the previously-rejected
                     // state.
+                    //
+                    // The debug_assert enforces the single-bit
+                    // invariant at runtime in debug builds: a
+                    // future change to NEEDS_RESET that introduces
+                    // additional bits would trip here before
+                    // shipping a regression that expands
+                    // `set_status`'s CAS retry universe.
+                    debug_assert_eq!(
+                        VIRTIO_CONFIG_S_NEEDS_RESET.count_ones(),
+                        1,
+                        "VIRTIO_CONFIG_S_NEEDS_RESET must be a single bit; \
+                         multi-bit fetch_or would expand set_status's CAS retry universe"
+                    );
                     device_status.fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
                     interrupt_status.fetch_or(VIRTIO_MMIO_INT_CONFIG, Ordering::Release);
                     // SAFETY: EAGAIN requires counter saturation at
@@ -409,36 +422,66 @@ pub(crate) fn drain_bracket_impl(
                     // `ready()` gate above already filtered this;
                     // would only fire on a TOCTOU race with a
                     // vCPU-side reset MMIO write) or
-                    // address-overflow on `avail_idx`. Log and
-                    // bail — the kick is wasted but the device
-                    // recovers on the next legitimate notify. Do
-                    // NOT poison: these are not
-                    // structural-invariant violations the way
-                    // InvalidAvailRingIndex is, so a future
-                    // legitimate kick may succeed.
+                    // address-overflow on `avail_idx`. These are
+                    // structural failures of the avail ring's
+                    // guest-published metadata: the next iter()
+                    // would re-trip the same error, and re-arming
+                    // notifications would just route the next kick
+                    // back into this same arm — looping the worker
+                    // forever at full vCPU/host-CPU cost, exactly
+                    // like the InvalidAvailRingIndex case above.
                     //
-                    // Re-arm notifications before bailing. The
-                    // outer-loop's normal exit path calls
-                    // `enable_notification` (Ok(false) arm at the
-                    // bottom of the outer loop); a raw `break 'outer`
-                    // here skips that re-arm and leaves used.flags
-                    // with VRING_USED_F_NO_NOTIFY set (legacy path)
-                    // or a stale avail_event (EVENT_IDX path) from
-                    // the entry-side `disable_notification`. Without
-                    // re-arm the next QUEUE_NOTIFY may not reach the
-                    // device (legacy: the guest's `virtqueue_kick`
-                    // skips the MMIO write when used.flags bit is
-                    // set; EVENT_IDX: the guest checks avail_event
-                    // for the suppression decision), and the queue
-                    // hangs until the hung-task watchdog
+                    // Poison the queue so future drains
+                    // short-circuit, and surface NEEDS_RESET +
+                    // INT_CONFIG to the guest's STATUS path. The
+                    // poison flag clears only on a full virtio
+                    // reset (`reset_engine_inline` /
+                    // `respawn_worker` rebuilds state with
+                    // `queue_poisoned: false`). Until then the
+                    // device will not service IO — operators see
+                    // the wedged state via `mmio_read(STATUS)` or
+                    // the failure-dump counters before the guest's
+                    // hung-task watchdog fires
                     // (`kernel.hung_task_timeout_secs`, default
-                    // 120 s — virtio_blk has no `mq_ops->timeout`
-                    // callback). Re-arming is best-effort: if it
-                    // also fails we log and bail anyway.
-                    if let Err(re) = queues[REQ_QUEUE].enable_notification(mem) {
-                        tracing::warn!(%re, "virtio-blk enable_notification failed after iter() error");
+                    // 120 s; virtio_blk has no `mq_ops->timeout`).
+                    //
+                    // Do NOT call `enable_notification` here for
+                    // the same reason as the
+                    // InvalidAvailRingIndex arm above:
+                    // re-enabling would arm the next kick to
+                    // re-enter `iter()` and re-trip the same
+                    // error. The poison gate at the top of
+                    // `drain_bracket_impl` ensures every
+                    // subsequent drain returns `Done` without
+                    // touching the queue.
+                    state.queue_poisoned = true;
+                    state.counters.record_io_error();
+                    tracing::warn!(
+                        %e,
+                        "virtio-blk iter() failed (non-InvalidAvailRingIndex); \
+                         poisoning queue until guest reset"
+                    );
+                    // Mirror the InvalidAvailRingIndex arm's
+                    // NEEDS_RESET signaling: SeqCst fetch_or pairs
+                    // with mmio_read's Acquire load and
+                    // set_status's CAS retry-loop Acquire failure
+                    // ordering so the guest's STATUS query
+                    // observes the bit. The single-bit invariant
+                    // (only NEEDS_RESET ever flipped from the
+                    // worker side) keeps `set_status`'s retry
+                    // loop bounded — see the assertion at the
+                    // sibling fetch_or above.
+                    debug_assert_eq!(
+                        VIRTIO_CONFIG_S_NEEDS_RESET.count_ones(),
+                        1,
+                        "VIRTIO_CONFIG_S_NEEDS_RESET must be a single bit; \
+                         multi-bit fetch_or would expand set_status's CAS retry universe"
+                    );
+                    device_status.fetch_or(VIRTIO_CONFIG_S_NEEDS_RESET, Ordering::SeqCst);
+                    interrupt_status.fetch_or(VIRTIO_MMIO_INT_CONFIG, Ordering::Release);
+                    if let Err(we) = irq_evt.write(1) {
+                        tracing::warn!(%we, "virtio-blk irq_evt.write failed");
                     }
-                    tracing::warn!(%e, "virtio-blk iter() failed");
                     break 'outer;
                 }
             };
@@ -478,16 +521,64 @@ pub(crate) fn drain_bracket_impl(
             // runs on the worker thread in production (cfg(test): on
             // the test thread) and is invoked once per kick (one
             // per QUEUE_NOTIFY MMIO write in production).
+            //
+            // Bound the push at `VIRTIO_BLK_SEG_MAX + 2`. A hostile
+            // guest can submit a chain with up to `queue.size` (max
+            // 32768 per virtio-v1.2 §2.7.5.2) descriptors, which at
+            // `sizeof(ChainDescriptor)` = 24 bytes would force the
+            // scratch Vec to grow to ~786KB per request — defeating
+            // the with_capacity preallocation and producing
+            // unbounded heap pressure under sustained hostile load.
+            // The kernel's `virtblk_add_req` (drivers/block/
+            // virtio_blk.c) never emits more than `seg_max + 2`
+            // descriptors, so this cap is invisible on the
+            // legitimate-guest path.
+            //
+            // For an oversized chain (`chain_len > SCRATCH_CAP`),
+            // the capped Vec misses the chain's true last
+            // descriptor (the guest's status descriptor), so the
+            // standard "extract status_addr from last entry"
+            // identification below would point at the wrong GPA
+            // and an IOERR-publish would write status to a
+            // non-status descriptor while the guest's real status
+            // descriptor stays uninitialized. The guest's
+            // `virtblk_done` reads `vbr->in_hdr.status` from its
+            // published address and observes stale blk-mq tag
+            // bytes — the F15 silent-data-corruption pattern.
+            //
+            // We therefore drop oversized chains BEFORE extracting
+            // status_addr. No add_used, no IOERR publish, no
+            // signal — the chain stays invisible to the guest and
+            // hangs in blk-mq's timer loop until the hung-task
+            // watchdog fires. Same blast radius as the
+            // "no status descriptor" branch below; same
+            // documentation rationale (a hostile guest submitting
+            // a structural-spec violation gets the hang). We bump
+            // `io_errors` so the operator sees the rejection.
             state.all_descs_scratch.clear();
+            const SCRATCH_CAP: usize = VIRTIO_BLK_SEG_MAX as usize + 2;
+            let mut chain_len: usize = 0;
             for desc in chain {
-                state.all_descs_scratch.push(ChainDescriptor {
-                    addr: desc.addr(),
-                    len: desc.len(),
-                    is_write_only: desc.is_write_only(),
-                });
+                chain_len += 1;
+                if state.all_descs_scratch.len() < SCRATCH_CAP {
+                    state.all_descs_scratch.push(ChainDescriptor {
+                        addr: desc.addr(),
+                        len: desc.len(),
+                        is_write_only: desc.is_write_only(),
+                    });
+                }
             }
-
-            let chain_len = state.all_descs_scratch.len();
+            if chain_len > SCRATCH_CAP {
+                tracing::warn!(
+                    head,
+                    desc_count = chain_len,
+                    "virtio-blk chain exceeds seg_max + 2; dropping (oversized chain \
+                     prevents reliable status_addr identification, leaving the guest \
+                     to surface the request via blk-mq timer / hung-task watchdog)"
+                );
+                state.counters.record_io_error();
+                continue;
+            }
 
             let mut header_addr: Option<GuestAddress> = None;
             let mut status_addr: Option<GuestAddress> = None;
@@ -577,48 +668,11 @@ pub(crate) fn drain_bracket_impl(
                 continue;
             };
 
-            // SEG_MAX enforcement: the descriptor count includes the
-            // header (1) + data segments (<= VIRTIO_BLK_SEG_MAX) +
-            // status (1). Reject chains whose total count exceeds
-            // `VIRTIO_BLK_SEG_MAX + 2`. Without this, the advertised
-            // `seg_max` is a lie a hostile guest can ignore — it
-            // could submit thousands of descriptors and force the
-            // device to allocate matching scratch storage per
-            // request. The check is placed AFTER status_addr
-            // identification so the rejection produces a normal
-            // IOERR completion (status byte write + add_used) rather
-            // than dropping the chain entirely. Hoisting the check
-            // earlier was the original design, but it left the
-            // chain stuck in the avail ring with no path to error
-            // surfacing — virtio_blk has no `mq_ops->timeout`
-            // callback (drivers/block/virtio_blk.c `virtio_mq_ops`
-            // has no `.timeout` field), so blk-mq alone never
-            // surfaces the unpublished request; the guest only sees
-            // the stall once the hung-task watchdog fires
-            // (`kernel.hung_task_timeout_secs`, default 120 s).
-            // Standard IOERR completion gives the guest's block
-            // layer an immediate error to surface.
-            if chain_len > VIRTIO_BLK_SEG_MAX as usize + 2 {
-                tracing::warn!(
-                    head,
-                    desc_count = chain_len,
-                    "virtio-blk chain exceeds seg_max + 2"
-                );
-                state.counters.record_io_error();
-                if publish_completion(
-                    mem,
-                    q,
-                    &state.counters,
-                    head,
-                    status_addr,
-                    VIRTIO_BLK_S_IOERR as u8,
-                    1,
-                    "seg_max reject",
-                ) {
-                    signal_needed = true;
-                }
-                continue;
-            }
+            // SEG_MAX enforcement: handled at scratch population
+            // above. An oversized chain is dropped before status
+            // extraction because the capped scratch view cannot
+            // identify the guest's true status descriptor — see
+            // the rationale above the chain-walk loop.
 
             // When the header is missing/short but the status
             // descriptor is valid, publish IOERR via
@@ -750,6 +804,41 @@ pub(crate) fn drain_bracket_impl(
                     VIRTIO_BLK_S_IOERR as u8,
                     1,
                     "zero-data",
+                ) {
+                    signal_needed = true;
+                }
+                continue;
+            }
+
+            // T_FLUSH with non-empty data segments must IOERR.
+            // virtio-v1.2 §5.2.6.2 defines T_FLUSH as carrying no
+            // data payload — only the header and status descriptors.
+            // The kernel's `virtblk_setup_cmd` sets
+            // `vbr->in_hdr_len = sizeof(status)` for flushes
+            // (drivers/block/virtio_blk.c) and never emits data
+            // descriptors for flush requests. A hostile guest that
+            // attaches fake data segments to T_FLUSH would otherwise
+            // drain the bytes_bucket budget for `data_len` bytes
+            // without any actual data transfer, defeating the
+            // throttle's bandwidth limit. Reject up-front so the
+            // throttle bucket is never charged for a malformed
+            // flush.
+            if req_type == VIRTIO_BLK_T_FLUSH && !data_segments.is_empty() {
+                tracing::warn!(
+                    head,
+                    seg_count = data_segments.len(),
+                    "virtio-blk T_FLUSH with non-empty data segments"
+                );
+                state.counters.record_io_error();
+                if publish_completion(
+                    mem,
+                    q,
+                    &state.counters,
+                    head,
+                    status_addr,
+                    VIRTIO_BLK_S_IOERR as u8,
+                    1,
+                    "flush-with-data",
                 ) {
                     signal_needed = true;
                 }

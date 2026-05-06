@@ -23,6 +23,7 @@ fn value_ctx<'a>(mem: &'a GuestMem, cr3_pa: u64, l5: bool) -> AccessorCtx<'a> {
         l5,
         tcr_el1: 0,
         start_kernel_map: START_KERNEL_MAP,
+        phys_base: 0,
     }
 }
 
@@ -41,6 +42,7 @@ pub(super) fn lookup_ctx<'a>(
         l5,
         tcr_el1: 0,
         start_kernel_map: START_KERNEL_MAP,
+        phys_base: 0,
     }
 }
 
@@ -3840,7 +3842,7 @@ fn map_metadata_short_copy_u64_at_falls_through_to_scalar() {
     );
     let mut buf = vec![0u8; total];
     let in_range_off: usize = 16;
-    let in_range_val: u64 = 0xCAFEBABE_DEAD_F00D;
+    let in_range_val: u64 = 0xCAFE_BABE_DEAD_F00D;
     buf[map_pa as usize + in_range_off..map_pa as usize + in_range_off + 8]
         .copy_from_slice(&in_range_val.to_ne_bytes());
     // SAFETY: buf is a live local Vec<u8> whose backing storage
@@ -3923,12 +3925,12 @@ fn per_cpu_offsets_cache_hit_returns_same_arc() {
         vec![0u64, 0x1000, 0x2000, 0x3000]
     };
 
-    let first = cache.get_or_init(4, &init);
+    let first = cache.get_or_init(4, init);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(first.as_slice(), &[0u64, 0x1000, 0x2000, 0x3000]);
 
     // Same num_cpus → cache hit. Closure must NOT run again.
-    let second = cache.get_or_init(4, &init);
+    let second = cache.get_or_init(4, init);
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,

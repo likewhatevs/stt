@@ -580,20 +580,25 @@ fn write_struct(
         {
             continue;
         }
-        // Pre-render the value to a single-line string ONLY for
-        // flat scalars. Compound members (Struct, Array, Ptr-with-
-        // deref, Truncated, CpuList, Unsupported) always produce
-        // multi-line output OR carry their own internal layout
-        // that the breadcrumb path re-renders directly via
-        // `write_rendered_value`. Pre-rendering them here would
-        // cost a full format pass whose result is discarded — the
-        // inline-fit probe rejects the row at line 922 because
-        // `single_line` is `None`, and the multi-line path skips
-        // the cached string anyway. Setting `None` for compounds
-        // matches the contract `try_inline_from_rendered` already
-        // expects (line 922 short-circuits on the first None).
+        // Pre-render the value to a single-line string for flat
+        // scalars and for nested Struct values whose own Display
+        // happens to fit inline (no embedded `\n`). Other compound
+        // members (Array, Ptr-with-deref, Truncated, CpuList,
+        // Unsupported) always produce multi-line output OR carry
+        // their own internal layout that the breadcrumb path
+        // re-renders directly via `write_rendered_value`, so they
+        // get `None` here. A `None` rendering causes
+        // `try_inline_from_rendered` to bail to the multi-line
+        // path. Allowing nested Structs to participate in the
+        // outer's inline form lets `outer{child=inner{a=1}}` pack
+        // onto one line when both are small enough — without it,
+        // any nested Struct would force the breadcrumb form even
+        // for trivial two-level cases.
         let single_line = if is_flat_scalar(&m.value) {
             Some(format!("{}", m.value))
+        } else if matches!(m.value, RenderedValue::Struct { .. }) {
+            let s = format!("{}", m.value);
+            if s.contains('\n') { None } else { Some(s) }
         } else {
             None
         };
@@ -1454,11 +1459,6 @@ pub trait MemReader {
 /// Render a BTF type's bytes into a [`RenderedValue`] without an
 /// associated guest-memory reader. Pointer dereferences degrade
 /// gracefully — the raw pointer hex is emitted without chasing.
-///
-/// `dead_code` allow: kept as the public entry point for callers
-/// that don't need pointer chasing; the live render paths in
-/// failure-dump rendering currently always supply a reader via
-/// [`render_value_with_mem`].
 #[allow(dead_code)]
 pub fn render_value(btf: &Btf, type_id: u32, bytes: &[u8]) -> RenderedValue {
     let mut visited: HashSet<u64> = HashSet::new();

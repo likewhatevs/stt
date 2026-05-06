@@ -20,8 +20,8 @@ use anyhow::{Context, Result};
 use super::Kva;
 use super::reader::{Aarch64WalkParams, GuestMem};
 use super::symbols::{
-    kva_to_pa, resolve_page_offset_with_tcr, resolve_pgtable_l5, start_kernel_map_for_tcr,
-    text_kva_to_pa_with_base,
+    kva_to_pa, resolve_page_offset_with_tcr, resolve_pgtable_l5, resolve_phys_base,
+    start_kernel_map_for_tcr, text_kva_to_pa_with_base,
 };
 
 /// Host-side accessor for kernel memory in a running guest VM.
@@ -80,6 +80,25 @@ pub struct GuestKernel<'a> {
     ///   and 52-bit-VA configurations both translate symbol KVAs to
     ///   the right PAs.
     start_kernel_map: u64,
+    /// Kernel runtime `phys_base` (x86_64) used by every text/data
+    /// symbol translation: `pa = (kva - start_kernel_map) + phys_base`
+    /// (`arch/x86/mm/physaddr.c:15-32`). On a non-KASLR kernel this is
+    /// `0` and the formula collapses to the historical
+    /// `pa = kva - start_kernel_map`. On a KASLR kernel the value
+    /// carries the post-randomization PA of the kernel image. Resolved
+    /// at construction time via [`resolve_phys_base`] which walks the
+    /// guest page tables (CR3 → PA chase, no `phys_base` involvement)
+    /// to find the symbol's PA, breaking the chicken-and-egg with the
+    /// text-symbol translation.
+    ///
+    /// On aarch64 the symbol is absent and the field stays `0`. The
+    /// existing aarch64 derivation (`text_kva_to_pa_with_base` with
+    /// `phys_base = 0` plus `start_kernel_map_for_tcr`-derived base)
+    /// remains correct for non-KASLR aarch64 boots; KASLR-aware
+    /// aarch64 support is a follow-up that resolves
+    /// `kimage_voffset` from a symbol read via the same page-table
+    /// walk.
+    phys_base: u64,
 }
 
 /// Decode `tcr_el1` into [`Aarch64WalkParams`]; returns `None` on
@@ -102,8 +121,17 @@ impl<'a> GuestKernel<'a> {
     /// Create from GuestMem and vmlinux path.
     ///
     /// Parses the ELF symbol table and resolves paging configuration
-    /// from guest memory. Requires `init_top_pgt` (or `swapper_pg_dir`)
-    /// for page table walks.
+    /// from guest memory.
+    ///
+    /// `cr3_pa` is the BSP's CR3 register value (KVM_GET_SREGS on
+    /// x86_64; TTBR1_EL1 on aarch64), masked to a PA. Used to walk
+    /// the page tables for `phys_base` resolution: with KASLR
+    /// enabled the kernel image's runtime PA cannot be derived from
+    /// the `init_top_pgt` symbol (that derivation requires
+    /// `phys_base` itself), so we use the live CR3 from the running
+    /// vCPU instead. `0` is accepted as a bootstrap value — the
+    /// resulting page-table walk will fail and `phys_base` falls
+    /// back to `0` (the non-KASLR value).
     ///
     /// `tcr_el1` is the guest's TCR_EL1 register value, used by the
     /// aarch64 page-table walker to determine the granule (4 KB / 16 KB
@@ -122,16 +150,30 @@ impl<'a> GuestKernel<'a> {
     /// e.g. Apple Silicon). Callers in retry contexts (the freeze
     /// coordinator's lazy-retry loops) must keep polling until
     /// `tcr_el1` has been populated by the BSP loop.
-    pub fn new(mem: &'a GuestMem, vmlinux: &Path, tcr_el1: u64) -> Result<Self> {
+    pub fn new(mem: &'a GuestMem, vmlinux: &Path, tcr_el1: u64, cr3_pa: u64) -> Result<Self> {
         let data = std::fs::read(vmlinux)
             .with_context(|| format!("read vmlinux: {}", vmlinux.display()))?;
         let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
 
+        // Filter on `st_shndx == SHN_UNDEF` (== 0 per ELF spec)
+        // rather than `st_value == 0`. SHN_UNDEF marks linker
+        // placeholders and imports — those have no defining section
+        // and must be skipped. A `st_value == 0` filter would also
+        // drop legitimate defined symbols whose section offset is 0
+        // (the percpu case, fixed identically in
+        // [`crate::vmm::freeze_coord::snapshot::VmlinuxSymbolCache::from_path`]
+        // at the user-watchpoint site). Keeping a defined symbol
+        // whose KVA happens to be 0 is safe — downstream resolvers
+        // reject `kva == 0` so a 0-valued defined symbol surfaces a
+        // diagnostic instead of being silently absent.
+        const SHN_UNDEF: usize = 0;
         let mut symbols = HashMap::new();
         for sym in elf.syms.iter() {
+            if sym.st_shndx == SHN_UNDEF {
+                continue;
+            }
             if let Some(name) = elf.strtab.get_at(sym.st_name)
                 && !name.is_empty()
-                && sym.st_value != 0
             {
                 symbols.insert(name.to_string(), sym.st_value);
             }
@@ -150,12 +192,43 @@ impl<'a> GuestKernel<'a> {
 
         // Resolve paging state using the same logic as KernelSymbols.
         let kern_syms = super::symbols::KernelSymbols::from_vmlinux(vmlinux)?;
-        let init_top_pgt_kva = kern_syms
-            .init_top_pgt
-            .ok_or_else(|| anyhow::anyhow!("init_top_pgt symbol not found in vmlinux"))?;
-        let cr3_pa = text_kva_to_pa_with_base(init_top_pgt_kva, start_kernel_map);
-        let page_offset = resolve_page_offset_with_tcr(mem, &kern_syms, start_kernel_map, tcr_el1);
-        let l5 = resolve_pgtable_l5(mem, &kern_syms, start_kernel_map);
+        // `__pgtable_l5_enabled` is set by `__startup_64` BEFORE
+        // `phys_base` is randomized (the L5 mode is needed to build
+        // the bootstrap page tables themselves), so reading it with
+        // `phys_base = 0` is correct on x86_64 KASLR boots. The bit
+        // is reflected in CR4.LA57 by hardware; using the symbol
+        // here matches the historical path.
+        let l5_bootstrap = resolve_pgtable_l5(mem, &kern_syms, start_kernel_map, 0);
+        // CR3 from KVM SREGS carries PCID/PCD/PWT in bits [11:0]; mask
+        // to a clean PA before walking. The walker also masks
+        // descriptor entries internally but the initial CR3 it
+        // receives is what we hand it, so do the mask here.
+        let walk_cr3 = cr3_pa & !0xFFFu64;
+        // Resolve `phys_base` by walking the page tables. The walker
+        // returns raw PAs from PTE entries — no `phys_base` is
+        // consumed during the walk itself, breaking the
+        // chicken-and-egg that `text_kva_to_pa_with_base` would
+        // otherwise create. A `None` result (symbol absent on
+        // aarch64, walk fails on a still-booting guest) defaults to
+        // `0`, which is the non-KASLR / aarch64 value and produces
+        // the historical translation behaviour.
+        let phys_base = resolve_phys_base(mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1)
+            .unwrap_or(0);
+
+        // Re-resolve l5 with the live `phys_base` so a future
+        // toolchain that sets the L5 flag after `phys_base`
+        // randomization (currently no such kernel exists, but
+        // documenting the assumption here) reads the right PA. With
+        // `phys_base == 0` this re-read is identical to the
+        // bootstrap.
+        let l5 = if phys_base == 0 {
+            l5_bootstrap
+        } else {
+            resolve_pgtable_l5(mem, &kern_syms, start_kernel_map, phys_base)
+        };
+
+        let page_offset =
+            resolve_page_offset_with_tcr(mem, &kern_syms, start_kernel_map, tcr_el1, phys_base);
 
         // Cache the decoded aarch64 walk parameters once. On x86_64
         // the helper's `from_tcr_el1` returns None; the cache stays
@@ -170,11 +243,12 @@ impl<'a> GuestKernel<'a> {
             mem,
             symbols,
             page_offset,
-            cr3_pa,
+            cr3_pa: walk_cr3,
             l5,
             tcr_el1,
             aarch64_params,
             start_kernel_map,
+            phys_base,
         })
     }
 
@@ -220,6 +294,9 @@ impl<'a> GuestKernel<'a> {
             // through `::new` where the value is derived from
             // `tcr_el1`.
             start_kernel_map: super::symbols::START_KERNEL_MAP,
+            // Tests don't exercise KASLR; `phys_base = 0` reproduces
+            // the historical translation: pa = kva - start_kernel_map.
+            phys_base: 0,
         }
     }
 
@@ -288,16 +365,27 @@ impl<'a> GuestKernel<'a> {
         self.start_kernel_map
     }
 
+    /// Resolved kernel runtime `phys_base` (x86_64 KASLR offset).
+    /// `0` on non-KASLR x86_64 boots and on aarch64. Forwarded into
+    /// helpers that build their own
+    /// [`super::symbols::text_kva_to_pa_with_base`] call (e.g.
+    /// reader-side bootstraps that don't carry a `GuestKernel`
+    /// handle directly).
+    pub fn phys_base(&self) -> u64 {
+        self.phys_base
+    }
+
     /// Translate a kernel text/data/bss symbol VA to a DRAM-relative
-    /// offset using the runtime kernel image base resolved at
-    /// construction time. Wraps
+    /// offset using the runtime kernel image base + KASLR `phys_base`
+    /// resolved at construction time. Wraps
     /// [`super::symbols::text_kva_to_pa_with_base`] with the cached
-    /// `start_kernel_map` so callers don't have to re-derive it. On
-    /// aarch64 with VA_BITS=47 (16 KB granule, e.g. Apple Silicon)
-    /// the cached base is the right one; a constant-based helper
-    /// would translate to the wrong offset on those hosts.
+    /// `start_kernel_map` and `phys_base` so callers don't have to
+    /// re-derive them. On aarch64 with VA_BITS=47 (16 KB granule,
+    /// e.g. Apple Silicon) the cached base is the right one; a
+    /// constant-based helper would translate to the wrong offset on
+    /// those hosts.
     pub fn text_kva_to_pa(&self, kva: u64) -> u64 {
-        text_kva_to_pa_with_base(kva, self.start_kernel_map)
+        text_kva_to_pa_with_base(kva, self.start_kernel_map, self.phys_base)
     }
 
     // ---------------------------------------------------------------
@@ -377,9 +465,10 @@ impl<'a> GuestKernel<'a> {
     /// duplicating the dispatch.
     fn translate_kva_cached(&self, kva: u64) -> Option<u64> {
         match self.aarch64_params.as_ref() {
-            Some(params) => self
-                .mem
-                .translate_kva_with_aarch64_params(self.cr3_pa, Kva(kva), self.l5, params),
+            Some(params) => {
+                self.mem
+                    .translate_kva_with_aarch64_params(self.cr3_pa, Kva(kva), self.l5, params)
+            }
             None => self
                 .mem
                 .translate_kva(self.cr3_pa, Kva(kva), self.l5, self.tcr_el1),
@@ -452,9 +541,7 @@ impl<'a> GuestKernel<'a> {
             // Advance to the next page boundary so the next translate
             // lands on a fresh resolved page.
             let page_end = (cur_kva & !(PAGE - 1)).wrapping_add(PAGE);
-            let mut chunk_len = (page_end - cur_kva)
-                .min(total - consumed)
-                .min(region_avail);
+            let mut chunk_len = (page_end - cur_kva).min(total - consumed).min(region_avail);
 
             // Greedy contiguity merge: walk forward translating the
             // next page; if its PA equals `pa + chunk_len` (consecutive
@@ -551,7 +638,7 @@ mod tests {
     fn text_kva_to_pa_and_read() {
         let start_kernel_map: u64 = START_KERNEL_MAP;
         let sym_kva = start_kernel_map + 0x1000;
-        let pa = text_kva_to_pa_with_base(sym_kva, start_kernel_map);
+        let pa = text_kva_to_pa_with_base(sym_kva, start_kernel_map, 0);
         assert_eq!(pa, 0x1000);
 
         let mut buf = vec![0u8; 0x2000];
@@ -589,12 +676,10 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        // SAFETY: mem outlives kernel because buf is on the stack in this test.
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("test_sym".to_string(), 0xFFFF_FFFF_8000_1000u64);
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -602,6 +687,7 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
         assert_eq!(kernel.symbol_kva("test_sym"), Some(0xFFFF_FFFF_8000_1000));
         assert_eq!(kernel.symbol_kva("missing"), None);
@@ -620,11 +706,10 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("my_counter".to_string(), sym_kva);
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -632,6 +717,7 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
         assert_eq!(kernel.read_symbol_u32("my_counter").unwrap(), 99);
     }
@@ -646,11 +732,10 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("my_u64".to_string(), sym_kva);
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -658,6 +743,7 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
         assert_eq!(
             kernel.read_symbol_u64("my_u64").unwrap(),
@@ -675,11 +761,10 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("my_bytes".to_string(), sym_kva);
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -687,6 +772,7 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
         assert_eq!(
             kernel.read_symbol_bytes("my_bytes", 5).unwrap(),
@@ -700,9 +786,8 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols: HashMap::new(),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -710,6 +795,7 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
         assert!(kernel.read_symbol_u32("nonexistent").is_err());
         assert!(kernel.read_symbol_u64("nonexistent").is_err());
@@ -725,11 +811,10 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let mut symbols = HashMap::new();
         symbols.insert("my_var".to_string(), sym_kva);
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols,
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
@@ -737,6 +822,7 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
         kernel.write_symbol_u64("my_var", 0xCAFE_BABE).unwrap();
         assert_eq!(kernel.read_symbol_u64("my_var").unwrap(), 0xCAFE_BABE);
@@ -757,9 +843,8 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols: HashMap::new(),
             page_offset,
             cr3_pa: 0,
@@ -767,6 +852,7 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
         assert_eq!(kernel.read_direct_u32(kva), 77);
         assert_eq!(kernel.read_direct_u64(kva + 8), 0xAAAA_BBBB);
@@ -779,9 +865,8 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols: HashMap::new(),
             page_offset: 0x1234,
             cr3_pa: 0x5678,
@@ -789,11 +874,12 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
         assert_eq!(kernel.page_offset(), 0x1234);
         assert_eq!(kernel.cr3_pa(), 0x5678);
         assert!(kernel.l5());
-        assert!(std::ptr::eq(kernel.mem(), mem_ref));
+        assert!(std::ptr::eq(kernel.mem(), &mem));
     }
 
     #[test]
@@ -814,7 +900,7 @@ mod tests {
         // SAFETY: buf is a live local buffer (Vec<u8> or stack array)
         // whose backing storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = match GuestKernel::new(&mem, &path, 0) {
+        let kernel = match GuestKernel::new(&mem, &path, 0, 0) {
             Ok(k) => k,
             Err(e) => {
                 // init_top_pgt missing in some kernel configs.
@@ -847,71 +933,27 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn read_kva_bytes_chunked_crosses_numa_region_boundary() {
-        // Two host buffers (region 0 and region 1) wired into
-        // one GuestMem with adjacent DRAM offsets, so PAs are
-        // contiguous across the boundary even though host
-        // pointers differ.
-        const REGION_SIZE: usize = 0x4000;
-        let mut buf0 = vec![0u8; REGION_SIZE];
-        let mut buf1 = vec![0u8; REGION_SIZE];
+        // Two adjacent regions backed by separate host buffers,
+        // with data pages A and B at contiguous PAs (0x4000 →
+        // 0x5000) straddling the boundary. Without the
+        // `region_avail` cap on the greedy merge, a single
+        // `read_bytes` call would short-return at the boundary
+        // and the wrapper would surface that as `None`.
+        //
+        // Region 0 [0x0000..0x5000): PML4@0, PDPT@0x1000,
+        // PD@0x2000, PT@0x3000, data A@0x4000.
+        // Region 1 [0x5000..0x9000): data B@0x5000.
+        //
+        // Every page-table base is 4-KiB-aligned. walk_4level
+        // masks descriptors with `ADDR_MASK =
+        // 0x000F_FFFF_FFFF_F000`; a sub-page-aligned base would
+        // round down to the page boundary and route the next
+        // table read to the wrong page.
+        const REGION0_SIZE: usize = 0x5000;
+        const REGION1_SIZE: usize = 0x4000;
+        let mut buf0 = vec![0u8; REGION0_SIZE];
+        let mut buf1 = vec![0u8; REGION1_SIZE];
 
-        // Page-table layout in region 0 (PAs < 0x4000):
-        //   PML4 at 0x0000 (page 0)
-        //   PDPT at 0x1000 (page 1)
-        //   PD   at 0x2000 (page 2)
-        //   PT   at 0x3000 (page 3)
-        // Data:
-        //   page A at PA 0x3800 (last 0x800 of region 0; PT is
-        //                        only 4 KiB but we use 0x3000 as
-        //                        its base, so 0x3800 lies AFTER
-        //                        the PT entries we use). Actually
-        //                        for safety put PT at 0x3000 and
-        //                        data page A at PA 0x4000-0x1000=
-        //                        no — PA 0x3000 IS the PT page;
-        //                        we must not overwrite it.
-        //   The 4 KiB data page A must sit somewhere not
-        //   overlapping the PT. Use PA 0x2000 for the PD and
-        //   PA 0x3000 for the PT, then place data page A at
-        //   region 0's last 4 KiB-aligned offset 0x3000? That
-        //   collides. Reshape: PT at PA 0x1800 (we only use
-        //   one PT entry, so 8 bytes is enough — PT page is
-        //   shared with PD page in this minimal test, and
-        //   PD at 0x1000 sub-region [0x1000..0x1800), PT at
-        //   [0x1800..0x2000)). We could use the upper half of
-        //   the PD page for PT entries since each table consumes
-        //   only one entry.
-        //
-        // Simpler: just pick PA layout that leaves room for data:
-        //   PML4 at 0x0000 (only entry pml4_idx is used)
-        //   PDPT at 0x1000
-        //   PD   at 0x2000
-        //   PT   at 0x3000 (entry pt_idx for first data page,
-        //                   pt_idx+1 for second data page)
-        //   Data page A at PA 0x3800 — but that's INSIDE the PT
-        //   page; 0x3800 is half-way through PT. With only two
-        //   entries used (each 8 bytes) at indices pt_idx and
-        //   pt_idx+1 < 0x100, PA 0x3800 is far past those entries,
-        //   so the data page can safely live there ONLY if we
-        //   alias the PT and the data page in the same physical
-        //   page — which the walker can't distinguish. Bad.
-        //
-        // Cleanest layout: page tables in a separate sub-region of
-        // region 0, data pages in their own sub-regions:
-        //   PML4 at 0x0000
-        //   PDPT at 0x1000
-        //   PD   at 0x2000
-        //   PT   at 0x2800 (uses 8 bytes per entry; 4 KiB - 0x800
-        //                   leaves 0x800 = 0x100 entries; we use
-        //                   2 entries at indices pt_idx and
-        //                   pt_idx+1, kept < 0x100 by choice of KVA).
-        //   Data page A at PA 0x3000 (in region 0)
-        //   Data page B at PA 0x4000 (in region 1, immediately
-        //                              after region 0)
-        //
-        // Choose KVA so pt_idx ranges fit in region's PT slot:
-        //   kva = 0xFFFF_8880_0000_5000 (canonical-half address
-        //   the existing tests reuse). pt_idx = (kva >> 12) &
-        //   0x1FF = 5 — well within the half-page PT we carved.
         let kva: u64 = 0xFFFF_8880_0000_5000;
         let pml4_idx = (kva >> 39) & 0x1FF;
         let pdpt_idx = (kva >> 30) & 0x1FF;
@@ -921,30 +963,23 @@ mod tests {
         let pml4_pa: u64 = 0x0000;
         let pdpt_pa: u64 = 0x1000;
         let pd_pa: u64 = 0x2000;
-        let pt_pa: u64 = 0x2800;
-        let data_pa_a: u64 = 0x3000; // in region 0
-        let data_pa_b: u64 = 0x4000; // in region 1
+        let pt_pa: u64 = 0x3000;
+        let data_pa_a: u64 = 0x4000;
+        let data_pa_b: u64 = 0x5000;
 
         let write_entry = |buf: &mut Vec<u8>, base: u64, idx: u64, val: u64| {
             let off = (base + idx * 8) as usize;
             buf[off..off + 8].copy_from_slice(&val.to_ne_bytes());
         };
-        // 0x63 = present|rw|user|accessed|dirty (per existing test).
+        // 0x63 = present | rw | user | accessed | dirty.
         write_entry(&mut buf0, pml4_pa, pml4_idx, pdpt_pa | 0x63);
         write_entry(&mut buf0, pdpt_pa, pdpt_idx, pd_pa | 0x63);
         write_entry(&mut buf0, pd_pa, pd_idx, pt_pa | 0x63);
-        // First page maps to PA in region 0; second page maps
-        // to PA at region 0's end + 1 byte → region 1's first
-        // byte. The PAs are contiguous; the host mappings are
-        // not.
         write_entry(&mut buf0, pt_pa, pt_idx, data_pa_a | 0x63);
         write_entry(&mut buf0, pt_pa, pt_idx + 1, data_pa_b | 0x63);
 
-        // Stamp a known pattern across both pages: 0x1000 bytes
-        // of 0xAA at data_pa_a (region 0), 0x1000 bytes of 0xBB
-        // at data_pa_b (region 1). The chunked reader must
-        // surface all 0x2000 bytes of the merged read in the
-        // right order.
+        // Stamp distinct bytes per page so the assertion can prove
+        // both regions were read in order.
         for b in &mut buf0[data_pa_a as usize..data_pa_a as usize + 0x1000] {
             *b = 0xAA;
         }
@@ -957,21 +992,20 @@ mod tests {
             MemRegion {
                 host_ptr: buf0.as_mut_ptr(),
                 offset: 0,
-                size: REGION_SIZE as u64,
+                size: REGION0_SIZE as u64,
             },
             MemRegion {
                 host_ptr: buf1.as_mut_ptr(),
-                offset: REGION_SIZE as u64,
-                size: REGION_SIZE as u64,
+                offset: REGION0_SIZE as u64,
+                size: REGION1_SIZE as u64,
             },
         ];
         // SAFETY: buf0 and buf1 outlive the GuestMem use; each
-        // region's host_ptr addresses a REGION_SIZE-byte mapping.
+        // region's host_ptr addresses its full mapping.
         let mem = unsafe { GuestMem::from_regions_for_test(regions) };
-        let mem_ref: &GuestMem = unsafe { &*(&mem as *const GuestMem) };
 
         let kernel = GuestKernel {
-            mem: mem_ref,
+            mem: &mem,
             symbols: HashMap::new(),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: pml4_pa,
@@ -979,15 +1013,13 @@ mod tests {
             tcr_el1: 0,
             aarch64_params: None,
             start_kernel_map: START_KERNEL_MAP,
+            phys_base: 0,
         };
 
-        // Read 0x2000 bytes spanning both pages — the greedy
-        // merge would extend chunk_len to 0x2000 but
-        // `read_bytes(data_pa_a, ..)` at the underlying GuestMem
-        // can only return REGION_SIZE - data_pa_a = 0x1000 bytes
-        // before hitting region 0's end. The fix caps chunk_len
-        // by `region_avail` so the first iteration reads 0x1000
-        // bytes and the loop continues into region 1.
+        // 0x2000 spans both pages. region_avail at PA 0x4000 is
+        // 0x1000 (REGION0_SIZE - data_pa_a), so the first chunk
+        // caps there and the next outer iteration translates into
+        // region 1.
         let buf = kernel
             .read_kva_bytes_chunked(kva, 0x2000)
             .expect("multi-region read must succeed; greedy merge across boundary was the bug");
@@ -1023,7 +1055,7 @@ mod tests {
         let mut buf = vec![0u8; 64 << 20];
         // SAFETY: buf outlives mem.
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let result = GuestKernel::new(&mem, &path, 0);
+        let result = GuestKernel::new(&mem, &path, 0, 0);
         let err = result.expect_err("tcr_el1=0 must be rejected on aarch64");
         let msg = format!("{err:#}");
         assert!(

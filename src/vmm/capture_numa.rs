@@ -273,7 +273,7 @@ mod tests {
     fn offline_node_skipped() {
         let mut layout = NumaLayout::build(2);
         let node_data_pa =
-            text_kva_to_pa_with_base(layout.node_data_kva, START_KERNEL_MAP) as usize;
+            text_kva_to_pa_with_base(layout.node_data_kva, START_KERNEL_MAP, 0) as usize;
         for b in &mut layout.buf[node_data_pa + 8..node_data_pa + 16] {
             *b = 0;
         }

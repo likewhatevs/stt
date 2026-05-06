@@ -115,8 +115,8 @@ the multi-step API.
 
 The `#[ktstr_test]` attribute carries the VM's CPU topology.
 Topology dimensions are big-to-little: `numa_nodes` (default 1),
-`llcs`, `cores` per LLC, and `threads` per core. Total CPU count is
-`numa_nodes * llcs * cores * threads`.
+`llcs` (total across all NUMA nodes), `cores` per LLC, and
+`threads` per core. Total CPU count is `llcs * cores * threads`.
 
 LLC count matters because the last-level cache is the primary
 scheduling boundary -- tasks sharing an LLC benefit from shared

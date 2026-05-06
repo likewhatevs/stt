@@ -783,7 +783,7 @@ pub struct WorkloadHandle {
     /// Per-region byte length, parallel to `futex_ptrs`. Each
     /// region was sized at spawn time to its source group's
     /// natural width (4 for FutexPingPong / FutexFanOut /
-    /// MutexContention / etc., 16 for FanOutCompute, 24 + Q*8 for
+    /// MutexContention / etc., 16 for FanOutCompute, 32 + Q*8 for
     /// ProducerConsumerImbalance — see [`futex_region_size_for`]).
     /// `futex_ptrs[i]` and `futex_region_sizes[i]` describe the
     /// same region; both are consumed pairwise on `Drop` so each
@@ -831,14 +831,22 @@ pub struct WorkloadHandle {
 /// - [`WorkType::FanOutCompute`] needs 16 bytes — futex `u32` at
 ///   offset 0, wake-timestamp `u64` at offset 8.
 /// - [`WorkType::ProducerConsumerImbalance`] needs a ring buffer:
-///   head `u64` @ 0, tail `u64` @ 8, producer-wake `u32` @ 16,
-///   consumer-wake `u32` @ 20, then `Q` × `u64` ring slots
-///   starting at offset 24. Total bytes = `24 + Q*8`.
-///   `queue_depth_target` is `u64` to match the variant; an `as
-///   usize` truncation on a 32-bit host could silently produce a
-///   sub-page region with a malformed queue, so the conversion is
-///   clamped at `usize::MAX/8 - 3` to keep the layout
-///   well-defined. Realistic configs use Q in the
+///   reserve-head `u64` @ 0, tail `u64` @ 8, producer-wake `u32`
+///   @ 16, consumer-wake `u32` @ 20, publish-head `u64` @ 24,
+///   then `Q` × `u64` ring slots starting at offset 32. Total
+///   bytes = `32 + Q*8`. The two head counters split the MPMC
+///   protocol: producers CAS-advance the reserve head to claim a
+///   unique slot index, write the slot, then in slot-index FIFO
+///   order release-store the publish head; consumers
+///   acquire-load the publish head so a slot is visible to a
+///   reader only after its producer's data write
+///   synchronizes-with the consumer through the publish-head
+///   release. `queue_depth_target` is `u64` to match the variant;
+///   an `as usize` truncation on a 32-bit host could silently
+///   produce a sub-page region with a malformed queue, so the
+///   conversion is clamped at `usize::MAX/8 - 4` to keep the
+///   layout well-defined (one fewer slot than before to make
+///   room for `pub_head`). Realistic configs use Q in the
 ///   hundreds-to-thousands; the clamp only triggers on a
 ///   degenerate input that itself fails admission control
 ///   elsewhere (the queue is far larger than RAM).
@@ -855,8 +863,8 @@ pub(super) fn futex_region_size_for(work_type: &WorkType) -> usize {
         WorkType::ProducerConsumerImbalance {
             queue_depth_target, ..
         } => {
-            let q = std::cmp::min(*queue_depth_target as usize, usize::MAX / 8 - 3);
-            24 + q * 8
+            let q = std::cmp::min(*queue_depth_target as usize, usize::MAX / 8 - 4);
+            32 + q * 8
         }
         _ => std::mem::size_of::<u32>(),
     }
@@ -900,7 +908,7 @@ pub(super) struct SpawnGuard {
     futex_ptrs: Vec<*mut u32>,
     /// Per-region byte length, parallel to `futex_ptrs`. Each
     /// region is sized to its source group's natural width
-    /// (4 / 16 / 24+Q*8 — see [`futex_region_size_for`]) and
+    /// (4 / 16 / 32+Q*8 — see [`futex_region_size_for`]) and
     /// recorded here at `spawn_group` time so munmap on Drop
     /// can call `libc::munmap(ptr, len)` with the matching length
     /// even when groups with different natural sizes co-exist.
@@ -1599,6 +1607,66 @@ impl WorkloadHandle {
                     group.group_idx,
                 );
             }
+            // Fork mode + EpollStorm is incompatible. EpollStorm
+            // creates an eventfd + epoll fd inside worker pos 0 and
+            // publishes their integer fd numbers through the per-group
+            // shared mmap region (`efd_slot` / `epfd_slot`); siblings
+            // load those numbers and operate on them as if they
+            // referred to the same kernel objects. Under
+            // [`CloneMode::Fork`] each forked child holds its own copy
+            // of the parent's fd table at fork time, but the eventfd
+            // and epoll fd are created AFTER the fork on worker pos 0
+            // — so sibling children's fd tables never contain those
+            // descriptors. The integer numbers they read from the
+            // shared region either resolve to unrelated fds the child
+            // happened to have at the same slot or fail with EBADF.
+            // The fd table is genuinely shared only under
+            // [`CloneMode::Thread`]. Reject at spawn time with an
+            // actionable diagnostic; CloneMode::Thread is the correct
+            // choice for EpollStorm.
+            if matches!(dispatch, Dispatch::Fork)
+                && matches!(group.work_type, WorkType::EpollStorm { .. })
+            {
+                anyhow::bail!(
+                    "CloneMode::Fork is incompatible with WorkType::EpollStorm \
+                     (group {}) — EpollStorm publishes eventfd/epoll fd numbers \
+                     through a shared mmap region for siblings to consume, but \
+                     forked children hold independent fd tables that never \
+                     contain those post-fork descriptors. Use CloneMode::Thread \
+                     for EpollStorm workloads.",
+                    group.group_idx,
+                );
+            }
+            // Thread mode + CgroupChurn is incompatible. CgroupChurn's
+            // worker body writes its own tid (`SYS_gettid`) to a
+            // sibling cgroup's `cgroup.procs` file. The kernel's
+            // `__cgroup_procs_write` resolves the tid to its
+            // task_struct, then migrates the *entire* thread group
+            // leader's task and every member of its tgid to the
+            // target cgroup (see `cgroup_attach_task` /
+            // `cgroup_migrate` in kernel/cgroup/cgroup.c — procs-file
+            // semantics are tgid-wide, contrast `cgroup.threads`
+            // which is per-thread under the threaded controller).
+            // Under [`CloneMode::Thread`] every worker is a member of
+            // the test harness's tgid, so the first CgroupChurn write
+            // migrates the harness itself and every sibling worker
+            // thread out from under the host. Reject at spawn time
+            // with an actionable diagnostic; CloneMode::Fork gives
+            // each worker its own tgid so a procs-file write moves
+            // only that worker.
+            if matches!(dispatch, Dispatch::Thread)
+                && matches!(group.work_type, WorkType::CgroupChurn { .. })
+            {
+                anyhow::bail!(
+                    "CloneMode::Thread is incompatible with WorkType::CgroupChurn \
+                     (group {}) — CgroupChurn writes the worker tid to \
+                     `cgroup.procs`, which the kernel resolves to the whole tgid \
+                     and migrates every sibling thread (including the harness) \
+                     to the target cgroup. Use CloneMode::Fork for CgroupChurn \
+                     workloads so each worker is a separate tgid.",
+                    group.group_idx,
+                );
+            }
             if let Some(group_size) = group.work_type.worker_group_size()
                 && (group.num_workers == 0 || !group.num_workers.is_multiple_of(group_size))
             {
@@ -1704,7 +1772,7 @@ impl WorkloadHandle {
         // futex region sizing is per-group, not MAX'd across all
         // groups. Each group's futex region has its own natural
         // size determined by [`futex_region_size_for`] (FanOutCompute
-        // = 16, ProducerConsumerImbalance = 24 + Q*8, everything
+        // = 16, ProducerConsumerImbalance = 32 + Q*8, everything
         // else = 4). Storing the size alongside each pointer in
         // `SpawnGuard::futex_region_sizes` lets Drop munmap each
         // region with its own length, so a small-variant group
@@ -2207,11 +2275,7 @@ impl WorkloadHandle {
                     // doesn't leave SIGUSR1 blocked in the calling
                     // thread for the rest of the process lifetime.
                     let psm_restore_rc = unsafe {
-                        libc::pthread_sigmask(
-                            libc::SIG_SETMASK,
-                            &old_mask,
-                            std::ptr::null_mut(),
-                        )
+                        libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut())
                     };
                     if psm_restore_rc != 0 {
                         tracing::warn!(
@@ -2377,11 +2441,7 @@ impl WorkloadHandle {
                         );
                     }
                     let psm_unblock_rc = unsafe {
-                        libc::pthread_sigmask(
-                            libc::SIG_SETMASK,
-                            &old_mask,
-                            std::ptr::null_mut(),
-                        )
+                        libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut())
                     };
                     if psm_unblock_rc != 0 {
                         eprintln!(
@@ -2646,6 +2706,52 @@ impl WorkloadHandle {
                             // global STOP, so resetting it here only affects
                             // this worker, not its siblings.
                             STOP.store(false, Ordering::Relaxed);
+                            // Publish a single "ready" byte on the report pipe
+                            // BEFORE entering `worker_main`. The parent's
+                            // auto-start barrier in `stop_and_collect` polls
+                            // every worker's report fd for POLLIN with a
+                            // bounded deadline and consumes this byte as the
+                            // explicit signal that the worker has finished
+                            // its post-fork init (cgroup placement, SIGUSR1
+                            // unblock, STOP reset) and is about to enter the
+                            // work loop. Replaces the prior 500 ms blind
+                            // sleep — under host CPU contention, real worker
+                            // start latency can exceed that sleep, dropping
+                            // a worker into its loop AFTER `stop_and_collect`
+                            // has already signalled stop, which surfaces as
+                            // a starvation false-positive.
+                            //
+                            // Done as a raw `libc::write` (not `File::write`)
+                            // to keep the report-fd's ownership inside its
+                            // existing `std::fs::File::from_raw_fd` block
+                            // below — wrapping it here would close the fd
+                            // when the local goes out of scope, before the
+                            // post-`worker_main` write_all path. A 1-byte
+                            // write to a freshly-grown 8 MiB pipe with no
+                            // reader contention completes synchronously
+                            // without blocking; signal-safe after fork.
+                            //
+                            // The byte is `b'r'`. The parent's collect path
+                            // strips a leading `b'r'` before
+                            // `serde_json::from_slice` so the explicit-start
+                            // call site (which skips the barrier) still
+                            // parses correctly. A zero return or short write
+                            // is treated as best-effort: if the kernel
+                            // refuses the write (EFAULT cannot occur with a
+                            // stack pointer; EBADF cannot occur on a fresh
+                            // fd; EPIPE only fires if the reader closed,
+                            // which the parent does not do mid-spawn), the
+                            // parent's barrier-deadline path falls back to
+                            // the same "skip this worker" branch as a
+                            // genuinely-dead worker.
+                            let ready_byte: u8 = b'r';
+                            unsafe {
+                                libc::write(
+                                    report_fds[1],
+                                    &ready_byte as *const u8 as *const libc::c_void,
+                                    1,
+                                );
+                            }
                             // Now run. Fork-mode workers thread the global
                             // STOP through `worker_main` — the SIGUSR1 handler
                             // is process-wide, so flipping `STOP` from
@@ -2700,11 +2806,7 @@ impl WorkloadHandle {
                     // the lifetime of the workload, swallowing any
                     // signal directed at the parent process.
                     let psm_parent_restore_rc = unsafe {
-                        libc::pthread_sigmask(
-                            libc::SIG_SETMASK,
-                            &old_mask,
-                            std::ptr::null_mut(),
-                        )
+                        libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut())
                     };
                     if psm_parent_restore_rc != 0 {
                         tracing::warn!(
@@ -2925,7 +3027,16 @@ impl WorkloadHandle {
     /// Stop all workers, collect their reports, and wait for exit.
     ///
     /// Auto-starts workers if [`start()`](Self::start) was not called,
-    /// then sleeps 500ms to let them begin before signaling stop.
+    /// then waits on an event-driven barrier — each fork worker
+    /// writes a single `b'r'` byte to its report pipe immediately
+    /// after the start handshake completes, and the parent polls
+    /// every report fd for `POLLIN` with a 5 s deadline. The
+    /// barrier wakes the moment the slowest worker finishes its
+    /// post-fork init, replacing the prior unconditional 500 ms
+    /// sleep that under-waited under host CPU contention and
+    /// over-waited on idle hosts. Thread-mode workers are pre-
+    /// synchronised by `start()`'s `mpsc::sync_channel(0)` rendezvous,
+    /// so the barrier is a no-op when no fork children were spawned.
     /// Consumes `self` -- workers cannot be restarted.
     ///
     /// Workers that fail to produce a report (died, timed out, or wrote
@@ -2989,11 +3100,182 @@ impl WorkloadHandle {
         let was_started = self.started;
         self.start();
 
-        // If we just started workers, give them time to begin before stopping.
-        // 500ms accommodates parallel test runs where CPU contention delays
-        // fork of worker processes.
-        if !was_started {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        // Event-driven worker-started barrier. Each fork worker writes
+        // a single `b'r'` byte to its report pipe immediately after
+        // the start-pipe handshake completes (see the matching write
+        // inside `worker_main`'s catch_unwind closure). Polling every
+        // worker's report fd for `POLLIN` with a bounded deadline
+        // wakes the moment the slowest worker has finished its
+        // post-fork init — replacing the prior 500 ms blind sleep
+        // that could under-wait on a CPU-contended host (false
+        // starvation if the worker entered its loop after stop was
+        // signalled) and over-wait on an idle host (~500 ms wasted
+        // per `stop_and_collect`).
+        //
+        // Thread-mode workers do not need a barrier here: `start()`
+        // above sent on a `mpsc::sync_channel(0)` SyncSender(0)
+        // rendezvous, which blocks the parent until the worker's
+        // matching `recv()` returns — by the time `start()` returns,
+        // every thread worker has crossed its start handshake. Only
+        // the fork-mode pipe-based start signal is fire-and-forget,
+        // so the barrier is gated on `!self.children.is_empty()`.
+        //
+        // Deadline budget: 5 s mirrors the existing collect deadline
+        // below. Each iteration polls every still-pending fd with
+        // the remaining budget; a worker that returns `POLLHUP` /
+        // `POLLERR` (died before writing the ready byte — fork-race
+        // close, panic during early init, or the kernel killed it)
+        // is dropped from the pending set and the surrounding
+        // collect path's sentinel-report logic surfaces it. The
+        // worst case (every worker hits the deadline without a
+        // ready byte) bounds the wait at the same 5 s the legacy
+        // sleep + collect path budgeted for the entire stop_and_collect.
+        if !was_started && !self.children.is_empty() {
+            let barrier_deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Pending = (index_into_children, read_fd). We track the
+            // index so a `POLLHUP` worker can be removed from
+            // pending without disturbing the collect loop's `for
+            // (pid, read_fd, _) in children` ordering below.
+            let mut pending: Vec<(usize, i32)> = self
+                .children
+                .iter()
+                .enumerate()
+                .map(|(i, &(_, read_fd, _))| (i, read_fd))
+                .collect();
+            while !pending.is_empty() {
+                let remaining = barrier_deadline
+                    .saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    // Barrier deadline expired with workers still
+                    // pending. Stop waiting and proceed to signal
+                    // stop. The collect path below treats any
+                    // worker whose pipe never produced data as a
+                    // sentinel report — same outcome as a worker
+                    // that started in time but produced an
+                    // unparseable report.
+                    break;
+                }
+                let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+                let mut pfds: Vec<libc::pollfd> = pending
+                    .iter()
+                    .map(|&(_, fd)| libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
+                    .collect();
+                // SAFETY: `pfds` is a non-empty owned Vec; nfds
+                // matches its length; `ms >= 0` since the
+                // remaining-zero branch above bails first. Return
+                // codes are interpreted below.
+                let ret =
+                    unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, ms) };
+                if ret < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::Interrupted {
+                        // EINTR — re-poll with the remaining budget
+                        // on the next iteration. Common during
+                        // teardown when a sibling thread sends a
+                        // signal; the loop's deadline guard bounds
+                        // total wait time regardless of EINTR
+                        // frequency.
+                        continue;
+                    }
+                    // Hard poll failure (EFAULT impossible with an
+                    // owned Vec; ENOMEM extreme). Bail out of the
+                    // barrier and let the collect path's per-fd
+                    // poll handle each worker individually.
+                    tracing::warn!(
+                        %err,
+                        pending = pending.len(),
+                        "WorkloadHandle::stop_and_collect: barrier poll failed; falling \
+                         through to per-worker collect"
+                    );
+                    break;
+                }
+                // ret == 0 means the per-iteration timeout fired
+                // without any fd ready — but we measured this
+                // against `remaining`, so the next iteration's
+                // saturating_duration_since will be zero and the
+                // top-of-loop guard exits. Don't break here: a
+                // future cycle could still be useful if the system
+                // clock jumped backward, and the cost is one extra
+                // iteration that immediately bails.
+                if ret > 0 {
+                    pending.retain(|&(_, fd)| {
+                        // Find this fd's pollfd entry. Linear scan
+                        // is fine: typical worker counts are <100
+                        // and the alternative (HashMap) costs more
+                        // in setup than the linear scan saves.
+                        let pfd = pfds.iter().find(|p| p.fd == fd);
+                        let revents = pfd.map(|p| p.revents).unwrap_or(0);
+                        if revents & libc::POLLIN != 0 {
+                            // Ready byte arrived. Consume exactly
+                            // 1 byte and remove from pending. The
+                            // raw `libc::read` does not take
+                            // ownership of the fd — the collect
+                            // path below still owns it via the
+                            // `children` Vec and will read the
+                            // JSON tail on its own deadline.
+                            let mut byte: u8 = 0;
+                            // SAFETY: `&mut byte` is a valid
+                            // 1-byte buffer; `fd` is the report
+                            // read end the parent owns until
+                            // collect drains it. A 0 / -1 return
+                            // is treated as not-yet-ready; the
+                            // next iteration retries.
+                            let n = unsafe {
+                                libc::read(
+                                    fd,
+                                    &mut byte as *mut u8 as *mut libc::c_void,
+                                    1,
+                                )
+                            };
+                            // n == 1 → ready byte consumed; drop
+                            // from pending.
+                            // n == 0 → POLLIN with zero-byte read
+                            // means EOF (writer closed) without
+                            // sending the byte — worker died
+                            // pre-write. Drop from pending; the
+                            // collect path emits a sentinel report.
+                            // n < 0 → transient error (EAGAIN
+                            // shouldn't happen since POLLIN
+                            // signalled readability, but on EINTR
+                            // the next iteration re-polls).
+                            if n >= 0 {
+                                return false;
+                            }
+                            // Negative return: re-check kind.
+                            let err = std::io::Error::last_os_error();
+                            if err.kind() == std::io::ErrorKind::Interrupted {
+                                return true;
+                            }
+                            tracing::warn!(
+                                %err,
+                                fd,
+                                "WorkloadHandle::stop_and_collect: barrier byte read \
+                                 failed; treating worker as ready"
+                            );
+                            return false;
+                        }
+                        if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                            != 0
+                        {
+                            // Worker closed the write end without
+                            // sending the ready byte (panic during
+                            // post-fork init, or kernel-killed
+                            // before reaching the write). Drop
+                            // from pending; the collect path's
+                            // `read_to_end` returns 0 bytes and the
+                            // sentinel-report branch fires.
+                            return false;
+                        }
+                        // No POLLIN, no hangup — keep waiting.
+                        true
+                    });
+                }
+            }
         }
 
         let mut reports = Vec::new();
@@ -3166,7 +3448,23 @@ impl WorkloadHandle {
                     waited
                 };
 
-            if let Ok(report) = serde_json::from_slice::<WorkerReport>(&buf) {
+            // Strip the leading `b'r'` worker-ready byte if the
+            // auto-start barrier above did not consume it. The
+            // worker writes this byte unconditionally on every
+            // success path right after the start handshake; the
+            // barrier polls + reads it when `stop_and_collect`
+            // auto-started workers, but explicit-start callers
+            // (`start()` invoked before `stop_and_collect`) bypass
+            // the barrier and the byte sits in the pipe ahead of
+            // the JSON. Strip exactly 1 byte if present so
+            // `serde_json::from_slice` sees a clean JSON document
+            // either way.
+            let report_slice: &[u8] = if buf.first() == Some(&b'r') {
+                &buf[1..]
+            } else {
+                &buf[..]
+            };
+            if let Ok(report) = serde_json::from_slice::<WorkerReport>(report_slice) {
                 reports.push(report);
             } else {
                 let exit_info = classify_wait_outcome(exit_info_source);

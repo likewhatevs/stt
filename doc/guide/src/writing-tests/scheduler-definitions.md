@@ -29,7 +29,7 @@ write wins.
 
 `kargs` is the extra GUEST KERNEL command-line (not the scheduler
 binary's CLI — use `sched_args` for that). Do not override the kargs
-ktstr injects itself (`nokaslr`, `console=`, `loglevel=`, `init=`):
+ktstr injects itself (`console=`, `loglevel=`, `init=`):
 those break guest-side init and leave the VM unable to run tests.
 
 Both `sysctls` and `kargs` are accepted by `#[derive(Scheduler)]`:

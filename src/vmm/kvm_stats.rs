@@ -47,6 +47,12 @@ const DESC_FIXED_SIZE: usize = 16;
 fn get_stats_fd<F: AsRawFd>(fd: &F) -> Option<OwnedFd> {
     let ret = unsafe { libc::ioctl(fd.as_raw_fd(), KVM_GET_STATS_FD()) };
     if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            errno = err.raw_os_error().unwrap_or(0),
+            error = %err,
+            "KVM_GET_STATS_FD ioctl failed"
+        );
         None
     } else {
         Some(unsafe { OwnedFd::from_raw_fd(ret) })
@@ -81,10 +87,22 @@ fn read_initial(fd: RawFd) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(8192);
     let mut chunk = [0u8; 4096];
     loop {
-        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
-        if n < 0 {
+        let n = loop {
+            let r = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut _, chunk.len()) };
+            if r >= 0 {
+                break r;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            tracing::warn!(
+                errno = err.raw_os_error().unwrap_or(0),
+                error = %err,
+                "KVM stats fd read failed"
+            );
             return None;
-        }
+        };
         if n == 0 {
             break;
         }

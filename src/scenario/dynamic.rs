@@ -78,7 +78,7 @@ pub fn custom_cgroup_remove_midrun(ctx: &Ctx) -> Result<AssertResult> {
 
 /// Rapid create/destroy cycling. Custom logic for dynamic naming.
 pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
-    let (handles, _guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
+    let (handles, mut guard) = setup_cgroups(ctx, 2, &dfl_wl(ctx))?;
     let deadline = Instant::now() + ctx.duration;
     let mut i = 0usize;
     // Cap on the number of distinct ephemeral cgroup names. The
@@ -93,10 +93,25 @@ pub fn custom_cgroup_rapid_churn(ctx: &Ctx) -> Result<AssertResult> {
     // exists (`if !p.exists()` in `CgroupManager::create_cgroup`), so
     // a cycle that lapped a still-resident sibling is a no-op
     // re-create rather than an error.
+    //
+    // Each ephemeral name is registered in the `setup_cgroups` guard
+    // via `add_cgroup_no_cpuset` (NOT `ctx.cgroups.create_cgroup`)
+    // so the guard's Drop reaps any cgroup whose best-effort
+    // remove_cgroup below failed. Without registration, a
+    // best-effort failure would silently leak the cgroup until the
+    // next iteration with the same modulo-100 name happened to win
+    // its create→remove race; if no such iteration arrived before
+    // the loop exited, the cgroup persisted past scenario teardown
+    // (the comment claiming the guard reaped it was wrong — the
+    // guard only reaps names it has been told about). Duplicate
+    // pushes of the same name across cycles are harmless: Drop
+    // iterates `names` and calls remove_cgroup for each, which
+    // returns ENOENT after the first successful removal — and
+    // `is_io_not_found` filters that case from the warn output.
     const MAX_EPHEMERAL_NAMES: usize = 100;
     while Instant::now() < deadline {
         let n = format!("ephemeral_{}", i % MAX_EPHEMERAL_NAMES);
-        ctx.cgroups.create_cgroup(&n)?;
+        guard.add_cgroup_no_cpuset(&n)?;
         thread::sleep(Duration::from_millis(100));
         // Best-effort teardown: rapid-churn drives cgroup
         // create/destroy at 10 Hz, racing the freeze/drain path.

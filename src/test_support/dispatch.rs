@@ -1405,7 +1405,7 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
     // incorrect sidecar metadata.
     let active_flags: Vec<String> = entry.required_flags.iter().map(|s| s.to_string()).collect();
 
-    if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
+    if entry.performance_mode && super::runtime::no_perf_mode_active() {
         crate::report::test_skip(format_args!(
             "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             bare_name,
@@ -1504,7 +1504,7 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
         }
     };
 
-    if entry.performance_mode && std::env::var("KTSTR_NO_PERF_MODE").is_ok() {
+    if entry.performance_mode && super::runtime::no_perf_mode_active() {
         crate::report::test_skip(format_args!(
             "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
@@ -1889,10 +1889,7 @@ mod tests {
     #[test]
     fn warn_duplicate_test_names_inner_independent_duplicates_each_warn() {
         let mut sink = Vec::<u8>::new();
-        warn_duplicate_test_names_inner(
-            ["alpha", "beta", "alpha", "gamma", "beta"],
-            &mut sink,
-        );
+        warn_duplicate_test_names_inner(["alpha", "beta", "alpha", "gamma", "beta"], &mut sink);
         let out = String::from_utf8(sink).expect("sink is utf-8");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(

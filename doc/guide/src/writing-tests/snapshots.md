@@ -317,7 +317,7 @@ scenario start, then writes the configured u32 at the configured
 offset. Only `BPF_MAP_TYPE_ARRAY` maps are supported; the framework
 finds the map by `map_name_suffix` (e.g. `".bss"`) via
 `BpfMapAccessor::find_map`. See [Monitor → BPF map writes](../architecture/monitor.md)
-for the prerequisites (vmlinux, `nokaslr`) and the full host-side
+for the prerequisites (vmlinux) and the full host-side
 contract.
 
 Read+write workflows then compose naturally: the test pre-seeds

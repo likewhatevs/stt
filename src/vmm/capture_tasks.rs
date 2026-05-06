@@ -178,9 +178,14 @@ pub(crate) fn build(
     //     which tasks were runnable on which CPU at freeze time
     //     (sets `is_runnable_in_scx: true` and the running_pc
     //     stamp on the curr task).
-    let tasks_node_off_in_task = task_offs.scx + see_offs.tasks_node;
-    let runnable_node_off_in_task = task_offs.scx + see_offs.runnable_node;
-    let runnable_list_off = rq_offs.scx + scx_rq_offs.runnable_list;
+    //
+    // checked_add guards against malformed BTF offsets. Plain `+`
+    // would wrap silently on overflow and produce nonsense
+    // container_of math; collapsing the whole capture to None is
+    // the safe degradation for an attacker-controlled BTF blob.
+    let tasks_node_off_in_task = task_offs.scx.checked_add(see_offs.tasks_node)?;
+    let runnable_node_off_in_task = task_offs.scx.checked_add(see_offs.runnable_node)?;
+    let runnable_list_off = rq_offs.scx.checked_add(scx_rq_offs.runnable_list)?;
 
     // Phase 1: harvest the global scx_tasks list — every task
     // currently owned by an scx_sched, regardless of CPU. This is
@@ -240,8 +245,17 @@ pub(crate) fn build(
             .and_then(|reg| reg.as_ref())
             .map(|reg| reg.instruction_pointer);
 
-        let head_kva = rq_kva.wrapping_add(runnable_list_off as u64);
-        let head_pa = rq_pa.wrapping_add(runnable_list_off as u64);
+        // checked_add: a malformed BTF offset combined with a
+        // hostile rq KVA/PA could wrap u64 silently with plain
+        // wrapping_add and point head_kva/head_pa into unrelated
+        // memory. Skip the CPU on overflow rather than walking a
+        // garbage list head.
+        let Some(head_kva) = rq_kva.checked_add(runnable_list_off as u64) else {
+            continue;
+        };
+        let Some(head_pa) = rq_pa.checked_add(runnable_list_off as u64) else {
+            continue;
+        };
 
         let task_kvas = walk_runnable_list(mem, walk, head_kva, head_pa, runnable_node_off_in_task);
 

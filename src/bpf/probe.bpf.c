@@ -40,8 +40,6 @@ enum ktstr_pcpu_idx {
 	KTSTR_PCPU_KPROBE_RETURNS,
 	KTSTR_PCPU_META_MISS,
 	KTSTR_PCPU_RINGBUF_DROPS,
-	KTSTR_PCPU_EVENT_TP_COUNT,
-	KTSTR_PCPU_EVENT_RINGBUF_DROPS,
 	KTSTR_PCPU_TIMELINE_COUNT,
 	KTSTR_PCPU_TIMELINE_DROPS,
 	KTSTR_PCPU_PI_COUNT,
@@ -243,14 +241,6 @@ u64 ktstr_last_trigger_ts = 0;
  * (which might come from racing `scx_sched` instances) skip the
  * write to keep the snapshot causally tied to the first error. */
 struct scx_event_stats ktstr_exit_event_stats = {};
-
-/* `KTSTR_PCPU_EVENT_TP_COUNT` and `KTSTR_PCPU_EVENT_RINGBUF_DROPS`
- * are per-CPU slots in the array above (see `enum ktstr_pcpu_idx`).
- * Replaced the prior `ktstr_event_tp_count` /
- * `ktstr_event_ringbuf_drops` globals to avoid cross-CPU cacheline
- * bouncing on the `tp_btf/sched_ext_event` hot path — the
- * tracepoint fires whenever any SCX_EV_* counter increments, which
- * on a busy scheduler is millions of times per second. */
 
 /* `KTSTR_PCPU_TIMELINE_COUNT` / `KTSTR_PCPU_TIMELINE_DROPS` are
  * per-CPU slots in the array above. The timeline producers
@@ -725,75 +715,6 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 
 	/* Store exit kind in args[1] for diagnostics. */
 	event->args[1] = (u64)kind;
-
-	bpf_ringbuf_submit(event, 0);
-
-	return 0;
-}
-
-/*
- * tp_btf/sched_ext_event handler. Fires from
- * `kernel/sched/ext.c::scx_add_event_stats` (and friends) every time
- * a scheduler-internal SCX_EV_* counter increments. The kernel
- * tracepoint argument signature is
- * `TP_PROTO(const char *name, __s64 delta)` (see
- * `include/trace/events/sched_ext.h`); the BPF prototype here mirrors
- * it via BPF_PROG's typed args.
- *
- * Pushes one EVENT_SCX_EVENT entry into the existing `ktstr_events`
- * ringbuf per fire. Each entry carries the ktime, the counter
- * name (NUL-terminated, capped at MAX_STR_LEN), and the delta as
- * args[0]. Userspace stitches the sequence into the per-event
- * timeline that surfaces which counter incremented when.
- *
- * Gated on `ktstr_enabled` so the timeline only records once
- * userspace has finished probe attach (sched_ext_event fires can
- * start as soon as the scheduler attaches; without the gate we'd
- * record events from before the test scenario started).
- */
-SEC("tp_btf/sched_ext_event")
-int BPF_PROG(ktstr_event_tp, const char *name, __s64 delta)
-{
-	if (!ktstr_enabled)
-		return 0;
-
-	ktstr_pcpu_inc(KTSTR_PCPU_EVENT_TP_COUNT);
-
-	struct probe_event *event = bpf_ringbuf_reserve(&ktstr_events,
-							sizeof(*event), 0);
-	if (!event) {
-		ktstr_pcpu_inc(KTSTR_PCPU_EVENT_RINGBUF_DROPS);
-		return 0;
-	}
-
-	event->type = EVENT_SCX_EVENT;
-	event->tid = (u32)bpf_get_current_pid_tgid();
-	event->func_idx = 0;
-	event->ts = bpf_ktime_get_ns();
-	event->nr_fields = 0;
-	/* args[0] carries the s64 delta cast through u64. The
-	 * tracepoint stores deltas (typically +1) as `__s64` per
-	 * include/trace/events/sched_ext.h's TP_STRUCT__entry, which
-	 * accommodates a future negative-delta case (decrement)
-	 * without changing the wire format. */
-	event->args[0] = (u64)delta;
-	event->kstack_sz = 0;
-
-	/* Counter name. Read via bpf_probe_read_kernel_str so the
-	 * verifier accepts the kernel-side `const char *` argument.
-	 * The name is a static literal in the kernel
-	 * (e.g. "SCX_EV_SELECT_CPU_FALLBACK"), well under
-	 * MAX_STR_LEN — but the BPF API requires the safe-read. */
-	int n = bpf_probe_read_kernel_str(event->str_val,
-					  sizeof(event->str_val),
-					  (const void *)name);
-	if (n > 0) {
-		event->has_str = 1;
-	} else {
-		event->has_str = 0;
-		event->str_val[0] = '\0';
-	}
-	event->str_param_idx = 0xff;
 
 	bpf_ringbuf_submit(event, 0);
 

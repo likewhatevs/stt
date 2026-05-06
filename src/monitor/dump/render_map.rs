@@ -1690,8 +1690,16 @@ pub(super) fn render_stack_traces(
                 data_ok = false;
                 break;
             };
+            // `page_end` wraps to 0 when `cur_kva` lies on the last
+            // page of the 64-bit address space (e.g. an aarch64 TTBR1
+            // KVA near `0xFFFF_FFFF_FFFF_F000`). A plain
+            // `page_end - cur_kva` then underflows and panics in debug.
+            // Modular arithmetic gives the correct chunk size — the
+            // subtraction is exact mod 2^64, so `0u64.wrapping_sub(
+            // 0xFFFF_FFFF_FFFF_F000) == PAGE` recovers the trailing-
+            // page byte count without a special case.
             let page_end = (cur_kva & !(PAGE - 1)).wrapping_add(PAGE);
-            let chunk_len = (page_end - cur_kva).min(total - consumed) as usize;
+            let chunk_len = page_end.wrapping_sub(cur_kva).min(total - consumed) as usize;
             let dst = &mut data_bytes[consumed as usize..consumed as usize + chunk_len];
             let n = mem.read_bytes(pa, dst);
             if n != chunk_len {

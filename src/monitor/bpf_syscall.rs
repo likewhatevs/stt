@@ -908,7 +908,18 @@ impl BpfMapAccessor for BpfSyscallAccessor {
                         ARENA_PAGE_SIZE,
                     );
                 }
-                let user_addr = user_vm_start + (idx as u64) * ARENA_PAGE_SIZE as u64;
+                // user_vm_start comes from the BPF map's map_extra
+                // field — a guest-controllable value. A hostile or
+                // corrupt map metadata could push the page identifier
+                // past u64::MAX. Skip the page rather than emit a
+                // wrapped address that consumers would treat as
+                // legitimate.
+                let Some(idx_offset) = (idx as u64).checked_mul(ARENA_PAGE_SIZE as u64) else {
+                    continue;
+                };
+                let Some(user_addr) = user_vm_start.checked_add(idx_offset) else {
+                    continue;
+                };
                 pages.push(ArenaPage {
                     user_addr,
                     bytes: buf,

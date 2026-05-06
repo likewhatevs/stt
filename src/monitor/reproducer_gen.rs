@@ -816,11 +816,7 @@ pub fn render_run_file_source(spec: &ReproducerSpec, template_name: &str) -> Str
         for h in &spec.cgroup_hints {
             s.push_str(&format!(
                 "// {} (weight={:?}, mem_max={:?}, cpuset={:?}, cpu_max_quota_us={:?})\n",
-                h.path,
-                h.cpu_weight,
-                h.memory_max_bytes,
-                h.cpuset_cpus,
-                h.cpu_max_quota_us,
+                h.path, h.cpu_weight, h.memory_max_bytes, h.cpuset_cpus, h.cpu_max_quota_us,
             ));
         }
     }

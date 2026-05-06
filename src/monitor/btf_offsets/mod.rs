@@ -407,34 +407,38 @@ pub struct ScxEventOffsets {
 }
 
 impl KernelOffsets {
-    /// Parse BTF from a vmlinux ELF and resolve field offsets for
-    /// `struct rq`, `struct scx_rq`, and `struct scx_dispatch_q`.
-    pub fn from_vmlinux(path: &Path) -> Result<Self> {
-        let btf =
-            load_btf_from_path(path).with_context(|| format!("btf: open {}", path.display()))?;
-
-        let (rq_struct, _) = find_struct(&btf, "rq")?;
-        let rq_nr_running = member_byte_offset(&btf, &rq_struct, "nr_running")?;
-        let rq_clock = member_byte_offset(&btf, &rq_struct, "clock")?;
-        let (rq_scx, scx_member) = member_byte_offset_with_member(&btf, &rq_struct, "scx")?;
+    /// Resolve `struct rq`, `struct scx_rq`, and `struct
+    /// scx_dispatch_q` field offsets from a pre-loaded BTF object.
+    ///
+    /// Callers that already hold a parsed [`Btf`] (e.g. the freeze
+    /// coordinator's monitor thread, which loads it once and threads
+    /// it into both `KernelOffsets::from_btf` and
+    /// [`BpfProgOffsets::from_btf`]) avoid a second
+    /// [`load_btf_from_path`] call. See [`Self::from_vmlinux`] for
+    /// the path-based wrapper that does the BTF load itself.
+    pub fn from_btf(btf: &Btf) -> Result<Self> {
+        let (rq_struct, _) = find_struct(btf, "rq")?;
+        let rq_nr_running = member_byte_offset(btf, &rq_struct, "nr_running")?;
+        let rq_clock = member_byte_offset(btf, &rq_struct, "clock")?;
+        let (rq_scx, scx_member) = member_byte_offset_with_member(btf, &rq_struct, "scx")?;
 
         // Resolve the type of rq.scx to get struct scx_rq.
         let scx_rq_struct =
-            resolve_member_struct(&btf, &scx_member).context("btf: resolve type of rq.scx")?;
-        let scx_rq_nr_running = member_byte_offset(&btf, &scx_rq_struct, "nr_running")?;
+            resolve_member_struct(btf, &scx_member).context("btf: resolve type of rq.scx")?;
+        let scx_rq_nr_running = member_byte_offset(btf, &scx_rq_struct, "nr_running")?;
         let (scx_rq_local_dsq, local_dsq_member) =
-            member_byte_offset_with_member(&btf, &scx_rq_struct, "local_dsq")?;
-        let scx_rq_flags = member_byte_offset(&btf, &scx_rq_struct, "flags")?;
+            member_byte_offset_with_member(btf, &scx_rq_struct, "local_dsq")?;
+        let scx_rq_flags = member_byte_offset(btf, &scx_rq_struct, "flags")?;
 
         // Resolve the type of scx_rq.local_dsq to get struct scx_dispatch_q.
-        let dsq_struct = resolve_member_struct(&btf, &local_dsq_member)
+        let dsq_struct = resolve_member_struct(btf, &local_dsq_member)
             .context("btf: resolve type of scx_rq.local_dsq")?;
-        let dsq_nr = member_byte_offset(&btf, &dsq_struct, "nr")?;
+        let dsq_nr = member_byte_offset(btf, &dsq_struct, "nr")?;
 
-        let event_offsets = resolve_event_offsets(&btf).ok();
-        let schedstat_offsets = resolve_schedstat_offsets(&btf).ok();
-        let sched_domain_offsets = resolve_sched_domain_offsets(&btf, &rq_struct).ok();
-        let watchdog_offsets = resolve_watchdog_offsets(&btf).ok();
+        let event_offsets = resolve_event_offsets(btf).ok();
+        let schedstat_offsets = resolve_schedstat_offsets(btf).ok();
+        let sched_domain_offsets = resolve_sched_domain_offsets(btf, &rq_struct).ok();
+        let watchdog_offsets = resolve_watchdog_offsets(btf).ok();
 
         Ok(Self {
             rq_nr_running,
@@ -449,6 +453,18 @@ impl KernelOffsets {
             sched_domain_offsets,
             watchdog_offsets,
         })
+    }
+
+    /// Parse BTF from a vmlinux ELF and resolve field offsets for
+    /// `struct rq`, `struct scx_rq`, and `struct scx_dispatch_q`.
+    /// Thin wrapper around [`Self::from_btf`] for callers that have
+    /// only the path; see [`Self::from_btf`] for the
+    /// already-parsed-Btf entry point.
+    #[allow(dead_code)]
+    pub fn from_vmlinux(path: &Path) -> Result<Self> {
+        let btf =
+            load_btf_from_path(path).with_context(|| format!("btf: open {}", path.display()))?;
+        Self::from_btf(&btf)
     }
 }
 

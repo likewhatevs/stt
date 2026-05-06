@@ -33,7 +33,8 @@ pub(crate) use virtio_bindings::virtio_blk::{
 };
 pub(crate) use virtio_bindings::virtio_config::{
     VIRTIO_CONFIG_S_ACKNOWLEDGE, VIRTIO_CONFIG_S_DRIVER, VIRTIO_CONFIG_S_DRIVER_OK,
-    VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_CONFIG_S_NEEDS_RESET, VIRTIO_F_VERSION_1,
+    VIRTIO_CONFIG_S_FAILED, VIRTIO_CONFIG_S_FEATURES_OK, VIRTIO_CONFIG_S_NEEDS_RESET,
+    VIRTIO_F_VERSION_1,
 };
 pub(crate) use virtio_bindings::virtio_ids::VIRTIO_ID_BLOCK;
 // `VIRTIO_MMIO_INT_CONFIG` and `VIRTIO_MMIO_INT_VRING` are consumed by
@@ -426,14 +427,19 @@ pub(crate) struct BlkWorkerState {
     /// Token-bucket for bytes/sec.
     pub(crate) bytes_bucket: TokenBucket,
     /// Reusable scratch for the descriptor-walk in `drain_bracket_impl`.
-    /// Allocated once at construction and `clear()`-ed each
-    /// iteration so the underlying capacity (sized by the worst-case
-    /// chain) is reused. Avoids one Vec allocation per request on
-    /// the hot path. Capacity grows monotonically up to
-    /// `VIRTIO_BLK_SEG_MAX + 2`. The data-segment slice given to
-    /// the handlers is borrowed directly from
-    /// `&state.all_descs_scratch[1..chain_len - 1]` once `status_addr`
-    /// has been validated — no second Vec, no copy.
+    /// Allocated once at construction with capacity
+    /// `VIRTIO_BLK_SEG_MAX + 2` and `clear()`-ed each iteration so
+    /// the underlying capacity is reused. Avoids one Vec
+    /// allocation per request on the hot path. The push loop in
+    /// `drain_bracket_impl` is hard-capped at this capacity — a
+    /// hostile guest submitting a chain longer than `seg_max + 2`
+    /// gets dropped before status-extraction (an oversized chain
+    /// cannot be reliably IOERR-completed because the capped view
+    /// loses sight of the chain's true status descriptor). The
+    /// data-segment slice given to the handlers is borrowed
+    /// directly from `&state.all_descs_scratch[1..chain_len - 1]`
+    /// once `status_addr` has been validated — no second Vec, no
+    /// copy.
     pub(crate) all_descs_scratch: Vec<ChainDescriptor>,
     /// Reusable per-segment IO buffer. Sized by `resize(len, 0)`
     /// per segment in the read/write handlers. Allocated once and
@@ -1261,7 +1267,7 @@ impl VirtioBlk {
     ///   by `preadv` (`n`), excluding the zero-pad tail.
     /// - `used.elem.len = bytes_to_guest + 1`: full `data_len` (data
     ///   + zero-pad tail) + 1 status byte (virtio-v1.2 §2.7.7.2 —
-    ///   bytes the device wrote into device-writable buffers).
+    ///     bytes the device wrote into device-writable buffers).
     ///
     /// `too_many_arguments` allow: same disjoint-borrow shape as
     /// [`Self::handle_read_impl`] — every parameter is a separate
@@ -1317,8 +1323,7 @@ impl VirtioBlk {
         // replaces — a quantum of overhead vastly smaller than the
         // N kernel-mode syscall transitions the legacy per-segment
         // path performed.
-        let mut iovecs: Vec<libc::iovec> =
-            Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
         let mut _guards: Vec<vm_memory::volatile_memory::PtrGuardMut> =
             Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
         for seg in data_segments {
@@ -1458,10 +1463,7 @@ impl VirtioBlk {
                 let mut remaining = seg_remaining;
                 while remaining > 0 {
                     let chunk = (remaining as usize).min(ZERO_BUF_LEN);
-                    if mem
-                        .write_slice(&zeros[..chunk], zero_addr)
-                        .is_err()
-                    {
+                    if mem.write_slice(&zeros[..chunk], zero_addr).is_err() {
                         counters.record_io_error();
                         return (VIRTIO_BLK_S_IOERR as u8, 1);
                     }
@@ -1555,8 +1557,7 @@ impl VirtioBlk {
         // hold `PtrGuard`s rather than `PtrGuardMut`s — no dirty
         // tracking is needed because we are not modifying guest
         // memory here.
-        let mut iovecs: Vec<libc::iovec> =
-            Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
+        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
         let mut _guards: Vec<vm_memory::volatile_memory::PtrGuard> =
             Vec::with_capacity(VIRTIO_BLK_SEG_MAX as usize + 2);
         for seg in data_segments {
@@ -2134,6 +2135,20 @@ impl VirtioBlk {
         // CAS succeeds, or the monotone-bit gate fires because
         // the new snapshot has NEEDS_RESET and `val` does not
         // include it.
+        //
+        // Defense-in-depth bounded-retry budget: the proof above
+        // says termination is bounded at one worker-induced retry,
+        // so any execution exceeding `MAX_CAS_RETRIES` (4) is
+        // either an invariant violation (worker fetch_or'ing
+        // something other than NEEDS_RESET, multi-writer
+        // device_status) or a hardware live-lock. Cap the loop
+        // and bail rather than spin the vCPU thread indefinitely
+        // — bailing is safe because the guest will simply retry
+        // the STATUS write and observe the worker-set NEEDS_RESET
+        // on the next attempt. The cap is large enough (4) that
+        // proof-respecting execution never reaches it.
+        const MAX_CAS_RETRIES: u32 = 4;
+        let mut cas_retries: u32 = 0;
         loop {
             if val & current_status != current_status {
                 // CORRECT behavior — do NOT "fix" this gate to admit
@@ -2209,6 +2224,88 @@ impl VirtioBlk {
             if new_bits == 0 {
                 return;
             }
+            // FAILED (virtio-v1.2 §2.1.1 bit 0x80) is the driver's
+            // "I give up" signal. The kernel's
+            // `virtio_add_status(dev, VIRTIO_CONFIG_S_FAILED)` is the
+            // exit path on probe failure
+            // (drivers/virtio/virtio.c:363, 570, 606, 643): it reads
+            // `get_status`, ORs in FAILED, and writes the result. So
+            // `val == current_status | FAILED` and `new_bits ==
+            // FAILED` regardless of which FSM rung the driver had
+            // reached. Accept and store without consulting the
+            // FSM-ladder match — FAILED can land at any state, and
+            // routing it through the ACK/DRIVER/FEATURES_OK/DRIVER_OK
+            // arms would reject the legitimate signal as an "illegal
+            // FSM transition" and silently drop the FAILED bit from
+            // device_status, leaving operators reading the failure
+            // dump unable to see the guest gave up. Reject only when
+            // FAILED appears alongside other unrecognised new bits —
+            // those are protocol violations unrelated to the
+            // legitimate FAILED signal and fall through to the
+            // FSM-ladder match below. Mirrors virtio_console.rs's
+            // FAILED early-accept pattern at the same location in its
+            // set_status.
+            if new_bits == VIRTIO_CONFIG_S_FAILED {
+                // CAS against the snapshot for the same race-safety
+                // reason as the valid-FSM-transition store below: the
+                // worker thread can fetch_or NEEDS_RESET between
+                // snapshot and store, and a naive `store(val,
+                // Release)` would clobber that bit. Acquire on
+                // failure synchronizes-with the worker's SeqCst
+                // fetch_or so the next iteration's monotone-bit gate
+                // (top of the loop) sees the worker's NEEDS_RESET. On
+                // CAS-failure retry the new snapshot has NEEDS_RESET
+                // but `val` does not (the kernel's `val` was computed
+                // from the pre-fetch_or get_status), so the
+                // monotone-bit gate fires and rejects — the device is
+                // already declaring itself broken via NEEDS_RESET, so
+                // dropping the FAILED bit on this path is acceptable;
+                // the guest must reset before any further FSM advance
+                // can succeed.
+                match self.device_status.compare_exchange(
+                    current_status,
+                    val,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        tracing::warn!(
+                            old = current_status,
+                            new = val,
+                            "virtio-blk set_status: guest set FAILED status \
+                             (virtio-v1.2 §2.1.1 bit 0x80 — driver gave up on \
+                             device probe). Stored without further FSM advance.",
+                        );
+                        return;
+                    }
+                    Err(observed) => {
+                        debug_assert_eq!(
+                            observed & !current_status & !VIRTIO_CONFIG_S_NEEDS_RESET,
+                            0,
+                            "device_status race: observed bits beyond NEEDS_RESET — \
+                             worker invariant violated (snapshot={current_status:#x}, \
+                             observed={observed:#x})",
+                        );
+                        cas_retries += 1;
+                        if cas_retries >= MAX_CAS_RETRIES {
+                            tracing::error!(
+                                device_status = observed,
+                                requested = val,
+                                retries = cas_retries,
+                                "virtio-blk set_status abandoned — \
+                                 CAS retry budget exhausted on FAILED \
+                                 store; either the worker invariant is \
+                                 violated or a hardware live-lock is \
+                                 starving the vCPU thread; bailing \
+                                 without advancing the FSM",
+                            );
+                            return;
+                        }
+                        current_status = observed;
+                        continue;
+                    }
+                }
+            }
             let valid = match new_bits {
                 VIRTIO_CONFIG_S_ACKNOWLEDGE => current_status == 0,
                 VIRTIO_CONFIG_S_DRIVER => current_status == S_ACK,
@@ -2240,6 +2337,37 @@ impl VirtioBlk {
                 ) {
                     Ok(_) => {}
                     Err(observed) => {
+                        // Verify the worker invariant: the only bits
+                        // that can appear in `observed` beyond the
+                        // pre-CAS snapshot are NEEDS_RESET. Any other
+                        // newly-set bit means a writer beyond the
+                        // documented queue-poison fetch_or site
+                        // exists — a regression that must surface
+                        // loudly in debug builds before the CAS retry
+                        // proof's bounded-retry assumption is
+                        // silently violated.
+                        debug_assert_eq!(
+                            observed & !current_status & !VIRTIO_CONFIG_S_NEEDS_RESET,
+                            0,
+                            "device_status race: observed bits beyond NEEDS_RESET — \
+                             worker invariant violated (snapshot={current_status:#x}, \
+                             observed={observed:#x})",
+                        );
+                        cas_retries += 1;
+                        if cas_retries >= MAX_CAS_RETRIES {
+                            tracing::error!(
+                                device_status = observed,
+                                requested = val,
+                                retries = cas_retries,
+                                "virtio-blk set_status abandoned — \
+                                 CAS retry budget exhausted; either the \
+                                 worker invariant is violated or a \
+                                 hardware live-lock is starving the \
+                                 vCPU thread; bailing without \
+                                 advancing the FSM",
+                            );
+                            return;
+                        }
                         current_status = observed;
                         continue;
                     }
@@ -2444,6 +2572,15 @@ impl VirtioBlk {
         // NEEDS_RESET concurrently with this reset(), and clearing
         // it before the worker is joined would let a phantom
         // NEEDS_RESET bit re-set itself between Phase 1 and Phase 2.
+        // `mem_unset_warned` is deferred to Phase 3 for the same
+        // reason: the worker thread does
+        // `mem_unset_warned.swap(true, Relaxed)` (worker.rs:788)
+        // when it observes a missing GuestMemory, and clearing the
+        // latch in Phase 1 would let a worker swap-true between
+        // Phase 1 and Phase 2 — leaving the latch stuck `true` for
+        // the post-reset driver session and silencing the
+        // wiring-bug warning we explicitly want for the next
+        // bind.
         self.queue_select = 0;
         self.device_features_sel = 0;
         self.driver_features_sel = 0;
@@ -2467,14 +2604,6 @@ impl VirtioBlk {
         // resizes the disk from a worker thread or a host
         // monitor); pairs with the Acquire load in `mmio_read`.
         self.config_generation.fetch_add(1, Ordering::Release);
-        // Re-arm the "queue notify before set_mem" warning so a
-        // post-reset wiring bug surfaces (virtio-v1.2 §3.1.1: a
-        // reset puts the device in a state where the driver must
-        // rebind and re-publish queue addresses; if a kick reaches
-        // us before the rebind completes, that's worth a fresh
-        // log line, not a quiet drop based on a latch from a
-        // previous lifetime).
-        self.mem_unset_warned.store(false, Ordering::Relaxed);
 
         // Phase 2 — engine-specific quiesce and queue reset
         // (production); respawn deferred to DRIVER_OK via
@@ -2537,6 +2666,19 @@ impl VirtioBlk {
         let _ = self.pause_evt.read();
         self.interrupt_status.store(0, Ordering::Release);
         self.device_status.store(0, Ordering::Release);
+        // Re-arm the "queue notify before set_mem" warning so a
+        // post-reset wiring bug surfaces (virtio-v1.2 §3.1.1: a
+        // reset puts the device in a state where the driver must
+        // rebind and re-publish queue addresses; if a kick reaches
+        // us before the rebind completes, that's worth a fresh
+        // log line, not a quiet drop based on a latch from a
+        // previous lifetime). Deferred to Phase 3 so the worker
+        // (which is the only thread that swaps the latch to
+        // `true` at worker.rs:788) is joined first — clearing in
+        // Phase 1 would race a live worker swap-true and leave
+        // the latch stuck `true` for the next driver session,
+        // silencing the wiring-bug warning we explicitly want.
+        self.mem_unset_warned.store(false, Ordering::Relaxed);
     }
 
     /// Test-mode engine reset: queue mutation and bucket rebuild
@@ -3539,11 +3681,27 @@ impl Drop for VirtioBlk {
         let instance_id = self.instance_id;
         match &mut self.worker.engine {
             #[cfg(test)]
-            WorkerEngine::Inline(_) => {
+            WorkerEngine::Inline(engine) => {
                 // Default-drop the inline state when this fn returns.
                 // Reference the snapshot vars to avoid `unused`
                 // lints in cfg(test).
                 let _ = (capacity_sectors, instance_id);
+                // Decrement the live "currently waiting for tokens"
+                // gauge if the device is being dropped while a
+                // chain is rollback-stalled. Symmetric with
+                // `reset_engine_inline`'s mid-stall path: the
+                // chain is gone from the device's perspective, so
+                // the gauge must match. Without this, an external
+                // observer that cloned the counters Arc before
+                // drop sees one stranded increment per
+                // drop-while-stalled. The shared gauge is
+                // saturating (see `record_throttle_pending_dec`),
+                // so this dec is safe even if a racing path
+                // already decremented.
+                if engine.state.currently_stalled {
+                    engine.state.currently_stalled = false;
+                    engine.state.counters.record_throttle_pending_dec();
+                }
             }
             #[cfg(not(test))]
             WorkerEngine::Spawned(eng) => {
@@ -3574,10 +3732,42 @@ impl Drop for VirtioBlk {
                 signal_worker_stop(&eng.stop_fd, stop_fd, instance_id, capacity_sectors);
                 if let Some(handle) = eng.handle.take() {
                     match join_worker_with_timeout(handle, DROP_JOIN_TIMEOUT) {
-                        JoinWithTimeoutOutcome::Joined(_state) => {
-                            // Clean shutdown: state drops at scope end.
+                        JoinWithTimeoutOutcome::Joined(state) => {
+                            // Clean shutdown. If the worker exited
+                            // while a chain was rollback-stalled
+                            // (worker observed STOP_TOKEN before
+                            // any post-stall successful drain
+                            // could clear the per-worker flag),
+                            // decrement the live "currently
+                            // waiting for tokens" gauge to match —
+                            // the chain is gone from the device's
+                            // perspective. Without this, every
+                            // drop-while-stalled pins one
+                            // increment on the shared counters
+                            // Arc for any external observer
+                            // (failure-dump renderer, host
+                            // monitor) that cloned the Arc
+                            // before drop. Symmetric with
+                            // `reset_engine_spawned`'s mid-stall
+                            // path. Saturating dec (see
+                            // `record_throttle_pending_dec`)
+                            // makes a redundant bump safe.
+                            if state.currently_stalled {
+                                state.counters.record_throttle_pending_dec();
+                            }
+                            // State drops at scope end.
                         }
                         JoinWithTimeoutOutcome::Panicked(payload) => {
+                            // Worker panicked — its `BlkWorkerState`
+                            // is lost (panic propagation drops
+                            // owned values without giving us
+                            // access). If a stall was in flight,
+                            // the gauge increment leaks for the
+                            // device's lifetime. The doc on
+                            // `VirtioBlkCounters::currently_throttled_gauge`
+                            // documents this acceptable leak —
+                            // operators must not depend on a
+                            // strictly zero-on-shutdown gauge.
                             tracing::error!(
                                 panic = panic_payload_str(&*payload),
                                 stop_fd,

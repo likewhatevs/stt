@@ -245,8 +245,7 @@ pub(super) fn iter_local_storage_entries(
             let mut val_buf: Vec<u8> = Vec::with_capacity(value_size);
             // SAFETY: capacity == value_size; we set_len only after
             // confirming `read_bytes` filled the requested length.
-            let slice =
-                unsafe { std::slice::from_raw_parts_mut(val_buf.as_mut_ptr(), value_size) };
+            let slice = unsafe { std::slice::from_raw_parts_mut(val_buf.as_mut_ptr(), value_size) };
             let n = ctx
                 .mem
                 .read_bytes(elem_pa + value_off_in_elem as u64, slice);

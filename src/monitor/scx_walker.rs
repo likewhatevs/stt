@@ -933,12 +933,15 @@ pub fn walk_dsqs(
     // rhashtable. Walks at most MAX_RHT_NODES nodes total across
     // all buckets.
     if let (Some(sched_offs), Some(rht_offs)) = (offsets.sched.as_ref(), offsets.rht.as_ref()) {
-        let rht_kva = sched_pa.wrapping_add(sched_offs.dsq_hash as u64);
-        // dsq_hash is embedded in scx_sched (not a pointer); rht_kva
-        // here is a KVA we can translate directly. The walker reads
-        // it via the rht sub-group offsets.
+        // dsq_hash is embedded in scx_sched (not a pointer), so its
+        // PA is the sched_pa with the field offset added directly —
+        // same pattern Pass 2 uses for pnode->global_dsq. Computing a
+        // KVA here would require sched_kva which the caller already
+        // discarded; translating sched_pa as a KVA would underflow
+        // page_offset and silently empty the user-DSQ list.
+        let rht_pa = sched_pa.wrapping_add(sched_offs.dsq_hash as u64);
         let (user_dsqs, user_dsqs_truncated) =
-            walk_user_dsq_hash(mem, walk, rht_kva, rht_offs, dsq_offs);
+            walk_user_dsq_hash(mem, walk, rht_pa, rht_offs, dsq_offs);
         if user_dsqs_truncated {
             // Surface the cap-hit so an operator parsing the
             // failure dump trace sees that the user-DSQ list is
@@ -1184,9 +1187,9 @@ fn walk_list_head_for_dsq_task_kvas(
         };
 
         let skip_entry = match is_cursor {
-            Some(true) => true,  // cursor entry — advance without recording
+            Some(true) => true,   // cursor entry — advance without recording
             Some(false) => false, // real task entry — push and advance
-            None => true,        // cursor-detection unreliable — skip rather than push bogus
+            None => true,         // cursor-detection unreliable — skip rather than push bogus
         };
 
         if !skip_entry {
@@ -1219,13 +1222,16 @@ fn walk_list_head_for_dsq_task_kvas(
     (task_kvas, false)
 }
 
-/// Walk the user-allocated DSQ rhashtable rooted at `rht_kva`.
+/// Walk the user-allocated DSQ rhashtable rooted at `rht_pa`.
 ///
-/// `rht_kva` addresses the embedded `struct rhashtable` inside
-/// `scx_sched.dsq_hash`. The walker reads `tbl` (bucket_table
-/// pointer), then for each of `tbl.buckets[i]` it strips the
-/// LSB tag (`RHT_PTR_LOCK_BIT`) and chases the `rhash_head.next`
-/// chain. For each node the walker computes
+/// `rht_pa` is the DRAM-relative offset of the embedded
+/// `struct rhashtable` inside `scx_sched.dsq_hash`. The caller
+/// computes it as `sched_pa + sched.dsq_hash` — the field is embedded
+/// (not a pointer), so its PA is just the containing struct's PA plus
+/// the field offset. The walker reads `tbl` (bucket_table pointer),
+/// then for each of `tbl.buckets[i]` it strips the LSB tag
+/// (`RHT_PTR_LOCK_BIT`) and chases the `rhash_head.next` chain. For
+/// each node the walker computes
 /// `dsq_kva = node_kva - scx_dispatch_q.hash_node` (container_of).
 ///
 /// Caps:
@@ -1244,22 +1250,11 @@ fn walk_list_head_for_dsq_task_kvas(
 fn walk_user_dsq_hash(
     mem: &GuestMem,
     walk: WalkContext,
-    rht_kva: u64,
+    rht_pa: u64,
     rht_offs: &super::btf_offsets::RhashtableOffsets,
     dsq_offs: &super::btf_offsets::ScxDispatchQOffsets,
 ) -> (Vec<u64>, bool) {
     let mut dsq_kvas = Vec::new();
-
-    let Some(rht_pa) = translate_any_kva(
-        mem,
-        walk.cr3_pa,
-        walk.page_offset,
-        rht_kva,
-        walk.l5,
-        walk.tcr_el1,
-    ) else {
-        return (dsq_kvas, false);
-    };
 
     let tbl_kva = mem.read_u64(rht_pa, rht_offs.tbl);
     if tbl_kva == 0 {
@@ -1304,10 +1299,7 @@ fn walk_user_dsq_hash(
         let mut node_kva = head_kva;
         let mut chain_visited: u32 = 0;
         let mut chain_terminated_naturally = false;
-        while node_kva != 0
-            && total_nodes < MAX_RHT_NODES
-            && chain_visited < PER_BUCKET_CHAIN_CAP
-        {
+        while node_kva != 0 && total_nodes < MAX_RHT_NODES && chain_visited < PER_BUCKET_CHAIN_CAP {
             chain_visited += 1;
             total_nodes += 1;
             let dsq_kva = node_kva.wrapping_sub(dsq_offs.hash_node as u64);
@@ -2404,6 +2396,97 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    /// Regression for the PA-as-KVA bug in walk_dsqs Pass 3
+    /// (user dsq_hash). With a real (non-zero) page_offset, the
+    /// pre-fix code added `sched_offs.dsq_hash` to `sched_pa` and
+    /// passed the result to `walk_user_dsq_hash` as a KVA. The
+    /// inner translate then ran `kva_to_pa(sched_pa+off, page_offset)
+    /// = (sched_pa+off).wrapping_sub(page_offset)`, which underflows
+    /// for any sched_pa < page_offset and produces an out-of-range
+    /// PA — `translate_any_kva` returns None, the user-DSQ list is
+    /// silently empty, and the failure dump loses every user DSQ.
+    ///
+    /// This test fires Pass 3 with `page_offset = 0xffff_8880_0000_0000`
+    /// (the x86_64 4-level direct-map base) and a single user DSQ
+    /// reachable through dsq_hash. Pre-fix: the walker returns 0
+    /// DSQ states for the user pass. Post-fix: 1 DSQ state with the
+    /// expected scalar fields.
+    #[test]
+    fn walk_dsqs_user_hash_with_real_page_offset() {
+        // The fixture is laid out at low PAs (small offsets into the
+        // GuestMem buffer) but every KVA derived from those PAs uses
+        // page_offset = X86_DIRECT_MAP. The walker must therefore
+        // never treat a PA as a KVA (the bug) — every translate must
+        // round-trip through `kva_to_pa(kva) = kva - page_offset`.
+        const PAGE_OFFSET: u64 = 0xffff_8880_0000_0000;
+
+        // PAs (DRAM offsets). Every "_kva" is the matching PA + PAGE_OFFSET.
+        let sched_pa: u64 = 0x100;
+        // sched.dsq_hash = 0x40 → rht_pa = 0x140
+        let rht_pa: u64 = 0x140;
+        let tbl_pa: u64 = 0x300;
+        let dsq_pa: u64 = 0x500; // user-allocated scx_dispatch_q
+
+        // KVAs returned by the rhashtable's tbl pointer, the
+        // bucket-table's stored hash_head pointer, and the dsq's
+        // own KVA must all live above PAGE_OFFSET so the walker's
+        // translate_any_kva calls succeed.
+        let tbl_kva = tbl_pa.wrapping_add(PAGE_OFFSET);
+        let dsq_kva_expected = dsq_pa.wrapping_add(PAGE_OFFSET);
+
+        // hash_node = 0 → container_of yields the dsq KVA unchanged.
+        // The test asserts the dsq KVA the walker recovers, not
+        // container_of math.
+        // Buffer must cover up to dsq_pa + dsq.id_off + 8 = 0x500 + 24 + 8.
+        let mut buf = vec![0u8; 0x1000];
+
+        // rht.tbl = tbl_kva (offset 0 inside rhashtable).
+        buf[rht_pa as usize..rht_pa as usize + 8].copy_from_slice(&tbl_kva.to_le_bytes());
+        // bucket_table.size = 1 (offset 0 in bucket_table).
+        buf[tbl_pa as usize..tbl_pa as usize + 4].copy_from_slice(&1u32.to_le_bytes());
+        // bucket_table.buckets[0] = dsq_kva (the rhash_head node lives
+        // inside scx_dispatch_q at hash_node=0). Buckets array starts
+        // at offset 16.
+        buf[(tbl_pa + 16) as usize..(tbl_pa + 16) as usize + 8]
+            .copy_from_slice(&dsq_kva_expected.to_le_bytes());
+        // rhash_head.next = 0 → bucket terminator.
+        buf[dsq_pa as usize..dsq_pa as usize + 8].copy_from_slice(&0u64.to_le_bytes());
+        // dsq scalars: id=0xc0ffee at offset 24.
+        buf[(dsq_pa + 24) as usize..(dsq_pa + 24) as usize + 8]
+            .copy_from_slice(&0xc0ffee_u64.to_le_bytes());
+
+        let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
+        let kernel = super::super::guest::GuestKernel::new_for_test(
+            &mem,
+            std::collections::HashMap::new(),
+            PAGE_OFFSET,
+            0,
+            false,
+        );
+
+        let mut offsets = dsq_test_offsets();
+        // Disable Pass 1 + Pass 2 so the test isolates Pass 3.
+        offsets.sched_pcpu = None;
+        offsets.sched_pnode = None;
+        // Force `hash_node = 0` so container_of from the bucket entry
+        // back to scx_dispatch_q is identity. The test pins Pass 3's
+        // PA-handling fix, not container_of math.
+        if let Some(dsq_offs) = offsets.dsq.as_mut() {
+            dsq_offs.hash_node = 0;
+        }
+
+        let (states, _entries) = walk_dsqs(&kernel, sched_pa, &[], 0, &offsets);
+
+        assert_eq!(
+            states.len(),
+            1,
+            "Pass 3 must surface the user DSQ when page_offset is non-zero — \
+             pre-fix the PA-as-KVA bug silently returned 0 user DSQs",
+        );
+        assert_eq!(states[0].origin, "user");
+        assert_eq!(states[0].id, 0xc0ffee);
+    }
+
     /// REQ 1 / not-all-or-nothing: 2 CPUs, local-DSQ pass produces
     /// one DsqState row per CPU regardless of whether that CPU's
     /// list has tasks. CPU 0 has 1 queued task; CPU 1 is empty. The
@@ -2893,8 +2976,7 @@ mod tests {
         // rht.tbl = tbl_kva
         buf[rht_pa as usize..rht_pa as usize + 8].copy_from_slice(&tbl_kva.to_le_bytes());
         // tbl.size = bucket_count
-        buf[tbl_pa as usize..tbl_pa as usize + 4]
-            .copy_from_slice(&bucket_count.to_le_bytes());
+        buf[tbl_pa as usize..tbl_pa as usize + 4].copy_from_slice(&bucket_count.to_le_bytes());
         // Stamp every bucket[i] = shared_node
         for i in 0..bucket_count as u64 {
             let off = (tbl_pa + buckets_off + i * 8) as usize;

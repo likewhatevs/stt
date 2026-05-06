@@ -148,34 +148,47 @@ pub enum SnapshotError {
         requested: String,
         available: Vec<String>,
     },
+    /// More than one global-section map exposes a top-level member
+    /// with the requested name, so [`Snapshot::var`] cannot pick a
+    /// deterministic answer. `found_in` lists every map (in capture
+    /// order) where the name was seen — the caller should disambiguate
+    /// via [`Snapshot::map`] and walk into the named map directly
+    /// (e.g. `snap.map("scx_obj.bss")?.at(0).get("nr_cpus")`).
+    AmbiguousVar {
+        requested: String,
+        found_in: Vec<String>,
+    },
     /// A path component did not match any
-    /// [`RenderedValue::Struct`] member at that depth. `walked` is
-    /// the prefix that resolved successfully; `component` is the
-    /// failing segment; `available` lists the struct's actual
-    /// member names.
+    /// [`RenderedValue::Struct`] member at that depth. `requested`
+    /// is the user-supplied lookup string; `walked` is the prefix
+    /// that resolved successfully; `component` is the failing
+    /// segment; `available` lists the struct's actual member names.
     FieldNotFound {
-        path: String,
+        requested: String,
         walked: String,
         component: String,
         available: Vec<String>,
     },
     /// A path component reached a non-Struct value where a struct
-    /// was expected (e.g. descending into a `Uint` leaf). `kind`
-    /// names the actual variant for diagnostics.
+    /// was expected (e.g. descending into a `Uint` leaf).
+    /// `requested` is the user-supplied lookup string; `kind` names
+    /// the actual variant for diagnostics.
     NotAStruct {
-        path: String,
+        requested: String,
         walked: String,
         component: String,
         kind: &'static str,
     },
     /// A typed accessor (`as_u64` etc.) was called on a rendered
     /// shape it cannot decode (e.g. `as_str` on a `Struct`).
-    /// `requested` names the requested scalar type;
-    /// `actual` names the rendered variant.
+    /// `expected` names the scalar type the accessor requires;
+    /// `actual` names the rendered variant; `requested` is the
+    /// user-supplied lookup string (empty when the accessor was
+    /// invoked on a leaf without a path walk).
     TypeMismatch {
-        requested: &'static str,
+        expected: &'static str,
         actual: &'static str,
-        path: String,
+        requested: String,
     },
     /// A map index was out of range for the underlying entry list.
     IndexOutOfRange {
@@ -193,7 +206,8 @@ pub enum SnapshotError {
     /// A predicate-based lookup (`find`, `max_by`) found no match.
     NoMatch { map: String, op: &'static str },
     /// A path string contained an empty component (e.g. `"a..b"`).
-    EmptyPathComponent { path: String },
+    /// `requested` is the user-supplied lookup string.
+    EmptyPathComponent { requested: String },
     /// `EntryAccessor::get` was called on a per-CPU entry without
     /// narrowing to a CPU first via [`SnapshotMap::cpu`].
     PerCpuNotNarrowed { map: String },
@@ -224,38 +238,48 @@ impl std::fmt::Display for SnapshotError {
                      *.bss/*.data/*.rodata map (available globals: {available:?})"
                 )
             }
+            SnapshotError::AmbiguousVar {
+                requested,
+                found_in,
+            } => {
+                write!(
+                    f,
+                    "snapshot global '{requested}' is ambiguous (found in \
+                     {found_in:?}); use Snapshot::map(name) to disambiguate"
+                )
+            }
             SnapshotError::FieldNotFound {
-                path,
+                requested,
                 walked,
                 component,
                 available,
             } => {
                 write!(
                     f,
-                    "path '{path}': component '{component}' (after walking '{walked}') \
+                    "path '{requested}': component '{component}' (after walking '{walked}') \
                      not found (members at this depth: {available:?})"
                 )
             }
             SnapshotError::NotAStruct {
-                path,
+                requested,
                 walked,
                 component,
                 kind,
             } => {
                 write!(
                     f,
-                    "path '{path}': component '{component}' (after walking '{walked}') \
+                    "path '{requested}': component '{component}' (after walking '{walked}') \
                      expected a Struct, got {kind}"
                 )
             }
             SnapshotError::TypeMismatch {
-                requested,
+                expected,
                 actual,
-                path,
+                requested,
             } => {
                 write!(
                     f,
-                    "path '{path}': cannot read as {requested} — actual rendered \
+                    "path '{requested}': cannot read as {expected} — actual rendered \
                      variant is {actual}"
                 )
             }
@@ -280,8 +304,11 @@ impl std::fmt::Display for SnapshotError {
             SnapshotError::NoMatch { map, op } => {
                 write!(f, "map '{map}': {op} matched no entries")
             }
-            SnapshotError::EmptyPathComponent { path } => {
-                write!(f, "path '{path}' has an empty component (consecutive '.')")
+            SnapshotError::EmptyPathComponent { requested } => {
+                write!(
+                    f,
+                    "path '{requested}' has an empty component (consecutive '.')"
+                )
             }
             SnapshotError::PerCpuNotNarrowed { map } => {
                 write!(
@@ -430,6 +457,28 @@ impl SnapshotStore {
     }
 }
 
+/// RAII guard for a reserved [`SnapshotBridge::watch_count`] slot.
+///
+/// [`SnapshotBridge::register_watch`] reserves a slot via CAS BEFORE
+/// calling the host's watch-register callback so concurrent callers
+/// cannot push the count past [`MAX_WATCH_SNAPSHOTS`] even
+/// transiently. If the callback panics (rather than returning Err),
+/// the prior manual-fetch_sub rollback never ran — the slot would
+/// leak permanently and every future `register_watch` call would hit
+/// the cap with no real watchpoints armed. This guard releases the
+/// reservation on every exit path (Err-return AND unwind); the
+/// success path commits the slot via `mem::forget`.
+struct WatchSlotGuard<'a> {
+    count: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for WatchSlotGuard<'_> {
+    fn drop(&mut self) {
+        self.count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 #[must_use = "dropping a SnapshotBridge discards the capture pipeline"]
 pub struct SnapshotBridge {
@@ -504,9 +553,7 @@ impl SnapshotBridge {
         // the cap before either rolled back, briefly violating the
         // invariant `watch_count <= MAX_WATCH_SNAPSHOTS`.
         loop {
-            let prev = self
-                .watch_count
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let prev = self.watch_count.load(std::sync::atomic::Ordering::Relaxed);
             if prev >= MAX_WATCH_SNAPSHOTS {
                 return Err(format!(
                     "Op::WatchSnapshot cap exceeded: scenario already registered \
@@ -532,9 +579,17 @@ impl SnapshotBridge {
             // and retry. spurious failures are also retried — that is
             // why this uses the _weak variant inside a loop.
         }
+        // Slot reserved. Wrap it in a Drop guard so a panic inside
+        // `register(symbol)` releases the reservation on unwind — the
+        // previous manual-fetch_sub rollback only ran on the explicit
+        // Err(reason) arm, leaking the slot permanently if the
+        // callback panicked. The success path commits the slot with
+        // mem::forget after register returns Ok.
+        let guard = WatchSlotGuard {
+            count: &self.watch_count,
+        };
         let Some(register) = self.register_watch.as_ref() else {
-            self.watch_count
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            drop(guard);
             return Err(format!(
                 "Op::WatchSnapshot('{symbol}'): no watch-register callback installed \
                  on this SnapshotBridge — the host wires one via \
@@ -542,11 +597,8 @@ impl SnapshotBridge {
                  in-guest / no-VM scenarios cannot register hardware watchpoints"
             ));
         };
-        if let Err(reason) = register(symbol) {
-            self.watch_count
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            return Err(reason);
-        }
+        register(symbol)?;
+        std::mem::forget(guard);
         Ok(())
     }
 
@@ -637,6 +689,23 @@ impl SnapshotBridge {
             .unwrap_or_else(|e| e.into_inner())
             .reports
             .is_empty()
+    }
+
+    /// True when a stored report already exists for `name`. Lets the
+    /// freeze coordinator's final-drain placeholder path skip storing
+    /// a degraded "coord exited before capture" report on top of a
+    /// real capture that the in-loop dispatch landed earlier — without
+    /// this gate, a vCPU thread that re-armed `hit=true` after the
+    /// in-loop service successfully published the report would have
+    /// its tag's stored capture overwritten by the placeholder at
+    /// teardown, presenting tests with a hollow snapshot in place of
+    /// the real one.
+    pub fn has(&self, name: &str) -> bool {
+        self.snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reports
+            .contains_key(name)
     }
 
     /// Take ownership of the captured snapshots, leaving the bridge
@@ -745,11 +814,21 @@ impl<'a> Snapshot<'a> {
     /// named `name`. Convenience for `.var("nr_cpus_onln")` style
     /// scalar reads without naming the section explicitly.
     ///
-    /// Returns [`SnapshotField::Value`] on the first hit;
-    /// [`SnapshotField::Missing`] with [`SnapshotError::VarNotFound`]
-    /// (and the union of every global-section map's top-level
-    /// member names in `available`) when no hit found.
+    /// Returns [`SnapshotField::Value`] on a unique match;
+    /// [`SnapshotField::Missing`] with
+    /// [`SnapshotError::VarNotFound`] (and the union of every
+    /// global-section map's top-level member names in `available`)
+    /// when no map exposes the name; or
+    /// [`SnapshotError::AmbiguousVar`] when more than one
+    /// global-section map exposes a top-level member with the same
+    /// name. Two BPF objects sharing a global symbol — common when
+    /// a scenario loads multiple progs into one report — would
+    /// otherwise fall through to an arbitrary first match keyed off
+    /// `report.maps` ordering, which depends on kernel IDR
+    /// allocation order. Callers disambiguate via
+    /// [`Self::map`] and walk the named map directly.
     pub fn var(&self, name: &str) -> SnapshotField<'a> {
+        let mut hits: Vec<(&'a str, &'a RenderedValue)> = Vec::new();
         for m in &self.report.maps {
             if !is_global_section_map(&m.name) {
                 continue;
@@ -757,26 +836,35 @@ impl<'a> Snapshot<'a> {
             if let Some(v) = m.value.as_ref()
                 && let Some(found) = lookup_member(v, name)
             {
-                return SnapshotField::Value(found);
+                hits.push((m.name.as_str(), found));
             }
         }
-        let mut available: Vec<String> = Vec::new();
-        for m in &self.report.maps {
-            if !is_global_section_map(&m.name) {
-                continue;
-            }
-            if let Some(RenderedValue::Struct { members, .. }) = m.value.as_ref() {
-                for member in members {
-                    available.push(member.name.clone());
+        match hits.len() {
+            1 => SnapshotField::Value(hits[0].1),
+            n if n > 1 => SnapshotField::Missing(SnapshotError::AmbiguousVar {
+                requested: name.to_string(),
+                found_in: hits.iter().map(|(name, _)| (*name).to_string()).collect(),
+            }),
+            _ => {
+                let mut available: Vec<String> = Vec::new();
+                for m in &self.report.maps {
+                    if !is_global_section_map(&m.name) {
+                        continue;
+                    }
+                    if let Some(RenderedValue::Struct { members, .. }) = m.value.as_ref() {
+                        for member in members {
+                            available.push(member.name.clone());
+                        }
+                    }
                 }
+                available.sort();
+                available.dedup();
+                SnapshotField::Missing(SnapshotError::VarNotFound {
+                    requested: name.to_string(),
+                    available,
+                })
             }
         }
-        available.sort();
-        available.dedup();
-        SnapshotField::Missing(SnapshotError::VarNotFound {
-            requested: name.to_string(),
-            available,
-        })
     }
 
     /// Number of maps captured in the report.
@@ -1126,16 +1214,16 @@ impl<'a> SnapshotEntry<'a> {
                     SnapshotField::PercpuKey { key: e.key }
                 } else {
                     SnapshotField::Missing(SnapshotError::TypeMismatch {
-                        requested: "Struct",
+                        expected: "Struct",
                         actual: "Uint(percpu key)",
-                        path: path.to_string(),
+                        requested: path.to_string(),
                     })
                 }
             }
             SnapshotEntry::Value(_) => SnapshotField::Missing(SnapshotError::TypeMismatch {
-                requested: "key",
+                expected: "key",
                 actual: "single Value (no key)",
-                path: path.to_string(),
+                requested: path.to_string(),
             }),
             SnapshotEntry::Missing(err) => SnapshotField::Missing(err.clone()),
         }
@@ -1172,9 +1260,9 @@ impl<'a> SnapshotField<'a> {
             SnapshotField::Value(v) => walk_dotted_path(v, path),
             SnapshotField::PercpuKey { .. } => {
                 SnapshotField::Missing(SnapshotError::TypeMismatch {
-                    requested: "Struct",
+                    expected: "Struct",
                     actual: "Uint(percpu key)",
-                    path: path.to_string(),
+                    requested: path.to_string(),
                 })
             }
             SnapshotField::Missing(err) => SnapshotField::Missing(err.clone()),
@@ -1221,9 +1309,9 @@ impl<'a> SnapshotField<'a> {
                 RenderedValue::Enum { value, .. } => Ok(*value != 0),
                 RenderedValue::Ptr { value, .. } => Ok(*value != 0),
                 other => Err(SnapshotError::TypeMismatch {
-                    requested: "bool",
+                    expected: "bool",
                     actual: describe_kind(other),
-                    path: String::new(),
+                    requested: String::new(),
                 }),
             },
             SnapshotField::PercpuKey { key } => Ok(*key != 0),
@@ -1240,9 +1328,9 @@ impl<'a> SnapshotField<'a> {
                 RenderedValue::Uint { value, .. } => Ok(*value as f64),
                 RenderedValue::Enum { value, .. } => Ok(*value as f64),
                 other => Err(SnapshotError::TypeMismatch {
-                    requested: "f64",
+                    expected: "f64",
                     actual: describe_kind(other),
-                    path: String::new(),
+                    requested: String::new(),
                 }),
             },
             SnapshotField::PercpuKey { key } => Ok(f64::from(*key)),
@@ -1260,15 +1348,15 @@ impl<'a> SnapshotField<'a> {
                     ..
                 } => Ok(name.as_str()),
                 other => Err(SnapshotError::TypeMismatch {
-                    requested: "str (enum variant name)",
+                    expected: "str (enum variant name)",
                     actual: describe_kind(other),
-                    path: String::new(),
+                    requested: String::new(),
                 }),
             },
             SnapshotField::PercpuKey { .. } => Err(SnapshotError::TypeMismatch {
-                requested: "str",
+                expected: "str",
                 actual: "Uint(percpu key)",
-                path: String::new(),
+                requested: String::new(),
             }),
             SnapshotField::Missing(err) => Err(err.clone()),
         }
@@ -1300,7 +1388,7 @@ impl<'a> SnapshotField<'a> {
 /// component matches a [`RenderedMember::name`] inside a
 /// [`RenderedValue::Struct`]; [`RenderedValue::Ptr`] dereferences
 /// are followed transparently. An empty path returns the root.
-pub fn walk_dotted_path<'a>(root: &'a RenderedValue, path: &str) -> SnapshotField<'a> {
+pub(crate) fn walk_dotted_path<'a>(root: &'a RenderedValue, path: &str) -> SnapshotField<'a> {
     if path.is_empty() {
         return SnapshotField::Value(root);
     }
@@ -1309,13 +1397,13 @@ pub fn walk_dotted_path<'a>(root: &'a RenderedValue, path: &str) -> SnapshotFiel
     for component in path.split('.') {
         if component.is_empty() {
             return SnapshotField::Missing(SnapshotError::EmptyPathComponent {
-                path: path.to_string(),
+                requested: path.to_string(),
             });
         }
         cursor = peel_pointer(cursor);
         let RenderedValue::Struct { members, .. } = cursor else {
             return SnapshotField::Missing(SnapshotError::NotAStruct {
-                path: path.to_string(),
+                requested: path.to_string(),
                 walked: walked.clone(),
                 component: component.to_string(),
                 kind: describe_kind(cursor),
@@ -1325,7 +1413,7 @@ pub fn walk_dotted_path<'a>(root: &'a RenderedValue, path: &str) -> SnapshotFiel
         let Some(member) = next else {
             let names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
             return SnapshotField::Missing(SnapshotError::FieldNotFound {
-                path: path.to_string(),
+                requested: path.to_string(),
                 walked: walked.clone(),
                 component: component.to_string(),
                 available: names,
@@ -1397,9 +1485,9 @@ fn render_to_u64(v: &RenderedValue) -> SnapshotResult<u64> {
         RenderedValue::Int { value, .. } => {
             if *value < 0 {
                 Err(SnapshotError::TypeMismatch {
-                    requested: "u64",
+                    expected: "u64",
                     actual: "Int(negative)",
-                    path: String::new(),
+                    requested: String::new(),
                 })
             } else {
                 Ok(*value as u64)
@@ -1410,9 +1498,9 @@ fn render_to_u64(v: &RenderedValue) -> SnapshotResult<u64> {
         RenderedValue::Enum { value, .. } => {
             if *value < 0 {
                 Err(SnapshotError::TypeMismatch {
-                    requested: "u64",
+                    expected: "u64",
                     actual: "Enum(negative)",
-                    path: String::new(),
+                    requested: String::new(),
                 })
             } else {
                 Ok(*value as u64)
@@ -1420,9 +1508,9 @@ fn render_to_u64(v: &RenderedValue) -> SnapshotResult<u64> {
         }
         RenderedValue::Ptr { value, .. } => Ok(*value),
         other => Err(SnapshotError::TypeMismatch {
-            requested: "u64",
+            expected: "u64",
             actual: describe_kind(other),
-            path: String::new(),
+            requested: String::new(),
         }),
     }
 }
@@ -1434,9 +1522,9 @@ fn render_to_i64(v: &RenderedValue) -> SnapshotResult<i64> {
         RenderedValue::Uint { value, .. } => {
             if *value > i64::MAX as u64 {
                 Err(SnapshotError::TypeMismatch {
-                    requested: "i64",
+                    expected: "i64",
                     actual: "Uint(>i64::MAX)",
-                    path: String::new(),
+                    requested: String::new(),
                 })
             } else {
                 Ok(*value as i64)
@@ -1446,9 +1534,9 @@ fn render_to_i64(v: &RenderedValue) -> SnapshotResult<i64> {
         RenderedValue::Char { value } => Ok(i64::from(*value)),
         RenderedValue::Enum { value, .. } => Ok(*value),
         other => Err(SnapshotError::TypeMismatch {
-            requested: "i64",
+            expected: "i64",
             actual: describe_kind(other),
-            path: String::new(),
+            requested: String::new(),
         }),
     }
 }
@@ -1701,6 +1789,100 @@ mod tests {
         assert!(f.as_bool().is_err());
     }
 
+    /// Pin the `Snapshot::var` ambiguity-detection invariant: when
+    /// two global-section maps expose a top-level member with the
+    /// same name, var() MUST surface AmbiguousVar with both map
+    /// names rather than silently returning the first match. The
+    /// previous first-match behavior depended on `report.maps`
+    /// ordering which mirrors kernel IDR allocation order — a
+    /// non-deterministic source. Regression: removing the
+    /// hits.len() > 1 arm or short-circuiting on first hit would
+    /// surface here as an `Ok` SnapshotField::Value with no error.
+    #[test]
+    fn snapshot_var_ambiguity_lists_every_match() {
+        let mut r = synthetic_report();
+        // Add a second .data global-section map that ALSO exposes a
+        // top-level `nr_cpus_onln` member. The synthetic report
+        // already contains `bpf.bss` with `nr_cpus_onln`; with two
+        // maps exposing the name, var() must error.
+        let dup_value = RenderedValue::Struct {
+            type_name: Some(".data".into()),
+            members: vec![RenderedMember {
+                name: "nr_cpus_onln".into(),
+                value: RenderedValue::Uint {
+                    bits: 32,
+                    value: 99,
+                },
+            }],
+        };
+        r.maps.push(FailureDumpMap {
+            name: "other.data".into(),
+            map_type: 2,
+            value_size: 32,
+            max_entries: 1,
+            value: Some(dup_value),
+            entries: Vec::new(),
+            percpu_entries: Vec::new(),
+            percpu_hash_entries: Vec::new(),
+            arena: None,
+            ringbuf: None,
+            stack_trace: None,
+            fd_array: None,
+            error: None,
+        });
+        let snap = Snapshot::new(&r);
+        let f = snap.var("nr_cpus_onln");
+        let err = f
+            .error()
+            .expect("duplicate global must surface AmbiguousVar");
+        match err {
+            SnapshotError::AmbiguousVar {
+                requested,
+                found_in,
+            } => {
+                assert_eq!(requested, "nr_cpus_onln");
+                assert!(
+                    found_in.contains(&"bpf.bss".to_string()),
+                    "first map must appear in found_in: {found_in:?}",
+                );
+                assert!(
+                    found_in.contains(&"other.data".to_string()),
+                    "second map must appear in found_in: {found_in:?}",
+                );
+                assert_eq!(
+                    found_in.len(),
+                    2,
+                    "AmbiguousVar must list every map where the name was found, no more no less: {found_in:?}",
+                );
+            }
+            other => panic!("expected AmbiguousVar, got: {other:?}"),
+        }
+        // Display must mention both map names so the test author
+        // can pick the right disambiguation target.
+        let rendered = err.to_string();
+        assert!(rendered.contains("nr_cpus_onln"), "{rendered}");
+        assert!(rendered.contains("bpf.bss"), "{rendered}");
+        assert!(rendered.contains("other.data"), "{rendered}");
+        // Caller can disambiguate via map() — verify both maps
+        // resolve independently.
+        let bss = snap
+            .map("bpf.bss")
+            .unwrap()
+            .at(0)
+            .get("nr_cpus_onln")
+            .as_u64()
+            .unwrap();
+        let data = snap
+            .map("other.data")
+            .unwrap()
+            .at(0)
+            .get("nr_cpus_onln")
+            .as_u64()
+            .unwrap();
+        assert_eq!(bss, 4);
+        assert_eq!(data, 99);
+    }
+
     #[test]
     fn missing_field_in_struct_lists_available_members() {
         let r = synthetic_report();
@@ -1746,8 +1928,8 @@ mod tests {
         let snap = Snapshot::new(&r);
         let f = snap.var("ctx").get("weight..value");
         match f.error().expect("missing carries error") {
-            SnapshotError::EmptyPathComponent { path } => {
-                assert_eq!(path, "weight..value");
+            SnapshotError::EmptyPathComponent { requested } => {
+                assert_eq!(requested, "weight..value");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -1949,6 +2131,50 @@ mod tests {
         assert_eq!(bridge.watch_count(), 0);
     }
 
+    /// Pin the WatchSlotGuard panic-safety invariant: a panic inside
+    /// the watch-register callback must NOT leak the reserved slot.
+    /// Before the guard was added, the manual fetch_sub rollback only
+    /// ran on the explicit `Err(reason)` arm — a panicking callback
+    /// left `watch_count` permanently incremented, eventually exhausting
+    /// the cap with no real watchpoints armed. The guard's `Drop` impl
+    /// runs on every exit path including unwind; success commits via
+    /// `mem::forget`. Regression: removing the guard or moving
+    /// `mem::forget` before the callback would surface here as
+    /// `watch_count() != 0` after the catch_unwind below.
+    #[test]
+    fn snapshot_bridge_register_watch_panic_releases_slot() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let reg: WatchRegisterCallback = Arc::new(|_symbol| {
+            panic!("synthetic register_watch panic — slot must still release");
+        });
+        let bridge = SnapshotBridge::new(cb).with_watch_register(reg);
+        let bridge_clone = bridge.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = bridge_clone.register_watch("kernel.panic_path");
+        }));
+        assert!(
+            result.is_err(),
+            "callback panic must propagate out of register_watch",
+        );
+        // Slot must be released — guard's Drop ran during unwind.
+        assert_eq!(
+            bridge.watch_count(),
+            0,
+            "WatchSlotGuard must release the reserved slot on panic; \
+             a non-zero count means the slot leaked and the cap will \
+             eventually exhaust with no real watchpoints armed",
+        );
+        // Cap must remain reachable: a fresh non-panicking callback
+        // can now register all 3 user slots.
+        let cb2: CaptureCallback = Arc::new(|_| None);
+        let reg2: WatchRegisterCallback = Arc::new(|_| Ok(()));
+        let bridge2 = SnapshotBridge::new(cb2).with_watch_register(reg2);
+        for i in 0..MAX_WATCH_SNAPSHOTS {
+            assert!(bridge2.register_watch(&format!("kernel.s{i}")).is_ok());
+        }
+        assert_eq!(bridge2.watch_count(), MAX_WATCH_SNAPSHOTS);
+    }
+
     #[test]
     fn snapshot_bridge_thread_local_install_and_restore() {
         assert!(with_active_bridge(|_| ()).is_none());
@@ -2132,17 +2358,20 @@ mod tests {
     }
 
     #[test]
-    fn nested_field_get_composes() {
+    fn var_exact_match_does_not_split_dotted_paths() {
         let r = synthetic_report();
         let snap = Snapshot::new(&r);
-        // Two-segment path equivalent to one chained get.
-        let one = snap.var("ctx.weight");
+        // Chained `var(...).get(...)` walks the rendered struct's
+        // members and yields the leaf value — the canonical way to
+        // reach a sub-field.
         let chained = snap.var("ctx").get("weight");
-        assert!(one.error().is_none());
         assert_eq!(chained.as_u64().unwrap(), 1024);
-        // Snapshot::var does not split — `ctx.weight` is treated
-        // as one global variable name by var() (and not present).
-        assert!(one.error().is_some());
+        // `Snapshot::var` does not split on `.` — a dotted
+        // string is treated as one global variable name. Since
+        // no top-level member named `"ctx.weight"` exists, the
+        // call resolves to `Missing`.
+        let dotted = snap.var("ctx.weight");
+        assert!(dotted.error().is_some());
     }
 
     #[test]
@@ -2155,9 +2384,9 @@ mod tests {
         let result = snap.var("ctx").get("weight").as_str();
         match result {
             Err(SnapshotError::TypeMismatch {
-                requested, actual, ..
+                expected, actual, ..
             }) => {
-                assert_eq!(requested, "str (enum variant name)");
+                assert_eq!(expected, "str (enum variant name)");
                 assert_eq!(actual, "Uint");
             }
             _ => panic!("expected TypeMismatch"),

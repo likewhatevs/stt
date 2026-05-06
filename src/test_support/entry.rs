@@ -304,8 +304,8 @@ pub struct Scheduler {
     /// the VM. This is the GUEST KERNEL cmdline, not the scheduler
     /// binary's CLI — use [`sched_args`](field@Self::sched_args) for that.
     ///
-    /// Do not override the kargs ktstr injects itself (`nokaslr`,
-    /// `console=`, `loglevel=`, `init=`): those break guest-side init
+    /// Do not override the kargs ktstr injects itself (`console=`,
+    /// `loglevel=`, `init=`): those break guest-side init
     /// and leave the VM unable to run tests.
     pub kargs: &'static [&'static str],
     /// Scheduler-wide assertion overrides merged on top of
@@ -780,12 +780,12 @@ impl KtstrTestEntry {
         auto_repro: true,
         assert: crate::assert::Assert::NO_OVERRIDES,
         extra_sched_args: &[],
-        watchdog_timeout: Duration::from_secs(4),
+        watchdog_timeout: Duration::from_secs(5),
         bpf_map_write: &[],
         required_flags: &[],
         excluded_flags: &[],
         performance_mode: false,
-        duration: Duration::from_secs(2),
+        duration: Duration::from_secs(12),
         workers_per_cgroup: 2,
         expect_err: false,
         host_only: false,
@@ -1044,12 +1044,12 @@ mod tests {
         assert!(!d.scheduler.has_active_scheduling());
         assert!(d.auto_repro);
         assert!(d.extra_sched_args.is_empty());
-        assert_eq!(d.watchdog_timeout, Duration::from_secs(4));
+        assert_eq!(d.watchdog_timeout, Duration::from_secs(5));
         assert!(d.bpf_map_write.is_empty());
         assert!(d.required_flags.is_empty());
         assert!(d.excluded_flags.is_empty());
         assert!(!d.performance_mode);
-        assert_eq!(d.duration, Duration::from_secs(2));
+        assert_eq!(d.duration, Duration::from_secs(12));
         assert_eq!(d.workers_per_cgroup, 2);
         assert!(!d.expect_err);
         assert!(!d.host_only);

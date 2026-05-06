@@ -162,16 +162,28 @@ fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
 fn classify_repro_vm_status(
     timed_out: bool,
     has_crash_message: bool,
-    output: &str,
+    _output: &str,
     exit_code: i32,
+    guest_messages: Option<&crate::vmm::host_comms::BulkDrainResult>,
 ) -> String {
     if timed_out {
         return "repro VM: timed out".to_string();
     }
-    if let Some(reason) = extract_not_attached_reason(output) {
+    if let Some(reason) = extract_not_attached_reason(guest_messages) {
         return format!("repro VM: scheduler did not attach ({reason}) (exit code {exit_code})",);
     }
-    if has_crash_message || output.contains(super::SENTINEL_SCHEDULER_DIED) {
+    let scheduler_died = guest_messages
+        .map(|d| {
+            d.entries.iter().any(|e| {
+                e.msg_type == crate::vmm::wire::MSG_TYPE_LIFECYCLE
+                    && e.crc_ok
+                    && !e.payload.is_empty()
+                    && crate::vmm::wire::LifecyclePhase::from_wire(e.payload[0])
+                        == Some(crate::vmm::wire::LifecyclePhase::SchedulerDied)
+            })
+        })
+        .unwrap_or(false);
+    if has_crash_message || scheduler_died {
         // Describe qemu's exit disposition precisely: a crash sentinel
         // in `output` can coincide with qemu itself exiting 0 (guest
         // panic handler + orderly reboot), >0 (propagated non-zero),
@@ -208,37 +220,47 @@ fn classify_repro_vm_status(
     "repro VM: scheduler ran normally (crash did not reproduce)".to_string()
 }
 
-/// Extract the reason suffix after `SCHEDULER_NOT_ATTACHED:` on the
-/// first line of `output` that carries the sentinel. Returns
-/// `Some("timeout")` for the line `SCHEDULER_NOT_ATTACHED: timeout`,
-/// `Some("sched_ext sysfs absent")` for the sysfs-absent emission,
-/// or `None` when no line carries the sentinel.
+/// Extract the reason suffix from the first
+/// [`crate::vmm::wire::LifecyclePhase::SchedulerNotAttached`] frame
+/// in the bulk-port drain. Returns `Some("timeout")` for a
+/// timeout-on-attach emission, `Some("sched_ext sysfs absent")` for
+/// the sysfs-absent emission, or `None` when no
+/// `SchedulerNotAttached` lifecycle frame is present (or the frame
+/// carries an empty reason).
 ///
-/// The sentinel emission in `vmm::rust_init::start_scheduler` writes
-/// `"SCHEDULER_NOT_ATTACHED: <reason>"` as a single COM2 line. The
-/// parser splits at the first `:` after the sentinel and trims the
-/// remainder so trailing whitespace from `write_com2` does not leak
-/// into the reason string.
+/// Pre-bincode-migration: the emission lived as a
+/// `"SCHEDULER_NOT_ATTACHED: <reason>"` COM2 line and the parser
+/// split at the first colon. The reason now travels in the
+/// `MSG_TYPE_LIFECYCLE` payload bytes after the 1-byte phase
+/// header (see `vmm::guest_comms::send_lifecycle`), so the
+/// extraction is a direct UTF-8 slice without any delimiter
+/// parsing.
 ///
-/// The FIRST line with the sentinel wins unconditionally. If that
-/// first occurrence is malformed — no colon, or an empty/
-/// whitespace-only suffix — the result is `None` and no subsequent
-/// line is consulted. A malformed first occurrence indicates an
-/// emitter bug; falling through to a later, "better" line would
-/// paper over that bug. The caller handles `None` by routing to the
-/// generic crashed / abnormal-exit branches, which already surface
-/// exit code and crash-message diagnostics.
-fn extract_not_attached_reason(output: &str) -> Option<&str> {
-    let line = output
-        .lines()
-        .find(|l| l.contains(super::SENTINEL_SCHEDULER_NOT_ATTACHED))?;
-    let idx = line.find(super::SENTINEL_SCHEDULER_NOT_ATTACHED)?;
-    let after = &line[idx + super::SENTINEL_SCHEDULER_NOT_ATTACHED.len()..];
-    let reason = after.strip_prefix(':')?.trim();
-    if reason.is_empty() {
-        return None;
+/// FIRST matching frame wins unconditionally — same semantics as
+/// the prior line-walk. The caller handles `None` by routing to
+/// the generic crashed / abnormal-exit branches, which already
+/// surface exit code and crash-message diagnostics.
+fn extract_not_attached_reason(
+    drain: Option<&crate::vmm::host_comms::BulkDrainResult>,
+) -> Option<String> {
+    use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE};
+    let drain = drain?;
+    for e in &drain.entries {
+        if e.msg_type != MSG_TYPE_LIFECYCLE || !e.crc_ok || e.payload.is_empty() {
+            continue;
+        }
+        if LifecyclePhase::from_wire(e.payload[0])
+            != Some(LifecyclePhase::SchedulerNotAttached)
+        {
+            continue;
+        }
+        let reason = String::from_utf8_lossy(&e.payload[1..]).trim().to_string();
+        if reason.is_empty() {
+            return None;
+        }
+        return Some(reason);
     }
-    Some(reason)
+    None
 }
 
 /// Attempt auto-repro: extract stack functions from COM2 scheduler output
@@ -340,7 +362,7 @@ pub(crate) fn attempt_auto_repro(
 
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
-    let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
+    let no_perf_mode = super::runtime::no_perf_mode_active();
     let mut builder = super::runtime::build_vm_builder_base(
         entry,
         kernel,
@@ -558,6 +580,7 @@ pub(crate) fn attempt_auto_repro(
             repro_result.crash_message.is_some(),
             &repro_result.output,
             repro_result.exit_code,
+            repro_result.guest_messages.as_ref(),
         ));
     }
 
@@ -810,7 +833,16 @@ pub(crate) fn format_probe_diagnostics(
     ));
 
     // Stage 2: filter
-    let passed = pipeline.stack_extracted as usize - pipeline.filter_dropped.len();
+    //
+    // Invariant from construction (see start_probe_phase_a /
+    // ProbeHandle setup): every name in `filter_dropped` is a member
+    // of the original `raw_functions` whose count became
+    // `stack_extracted`, so `filter_dropped.len() <= stack_extracted`.
+    // `PipelineDiagnostics` is serde-serialized over COM2 though, and
+    // the format runs on the failure-reporting path. `saturating_sub`
+    // keeps a corrupt or partial payload from masking the real failure
+    // with a subtract-with-overflow panic during diagnostic rendering.
+    let passed = (pipeline.stack_extracted as usize).saturating_sub(pipeline.filter_dropped.len());
     if pipeline.filter_dropped.is_empty() {
         out.push_str(&format!("  traceable:   {passed} passed filter\n"));
     } else {
@@ -899,6 +931,16 @@ pub(crate) fn format_probe_diagnostics(
                 "not fired"
             },
             trigger_type,
+        ));
+    }
+    if let Some(ref panic_msg) = skeleton.host_thread_panic {
+        // Render at the top of stage-7 output so an operator
+        // grepping the probe summary sees the panic line before any
+        // counter the panicking thread might have published mid-run.
+        // Terminal failure: every other stat below this line is
+        // suspect because the producer thread did not finish.
+        out.push_str(&format!(
+            "  ERROR:       probe-collection thread panicked: {panic_msg}\n"
         ));
     }
 
@@ -1693,11 +1735,30 @@ fn collect_and_print_probe_data(
     let (events, skeleton_diag, accumulated_fn_names) = match ph.thread.join() {
         Ok((Some(events), diag, fnames)) => (events, diag, fnames),
         Ok((None, diag, fnames)) => (Vec::new(), diag, fnames),
-        Err(_) => (
-            Vec::new(),
-            crate::probe::process::ProbeDiagnostics::default(),
-            Vec::new(),
-        ),
+        Err(payload) => {
+            // Stamp the panic payload onto a fresh diagnostics
+            // record. Without this, the empty events vec + default
+            // diag emitted on the host COM2 channel is byte-for-byte
+            // identical to a clean run where the trigger simply
+            // never fired — the host can't tell that the probe
+            // thread crashed and would silently record the test as
+            // passing. Setting `host_thread_panic` is the
+            // single signal the host parser uses to fail the run.
+            // `panic!(...)` payloads in safe code are either
+            // `&'static str` or `String`; other types fall through
+            // to a sentinel so the field is always populated when
+            // we reach this arm.
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic>".to_string()
+            };
+            let mut diag = crate::probe::process::ProbeDiagnostics::default();
+            diag.host_thread_panic = Some(msg);
+            (Vec::new(), diag, Vec::new())
+        }
     };
 
     // Prefer accumulated func_names (includes both Phase A and Phase B).
@@ -1959,7 +2020,8 @@ mod tests {
                     }
                     depth += 1;
                 }
-                b'}' => depth -= 1,
+                b'}' => depth = depth.saturating_sub(1),
+                b']' if depth == 0 => break,
                 _ => {}
             }
         }
@@ -2536,96 +2598,170 @@ mod tests {
 
     // -- extract_not_attached_reason --
 
+    fn lifecycle_drain(
+        phase: crate::vmm::wire::LifecyclePhase,
+        reason: &str,
+    ) -> crate::vmm::host_comms::BulkDrainResult {
+        let mut payload = vec![phase.wire_value()];
+        payload.extend_from_slice(reason.as_bytes());
+        crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![crate::vmm::wire::ShmEntry {
+                msg_type: crate::vmm::wire::MSG_TYPE_LIFECYCLE,
+                payload,
+                crc_ok: true,
+            }],
+        }
+    }
+
     #[test]
     fn extract_not_attached_reason_timeout() {
-        let output = "noise\nSCHEDULER_NOT_ATTACHED: timeout\nmore";
-        assert_eq!(extract_not_attached_reason(output), Some("timeout"));
+        let drain = lifecycle_drain(
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+            "timeout",
+        );
+        assert_eq!(
+            extract_not_attached_reason(Some(&drain)).as_deref(),
+            Some("timeout"),
+        );
     }
 
     #[test]
     fn extract_not_attached_reason_sysfs_absent() {
         // Multi-word reason must survive through to the caller so the
         // user can distinguish "timeout" from "sched_ext sysfs absent".
-        let output = "SCHEDULER_NOT_ATTACHED: sched_ext sysfs absent";
+        let drain = lifecycle_drain(
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+            "sched_ext sysfs absent",
+        );
         assert_eq!(
-            extract_not_attached_reason(output),
+            extract_not_attached_reason(Some(&drain)).as_deref(),
             Some("sched_ext sysfs absent"),
         );
     }
 
     #[test]
-    fn extract_not_attached_reason_trims_trailing_whitespace() {
-        // `write_com2` may append whitespace; the reason comparison
-        // and display path should not expose that to the user.
-        let output = "SCHEDULER_NOT_ATTACHED:  timeout  \n";
-        assert_eq!(extract_not_attached_reason(output), Some("timeout"));
-    }
-
-    #[test]
-    fn extract_not_attached_reason_absent_returns_none() {
-        assert_eq!(extract_not_attached_reason(""), None);
+    fn extract_not_attached_reason_trims_surrounding_whitespace() {
+        // The lifecycle payload's reason is trimmed before
+        // surfacing to the caller, so a stray space or newline
+        // appended at the emit site does not leak into the
+        // displayed reason string.
+        let drain = lifecycle_drain(
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+            "  timeout  ",
+        );
         assert_eq!(
-            extract_not_attached_reason("SCHEDULER_DIED\nKTSTR_EXIT=1"),
-            None,
+            extract_not_attached_reason(Some(&drain)).as_deref(),
+            Some("timeout"),
         );
     }
 
     #[test]
-    fn extract_not_attached_reason_without_colon_returns_none() {
-        // The sentinel token alone, with no `: reason` suffix, carries
-        // no diagnostic value. `None` lets the caller fall through to
-        // the generic abnormal-exit branch instead of surfacing an
-        // empty reason.
-        let output = "SCHEDULER_NOT_ATTACHED\nKTSTR_EXIT=1";
-        assert_eq!(extract_not_attached_reason(output), None);
+    fn extract_not_attached_reason_absent_returns_none() {
+        assert_eq!(extract_not_attached_reason(None), None);
+        let died = lifecycle_drain(crate::vmm::wire::LifecyclePhase::SchedulerDied, "");
+        assert_eq!(extract_not_attached_reason(Some(&died)), None);
     }
 
     #[test]
     fn extract_not_attached_reason_empty_suffix_returns_none() {
-        // `SCHEDULER_NOT_ATTACHED:` with no reason text is functionally
-        // equivalent to no sentinel — no classification signal to
-        // surface.
-        let output = "SCHEDULER_NOT_ATTACHED:\n";
-        assert_eq!(extract_not_attached_reason(output), None);
-        let output_ws = "SCHEDULER_NOT_ATTACHED:   \n";
-        assert_eq!(extract_not_attached_reason(output_ws), None);
+        // A `SchedulerNotAttached` lifecycle with no reason bytes
+        // carries no diagnostic value — `None` lets the caller
+        // fall through to the generic abnormal-exit branch instead
+        // of surfacing an empty reason.
+        let drain = lifecycle_drain(
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+            "",
+        );
+        assert_eq!(extract_not_attached_reason(Some(&drain)), None);
+        let drain_ws = lifecycle_drain(
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+            "   ",
+        );
+        assert_eq!(extract_not_attached_reason(Some(&drain_ws)), None);
     }
 
     #[test]
     fn extract_not_attached_reason_first_match_wins() {
-        // Two sentinel lines should not be possible in production
-        // (rust_init emits exactly one before force_reboot), but if
-        // the harness ever concatenates outputs, pinning "first match"
-        // keeps the classification stable.
-        let output =
-            "SCHEDULER_NOT_ATTACHED: timeout\nSCHEDULER_NOT_ATTACHED: sched_ext sysfs absent";
-        assert_eq!(extract_not_attached_reason(output), Some("timeout"));
+        // Two `SchedulerNotAttached` frames should not be possible
+        // in production (rust_init emits exactly one before
+        // force_reboot), but if the bulk drain ever concatenates
+        // multiple, pinning "first match" keeps the classification
+        // stable.
+        let drain = crate::vmm::host_comms::BulkDrainResult {
+            entries: vec![
+                lifecycle_drain(
+                    crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+                    "timeout",
+                )
+                .entries
+                .pop()
+                .unwrap(),
+                lifecycle_drain(
+                    crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+                    "sched_ext sysfs absent",
+                )
+                .entries
+                .pop()
+                .unwrap(),
+            ],
+        };
+        assert_eq!(
+            extract_not_attached_reason(Some(&drain)).as_deref(),
+            Some("timeout"),
+        );
+    }
+
+    #[test]
+    fn extract_not_attached_reason_skips_crc_bad() {
+        // CRC-bad lifecycle frames must be ignored — same rule as
+        // every other host-side bulk-drain consumer.
+        let mut bad = lifecycle_drain(
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+            "timeout",
+        );
+        bad.entries[0].crc_ok = false;
+        assert_eq!(extract_not_attached_reason(Some(&bad)), None);
     }
 
     // -- classify_repro_vm_status --
+    //
+    // Lifecycle phases now travel as `MSG_TYPE_LIFECYCLE` TLV
+    // frames on the bulk data port, so each fixture builds a
+    // `BulkDrainResult` containing the relevant frame(s). The
+    // `lifecycle_drain` helper above produces a single-frame drain;
+    // multi-frame fixtures construct entries inline.
+
+    fn died_drain() -> crate::vmm::host_comms::BulkDrainResult {
+        lifecycle_drain(crate::vmm::wire::LifecyclePhase::SchedulerDied, "")
+    }
+
+    fn not_attached_drain(reason: &str) -> crate::vmm::host_comms::BulkDrainResult {
+        lifecycle_drain(
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+            reason,
+        )
+    }
 
     #[test]
     fn classify_repro_vm_status_timeout_wins_over_other_signals() {
         // Even with a crash message present, the VM-level timeout is
         // the primary classification — a timed-out VM may have dumped
         // any signal on the way out.
+        let drain = not_attached_drain("timeout");
         let status = classify_repro_vm_status(
             /*timed_out*/ true,
             /*has_crash_message*/ true,
-            "SCHEDULER_NOT_ATTACHED: timeout\nSCHEDULER_DIED",
+            "",
             137,
+            Some(&drain),
         );
         assert_eq!(status, "repro VM: timed out");
     }
 
     #[test]
     fn classify_repro_vm_status_not_attached_with_reason() {
-        let status = classify_repro_vm_status(
-            false,
-            false,
-            "noise\nSCHEDULER_NOT_ATTACHED: sched_ext sysfs absent\nKTSTR_EXIT=1",
-            1,
-        );
+        let drain = not_attached_drain("sched_ext sysfs absent");
+        let status = classify_repro_vm_status(false, false, "", 1, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler did not attach (sched_ext sysfs absent) (exit code 1)",
@@ -2634,17 +2770,15 @@ mod tests {
 
     #[test]
     fn classify_repro_vm_status_not_attached_takes_precedence_over_crashed() {
-        // The rust_init emission path writes SCHEDULER_NOT_ATTACHED and
-        // then force-reboots before any SCHEDULER_DIED write could
-        // happen. If both sentinels ever appear in the same output,
-        // NOT_ATTACHED is the more specific classification and should
-        // win.
-        let status = classify_repro_vm_status(
-            false,
-            true,
-            "SCHEDULER_DIED\nSCHEDULER_NOT_ATTACHED: timeout",
-            1,
-        );
+        // The rust_init emission path writes SchedulerNotAttached and
+        // then force-reboots before any SchedulerDied could happen.
+        // If both ever appear in the same drain, NotAttached is the
+        // more specific classification and wins.
+        let mut drain = died_drain();
+        drain
+            .entries
+            .push(not_attached_drain("timeout").entries.pop().unwrap());
+        let status = classify_repro_vm_status(false, true, "", 1, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler did not attach (timeout) (exit code 1)",
@@ -2656,7 +2790,8 @@ mod tests {
         // Positive exit code on the crash-sentinel branch → qemu
         // propagated a non-zero exit alongside the guest crash
         // sentinel. Clause format: "exited with non-zero status (N)".
-        let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", 139);
+        let drain = died_drain();
+        let status = classify_repro_vm_status(false, false, "", 139, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler crashed — exited with non-zero status (139)",
@@ -2665,25 +2800,26 @@ mod tests {
 
     #[test]
     fn classify_repro_vm_status_crashed_from_crash_message() {
-        // crash_message set without a SCHEDULER_DIED sentinel (e.g.
-        // a guest-side panic captured from COM2 by
+        // crash_message set without a SchedulerDied lifecycle frame
+        // (e.g. a guest-side panic captured from COM2 by
         // `extract_panic_message`) still routes to the crashed
         // branch. Positive exit code → non-zero-status clause.
-        let status = classify_repro_vm_status(false, true, "no sentinels here", 134);
+        let status = classify_repro_vm_status(false, true, "no sentinels here", 134, None);
         assert_eq!(
             status,
             "repro VM: scheduler crashed — exited with non-zero status (134)",
         );
     }
 
-    /// exit_code == 0 with a crash sentinel is the "guest panic
-    /// handler + orderly reboot" case — qemu shut down cleanly but
-    /// the guest emitted SCHEDULER_DIED. The old format conflated
-    /// this with a true qemu-level crash; the branched format makes
-    /// it unambiguous.
+    /// exit_code == 0 with a SchedulerDied lifecycle frame is the
+    /// "guest panic handler + orderly reboot" case — qemu shut down
+    /// cleanly but the guest emitted SchedulerDied. The old format
+    /// conflated this with a true qemu-level crash; the branched
+    /// format makes it unambiguous.
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel_qemu_clean_exit() {
-        let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", 0);
+        let drain = died_drain();
+        let status = classify_repro_vm_status(false, false, "", 0, Some(&drain));
         assert_eq!(status, "repro VM: scheduler crashed — exited cleanly");
     }
 
@@ -2698,7 +2834,8 @@ mod tests {
     /// i32, on signal-kill). Clause format: "killed by signal (N)".
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel_killed_by_signal() {
-        let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", -9);
+        let drain = died_drain();
+        let status = classify_repro_vm_status(false, false, "", -9, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler crashed — killed by signal (-9)",
@@ -2721,7 +2858,8 @@ mod tests {
     /// here.
     #[test]
     fn classify_repro_vm_status_crashed_from_sentinel_vmm_exit_code_unset() {
-        let status = classify_repro_vm_status(false, false, "SCHEDULER_DIED\n", -1);
+        let drain = died_drain();
+        let status = classify_repro_vm_status(false, false, "", -1, Some(&drain));
         assert_eq!(
             status,
             "repro VM: scheduler crashed — VM host reported no final exit \
@@ -2747,13 +2885,13 @@ mod tests {
 
     #[test]
     fn classify_repro_vm_status_abnormal_exit() {
-        let status = classify_repro_vm_status(false, false, "clean output", 2);
+        let status = classify_repro_vm_status(false, false, "clean output", 2, None);
         assert_eq!(status, "repro VM: exited abnormally (exit code 2)");
     }
 
     #[test]
     fn classify_repro_vm_status_clean_run() {
-        let status = classify_repro_vm_status(false, false, "clean output", 0);
+        let status = classify_repro_vm_status(false, false, "clean output", 0, None);
         assert_eq!(
             status,
             "repro VM: scheduler ran normally (crash did not reproduce)",
@@ -2762,13 +2900,13 @@ mod tests {
 
     #[test]
     fn classify_repro_vm_status_malformed_not_attached_falls_through() {
-        // A SCHEDULER_NOT_ATTACHED token with no colon-delimited
-        // reason does not count as a classification signal. With no
+        // A SchedulerNotAttached lifecycle frame with no reason
+        // bytes does not count as a classification signal. With no
         // crash signals and exit_code=1 the result should be the
-        // abnormal-exit branch, not a NOT_ATTACHED branch with an
+        // abnormal-exit branch, not a NotAttached branch with an
         // empty reason.
-        let status =
-            classify_repro_vm_status(false, false, "SCHEDULER_NOT_ATTACHED\nKTSTR_EXIT=1", 1);
+        let drain = not_attached_drain("");
+        let status = classify_repro_vm_status(false, false, "", 1, Some(&drain));
         assert_eq!(status, "repro VM: exited abnormally (exit code 1)");
     }
 

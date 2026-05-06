@@ -70,9 +70,10 @@ impl VirtioBlk {
     /// shape — every parameter is a separate `&self` field that
     /// must be passed by reference so the caller can hold a
     /// concurrent mutable borrow of the queues vec.
-    // Production T_IN goes through [`Self::handle_read_vectored_impl`];
-    // this per-segment variant is reached only by the cfg(test)
-    // `handle_read` wrapper.
+    // TEST-ONLY: no production caller exists;
+    // [`Self::handle_read_vectored_impl`] is canonical. Retained for
+    // per-segment unit-test coverage — the cfg(test) `handle_read`
+    // wrapper is the sole reach point.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_read_impl(
@@ -193,9 +194,10 @@ impl VirtioBlk {
     ///
     /// `too_many_arguments` allow: same disjoint-borrow shape as
     /// [`Self::handle_read_impl`].
-    // Production T_OUT goes through
-    // [`Self::handle_write_vectored_impl`]; this per-segment variant
-    // is reached only by the cfg(test) `handle_write` wrapper.
+    // TEST-ONLY: no production caller exists;
+    // [`Self::handle_write_vectored_impl`] is canonical. Retained for
+    // per-segment unit-test coverage — the cfg(test) `handle_write`
+    // wrapper is the sole reach point.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn handle_write_impl(

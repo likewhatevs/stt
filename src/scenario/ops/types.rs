@@ -392,10 +392,11 @@ pub enum Op {
     /// [`SnapshotBridge`](crate::scenario::snapshot::SnapshotBridge)
     /// is for **host-side unit testing only** — it lets in-process
     /// executor tests record the symbol and return without arming
-    /// any hardware. Production in-VM scenarios run via the SHM
-    /// doorbell and the host coordinator's `arm_user_watchpoint`
-    /// path (`src/vmm/freeze_coord.rs`); the thread-local bridge
-    /// is never installed inside the guest.
+    /// any hardware. Production in-VM scenarios run via the
+    /// virtio-console port 1 `MSG_TYPE_SNAPSHOT_REQUEST` TLV frame
+    /// and the host coordinator's `arm_user_watchpoint` path
+    /// (`src/vmm/freeze_coord.rs`); the thread-local bridge is
+    /// never installed inside the guest.
     ///
     /// # Guard rails
     ///

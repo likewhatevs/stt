@@ -39,8 +39,8 @@ pub(crate) struct BaseKey(pub(crate) u64);
 /// Process-local memoisation key for [`hash_file`]. `(path, dev, ino,
 /// mtime_secs, mtime_nsecs)` identifies a specific file revision: dev
 /// + ino pin the inode (so a path replaced by a different file
-/// invalidates), and mtime catches in-place edits. Same file unchanged
-/// = identical key = HashMap hit, no re-stream.
+///   invalidates), and mtime catches in-place edits. Same file unchanged
+///   = identical key = HashMap hit, no re-stream.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct HashFileKey {
     path: PathBuf,
@@ -108,10 +108,7 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
         hasher.write(&buf[..n]);
     }
     let digest = hasher.finish();
-    hash_file_cache()
-        .lock()
-        .unwrap()
-        .insert(cache_key, digest);
+    hash_file_cache().lock().unwrap().insert(cache_key, digest);
     Ok(digest)
 }
 
@@ -402,6 +399,18 @@ pub(crate) fn get_or_build_base(
 /// fails (`EWOULDBLOCK`), another process is actively using the
 /// segment and it is skipped.
 ///
+/// Path-rebind defense: between the initial `shm_open(RDONLY)` and the
+/// `LOCK_EX | LOCK_NB` acquisition, a peer can `unlink + O_CREAT|O_EXCL`
+/// to recreate the segment at the same name with a new inode. Our held
+/// fd then references the orphaned old inode while the path resolves to
+/// the peer's fresh inode; an unconditional unlink would remove the
+/// peer's directory entry. After the lock succeeds, fstat the held fd
+/// and re-resolve the name to a second fd via `shm_open(RDONLY)`, then
+/// fstat that. If `(st_dev, st_ino)` differ, the path was rebound — drop
+/// both fds without unlinking. This narrows the residual window from
+/// "open-to-flock" (potentially long, since flock can block) to
+/// "fstat-recheck-to-unlink" (two adjacent syscalls).
+///
 /// Called once per process via the [`OnceLock`] gate in
 /// [`get_or_build_base`]. Sweeping on every call is wasteful when many
 /// tests share a process — the first cache lookup pays for the scan
@@ -442,10 +451,38 @@ fn cleanup_stale_shm(current: &BaseKey) {
         ) else {
             continue;
         };
-        if rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
-            let _ = rustix::shm::unlink(shm_name.as_str());
-            let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+        if rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+            continue;
         }
+        // Rebind probe: re-resolve the name. If the second open fails
+        // (e.g. ENOENT — peer unlinked between our flock and now),
+        // skip — there's nothing to unlink, and unlinking the name
+        // could clobber a future peer recreation that lands before
+        // our unlink would run.
+        let Ok(recheck_fd) = rustix::shm::open(
+            shm_name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        ) else {
+            let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+            continue;
+        };
+        let stat_fd = rustix::fs::fstat(&fd);
+        let stat_recheck = rustix::fs::fstat(&recheck_fd);
+        match (stat_fd, stat_recheck) {
+            (Ok(a), Ok(b)) if a.st_dev == b.st_dev && a.st_ino == b.st_ino => {
+                // Path still names the inode we hold. Safe to unlink.
+                let _ = rustix::shm::unlink(shm_name.as_str());
+            }
+            _ => {
+                // Either fstat failed (skip — can't prove identity) or
+                // the path now names a different inode (peer rebound
+                // between our open and our flock). Close both fds
+                // without unlinking; the live segment at the path is
+                // not ours to remove.
+            }
+        }
+        let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
     }
 }
 
@@ -704,8 +741,7 @@ mod tests {
     /// changes — same path, new content, must yield a new hash.
     #[test]
     fn hash_file_memoisation_invalidates_on_change() {
-        let tmp =
-            std::env::temp_dir().join(format!("ktstr-hash-memo-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("ktstr-hash-memo-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("rev");
 
@@ -719,10 +755,7 @@ mod tests {
         std::fs::write(&f, b"revision-two-with-different-bytes").unwrap();
         let h2 = hash_file(&f).unwrap();
 
-        assert_ne!(
-            h1, h2,
-            "mtime change must bypass the memoisation cache"
-        );
+        assert_ne!(h1, h2, "mtime change must bypass the memoisation cache");
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 

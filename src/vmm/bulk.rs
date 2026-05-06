@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use crc32fast;
 use zerocopy::FromBytes;
 
 use super::wire::{FRAME_HEADER_SIZE, ShmMessage};
@@ -470,7 +469,7 @@ mod tests {
         blast.resize(64 * 1024, 0xAAu8);
         let _ = a.feed(&blast);
         assert!(
-            a.buf.capacity() < 1024 * 1024 * 1024,
+            a.buf.capacity() < 1024 * 1024,
             "buffer capacity must not approach the announced 4 GiB length \
              (saw {} bytes)",
             a.buf.capacity()

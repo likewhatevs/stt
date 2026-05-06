@@ -62,21 +62,14 @@ struct func_meta {
 	unsigned char str_param_idx; /* param index for char * string (0xff = none) */
 };
 
-/* Event type for ring buffer. */
+/* Event type for ring buffer. EVENT_TRIGGER is currently the only
+ * record type emitted on the `ktstr_events` ringbuf. EVENT_SCX_EVENT
+ * (value 3) was previously emitted by `tp_btf/sched_ext_event` but
+ * fired millions of times per second on a busy scheduler while the
+ * userspace consumer dropped every record on the floor — the
+ * handler and its enum value were removed. */
 enum event_type {
 	EVENT_TRIGGER   = 2,
-	/* SCX_EV_* counter delta event from the
-	 * `tp_btf/sched_ext_event` kernel tracepoint. Each fire
-	 * captures one (timestamp, counter_name, delta) tuple. The
-	 * sequence of EVENT_SCX_EVENT entries forms a per-event
-	 * timeline: a downstream consumer can plot when each
-	 * SCX_EV_* counter incremented (vs. only the first/last
-	 * snapshot the failure-dump captures).
-	 *
-	 * `args[0]` carries the s64 delta as a u64 (caller casts
-	 * back); `fields[0]` is unused. The counter name lands in
-	 * `str_val` (NUL-terminated, capped at MAX_STR_LEN). */
-	EVENT_SCX_EVENT = 3,
 };
 
 /* Timeline event types written into the dedicated `timeline_events`
@@ -187,16 +180,11 @@ struct timeline_event {
  *             `SCX_EXIT_ERROR`).
  *   args[1] = exit kind (scx_exit_kind enum value).
  *
- * For EVENT_SCX_EVENT:
- *   args[0] = s64 delta (cast through u64; the kernel's
- *             `tp_btf/sched_ext_event` argument carries an `__s64`,
- *             see `include/trace/events/sched_ext.h`).
- *   `str_val` = counter name (e.g. "SCX_EV_SELECT_CPU_FALLBACK"),
- *               NUL-terminated, capped at MAX_STR_LEN.
- *   `has_str` = 1, `str_param_idx` = 0xff (no source-arg index
- *               applies; the field is just a marker for
- *               `str_val` populated on this event).
- *   `kstack_sz` = 0 — this event type does not carry a stack.
+ * `str_val`/`has_str`/`str_param_idx` are kept in the wire layout
+ * for ABI stability with `struct probe_entry` (the kprobe-side hash
+ * map uses an identically-named trio); EVENT_TRIGGER leaves all
+ * three zeroed. The dedicated EVENT_SCX_EVENT producer that
+ * populated them was removed (see the enum doc above).
  */
 struct probe_event {
 	unsigned int type;
@@ -208,9 +196,6 @@ struct probe_event {
 	unsigned int nr_fields;
 	unsigned long long kstack[MAX_STACK_DEPTH];
 	unsigned int kstack_sz;
-	/* Counter name for EVENT_SCX_EVENT entries. NUL-terminated,
-	 * capped at MAX_STR_LEN. Zero on EVENT_TRIGGER (the trigger
-	 * event does not carry a name string). */
 	char str_val[MAX_STR_LEN];
 	unsigned char has_str;
 	unsigned char str_param_idx;

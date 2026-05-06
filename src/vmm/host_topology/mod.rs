@@ -1649,7 +1649,20 @@ fn try_acquire_cpu_window(
 /// Bind a memory region to specific NUMA nodes using `mbind(MPOL_BIND)`.
 /// `nodes` is the set of NUMA node IDs. Logs a warning on error
 /// (single-node systems, missing capabilities).
-pub fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
+///
+/// # Safety
+///
+/// The caller must ensure that `addr` points to a valid mmap'd region
+/// of at least `len` bytes. The kernel will read this range via the
+/// `mbind(2)` syscall to set its NUMA memory policy; passing a stale,
+/// unmapped, or out-of-bounds pointer is undefined behavior from the
+/// process's perspective (the syscall itself returns EFAULT, but the
+/// surrounding Rust contract is violated).
+///
+/// When `nodes.is_empty()` or `len == 0`, the function short-circuits
+/// without dereferencing `addr`, so a null or dangling pointer is
+/// permitted in those cases.
+pub unsafe fn mbind_to_nodes(addr: *mut u8, len: usize, nodes: &[usize]) {
     if nodes.is_empty() || len == 0 {
         return;
     }

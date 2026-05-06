@@ -32,16 +32,23 @@ use vm_memory::Address;
 /// of descriptors and force the device to allocate matching
 /// scratch storage per request (heap blowup).
 ///
-/// The gate runs AFTER status_addr identification so the
-/// rejection produces a normal IOERR completion (status byte
-/// + add_used) — not a chain drop. Earlier-positioned drop
-///   behaviour was the original design but left the chain stuck
-///   in the avail ring until the guest's hung-task watchdog
-///   fired (`kernel.hung_task_timeout_secs`, default 120 s —
-///   virtio_blk has no `mq_ops->timeout`), hiding the rejection
-///   from operators.
+/// Oversized chains drop entirely — no add_used, no IOERR
+/// publish, no status write. The descriptor walk is bounded
+/// at `VIRTIO_BLK_SEG_MAX + 2` to keep the scratch Vec inside
+/// its preallocated capacity, but a capped scratch view loses
+/// sight of the chain's true last descriptor (the guest's
+/// status). Publishing IOERR with a misidentified status_addr
+/// would write a status byte to a non-status descriptor while
+/// the guest's real status byte stays uninitialized — the
+/// guest's `virtblk_done` then reads `vbr->in_hdr.status` from
+/// the stale blk-mq tag bytes, which `virtblk_result(0)` maps
+/// to `BLK_STS_OK` (the F15 silent-data-corruption pattern).
+/// Dropping the chain forces the request to surface via the
+/// hung-task watchdog instead — same blast radius as the
+/// "no status descriptor" branch, which is the documented
+/// fallback for spec-violating chains.
 #[test]
-fn seg_max_rejected_with_ioerr() {
+fn seg_max_dropped_no_publish() {
     use virtio_bindings::bindings::virtio_ring::VRING_DESC_F_NEXT;
     let cap = 4096u64;
     let f = make_backed_file_with_pattern(cap, 0xAB);
@@ -83,32 +90,34 @@ fn seg_max_rejected_with_ioerr() {
     )));
     // Pre-fill status_addr with 0xEE — a value distinct from
     // S_OK (0), S_IOERR (1), S_UNSUPP (2). The post-notify
-    // assertion expects the device to overwrite this with
-    // S_IOERR.
+    // assertion expects the device to leave this byte alone:
+    // oversized chains drop without any status-byte write.
     mem.write_slice(&[0xEEu8], status_addr).unwrap();
     mock.add_desc_chains(&descs, 0).expect("add chain");
     write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
 
-    // Used ring advances — SEG_MAX rejection returns the chain
-    // via add_used so the guest sees an immediate completion.
+    // Used ring stays empty — oversized chain is dropped before
+    // status_addr extraction so add_used is never called.
     let used_idx: u16 = mem
         .read_obj(mock.used_addr().checked_add(2).unwrap())
         .expect("read used.idx");
-    assert_eq!(used_idx, 1, "SEG_MAX rejection still updates used.idx");
+    assert_eq!(used_idx, 0, "SEG_MAX drop must NOT advance used.idx");
 
     let c = dev.counters();
     assert!(c.io_errors.load(Ordering::Relaxed) >= 1);
     assert_eq!(c.reads_completed.load(Ordering::Relaxed), 0);
-    // Throttle untouched — gate fires before token consumption.
+    // Throttle untouched — drop fires before token consumption.
     assert_eq!(c.throttled_count.load(Ordering::Relaxed), 0);
 
-    // Status byte is S_IOERR — not the 0xEE sentinel and not
-    // a stale 0 (which would be S_OK silent corruption).
+    // Status byte stays at the 0xEE sentinel — a SEG_MAX drop
+    // must not touch the status descriptor (the capped scratch
+    // view cannot identify the true last descriptor, so any
+    // write would target the wrong GPA).
     let mut s = [0u8; 1];
     mem.read_slice(&mut s, status_addr).unwrap();
     assert_eq!(
-        s[0], VIRTIO_BLK_S_IOERR as u8,
-        "SEG_MAX rejection must write S_IOERR to status descriptor",
+        s[0], 0xEE,
+        "SEG_MAX drop must leave status descriptor untouched",
     );
 }
 
@@ -2147,5 +2156,177 @@ fn size_max_advertised_in_config_space() {
         u32::from_le_bytes(buf),
         VIRTIO_BLK_SIZE_MAX,
         "config-space size_max must equal VIRTIO_BLK_SIZE_MAX (1 MB)",
+    );
+}
+
+/// Validation gate ordering: a chain that would pass the throttle
+/// but fails validation must NOT consume throttle tokens.
+///
+/// Sets up a finite throttle (`iops=1000`, `bytes_per_sec=1_000_000`)
+/// stocked at full capacity, then submits a sub-sector T_IN chain
+/// (data_len=513). The sector-alignment validation gate in
+/// `drain_bracket_impl` rejects it at the
+/// `data_len.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE)` arm — BEFORE the
+/// `pre_throttle.is_none()` guarded `ops_bucket.can_consume(1)` /
+/// `bytes_bucket.can_consume(data_len)` call site.
+///
+/// Pre-conditions imply the request would have passed throttle if it
+/// had reached the bucket: `1 <= 1000` ops capacity, `513 <=
+/// 1_000_000` bytes capacity, and both buckets are seeded at
+/// capacity by `TokenBucket::new`.
+///
+/// Pins the gate-ordering invariant: the bucket's `available` field
+/// stays at exactly `capacity` across the rejected chain — no token
+/// consumption, no debt. Asserting `available` directly (not just
+/// `can_consume(capacity)`) catches a regression that consumed a
+/// token AND immediately let `refill()` restore it (the wall-clock
+/// gap between the consume site and the assertion is well below 1ms,
+/// at which `refill()` adds 0 tokens at rate=1000/sec; but pinning
+/// `last_refill` and reading `available` directly removes any wall-
+/// clock dependency).
+///
+/// Companion to `validation_precedes_throttle_on_stall` in
+/// tests_drain.rs (drained-bucket case): together they pin the
+/// gate-ordering contract from both sides — validation rejects on a
+/// stocked bucket without consuming tokens (this test) and on a
+/// drained bucket without producing a stall (the sibling).
+#[test]
+fn validation_gate_does_not_consume_throttle_tokens() {
+    let cap = 4096u64;
+    let f = make_backed_file_with_pattern(cap, 0xAB);
+    let throttle = DiskThrottle {
+        iops: NonZeroU64::new(1000),
+        bytes_per_sec: NonZeroU64::new(1_000_000),
+        iops_burst_capacity: None,
+        bytes_burst_capacity: None,
+    };
+    let mut dev = VirtioBlk::new(f, cap, throttle);
+
+    // Pin both buckets' last_refill so the in-place refill inside
+    // `consume`/`can_consume` cannot grant or revoke tokens between
+    // the pre-notify capture and the post-notify assertion.
+    let now = Instant::now();
+    dev.worker
+        .state_mut()
+        .ops_bucket
+        .set_last_refill_for_test(now);
+    dev.worker
+        .state_mut()
+        .bytes_bucket
+        .set_last_refill_for_test(now);
+
+    // Capture the seeded balance — `TokenBucket::new` sets
+    // `available = i64::try_from(capacity).unwrap_or(i64::MAX)`,
+    // so this should equal the rate (capacity == rate when
+    // *_burst_capacity is None — see buckets_from_throttle).
+    let ops_avail_before = dev.worker.state_mut().ops_bucket.available;
+    let bytes_avail_before = dev.worker.state_mut().bytes_bucket.available;
+    assert_eq!(
+        ops_avail_before, 1000,
+        "ops bucket must be seeded at capacity (1000) on construction",
+    );
+    assert_eq!(
+        bytes_avail_before, 1_000_000,
+        "bytes bucket must be seeded at capacity (1_000_000) on construction",
+    );
+
+    let mem = make_chain_test_mem();
+    let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+    let header_addr = GuestAddress(0x4000);
+    let data_addr = GuestAddress(0x5000);
+    let status_addr = GuestAddress(0x6000);
+    write_blk_header(&mem, header_addr, VIRTIO_BLK_T_IN, 0);
+    // Sub-sector data length: 513 bytes is not a multiple of
+    // VIRTIO_BLK_SECTOR_SIZE (512). The sector-alignment gate in
+    // drain_bracket_impl rejects this BEFORE pre_throttle.is_none()
+    // path reaches `ops_bucket.can_consume(1)`. 513 fits well under
+    // both bucket capacities (1 op, 513 bytes vs 1000/1_000_000
+    // capacities), so a regression that swapped gate ordering and
+    // consumed tokens before validating would succeed at the
+    // throttle path — and the post-notify assertions below would
+    // catch the consumption.
+    let descs = [
+        RawDescriptor::from(SplitDescriptor::new(
+            header_addr.0,
+            VIRTIO_BLK_OUTHDR_SIZE as u32,
+            0,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            513,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+        RawDescriptor::from(SplitDescriptor::new(
+            status_addr.0,
+            1,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        )),
+    ];
+    mock.build_desc_chain(&descs).expect("build chain");
+    dev.set_mem(mem.clone());
+    wire_device_to_mock(&mut dev, &mock);
+
+    // Re-pin after the FSM walk so MMIO writes' wall time does not
+    // leak refill into the buckets between pre-notify and the
+    // post-notify assertion.
+    let now2 = Instant::now();
+    dev.worker
+        .state_mut()
+        .ops_bucket
+        .set_last_refill_for_test(now2);
+    dev.worker
+        .state_mut()
+        .bytes_bucket
+        .set_last_refill_for_test(now2);
+
+    write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NOTIFY, REQ_QUEUE as u32);
+
+    // Validation rejected the chain — IOERR published, io_errors
+    // bumped exactly once.
+    let mut s = [0u8; 1];
+    mem.read_slice(&mut s, status_addr).unwrap();
+    assert_eq!(
+        s[0], VIRTIO_BLK_S_IOERR as u8,
+        "sub-sector chain must be rejected by the sector-alignment validation gate",
+    );
+    let c = dev.counters();
+    assert_eq!(
+        c.io_errors.load(Ordering::Relaxed),
+        1,
+        "validation gate bumps io_errors exactly once",
+    );
+    assert_eq!(
+        c.reads_completed.load(Ordering::Relaxed),
+        0,
+        "rejected chain must not count as a completed read",
+    );
+    assert_eq!(
+        c.throttled_count.load(Ordering::Relaxed),
+        0,
+        "validation rejection is not a throttle stall — \
+             throttled_count must stay 0",
+    );
+
+    // The load-bearing assertion: throttle bucket balances are
+    // unchanged. A regression that consumed tokens before the
+    // validation gate would surface as `available < capacity`. With
+    // last_refill pinned, no in-place refill can mask a consume
+    // round-trip.
+    assert_eq!(
+        dev.worker.state_mut().ops_bucket.available,
+        ops_avail_before,
+        "ops bucket `available` must be unchanged across a \
+             validation rejection — gate ordering requires the \
+             validation check to fire BEFORE token consumption",
+    );
+    assert_eq!(
+        dev.worker.state_mut().bytes_bucket.available,
+        bytes_avail_before,
+        "bytes bucket `available` must be unchanged across a \
+             validation rejection — gate ordering requires the \
+             validation check to fire BEFORE token consumption",
     );
 }

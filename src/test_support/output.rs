@@ -1,21 +1,21 @@
 //! Guest-output and console parsing for ktstr test results.
 //!
-//! Every VM-hosted `#[ktstr_test]` run emits three distinguishable
+//! Every VM-hosted `#[ktstr_test]` run emits these distinguishable
 //! streams that the host must parse before it can judge pass/fail or
 //! surface useful diagnostics:
 //!
-//! - **AssertResult JSON** on stdout/COM2, bracketed by
-//!   [`RESULT_START`] / [`RESULT_END`] — and also on the bulk data
-//!   channel with `MSG_TYPE_TEST_RESULT` for the primary transport.
-//!   See [`print_assert_result`] (guest emit), [`parse_assert_result`]
-//!   (host parse from COM2 string), and [`parse_assert_result_from_drain`]
-//!   (host parse from the merged bulk drain).
-//! - **Scheduler log** on COM2, bracketed by
+//! - **AssertResult bincode** on the bulk data channel under
+//!   `MSG_TYPE_TEST_RESULT`. See [`print_assert_result`] (guest
+//!   emit) and [`parse_assert_result_from_drain`] (host parse).
+//!   The wire format is bincode v2 with `bincode::config::standard()`
+//!   so guest and host stay in lock-step on the encoding choice.
+//! - **Scheduler log** in `MSG_TYPE_SCHED_LOG` chunks on the bulk
+//!   data channel. The chunks carry the
 //!   [`SCHED_OUTPUT_START`](crate::verifier::SCHED_OUTPUT_START) /
-//!   [`SCHED_OUTPUT_END`](crate::verifier::SCHED_OUTPUT_END) — both
-//!   live in [`crate::verifier`] since that is the primary host-side
-//!   consumer that also parses the BPF verifier log carried inside the
-//!   block.
+//!   [`SCHED_OUTPUT_END`](crate::verifier::SCHED_OUTPUT_END) markers
+//!   verbatim (defined in [`crate::verifier`] since that is the
+//!   primary host-side consumer that also parses the BPF verifier
+//!   log carried inside the block).
 //!   [`parse_sched_output`](crate::verifier::parse_sched_output)
 //!   extracts the block; [`sched_log_fingerprint`] returns the last
 //!   non-empty line as a failure fingerprint so duplicate failures
@@ -28,10 +28,12 @@
 //! - [`extract_kernel_version`] reads the `Linux version X.Y.Z ...`
 //!   line from boot output.
 //! - [`extract_panic_message`] pulls the guest's `PANIC:` line (the
-//!   Rust panic hook in `rust_init.rs` writes these to COM2).
-//! - [`classify_init_stage`] reads [`SENTINEL_INIT_STARTED`] and
-//!   [`SENTINEL_PAYLOAD_STARTING`] to pinpoint where in the init
-//!   lifecycle a silent failure happened.
+//!   Rust panic hook in `rust_init.rs` still writes these to COM2
+//!   because the panic hook cannot block on virtio backpressure;
+//!   every other guest stream now travels over the bulk port).
+//! - [`classify_init_stage`] walks the bucketed lifecycle phase
+//!   vec to pinpoint where in the init lifecycle a silent failure
+//!   happened.
 //! - [`format_console_diagnostics`] composes the `--- diagnostics ---`
 //!   block appended to failed-test error output.
 
@@ -41,22 +43,23 @@ use crate::assert::AssertResult;
 use crate::verifier::parse_sched_output;
 use crate::vmm;
 
-/// Delimiters for the AssertResult JSON in guest output.
-pub(crate) const RESULT_START: &str = "===KTSTR_TEST_RESULT_START===";
-pub(crate) const RESULT_END: &str = "===KTSTR_TEST_RESULT_END===";
-
-/// Write AssertResult to the bulk data channel (primary) and
-/// stdout/COM2 (fallback).
+/// Emit AssertResult to the host over the bulk data channel
+/// (`MSG_TYPE_TEST_RESULT`) using bincode v2 with
+/// `bincode::config::standard()`. The encoding choice is paired
+/// with the host's [`parse_assert_result_from_drain`] decoder so
+/// layout never diverges.
+///
+/// Pre-1.0: the legacy COM2 `RESULT_START` / `RESULT_END` JSON
+/// fallback is gone — bulk port is the only transport.
 pub(crate) fn print_assert_result(r: &AssertResult) {
-    if let Ok(json) = serde_json::to_string(r) {
-        vmm::guest_comms::send_test_result(json.as_bytes());
-        println!("{RESULT_START}");
-        println!("{json}");
-        println!("{RESULT_END}");
-    }
+    vmm::guest_comms::send_test_result(r);
 }
 
 /// Extract AssertResult from a bulk-drain entries.
+///
+/// Walks entries in reverse so the last-emitted (most recent)
+/// `MSG_TYPE_TEST_RESULT` frame wins — matches the existing
+/// "latest wins" semantics for the primary transport.
 pub(crate) fn parse_assert_result_from_drain(
     drain: Option<&vmm::host_comms::BulkDrainResult>,
 ) -> Result<AssertResult> {
@@ -67,14 +70,12 @@ pub(crate) fn parse_assert_result_from_drain(
         .rev()
         .find(|e| e.msg_type == vmm::wire::MSG_TYPE_TEST_RESULT && e.crc_ok)
         .ok_or_else(|| anyhow::anyhow!("no test result in guest messages"))?;
-    serde_json::from_slice(&entry.payload).context("parse AssertResult from drain")
-}
-
-/// Parse AssertResult from guest COM2 output between delimiters.
-pub(crate) fn parse_assert_result(output: &str) -> Result<AssertResult> {
-    let json = crate::probe::output::extract_section(output, RESULT_START, RESULT_END);
-    anyhow::ensure!(!json.is_empty(), "missing result delimiters");
-    serde_json::from_str(&json).context("parse AssertResult JSON")
+    let (result, _) = bincode::serde::decode_from_slice::<AssertResult, _>(
+        &entry.payload,
+        bincode::config::standard(),
+    )
+    .context("decode AssertResult bincode payload from drain")?;
+    Ok(result)
 }
 
 /// Extract the last non-empty line from the scheduler log.
@@ -137,31 +138,18 @@ pub(crate) fn extract_panic_message(output: &str) -> Option<&str> {
         .find_map(|l| l.strip_prefix("PANIC:").map(str::trim_start))
 }
 
-/// Written to COM2 by Rust init after filesystem mounts complete.
-pub(crate) const SENTINEL_INIT_STARTED: &str = "KTSTR_INIT_STARTED";
-
-/// Written to COM2 by guest dispatch immediately before the test
-/// function is called.
-pub(crate) const SENTINEL_PAYLOAD_STARTING: &str = "KTSTR_PAYLOAD_STARTING";
-
-/// Prefix written by guest init on final exit. The full marker is
-/// `KTSTR_EXIT=<code>`; callers that need the code parse the suffix.
-pub(crate) const SENTINEL_EXIT_PREFIX: &str = "KTSTR_EXIT=";
-
-/// Prefix written by `shell --exec` after the user command returns.
-/// Carries the exec'd process's exit code (`KTSTR_EXEC_EXIT=<code>`).
-pub(crate) const SENTINEL_EXEC_EXIT_PREFIX: &str = "KTSTR_EXEC_EXIT=";
-
-/// Written by guest init when the scheduler process dies during
-/// startup. Paired with `KTSTR_EXIT=1` on the surrounding lines.
-pub(crate) const SENTINEL_SCHEDULER_DIED: &str = "SCHEDULER_DIED";
-
-/// Written by guest init when the scheduler process stays alive but
-/// never attaches to sched_ext (BPF verifier reject, ops mismatch,
-/// sysfs absent). Emitted as `SCHEDULER_NOT_ATTACHED: <reason>`; the
-/// reason suffix is appended by the caller. Paired with `KTSTR_EXIT=1`
-/// on the surrounding lines.
-pub(crate) const SENTINEL_SCHEDULER_NOT_ATTACHED: &str = "SCHEDULER_NOT_ATTACHED";
+// Pre-bincode-migration the guest emitted COM2 sentinel strings
+// (`KTSTR_INIT_STARTED`, `KTSTR_PAYLOAD_STARTING`,
+// `KTSTR_EXIT=<code>`, `KTSTR_EXEC_EXIT=<code>`, `SCHEDULER_DIED`,
+// `SCHEDULER_NOT_ATTACHED: <reason>`) that the host scraped to
+// classify boot phase, exit code, and scheduler-attach failures.
+// All five now travel as typed `MSG_TYPE_LIFECYCLE` /
+// `MSG_TYPE_EXIT` / `MSG_TYPE_EXEC_EXIT` frames on the bulk data
+// port (see `crate::vmm::guest_comms::send_lifecycle`,
+// `send_exit`, and `send_exec_exit`). The `SENTINEL_*` const
+// strings are gone — host code walks
+// `result.guest_messages.entries` and matches on
+// `crate::vmm::wire::LifecyclePhase` / `MSG_TYPE_*` discriminants.
 
 // ---------------------------------------------------------------------------
 // Init-stage classification labels
@@ -193,14 +181,42 @@ pub(crate) const STAGE_INIT_STARTED_NO_PAYLOAD: &str =
 pub(crate) const STAGE_PAYLOAD_STARTED_NO_RESULT: &str =
     "payload started but produced no test result";
 
-/// Classify the failure stage based on which sentinels appear in COM2 output.
-pub(crate) fn classify_init_stage(output: &str) -> &'static str {
-    if output.contains(SENTINEL_PAYLOAD_STARTING) {
-        STAGE_PAYLOAD_STARTED_NO_RESULT
-    } else if output.contains(SENTINEL_INIT_STARTED) {
-        STAGE_INIT_STARTED_NO_PAYLOAD
-    } else {
-        STAGE_INIT_NOT_STARTED
+/// Classify the failure stage based on which `MSG_TYPE_LIFECYCLE`
+/// phase events appear in the bulk-port drain.
+///
+/// Pre-bincode-migration: read `KTSTR_INIT_STARTED` /
+/// `KTSTR_PAYLOAD_STARTING` substrings from COM2 output. Now the
+/// guest emits each phase as a typed
+/// [`crate::vmm::wire::LifecyclePhase`] frame; the classifier walks
+/// the entries in arrival order and picks the latest known phase,
+/// which is the deepest stage the guest reached before failing.
+///
+/// Returns the matching `STAGE_*` label. `None` drain (the bulk
+/// port produced no entries at all) maps to
+/// [`STAGE_INIT_NOT_STARTED`] — same as the prior "no sentinel
+/// seen" branch.
+pub(crate) fn classify_init_stage(
+    drain: Option<&vmm::host_comms::BulkDrainResult>,
+) -> &'static str {
+    use crate::vmm::wire::{LifecyclePhase, MSG_TYPE_LIFECYCLE};
+    let Some(drain) = drain else {
+        return STAGE_INIT_NOT_STARTED;
+    };
+    let mut latest: Option<LifecyclePhase> = None;
+    for e in &drain.entries {
+        if e.msg_type != MSG_TYPE_LIFECYCLE || !e.crc_ok || e.payload.is_empty() {
+            continue;
+        }
+        if let Some(phase) = LifecyclePhase::from_wire(e.payload[0]) {
+            latest = Some(phase);
+        }
+    }
+    match latest {
+        Some(LifecyclePhase::PayloadStarting)
+        | Some(LifecyclePhase::SchedulerDied)
+        | Some(LifecyclePhase::SchedulerNotAttached) => STAGE_PAYLOAD_STARTED_NO_RESULT,
+        Some(LifecyclePhase::InitStarted) => STAGE_INIT_STARTED_NO_PAYLOAD,
+        None => STAGE_INIT_NOT_STARTED,
     }
 }
 
@@ -277,72 +293,106 @@ pub(crate) fn format_console_diagnostics(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::build_assert_result_json;
+    use super::super::test_helpers::{assert_result_tlv_entry, build_assert_result};
     use super::*;
     use crate::assert::{AssertDetail, DetailKind};
     use crate::verifier::{SCHED_OUTPUT_END, SCHED_OUTPUT_START};
+    use crate::vmm::host_comms::BulkDrainResult;
+    use crate::vmm::wire::{MSG_TYPE_TEST_RESULT, ShmEntry};
 
-    // -- parse_assert_result --
+    fn drain_with_assert(r: &AssertResult) -> BulkDrainResult {
+        BulkDrainResult {
+            entries: vec![assert_result_tlv_entry(r)],
+        }
+    }
 
+    // -- parse_assert_result_from_drain --
+
+    /// A bincode-encoded `MSG_TYPE_TEST_RESULT` entry decodes back to
+    /// the same `AssertResult`. Pin the round-trip so a future
+    /// encoding tweak (e.g. config swap to legacy()) trips this test
+    /// before reaching the real wire.
     #[test]
-    fn parse_assert_result_valid() {
-        let json = build_assert_result_json(true, vec![]);
-        let output = format!("noise\n{RESULT_START}\n{json}\n{RESULT_END}\nmore");
-        let r = parse_assert_result(&output).unwrap();
+    fn parse_assert_result_from_drain_round_trips() {
+        let original = build_assert_result(true, vec![]);
+        let drain = drain_with_assert(&original);
+        let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
         assert!(r.passed);
     }
 
+    /// A failing `AssertResult` round-trips its details verbatim.
     #[test]
-    fn parse_assert_result_missing_start() {
-        let output = format!("no start\n{RESULT_END}\n");
-        assert!(parse_assert_result(&output).is_err());
-    }
-
-    #[test]
-    fn parse_assert_result_missing_end() {
-        let output = format!("{RESULT_START}\n{{}}");
-        assert!(parse_assert_result(&output).is_err());
-    }
-
-    #[test]
-    fn parse_assert_result_failed() {
-        let json = build_assert_result_json(
+    fn parse_assert_result_from_drain_failed_preserves_details() {
+        let original = build_assert_result(
             false,
             vec![AssertDetail::new(DetailKind::Stuck, "stuck 3000ms")],
         );
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
-        let r = parse_assert_result(&output).unwrap();
+        let drain = drain_with_assert(&original);
+        let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
         assert!(!r.passed);
         assert_eq!(r.details, vec!["stuck 3000ms"]);
     }
 
+    /// `None` drain → "no guest messages" error. Mirrors the host
+    /// path where `result.guest_messages` is `None` because the bulk
+    /// port never produced a single byte.
     #[test]
-    fn parse_assert_result_malformed_json() {
-        let output = format!("{RESULT_START}\nnot valid json\n{RESULT_END}");
-        assert!(parse_assert_result(&output).is_err());
+    fn parse_assert_result_from_drain_none_returns_error() {
+        assert!(parse_assert_result_from_drain(None).is_err());
     }
 
+    /// Empty `BulkDrainResult` → "no test result in guest messages"
+    /// error. Mirrors the host path where the bulk port produced
+    /// other entries (PROFRAW, STIMULUS, EXIT) but never a
+    /// MSG_TYPE_TEST_RESULT frame.
     #[test]
-    fn parse_assert_result_empty_json_between_delimiters() {
-        let output = format!("{RESULT_START}\n\n{RESULT_END}");
-        assert!(parse_assert_result(&output).is_err());
+    fn parse_assert_result_from_drain_empty_returns_error() {
+        let drain = BulkDrainResult { entries: vec![] };
+        assert!(parse_assert_result_from_drain(Some(&drain)).is_err());
     }
 
+    /// CRC-bad MSG_TYPE_TEST_RESULT entry is ignored; the helper
+    /// returns "no test result" rather than feeding a corrupt
+    /// payload into the bincode decoder.
     #[test]
-    fn parse_assert_result_with_details() {
-        let json = build_assert_result_json(
-            false,
-            vec![
-                AssertDetail::new(DetailKind::Other, "err1"),
-                AssertDetail::new(DetailKind::Other, "err2"),
-            ],
-        );
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
-        let r = parse_assert_result(&output).unwrap();
-        assert!(!r.passed);
-        assert_eq!(r.details.len(), 2);
-        assert_eq!(r.details[0], "err1");
-        assert_eq!(r.details[1], "err2");
+    fn parse_assert_result_from_drain_skips_crc_bad_entries() {
+        let drain = BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_TEST_RESULT,
+                payload: vec![0xff; 4],
+                crc_ok: false,
+            }],
+        };
+        assert!(parse_assert_result_from_drain(Some(&drain)).is_err());
+    }
+
+    /// Multiple MSG_TYPE_TEST_RESULT entries — the helper picks the
+    /// last (latest-emitted) one. Pins "latest wins" semantics.
+    #[test]
+    fn parse_assert_result_from_drain_picks_latest() {
+        let early = build_assert_result(false, vec![AssertDetail::new(DetailKind::Other, "early")]);
+        let late = build_assert_result(true, vec![]);
+        let drain = BulkDrainResult {
+            entries: vec![assert_result_tlv_entry(&early), assert_result_tlv_entry(&late)],
+        };
+        let r = parse_assert_result_from_drain(Some(&drain)).unwrap();
+        assert!(r.passed, "latest entry must win");
+    }
+
+    /// Malformed bincode payload (right msg_type, right CRC, wrong
+    /// bytes) surfaces the bincode decode error rather than silently
+    /// returning a default `AssertResult`.
+    #[test]
+    fn parse_assert_result_from_drain_rejects_garbage_payload() {
+        let payload = vec![0xab; 8];
+        let drain = BulkDrainResult {
+            entries: vec![ShmEntry {
+                msg_type: MSG_TYPE_TEST_RESULT,
+                payload,
+                crc_ok: true,
+            }],
+        };
+        assert!(parse_assert_result_from_drain(Some(&drain)).is_err());
     }
 
     // -- sched_log_fingerprint --
@@ -611,43 +661,104 @@ mod tests {
         let lines: Vec<String> = (0..50).map(|i| format!("boot line {i}")).collect();
         let console = lines.join("\n");
         let s = format_console_diagnostics(&console, 0, "test");
-        assert!(s.contains(
-            "console (20 lines, window-truncated, last line incomplete)"
-        ));
+        assert!(s.contains("console (20 lines, window-truncated, last line incomplete)"));
         assert!(s.contains("boot line 49 [partial]"));
         assert!(!s.contains("boot line 29"));
     }
 
     // -- classify_init_stage --
 
+    fn lifecycle_only_drain(
+        phases: &[crate::vmm::wire::LifecyclePhase],
+    ) -> crate::vmm::host_comms::BulkDrainResult {
+        let entries = phases
+            .iter()
+            .map(|p| ShmEntry {
+                msg_type: crate::vmm::wire::MSG_TYPE_LIFECYCLE,
+                payload: vec![p.wire_value()],
+                crc_ok: true,
+            })
+            .collect();
+        crate::vmm::host_comms::BulkDrainResult { entries }
+    }
+
     #[test]
-    fn classify_no_sentinels() {
-        assert_eq!(classify_init_stage(""), STAGE_INIT_NOT_STARTED);
+    fn classify_no_lifecycle_frames() {
+        // None drain — bulk port produced no entries. Maps to the
+        // "init did not even start" stage.
+        assert_eq!(classify_init_stage(None), STAGE_INIT_NOT_STARTED);
+        // Empty drain — same outcome.
+        let drain = crate::vmm::host_comms::BulkDrainResult { entries: vec![] };
+        assert_eq!(classify_init_stage(Some(&drain)), STAGE_INIT_NOT_STARTED);
     }
 
     #[test]
     fn classify_init_started_only() {
+        let drain = lifecycle_only_drain(&[crate::vmm::wire::LifecyclePhase::InitStarted]);
         assert_eq!(
-            classify_init_stage("KTSTR_INIT_STARTED\nsome noise"),
+            classify_init_stage(Some(&drain)),
             STAGE_INIT_STARTED_NO_PAYLOAD,
         );
     }
 
     #[test]
     fn classify_payload_starting() {
-        let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\nsome output";
-        assert_eq!(classify_init_stage(output), STAGE_PAYLOAD_STARTED_NO_RESULT);
+        let drain = lifecycle_only_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::PayloadStarting,
+        ]);
+        assert_eq!(
+            classify_init_stage(Some(&drain)),
+            STAGE_PAYLOAD_STARTED_NO_RESULT,
+        );
     }
 
     #[test]
     fn classify_payload_starting_without_init() {
-        // Edge case: payload sentinel present but init sentinel
-        // missing. payload_starting implies init ran, so classify as
-        // payload started.
+        // Edge case: PayloadStarting present but InitStarted
+        // missing. PayloadStarting implies init ran, so classify
+        // as payload started — same semantics the old string-walk
+        // pinned.
+        let drain = lifecycle_only_drain(&[crate::vmm::wire::LifecyclePhase::PayloadStarting]);
         assert_eq!(
-            classify_init_stage("KTSTR_PAYLOAD_STARTING"),
+            classify_init_stage(Some(&drain)),
             STAGE_PAYLOAD_STARTED_NO_RESULT,
         );
+    }
+
+    #[test]
+    fn classify_scheduler_died_after_init() {
+        // SchedulerDied / SchedulerNotAttached fire AFTER init has
+        // started — both map to the "payload started but no
+        // result" stage so the operator sees the deepest stage
+        // reached. Pin both so a future regression that flipped
+        // either to a shallower stage would trip here.
+        let died = lifecycle_only_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::SchedulerDied,
+        ]);
+        assert_eq!(
+            classify_init_stage(Some(&died)),
+            STAGE_PAYLOAD_STARTED_NO_RESULT,
+        );
+        let not_attached = lifecycle_only_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+        ]);
+        assert_eq!(
+            classify_init_stage(Some(&not_attached)),
+            STAGE_PAYLOAD_STARTED_NO_RESULT,
+        );
+    }
+
+    #[test]
+    fn classify_init_stage_skips_crc_bad_lifecycle_frames() {
+        // CRC-bad lifecycle frames are ignored. With only a
+        // CRC-bad InitStarted in the drain, the classifier sees no
+        // valid phase and returns NOT_STARTED.
+        let mut drain = lifecycle_only_drain(&[crate::vmm::wire::LifecyclePhase::InitStarted]);
+        drain.entries[0].crc_ok = false;
+        assert_eq!(classify_init_stage(Some(&drain)), STAGE_INIT_NOT_STARTED);
     }
 
     // -- extract_panic_message --
@@ -704,33 +815,33 @@ mod tests {
 
     // -- Verdict API integration coverage -------------------------------
     //
-    // The host-side runner parses a guest AssertResult JSON via
-    // `parse_assert_result`, then a scenario's verifier folds that
-    // result into a Verdict via `Verdict::merge`. This integration
-    // shape is the single most important assertion path for any test
-    // running inside a VM — pin it here so a regression that broke
-    // either the parse OR the merge surface trips at the seam.
+    // The host-side runner decodes the guest's bincode-encoded
+    // AssertResult via `parse_assert_result_from_drain`, then a
+    // scenario's verifier folds that result into a Verdict via
+    // `Verdict::merge`. This integration shape is the single most
+    // important assertion path for any test running inside a VM —
+    // pin it here so a regression that broke either the decode OR the
+    // merge surface trips at the seam.
 
-    /// Round-trip: print_assert_result-equivalent JSON through
-    /// parse_assert_result, then merge into a Verdict that records a
-    /// pointwise claim from the host side. The combined result must
-    /// fail (the parsed AssertResult was failing) AND carry both the
-    /// guest-side detail AND the host-side claim's failure detail —
-    /// pinning that `Verdict::merge` preserves details from both
-    /// sides.
+    /// Round-trip: failing AssertResult through bincode TLV →
+    /// `parse_assert_result_from_drain`, then merge into a Verdict
+    /// that records a pointwise claim from the host side. The
+    /// combined result must fail (the parsed AssertResult was
+    /// failing) AND carry both the guest-side detail AND the
+    /// host-side claim's failure detail — pinning that
+    /// `Verdict::merge` preserves details from both sides.
     #[test]
     fn parse_assert_result_threads_into_verdict_merge() {
         use crate::assert::Verdict;
 
         // Guest produced a failing AssertResult with one Stuck detail
         // and a wake-latency measurement.
-        let json = build_assert_result_json(
+        let original = build_assert_result(
             false,
             vec![AssertDetail::new(DetailKind::Stuck, "tid 42 stuck 3000ms")],
         );
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
-
-        let parsed = parse_assert_result(&output).unwrap();
+        let drain = drain_with_assert(&original);
+        let parsed = parse_assert_result_from_drain(Some(&drain)).unwrap();
         assert!(!parsed.passed, "guest result must be failing");
 
         // Host-side scenario adds its own claim — say, a deadline
@@ -769,9 +880,9 @@ mod tests {
     fn parse_assert_result_passing_merge_keeps_verdict_passing() {
         use crate::assert::Verdict;
 
-        let json = build_assert_result_json(true, vec![]);
-        let output = format!("{RESULT_START}\n{json}\n{RESULT_END}");
-        let parsed = parse_assert_result(&output).unwrap();
+        let original = build_assert_result(true, vec![]);
+        let drain = drain_with_assert(&original);
+        let parsed = parse_assert_result_from_drain(Some(&drain)).unwrap();
 
         let observed: u64 = 100;
         let mut v = Verdict::new();

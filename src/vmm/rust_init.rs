@@ -220,6 +220,272 @@ fn proc_pid_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Async-signal-safe rendering of `value` as lowercase hex (no `0x`
+/// prefix, no leading-zero trim) into the tail of `buf`. Returns the
+/// byte slice covering the rendered digits.
+///
+/// Used by [`fatal_signal_handler`], where every libc allocator
+/// boundary is forbidden — `format!`, `write!`, and even
+/// `core::fmt::Display` formatters can pull in heap or thread-local
+/// state. A hand-rolled nibble walk over a stack buffer is the only
+/// AS-safe way to surface the faulting address.
+///
+/// 16 hex digits cover the full `u64` range. The caller passes a
+/// `[u8; 16]` and uses the returned subslice (always exactly 16
+/// bytes) directly.
+fn u64_to_hex_asm(value: u64, buf: &mut [u8; 16]) -> &[u8] {
+    static HEX: &[u8; 16] = b"0123456789abcdef";
+    for i in 0..16 {
+        let nibble = (value >> ((15 - i) * 4)) & 0xf;
+        buf[i] = HEX[nibble as usize];
+    }
+    &buf[..]
+}
+
+/// AS-safe write of every byte in `bytes` to fd `fd`. Loops on partial
+/// writes; bails on the first error or zero-byte return so a closed/
+/// faulted fd cannot wedge the handler.
+fn write_all_asm(fd: libc::c_int, bytes: &[u8]) {
+    let mut off = 0;
+    while off < bytes.len() {
+        // SAFETY: `write(2)` is async-signal-safe per signal-safety(7)
+        // on Linux. `bytes.as_ptr().add(off)` is in-bounds because
+        // `off < bytes.len()`. The write is best-effort — any
+        // failure short-circuits the loop and the handler proceeds
+        // to `reboot(2)`.
+        let n = unsafe {
+            libc::write(
+                fd,
+                bytes.as_ptr().add(off) as *const libc::c_void,
+                bytes.len() - off,
+            )
+        };
+        if n <= 0 {
+            return;
+        }
+        off += n as usize;
+    }
+}
+
+/// Async-signal-safe handler for SIGSEGV / SIGBUS / SIGILL.
+///
+/// The Rust panic hook installed in [`ktstr_guest_init`] does NOT
+/// fire for native CPU faults: the kernel raises these signals with
+/// `SIG_DFL` disposition, which calls `do_coredump` and terminates
+/// the process. Inside guest init that means PID 1 dies, the kernel
+/// observes "init exited", and the host sees the VM force-reboot
+/// without any guest-side diagnostic on COM2.
+///
+/// This handler closes the gap by emitting a `PANIC:`-prefixed line
+/// — matching the prefix [`extract_panic_message`] anchors on — that
+/// names the signal and the faulting address before driving
+/// [`force_reboot`]. The host crash-classification pipeline then
+/// surfaces native faults through the same code path as Rust panics.
+///
+/// Constraints, all enforced inside the handler:
+///
+/// - Async-signal-safety per `signal-safety(7)`. No `fs::write`, no
+///   `format!`, no `Backtrace::force_capture` — all of those touch
+///   the heap, locks, or per-thread formatter state. Only `open(2)`,
+///   `write(2)`, `tcdrain(2)`, and `reboot(2)` (all in the AS-safe
+///   list) are invoked, plus pure stack arithmetic.
+/// - No thread-local state. Worker threads spawned later
+///   (`hvc0_poll_loop`, `start_trace_pipe`) inherit the parent's
+///   sigaction disposition because Linux signal dispositions are
+///   process-wide; this handler runs on whichever thread faulted.
+/// - Bounded recursion. `SA_RESETHAND` is set so a fault inside this
+///   handler reverts to `SIG_DFL`, which terminates immediately
+///   instead of looping.
+unsafe extern "C" fn fatal_signal_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    // Static prefixes per signal. Hard-coded because signal-name
+    // formatting via `strsignal(3)` allocates / touches locale
+    // state and is not AS-safe.
+    let prefix: &[u8] = match sig {
+        libc::SIGSEGV => b"PANIC: fatal signal SIGSEGV at addr 0x",
+        libc::SIGBUS => b"PANIC: fatal signal SIGBUS at addr 0x",
+        libc::SIGILL => b"PANIC: fatal signal SIGILL at addr 0x",
+        _ => b"PANIC: fatal signal (unknown) at addr 0x",
+    };
+
+    // Faulting address from `siginfo_t.si_addr`. `siginfo_t` field
+    // access in Rust requires going through the libc bindings;
+    // `si_addr()` is the canonical accessor that handles the union
+    // layout differences between glibc and musl. Falls back to 0
+    // when `info` is null. Defensive null check; Linux always
+    // populates info for SA_SIGINFO handlers (see kernel/signal.c
+    // `force_sig_fault_to_task` → `force_sig_info_to_task` and the
+    // arch `setup_rt_frame` paths, which unconditionally pass
+    // `&frame->info` to the handler).
+    let addr: u64 = if info.is_null() {
+        0
+    } else {
+        // SAFETY: `info` is non-null here; `si_addr()` reads the
+        // address-fault arm of the siginfo union, which is the
+        // valid arm for SIGSEGV / SIGBUS / SIGILL per the kernel's
+        // `force_sig_fault` path (`kernel/signal.c`).
+        let p = unsafe { (*info).si_addr() };
+        p as u64
+    };
+
+    let mut hex_buf = [0u8; 16];
+    let hex = u64_to_hex_asm(addr, &mut hex_buf);
+
+    // Open COM2 first (canonical destination), then COM1. Both with
+    // `O_WRONLY | O_NONBLOCK` so the open and the `write_all_asm`
+    // loop never block on guest-side flow control. `tcdrain(2)`
+    // does NOT honor `O_NONBLOCK` — it is a separate ioctl that
+    // waits for the kernel tty layer's write queue to drain — but
+    // the wait is bounded by UART FIFO drain time (microseconds at
+    // worst) because PIO commits each byte inside `KVM_RUN` before
+    // userspace returns; the kernel sees its own output queue empty
+    // almost immediately after the final `write(2)` returns.
+    //
+    // SAFETY: `open(2)`, `write(2)`, `tcdrain(2)`, and `close(2)`
+    // are all in the signal-safety(7) AS-safe set. The path
+    // strings are static C strings with explicit NUL terminators.
+    for path in [c"/dev/ttyS1", c"/dev/ttyS0"] {
+        let fd =
+            unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if fd < 0 {
+            continue;
+        }
+        write_all_asm(fd, prefix);
+        write_all_asm(fd, hex);
+        write_all_asm(fd, b"\n");
+        // Seal the contract: tcdrain waits for the kernel's output
+        // queue to drain before we issue `reboot(2)`. PIO commits
+        // per byte so the wait is effectively immediate; tcdrain
+        // ignores `O_NONBLOCK` but the drain time is bounded by
+        // UART FIFO depth, not by host-side back-pressure.
+        unsafe {
+            libc::tcdrain(fd);
+            libc::close(fd);
+        }
+    }
+
+    // `reboot(LINUX_REBOOT_CMD_RESTART)` is the AS-safe analogue of
+    // `force_reboot()`'s nix wrapper. The syscall does not return
+    // on success; if it somehow does (CAP_SYS_BOOT missing,
+    // already rebooting), `_exit(1)` ensures the handler does
+    // NOT fall through to user code with a corrupt stack /
+    // mid-fault state.
+    unsafe {
+        libc::reboot(libc::LINUX_REBOOT_CMD_RESTART);
+        libc::_exit(1);
+    }
+}
+
+/// Install [`fatal_signal_handler`] for SIGSEGV, SIGBUS, and SIGILL.
+///
+/// `SA_SIGINFO` makes the handler receive the `siginfo_t *` whose
+/// `si_addr` carries the faulting address. `SA_RESETHAND` reverts
+/// the disposition to `SIG_DFL` after the first delivery so a fault
+/// inside the handler terminates cleanly instead of looping. `SA_ONSTACK`
+/// directs the kernel to run the handler on the alternate stack
+/// registered via `sigaltstack(2)` below — without it a stack-overflow
+/// SIGSEGV faults again on the overflowed stack and the kernel
+/// terminates the process before any diagnostic reaches the host.
+///
+/// `sa_mask` adds SIGSEGV / SIGBUS / SIGILL so that while one fatal-
+/// signal handler is executing, the other two cannot interrupt it.
+/// Cross-signal nesting (e.g. SIGBUS arriving while the SIGSEGV
+/// handler is mid-write to COM2) would scribble interleaved bytes
+/// onto the serial output and lose the diagnostic. The signal being
+/// delivered is also masked by default; combined with `SA_RESETHAND`
+/// a re-fault of the same signal terminates under `SIG_DFL` instead
+/// of looping back into this handler.
+///
+/// Failures are silently ignored: if `sigaction(2)` rejects the
+/// install (returns -1), the previous disposition (typically
+/// `SIG_DFL`) remains in place — which is exactly the pre-fix
+/// behavior. There's no user-visible regression on failure, just
+/// the unchanged gap the panic hook also doesn't cover. `mmap(2)` /
+/// `sigaltstack(2)` failures are similarly tolerated: the handler
+/// stays installed without `SA_ONSTACK`, which only loses the
+/// stack-overflow diagnostic — every other fatal-signal path keeps
+/// working.
+fn install_fatal_signal_handlers() {
+    // SAFETY: `std::mem::zeroed::<libc::sigaction>()` produces a
+    // valid all-zero `sigaction` (all libc fields are integer or
+    // pointer-typed, zero is valid for all of them). The
+    // `sa_sigaction` field is then set to a function pointer with
+    // the correct `extern "C"` signature, and `sa_flags` is set
+    // to a valid combination of POSIX `SA_*` constants.
+    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+    act.sa_sigaction = fatal_signal_handler as *const () as usize;
+    act.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+    // Initialize the mask, then add every fatal signal so that one
+    // handler in flight cannot be interrupted by another fatal
+    // signal — see fn doc for why interleaved handlers corrupt the
+    // diagnostic.
+    unsafe {
+        libc::sigemptyset(&mut act.sa_mask);
+        libc::sigaddset(&mut act.sa_mask, libc::SIGSEGV);
+        libc::sigaddset(&mut act.sa_mask, libc::SIGBUS);
+        libc::sigaddset(&mut act.sa_mask, libc::SIGILL);
+    }
+
+    // Allocate and register a signal alternate stack so a stack-
+    // overflow SIGSEGV runs the handler on a separate stack instead
+    // of faulting again on the overflowed one. `SIGSTKSZ` is the
+    // platform's recommended minimum; clamp to 64 KiB so older libc
+    // headers (where SIGSTKSZ is 8 KiB) still leave headroom for the
+    // backtrace-free handler frame plus `write(2)` / `tcdrain(2)` /
+    // `reboot(2)` syscall trampolines.
+    //
+    // `mmap(MAP_PRIVATE | MAP_ANONYMOUS)` is the AS-safe-allocation
+    // analogue to a heap allocation: pages are zero-initialised on
+    // first touch, so no separate clear is needed. The mapping is
+    // intentionally leaked — `sigaltstack` keeps the kernel pointing
+    // at it for the lifetime of the process, and PID 1 never returns
+    // from `ktstr_guest_init`.
+    //
+    // SAFETY: `mmap(2)` and `sigaltstack(2)` are both POSIX-defined
+    // syscalls. The pointers / lengths supplied are well-formed
+    // (NULL hint, fd=-1 for anonymous mappings, offset=0). Failure
+    // returns `MAP_FAILED`; on that path we skip `sigaltstack` and
+    // leave `SA_ONSTACK` unset on `sa_flags` — see fn doc for the
+    // failure-mode rationale.
+    let stack_size = libc::SIGSTKSZ.max(65536);
+    let stack = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            stack_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if stack != libc::MAP_FAILED {
+        let ss = libc::stack_t {
+            ss_sp: stack,
+            ss_flags: 0,
+            ss_size: stack_size,
+        };
+        // SAFETY: `ss` is a fully-initialised `stack_t` with a
+        // valid mmap'd buffer and matching size. Passing
+        // `null_mut()` for `oss` discards the previous alternate
+        // stack — PID 1 has no prior alternate stack at this
+        // call site (signal handling has not been touched yet).
+        unsafe {
+            libc::sigaltstack(&ss, std::ptr::null_mut());
+        }
+        act.sa_flags |= libc::SA_ONSTACK;
+    }
+
+    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL] {
+        // SAFETY: `sigaction(2)` with a valid `struct sigaction`
+        // and a NULL old-action pointer is well-defined.
+        // Failures are silently swallowed (see fn doc).
+        let _ = unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) };
+    }
+}
+
 /// Full guest init lifecycle. Called from the ctor when PID 1 is
 /// detected. Mounts filesystems, then either runs the test lifecycle
 /// (scheduler + dispatch + reboot) or drops into an interactive
@@ -227,15 +493,37 @@ fn proc_pid_alive(pid: u32) -> bool {
 pub(crate) fn ktstr_guest_init() -> ! {
     let t0 = std::time::Instant::now();
 
-    // Panic hook: write crash diagnostic to COM2 (the canonical
-    // crash-diagnostic transport, survives a wedged virtio
-    // port). The bulk-virtio path is intentionally NOT used here
-    // because the kernel virtio_console TX path can block on
-    // host backpressure, and blocking inside a panic hook would
-    // deadlock the guest before the crash diagnostic reaches the
-    // host. COM2 (16550 UART) PIO writes commit synchronously
-    // inside `KVM_RUN` before userspace returns, so the host's
-    // serial capture sees every byte even on a wedged guest.
+    // Crash diagnostic capture has two arms because they have
+    // disjoint trigger surfaces:
+    //
+    // 1. Native fatal signals (`install_fatal_signal_handlers`,
+    //    installed first): SIGSEGV / SIGBUS / SIGILL invoke the
+    //    kernel's `do_coredump` under SIG_DFL — they bypass the
+    //    panic hook entirely. Without a sigaction handler the
+    //    kernel terminates init, which the parent kernel observes
+    //    as "init exited" and force-reboots without any guest-side
+    //    diagnostic reaching the host. Installing this arm before
+    //    the panic hook minimises the window where an early fault
+    //    (heap setup, mount syscalls, anything before the hook
+    //    registers) escapes capture.
+    // 2. Rust panic hook (below): fires on `panic!`, `unwrap`,
+    //    assertion failures, and any other invocation of the Rust
+    //    panic machinery (both `panic = "unwind"` and
+    //    `panic = "abort"` runtimes invoke the hook before
+    //    unwinding/aborting).
+    //
+    // Both arms write a `PANIC:`-prefixed line to COM2 (and COM1)
+    // so the host-side `extract_panic_message` picks them up
+    // through the same code path. COM2 is the canonical crash-
+    // diagnostic transport, surviving a wedged virtio port: the
+    // bulk-virtio path is intentionally NOT used here because the
+    // kernel `virtio_console` TX can block on host backpressure
+    // and blocking inside a fault handler would deadlock the
+    // guest before the diagnostic reached the host. COM2 (16550
+    // UART) PIO writes commit synchronously inside `KVM_RUN`
+    // before userspace returns, so the host's serial capture
+    // sees every byte even on a wedged guest.
+    install_fatal_signal_handlers();
     std::panic::set_hook(Box::new(|info| {
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC: {info}\n{bt}\n");
@@ -246,17 +534,23 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // diagnostic.
         let _ = fs::write(COM2, &msg);
         let _ = fs::write(COM1, &msg);
+        // Push any buffered Rust-side bytes into the underlying pipe
+        // before reboot. After stdio redirect, fd 1 / fd 2 are
+        // pipe write ends drained by `redirect_stdio_to_bulk_port`'s
+        // forwarder threads — `tcdrain` is unavailable here (the
+        // pipe is not a tty, the syscall returns ENOTTY silently).
+        // `flush()` is the equivalent: it commits any
+        // BufWriter-buffered bytes into the pipe's kernel buffer
+        // where the forwarder thread can pick them up. The
+        // forwarder threads are not joined before `force_reboot`;
+        // bytes that have not yet been read out of the pipe and
+        // shipped over the bulk port at the moment of reboot are
+        // lost — see the queue task on joining the forwarders for
+        // the residual gap. The COM1/COM2 `fs::write` above remains
+        // the synchronous-PIO path that guarantees the panic
+        // diagnostic itself reaches the host before reboot.
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
-        // tcdrain is synchronous on the vCPU exit: when the syscall
-        // returns in the guest, every byte is already in the host's
-        // Serial writer Vec (PIO/MMIO is committed inside KVM_RUN
-        // before userspace returns). No host-side post-drain wait
-        // is needed.
-        unsafe {
-            libc::tcdrain(1);
-            libc::tcdrain(2);
-        }
         force_reboot();
     }));
 
@@ -290,6 +584,59 @@ pub(crate) fn ktstr_guest_init() -> ! {
         force_reboot();
     }
 
+    // Boot-complete signal. The host monitor's pre-sample
+    // `epoll_wait` blocks on a sys_rdy eventfd; the freeze
+    // coordinator's bulk-drain dispatch promotes a CRC-valid
+    // `MSG_TYPE_SYS_RDY` frame into that eventfd. Sending here —
+    // after `mount_filesystems()` brought up devtmpfs so
+    // `/dev/vport0p1` exists, and after the initramfs-extraction
+    // sentinel confirms userspace is sound — guarantees the
+    // host's first sample observes a fully-booted guest with
+    // `setup_per_cpu_areas` populated and KASLR randomization
+    // already complete (both kernel-boot prerequisites for the
+    // monitor's `__per_cpu_offset[]` / `page_offset_base`
+    // reads). Replaces the earlier trigger that fired on the
+    // first port-0 TX byte (kernel printk via `/dev/hvc0`),
+    // which depended on incidental console traffic rather than
+    // an explicit readiness signal.
+    //
+    // The kernel virtio_console driver's multiport handshake
+    // (DEVICE_READY → PORT_ADD → PORT_READY → PORT_OPEN, see
+    // `drivers/char/virtio_console.c`) completes asynchronously
+    // and is independent of devtmpfs being mounted. On a fast
+    // boot the handshake can still be in flight when this
+    // statement runs, so `send_sys_rdy()`'s lazy
+    // `/dev/vport0p1` open returns `None` and the call returns
+    // `false`. Retry up to 100 × 100 ms (10 s) — generous
+    // enough to absorb cold-cache TRY 1 boots where the
+    // multiport handshake may take several seconds. The host
+    // monitor's pre-sample wait is bounded at 5 s; once that
+    // expires the monitor falls through to its `data_valid`
+    // gate and starts sampling, while THIS retry continues
+    // running in the guest's init thread to deliver SYS_RDY
+    // as soon as the device appears. Late delivery still
+    // promotes the eventfd, but the freeze coordinator's
+    // `Option::take` makes the promotion fire-once so a late
+    // SYS_RDY past the host wait is harmless. If the full 10 s
+    // budget exhausts, the guest continues with the rest of
+    // init and the monitor's `data_valid` gate keeps reads
+    // safe — the BSS-zero rejection in
+    // [`super::super::monitor::reader`]'s sample loop tolerates
+    // pre-boot zeros for as long as needed.
+    for attempt in 0..100 {
+        if crate::vmm::guest_comms::send_sys_rdy() {
+            break;
+        }
+        if attempt == 99 {
+            tracing::warn!(
+                "ktstr-init: send_sys_rdy retry budget exhausted (10 s); \
+                 monitor will rely on its 5 s pre-sample timeout + \
+                 data_valid gate"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
     // Phase 1.5: Auto-mount the user data disk at /mnt/disk0 if the
     // host pre-formatted it (KTSTR_DISK0_FS=<tag> on the cmdline).
     // Runs BEFORE `disk_template_mode_requested()` is checked below
@@ -303,13 +650,17 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // only populates bpf_prog_stats when bpf_stats_enabled_key is set.
     let _ = fs::write("/proc/sys/kernel/bpf_stats_enabled", "1");
 
-    // Phase 2: Sentinel + stdio redirect. The sentinel is for the test
-    // harness on the host; shell mode doesn't need it and it would leak
-    // to the user's terminal via COM2 stdout drain.
+    // Phase 2: Lifecycle event + stdio redirect. The lifecycle frame
+    // is for the test harness on the host; shell mode doesn't need it
+    // and would route the InitStarted phase into the operator's
+    // bulk-port-backed transcript otherwise.
     if !shell_mode_requested() {
-        write_com2(crate::test_support::SENTINEL_INIT_STARTED);
+        crate::vmm::guest_comms::send_lifecycle(
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            "",
+        );
     }
-    redirect_stdio_to_com2();
+    redirect_stdio_to_bulk_port();
     let t_stdio = t0.elapsed();
 
     // Extract RUST_LOG from kernel cmdline before installing the
@@ -375,27 +726,22 @@ pub(crate) fn ktstr_guest_init() -> ! {
     if disk_template_mode_requested() {
         let _span = tracing::debug_span!("disk_template_mode").entered();
         let code = run_disk_template_mode();
-        // Match the post-test exit semantics: drain stdout/stderr,
-        // emit the exit sentinel on COM2 so the host knows we're
-        // done, reboot.
+        // Match the post-test exit semantics: push buffered stdio
+        // bytes into the pipe (the forwarder threads then ship them
+        // over the bulk port), emit the binary exit code over the
+        // bulk data port so the host knows we're done, reboot.
+        // `flush()` replaces the broken `tcdrain(1/2)`
+        // which returned ENOTTY against the pipe write ends; the
+        // forwarder threads aren't joined here, so bytes still in
+        // the pipe at reboot time are lost — see the queue task
+        // for forwarder-join plumbing.
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
-        unsafe {
-            libc::tcdrain(1);
-            libc::tcdrain(2);
-        }
-        write_com2(&format!(
-            "{prefix}{code}",
-            prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
-        ));
-        if let Ok(com2) = fs::OpenOptions::new().write(true).open(COM2) {
-            unsafe {
-                libc::tcdrain(com2.as_raw_fd());
-            }
-        }
-        // tcdrain is synchronous on the vCPU exit — bytes are in the
-        // host writer the moment it returns. No additional wait
-        // needed before reboot.
+        crate::vmm::guest_comms::send_exit(code as i32);
+        // The bulk-port write inside `send_exit` commits via MMIO
+        // before userspace returns from KVM_RUN — the EXIT frame is
+        // in the host's port-1 RX buffer the moment `send_exit`
+        // returns. No additional wait needed before reboot.
         force_reboot();
     }
 
@@ -453,12 +799,9 @@ pub(crate) fn ktstr_guest_init() -> ! {
                     1
                 }
             };
-            // Exit code on stderr so it does not pollute captured
-            // command output on stdout.
-            eprintln!(
-                "{prefix}{code}",
-                prefix = crate::test_support::SENTINEL_EXEC_EXIT_PREFIX,
-            );
+            // Exit code travels via the bulk data port so it does
+            // not pollute captured command output on stdout.
+            crate::vmm::guest_comms::send_exec_exit(code as i32);
             let _ = std::io::stdout().flush();
             let _ = std::io::stderr().flush();
             // tcdrain is synchronous on the vCPU exit: when these
@@ -580,7 +923,10 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // Phase 5: Dispatch.
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
     tracing::debug!("dispatching test");
-    write_com2(crate::test_support::SENTINEL_PAYLOAD_STARTING);
+    crate::vmm::guest_comms::send_lifecycle(
+        crate::vmm::wire::LifecyclePhase::PayloadStarting,
+        "",
+    );
     let code = if let Some(pa) = probe_phase_a {
         // Phase A/B split path: Phase A already attached, dispatch
         // with Phase B for BPF fentry after scheduler is running.
@@ -613,8 +959,16 @@ pub(crate) fn ktstr_guest_init() -> ! {
     if let Some(ref stop) = vc_poll_stop {
         stop.store(true, Ordering::Release);
     }
-    if let Some(ref stop) = sched_exit_stop {
-        stop.store(true, Ordering::Release);
+    if let Some(ref handle) = sched_exit_stop {
+        // Order: store `true` first so the monitor's `Acquire` load
+        // at the top of its loop sees the stop flag. Then write the
+        // wake eventfd to drop the monitor's `poll(2)` wait latency
+        // from the legacy 250 ms cadence to microseconds. A
+        // monitor that races the eventfd write into its
+        // `Acquire` load still observes `stop=true` immediately —
+        // the eventfd is the wake edge, not the source of truth.
+        handle.stop.store(true, Ordering::Release);
+        handle.wake();
     }
 
     // Flush COM1 trace data before reboot. The reader thread runs on
@@ -656,24 +1010,26 @@ pub(crate) fn ktstr_guest_init() -> ! {
     }
 
     // Phase 7: Exit.
-    // tcdrain stdout (COM2 after redirect) to wait for the UART to
-    // finish transmitting all queued bytes.
-    unsafe {
-        libc::tcdrain(1);
-    }
+    // Push buffered stdout/stderr bytes into the pipe write ends so
+    // the bulk-port forwarder threads can ship them before reboot.
+    // After stdio redirect, fd 1 / fd 2 are pipe write ends
+    // (not the COM2 UART) so `tcdrain(1)` would return ENOTTY
+    // silently — `flush()` is the equivalent for pipes. The
+    // forwarder threads are not joined before `force_reboot`; bytes
+    // still resident in the pipe buffer at reboot time are lost
+    // (see the queue task for forwarder-join plumbing).
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
 
-    // Write exit code via the typed guest API. The virtio-console
-    // port-1 path is primary; the COM2 SENTINEL_EXIT_PREFIX line
-    // below is the fallback the host's `collect_results` walks
-    // when no `MSG_TYPE_EXIT` frame arrived (e.g. a panic before
-    // bulk port open).
+    // Write exit code via the typed guest API on the bulk data
+    // port. The legacy COM2 `SENTINEL_EXIT_PREFIX` fallback is gone
+    // — bulk-port backpressure guarantees delivery and the host's
+    // `collect_results` walks `guest_messages` for a binary
+    // `MSG_TYPE_EXIT` frame as the sole authoritative source.
     crate::vmm::guest_comms::send_exit(code as i32);
-    write_com2(&format!(
-        "{prefix}{code}",
-        prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
-    ));
 
-    // Drain COM2 UART after writing the exit sentinel.
+    // Drain COM2 UART for any panic-hook bytes that may still be
+    // in flight (the panic hook is the one remaining COM2 writer).
     // tcdrain is synchronous on the vCPU exit: when it returns,
     // every byte is already in the host's COM2 writer Vec.
     if let Ok(com2) = fs::OpenOptions::new().write(true).open(COM2) {
@@ -686,23 +1042,136 @@ pub(crate) fn ktstr_guest_init() -> ! {
     force_reboot()
 }
 
-/// Redirect stdout and stderr to COM2 (/dev/ttyS1).
-///
-/// As PID 1, stdout/stderr initially point to the kernel console (COM1).
-/// Test output (println!/eprintln! from the test function and framework)
-/// must appear on COM2 so the host-side serial parser sees it.
-fn redirect_stdio_to_com2() {
-    use std::os::unix::io::AsRawFd;
+/// Maximum bytes per [`MsgType::Stdout`] / [`MsgType::Stderr`] TLV
+/// chunk emitted by the pipe forwarder threads. 4 KiB matches a
+/// page-size pipe read; well under the host-side per-frame cap
+/// [`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`] so a chunk fits
+/// comfortably in one frame even with the 16-byte header.
+const STDIO_CHUNK_BYTES: usize = 4 * 1024;
 
-    let Ok(com2) = fs::OpenOptions::new().write(true).open(COM2) else {
+/// Redirect stdout and stderr through bulk-port forwarder threads.
+///
+/// Pre-bincode-migration: dup2'd `/dev/ttyS1` over fd 1 and fd 2 so
+/// every `println!` / `eprintln!` reached the host as a stream of
+/// COM2 bytes.  The bulk-port migration replaces COM2 with one
+/// [`MsgType::Stdout`] / [`MsgType::Stderr`] TLV frame per chunk:
+///
+///   1. Open a pair of `pipe(2)` pipes (one for stdout, one for
+///      stderr).
+///   2. `dup2` each pipe's write end over fd 1 / fd 2 so every
+///      `println!` / `eprintln!` lands in the pipe.
+///   3. Spawn one reader thread per pipe.  Each thread reads up to
+///      [`STDIO_CHUNK_BYTES`] at a time from the pipe's read end and
+///      ships the chunk via
+///      [`crate::vmm::guest_comms::send_stdout_chunk`] /
+///      [`crate::vmm::guest_comms::send_stderr_chunk`].
+///
+/// The threads are detached: they exit cleanly when fd 1 / fd 2 are
+/// closed (process exit / `force_reboot`) because the read end then
+/// returns EOF.
+///
+/// Panic diagnostics still go to COM2 — the panic hook in
+/// [`ktstr_guest_init`] writes directly to `/dev/ttyS1` because the
+/// hook cannot block on virtio backpressure.  Every other guest
+/// stream now travels over the bulk port.
+///
+/// On any pipe / dup2 / thread-spawn failure the function logs via
+/// `eprintln!` (fd 2 is still attached to the kernel console at the
+/// failure point, so the operator sees the misroute) and returns —
+/// stdout/stderr stay attached to whatever fd they pointed at on
+/// entry.
+fn redirect_stdio_to_bulk_port() {
+    use std::io::Read;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    fn make_pipe() -> Option<(std::fs::File, std::fs::File)> {
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid `&mut [i32; 2]`; `pipe(2)` writes
+        // exactly two file descriptors on success.  Passing `O_CLOEXEC`
+        // would belong on `pipe2`, but we deliberately want the pipe
+        // ends to survive across any forks the test may perform — the
+        // dup2'd write end carries fd 1 / fd 2 across exec/fork, which
+        // is the entire point.
+        let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if r < 0 {
+            return None;
+        }
+        // SAFETY: `pipe(2)` just returned with the two fds populated.
+        // `from_raw_fd` takes ownership of each side; both close on
+        // drop.  Held by `File` for the natural Read/Write impls.
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let write_end = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        Some((read_end, write_end))
+    }
+
+    fn spawn_forwarder(
+        mut read_end: std::fs::File,
+        name: &'static str,
+        sender: fn(&[u8]) -> bool,
+    ) {
+        let _ = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let mut buf = [0u8; STDIO_CHUNK_BYTES];
+                loop {
+                    match read_end.read(&mut buf) {
+                        Ok(0) => break, // EOF — fd 1/2 closed.
+                        Ok(n) => {
+                            // Fire-and-forget.  `send_*_chunk`
+                            // returns false when the bulk port is
+                            // not yet ready; bytes emitted before
+                            // the multiport handshake completes are
+                            // dropped.  Same caveat as the prior
+                            // COM2 path's pre-handshake byte loss.
+                            let _ = sender(&buf[..n]);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+            });
+    }
+
+    let Some((stdout_r, stdout_w)) = make_pipe() else {
+        eprintln!("ktstr-init: redirect_stdio_to_bulk_port: pipe(stdout) failed");
         return;
     };
-    let fd = com2.as_raw_fd();
-    unsafe {
-        libc::dup2(fd, 1); // stdout
-        libc::dup2(fd, 2); // stderr
+    let Some((stderr_r, stderr_w)) = make_pipe() else {
+        eprintln!("ktstr-init: redirect_stdio_to_bulk_port: pipe(stderr) failed");
+        return;
+    };
+
+    // Capture errno via `last_os_error` BEFORE any subsequent libc
+    // call: errno is per-thread but every libc call may clobber it.
+    let (rc1, err1, rc2, err2) = unsafe {
+        let r1 = libc::dup2(stdout_w.as_raw_fd(), 1);
+        let e1 = std::io::Error::last_os_error();
+        let r2 = libc::dup2(stderr_w.as_raw_fd(), 2);
+        let e2 = std::io::Error::last_os_error();
+        (r1, e1, r2, e2)
+    };
+    // The dup2 above duplicated each pipe's write end onto fd 1 / fd 2;
+    // the originals (`stdout_w` / `stderr_w`) close on this scope's
+    // exit.  Without that close, the read end of each pipe would see
+    // EOF only after the test process holding fd 1 / fd 2 also dropped
+    // those file descriptors — but we want the EOF condition to fire
+    // when fd 1 / fd 2 reach their natural close-on-exit, not when
+    // some other holder of `stdout_w` closes too.  Letting the
+    // originals drop here is correct because `dup2` increments the
+    // file's refcount.
+    if rc1 < 0 {
+        eprintln!("ktstr-init: redirect_stdio_to_bulk_port: dup2(stdout) failed: {err1}");
     }
-    // com2 is dropped here but fd 1 and 2 keep the file open.
+    if rc2 < 0 {
+        eprintln!("ktstr-init: redirect_stdio_to_bulk_port: dup2(stderr) failed: {err2}");
+    }
+
+    spawn_forwarder(stdout_r, "ktstr-stdout-fwd", |b| {
+        crate::vmm::guest_comms::send_stdout_chunk(b)
+    });
+    spawn_forwarder(stderr_r, "ktstr-stderr-fwd", |b| {
+        crate::vmm::guest_comms::send_stderr_chunk(b)
+    });
 }
 
 /// Check kernel cmdline for KTSTR_MODE=shell.
@@ -741,13 +1210,14 @@ fn cmdline_contains_token(cmdline: &str, token: &str) -> bool {
 /// returns and the VM reboots, the host's [`crate::vmm::disk_template::store_atomic`]
 /// publishes the now-formatted image into the cache.
 ///
-/// This dispatch matches the constraint stated in the project
-/// CLAUDE.md "disk template lifecycle" section: the kernel's own
-/// mkfs (driven by the userspace `mkfs.btrfs` binary running
-/// inside the guest) is the on-disk-format authority. The host
-/// never execs mkfs against a real backing file.
+/// The host never execs `mkfs.btrfs` against a real backing file —
+/// driving the format through this guest-side dispatch keeps the
+/// kernel under test as the on-disk-format authority, so any btrfs
+/// feature regression in that kernel surfaces as a guest format
+/// failure here instead of as a host/guest mkfs disagreement that
+/// would slip past testing.
 fn run_disk_template_mode() -> i32 {
-    redirect_stdio_to_com2();
+    redirect_stdio_to_bulk_port();
     // The mkfs.btrfs binary is packed at `bin/mkfs.btrfs` by
     // [`crate::vmm::disk_template::build_template_via_vm`] via
     // `include_files`; that function — not `ensure_template` — is
@@ -846,6 +1316,12 @@ fn build_include_path() -> String {
 ///
 /// Shell mode needs all three fds on the console device: stdin for
 /// reading input, stdout/stderr for writing output.
+///
+/// `dup2` failures are logged via `eprintln!`. A failing `dup2`
+/// leaves the target fd unchanged, so the eprintln still reaches the
+/// pre-redirect stderr (kernel console / COM1) and the operator sees
+/// the misroute rather than the failing path silently writing to a
+/// wrong device.
 fn redirect_all_stdio_to(path: &str) {
     use std::os::unix::io::AsRawFd;
 
@@ -853,10 +1329,27 @@ fn redirect_all_stdio_to(path: &str) {
         return;
     };
     let fd = dev.as_raw_fd();
-    unsafe {
-        libc::dup2(fd, 0); // stdin
-        libc::dup2(fd, 1); // stdout
-        libc::dup2(fd, 2); // stderr
+    // Capture errno per call before the next libc call clobbers
+    // it. Run all three syscalls sequentially without aborting on
+    // a partial failure — fd 0 redirect failing should not stop us
+    // from at least getting stdout/stderr onto the console.
+    let (rc0, err0, rc1, err1, rc2, err2) = unsafe {
+        let r0 = libc::dup2(fd, 0);
+        let e0 = std::io::Error::last_os_error();
+        let r1 = libc::dup2(fd, 1);
+        let e1 = std::io::Error::last_os_error();
+        let r2 = libc::dup2(fd, 2);
+        let e2 = std::io::Error::last_os_error();
+        (r0, e0, r1, e1, r2, e2)
+    };
+    if rc0 < 0 {
+        eprintln!("ktstr-init: redirect_all_stdio_to({path}): dup2(stdin) failed: {err0}");
+    }
+    if rc1 < 0 {
+        eprintln!("ktstr-init: redirect_all_stdio_to({path}): dup2(stdout) failed: {err1}");
+    }
+    if rc2 < 0 {
+        eprintln!("ktstr-init: redirect_all_stdio_to({path}): dup2(stderr) failed: {err2}");
     }
 }
 
@@ -1344,6 +1837,16 @@ fn write_com2(msg: &str) {
 /// Create the cgroup parent directory specified by `--cell-parent-cgroup`
 /// in `/sched_args`. The directory must exist before the scheduler starts
 /// because the scheduler expects it at startup.
+///
+/// In cgroup v2, a controller is only visible inside a cgroup when its
+/// parent's `cgroup.subtree_control` enables it. The kernel enforces
+/// this in `cgroup_subtree_control_write` via `cgroup_control(cgrp)`,
+/// which returns `parent->subtree_control` for non-root cgroups. To
+/// make `cpuset` and `cpu` available in the leaf, every ancestor from
+/// the cgroup root down to (and including) the leaf's immediate parent
+/// must enable both controllers. Writes are applied root-to-leaf so
+/// each level's prerequisite is already in place when its child is
+/// written.
 #[tracing::instrument]
 fn create_cgroup_parent_from_sched_args() {
     let sched_args = match fs::read_to_string("/sched_args") {
@@ -1357,13 +1860,62 @@ fn create_cgroup_parent_from_sched_args() {
         {
             let cgroup_dir = format!("/sys/fs/cgroup{path}");
             mkdir_p(&cgroup_dir);
-            // Enable cgroup controllers for the parent.
-            let parent = Path::new(&cgroup_dir)
-                .parent()
-                .unwrap_or(Path::new("/sys/fs/cgroup"));
-            let control = parent.join("cgroup.subtree_control");
-            let _ = fs::write(&control, "+cpuset +cpu");
+            enable_subtree_controllers_to(&cgroup_dir);
             return;
+        }
+    }
+}
+
+/// Enable `+cpuset +cpu` in `cgroup.subtree_control` at every ancestor
+/// from `/sys/fs/cgroup` (inclusive) down to (and including) the
+/// immediate parent of `leaf`. Writes are ordered root-first so each
+/// level's parent already advertises the controllers when its child is
+/// written — without that ordering the kernel rejects the write with
+/// `-ENOENT` (see `cgroup_subtree_control_write` /
+/// `cgroup_control` in `kernel/cgroup/cgroup.c`).
+///
+/// `leaf` is expected to live under `/sys/fs/cgroup/...` (the format
+/// emitted at the call site). The leaf itself is NOT written: enabling
+/// controllers in a cgroup means they are visible inside that cgroup's
+/// CHILDREN, so the leaf's own `subtree_control` only matters if the
+/// scheduler ever creates sub-cgroups under it. The scheduler attaches
+/// tasks to the leaf, so what it needs is `cpuset`/`cpu` enabled IN
+/// the leaf — which is achieved by writing to the leaf's parent.
+///
+/// Failures on individual writes are logged via [`write_com2`] and do
+/// not abort the walk: a single intermediate level that already has
+/// both controllers enabled returns `0` from kernel side, so most
+/// failures observed here will surface a real misconfiguration that
+/// the scheduler's own `cgroup_attach` will then re-report with
+/// scheduler-specific context.
+fn enable_subtree_controllers_to(leaf: &str) {
+    let cgroup_root = Path::new("/sys/fs/cgroup");
+    let leaf_path = Path::new(leaf);
+    // Verify leaf is under the cgroup root before touching anything.
+    // A malformed `--cell-parent-cgroup` argument that produces a path
+    // outside `/sys/fs/cgroup` (e.g. an empty or missing-leading-slash
+    // value) would otherwise walk into `/sys/fs`, `/sys`, or `/`.
+    if !leaf_path.starts_with(cgroup_root) || leaf_path == cgroup_root {
+        return;
+    }
+    // `Path::ancestors` yields leaf-first; collect the strict ancestors
+    // (skip the leaf itself) up to and including the cgroup root.
+    let mut ancestors: Vec<&Path> = leaf_path
+        .ancestors()
+        .skip(1)
+        .take_while(|p| p.starts_with(cgroup_root))
+        .collect();
+    // Apply root-to-leaf-parent: each level's parent must already
+    // enable the controller before the child write is accepted.
+    ancestors.reverse();
+    for level in ancestors {
+        let control = level.join("cgroup.subtree_control");
+        if let Err(e) = fs::write(&control, "+cpuset +cpu") {
+            write_com2(&format!(
+                "ktstr-init: write {} +cpuset +cpu: {}",
+                control.display(),
+                e
+            ));
         }
     }
 }
@@ -1464,11 +2016,36 @@ fn poll_scx_attached(
     // must explicitly call `sysfs_notify`. Polling at `interval`
     // cadence is the supported mechanism for attributes whose
     // producer doesn't notify, so the fallback is mandatory.
-    let attr_fd = unsafe {
-        libc::open(
-            c"/sys/kernel/sched_ext/root/ops".as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC,
-        )
+    // Wrap the raw fd in `OwnedFd` so it is closed automatically on
+    // every return path — including a panic anywhere inside the
+    // loop body. The previous version close()d at each `return`
+    // site manually; a panic in `read_to_string`, `Instant::now`
+    // arithmetic, or `libc::poll` would have leaked the fd. PID 1's
+    // fd budget is small and a leak across repeated calls would be
+    // observable.
+    //
+    // The libc::open returns -1 on failure; turn that into `None`
+    // before constructing `OwnedFd` (which requires a valid fd to
+    // uphold its safety contract). Subsequent uses gate on
+    // `attr_fd.is_some()` exactly like the previous `attr_fd >= 0`
+    // checks, but the close on the success / timeout returns is now
+    // implicit via Drop.
+    let attr_fd: Option<OwnedFd> = {
+        let raw = unsafe {
+            libc::open(
+                c"/sys/kernel/sched_ext/root/ops".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            None
+        } else {
+            // SAFETY: `raw` is a valid fd we just opened and have
+            // exclusive ownership of. `OwnedFd::from_raw_fd` takes
+            // ownership; the previous manual `close()` calls are
+            // now Drop's responsibility.
+            Some(unsafe { OwnedFd::from_raw_fd(raw) })
+        }
     };
     let interval_ms_clamped = interval.as_millis().min(i32::MAX as u128) as i32;
     loop {
@@ -1482,13 +2059,7 @@ fn poll_scx_attached(
             Ok(contents) => {
                 ever_read_ok = true;
                 if !contents.trim().is_empty() {
-                    if attr_fd >= 0 {
-                        // SAFETY: attr_fd opened above by this
-                        // function; not used after close.
-                        unsafe {
-                            libc::close(attr_fd);
-                        }
-                    }
+                    // `attr_fd` Drop closes the OwnedFd on return.
                     return ScxAttachStatus::Attached;
                 }
             }
@@ -1500,13 +2071,7 @@ fn poll_scx_attached(
         }
         let now = std::time::Instant::now();
         if now.duration_since(start) >= timeout {
-            if attr_fd >= 0 {
-                // SAFETY: attr_fd opened above by this function;
-                // not used after close.
-                unsafe {
-                    libc::close(attr_fd);
-                }
-            }
+            // `attr_fd` Drop closes the OwnedFd on return.
             return if ever_read_ok {
                 ScxAttachStatus::Timeout
             } else {
@@ -1516,7 +2081,7 @@ fn poll_scx_attached(
         let remaining_ms = (start + timeout - now)
             .as_millis()
             .min(interval_ms_clamped as u128) as i32;
-        if attr_fd >= 0 {
+        if let Some(ref fd) = attr_fd {
             // poll(POLLPRI) is the kernfs notification mechanism
             // for attribute content changes. Cap the wait at the
             // requested polling interval so we never exceed the
@@ -1532,7 +2097,7 @@ fn poll_scx_attached(
             // the read-fallback that catches changes the producer
             // didn't notify on.
             let mut pfd = libc::pollfd {
-                fd: attr_fd,
+                fd: fd.as_raw_fd(),
                 events: libc::POLLPRI,
                 revents: 0,
             };
@@ -1593,9 +2158,8 @@ fn poll_startup(
     // synchronisation. Failure (rare — e.g. very tight pid reuse,
     // sandbox restriction) falls back to a `proc_pid_alive` loop
     // below.
-    let pidfd = unsafe {
-        libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int
-    };
+    let pidfd =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int };
     if pidfd < 0 {
         // pidfd_open unsupported on this kernel. `proc_pid_alive`
         // is the SIG_IGN-safe fallback: the procfs entry vanishes
@@ -1775,15 +2339,18 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
                 std::time::Duration::from_secs(1),
             ) {
                 StartupStatus::Died => {
-                    // Scheduler died during startup.
-                    write_com2(crate::verifier::SCHED_OUTPUT_START);
-                    dump_file_to_com2(log_path);
-                    write_com2(crate::verifier::SCHED_OUTPUT_END);
-                    write_com2(crate::test_support::SENTINEL_SCHEDULER_DIED);
-                    write_com2(&format!(
-                        "{prefix}1",
-                        prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
-                    ));
+                    // Scheduler died during startup. Dump the
+                    // scheduler log via the bulk data port — the
+                    // SCHED_OUTPUT_START / SCHED_OUTPUT_END markers
+                    // travel verbatim inside the chunk bytes so
+                    // the host's `parse_sched_output` walker keeps
+                    // working unchanged.
+                    dump_sched_output(log_path);
+                    crate::vmm::guest_comms::send_lifecycle(
+                        crate::vmm::wire::LifecyclePhase::SchedulerDied,
+                        "",
+                    );
+                    crate::vmm::guest_comms::send_exit(1);
                     // Drain the probe pipeline so PROBE_OUTPUT_END
                     // hits COM2 before force_reboot rips the VM.
                     // No-op when no probe stack was supplied.
@@ -1803,24 +2370,17 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
                         std::time::Duration::from_secs(3),
                     );
                     if !status.is_attached() {
-                        write_com2(crate::verifier::SCHED_OUTPUT_START);
-                        dump_file_to_com2(log_path);
-                        write_com2(crate::verifier::SCHED_OUTPUT_END);
-                        match status {
-                            ScxAttachStatus::Timeout => write_com2(&format!(
-                                "{}: timeout",
-                                crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED,
-                            )),
-                            ScxAttachStatus::SysfsAbsent => write_com2(&format!(
-                                "{}: sched_ext sysfs absent",
-                                crate::test_support::SENTINEL_SCHEDULER_NOT_ATTACHED,
-                            )),
+                        dump_sched_output(log_path);
+                        let reason = match status {
+                            ScxAttachStatus::Timeout => "timeout",
+                            ScxAttachStatus::SysfsAbsent => "sched_ext sysfs absent",
                             ScxAttachStatus::Attached => unreachable!(),
-                        }
-                        write_com2(&format!(
-                            "{prefix}1",
-                            prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
-                        ));
+                        };
+                        crate::vmm::guest_comms::send_lifecycle(
+                            crate::vmm::wire::LifecyclePhase::SchedulerNotAttached,
+                            reason,
+                        );
+                        crate::vmm::guest_comms::send_exit(1);
                         // Drain the probe pipeline before reboot —
                         // see Died-arm comment.
                         drain_probe_pipeline(probe_drain.as_ref());
@@ -1832,14 +2392,22 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
         }
         Err(e) => {
             eprintln!("ktstr-init: spawn scheduler: {e}");
-            write_com2(crate::verifier::SCHED_OUTPUT_START);
-            write_com2(&format!("failed to spawn: {e}"));
-            write_com2(crate::verifier::SCHED_OUTPUT_END);
-            write_com2(crate::test_support::SENTINEL_SCHEDULER_DIED);
-            write_com2(&format!(
-                "{prefix}1",
-                prefix = crate::test_support::SENTINEL_EXIT_PREFIX,
-            ));
+            // Synthesize a minimal sched-log payload framed by the
+            // existing SCHED_OUTPUT_START/END markers so the host's
+            // `parse_sched_output` returns the spawn-failure
+            // diagnostic exactly as the prior COM2 path did.
+            crate::vmm::guest_comms::send_sched_log(
+                crate::verifier::SCHED_OUTPUT_START.as_bytes(),
+            );
+            send_sched_log_text(&format!("failed to spawn: {e}"));
+            crate::vmm::guest_comms::send_sched_log(
+                crate::verifier::SCHED_OUTPUT_END.as_bytes(),
+            );
+            crate::vmm::guest_comms::send_lifecycle(
+                crate::vmm::wire::LifecyclePhase::SchedulerDied,
+                "",
+            );
+            crate::vmm::guest_comms::send_exit(1);
             // Drain the probe pipeline before reboot — see
             // Died-arm comment.
             drain_probe_pipeline(probe_drain.as_ref());
@@ -1848,20 +2416,58 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
     }
 }
 
-/// Dump scheduler output to COM2 between markers.
+/// Maximum scheduler-log chunk emitted in a single
+/// [`crate::vmm::guest_comms::send_sched_log`] frame. Sub-cap of
+/// [`crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD`] so a chunk fits
+/// comfortably inside one TLV frame; chunks above this size are
+/// split before emission.
+const SCHED_LOG_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Send the scheduler log to the host bracketed by
+/// [`crate::verifier::SCHED_OUTPUT_START`] /
+/// [`crate::verifier::SCHED_OUTPUT_END`] markers. Replaces the
+/// prior COM2 dump path: the markers travel verbatim inside the
+/// chunk bytes so the host's `parse_sched_output` walker (which
+/// scans for the start/end pair after concatenating chunks) keeps
+/// working unchanged. The BPF verifier section embedded in the
+/// scheduler's stderr / stdout passes through byte-for-byte so a
+/// scheduler author still sees the kernel's verifier rejection
+/// text in the host-side failure render.
 fn dump_sched_output(log_path: &str) {
-    write_com2(crate::verifier::SCHED_OUTPUT_START);
-    dump_file_to_com2(log_path);
-    write_com2(crate::verifier::SCHED_OUTPUT_END);
+    crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_START.as_bytes());
+    send_sched_log_file(log_path);
+    crate::vmm::guest_comms::send_sched_log(crate::verifier::SCHED_OUTPUT_END.as_bytes());
 }
 
-/// Write a file's contents to COM2.
-fn dump_file_to_com2(path: &str) {
-    if let Ok(content) = fs::read_to_string(path)
-        && let Ok(mut f) = fs::OpenOptions::new().write(true).open(COM2)
-    {
-        let _ = f.write_all(content.as_bytes());
+/// Read the scheduler log file and emit it to the host as one or
+/// more [`crate::vmm::wire::MsgType::SchedLog`] TLV chunks bounded
+/// by [`SCHED_LOG_CHUNK_BYTES`]. Empty / missing file is a silent
+/// no-op (mirrors the prior `dump_file_to_com2` behaviour where an
+/// `Err` from `read_to_string` skipped the dump rather than
+/// emitting a partial marker pair).
+fn send_sched_log_file(path: &str) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    let bytes = content.as_bytes();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let end = (start + SCHED_LOG_CHUNK_BYTES).min(bytes.len());
+        crate::vmm::guest_comms::send_sched_log(&bytes[start..end]);
+        start = end;
     }
+}
+
+/// Send a fixed text snippet (e.g. a "failed to spawn" diagnostic)
+/// to the host as a single [`crate::vmm::wire::MsgType::SchedLog`]
+/// TLV chunk. The snippet is bounded by `SCHED_LOG_CHUNK_BYTES`
+/// like every other chunk; oversized snippets would be rejected
+/// by the host-side per-frame cap and are guarded here by
+/// truncating the input before the call.
+fn send_sched_log_text(s: &str) {
+    let bytes = s.as_bytes();
+    let cap = SCHED_LOG_CHUNK_BYTES.min(bytes.len());
+    crate::vmm::guest_comms::send_sched_log(&bytes[..cap]);
 }
 
 /// Enable sched_ext_dump trace event and pipe trace_pipe to COM1 in a
@@ -2042,23 +2648,96 @@ fn start_hvc0_poll(trace_stop: Option<Arc<AtomicBool>>) -> Option<Arc<AtomicBool
 fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
     use std::os::unix::io::AsRawFd;
 
-    let hvc0 = fs::OpenOptions::new()
+    // Open the virtio-console wake fd. Failure here used to be
+    // `.expect()`d, which panicked the worker thread; the
+    // process-wide panic hook installed at PID-1 entry calls
+    // `force_reboot()`, so a transient open failure (e.g. devtmpfs
+    // not yet populated when the thread spawns) tore the VM down
+    // before any test could dispatch. Log + return instead so the
+    // poll loop simply doesn't deliver wake bytes for this boot —
+    // tests that rely on `bpf_map_write` notification will time out
+    // on their `wait_for_map_write` latch with a recoverable error
+    // instead of a forced reboot.
+    let hvc0 = match fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(HVC0)
-        .expect("ktstr.kconfig requires CONFIG_VIRTIO_CONSOLE=y; /dev/hvc0 must exist");
+    {
+        Ok(f) => f,
+        Err(e) => {
+            write_com2(&format!(
+                "ktstr-init: hvc0 poll loop disabled — open {HVC0}: {e}"
+            ));
+            return;
+        }
+    };
     let poll_timeout_ms: PollTimeout = 1000u16.into();
 
     while !stop.load(Ordering::Acquire) {
         let borrowed = unsafe { BorrowedFd::borrow_raw(hvc0.as_raw_fd()) };
         let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
         match poll(&mut fds, poll_timeout_ms) {
-            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
             Err(_) => break,
+        }
+        // Inspect revents before reading: a host-side virtio-console
+        // disconnect raises POLLHUP/POLLERR permanently, and without
+        // this guard the bare `read().unwrap_or(0)` below returns
+        // Ok(0) every iteration, the next `poll()` returns
+        // immediately because the hangup is still latched, and the
+        // loop spins burning CPU until `stop` is set. Mirrors the
+        // pattern in `start_trace_pipe` (above): break on
+        // POLLERR/POLLNVAL, break on POLLHUP-without-POLLIN, and
+        // skip the read on a wake without POLLIN.
+        if let Some(revents) = fds[0].revents() {
+            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+                break;
+            }
+            if !revents.contains(PollFlags::POLLIN) {
+                if revents.contains(PollFlags::POLLHUP) {
+                    break;
+                }
+                continue;
+            }
         }
         let mut buf = [0u8; 16];
         let mut hvc_ref: &fs::File = &hvc0;
-        let n = hvc_ref.read(&mut buf).unwrap_or(0);
+        // Retry on EINTR (the read was interrupted by a signal before
+        // returning data). The previous `unwrap_or(0)` collapsed both
+        // EINTR and EIO into 0 bytes, masking transient signal races
+        // (drops a real wake byte) and permanent device errors (silent
+        // hang in the next poll iteration). Treat:
+        //   - Ok(n): consume n bytes and dispatch signals below. An
+        //     `Ok(0)` here is rare (poll already confirmed POLLIN)
+        //     but harmless — the byte-contains checks no-op and the
+        //     outer loop iterates normally, same as the original
+        //     `unwrap_or(0)` behaviour for that case.
+        //   - EINTR: retry the read inline; poll already confirmed
+        //     POLLIN, so the wake byte is still in the device's RX
+        //     queue waiting to be drained.
+        //   - other Err: log via tracing::warn and break the outer
+        //     poll loop. A non-EINTR read error after POLLIN means
+        //     the device is in an unrecoverable state (host-side
+        //     disconnect that didn't surface as POLLHUP, kernel-side
+        //     I/O error, fd revoked) and continuing would either
+        //     spin on the same error or silently miss every wake
+        //     byte for the rest of the run.
+        let n = 'read_retry: loop {
+            match hvc_ref.read(&mut buf) {
+                Ok(n) => break 'read_retry Some(n),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        "ktstr-init: hvc0 read failed; aborting poll loop"
+                    );
+                    break 'read_retry None;
+                }
+            }
+        };
+        let Some(n) = n else { break };
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP) {
             let _ = fs::write("/proc/sysrq-trigger", "D");
         }
@@ -2088,19 +2767,82 @@ fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
     }
 }
 
+/// Stop handle for the sched-exit monitor. Carries both the
+/// `Arc<AtomicBool>` source-of-truth flag and a writable eventfd handle
+/// the cleanup site uses to wake the monitor thread out of `poll(2)`
+/// without waiting for the legacy 250 ms cadence.
+///
+/// Cleanup contract: before reading `stop`, the cleanup site MUST
+/// `store(true, Release)` the bool AND call [`SchedExitStop::wake`].
+/// The bool is the source of truth; the eventfd write delivers the
+/// edge that pulls the thread out of an indefinite `poll`. The
+/// eventfd is owned by this struct on the writer side and by the
+/// monitor thread on the reader side; both sides drop their fds when
+/// the run ends, so the kernel-side counter is reclaimed cleanly.
+pub(crate) struct SchedExitStop {
+    /// Stop flag the monitor thread polls under `Acquire` ordering at
+    /// every loop iteration. Setting `true` is the only way to make
+    /// the thread exit through its top-of-loop early-return arm; the
+    /// eventfd below is the wake-edge that pairs with this store.
+    pub(crate) stop: Arc<AtomicBool>,
+    /// Owned eventfd write side. `wake()` writes `1` here; the
+    /// monitor's `poll(2)` returns within microseconds. `None` when
+    /// `eventfd(2)` failed at monitor spawn (legacy 250 ms timeout
+    /// still bounds wake latency in that degraded path).
+    wake_fd: Option<OwnedFd>,
+}
+
+impl SchedExitStop {
+    /// Wake the monitor thread out of its `poll(2)` wait. Idempotent
+    /// — eventfd in counter mode coalesces multiple writes into a
+    /// single wake. EAGAIN under `EFD_NONBLOCK` (counter saturation —
+    /// physically impossible with a single writer + 64-bit counter)
+    /// is silently absorbed; the `Acquire`-loaded `stop` bool above
+    /// remains the source of truth.
+    pub(crate) fn wake(&self) {
+        if let Some(ref fd) = self.wake_fd {
+            // SAFETY: `fd` is the owned write side of an eventfd
+            // created with `EFD_NONBLOCK`; a single 8-byte write of
+            // a non-zero u64 advances the counter and edge-fires
+            // every reader's `poll(POLLIN)`. The bytes pointer is a
+            // 64-bit aligned local; `count` is exactly 8 as
+            // eventfd(2) requires.
+            let val: u64 = 1;
+            let bytes = val.to_ne_bytes();
+            let _ = unsafe {
+                libc::write(
+                    fd.as_raw_fd(),
+                    bytes.as_ptr() as *const libc::c_void,
+                    bytes.len(),
+                )
+            };
+        }
+    }
+}
+
 /// Monitor the scheduler child process for unexpected exit.
 ///
-/// Polls `/proc/{pid}` every 200ms. When the directory disappears, the
-/// scheduler has exited. When `suppress_com2` is false (normal mode),
-/// writes MSG_TYPE_SCHED_EXIT to SHM and dumps the scheduler log to
-/// COM2. The host detects the SHM message and can terminate the VM
-/// early. When `suppress_com2` is true (probes active), both the SHM
-/// signal and COM2 dump are suppressed — the probe pipeline handles
-/// crash detection via tp_btf/sched_ext_exit instead, and the VM
-/// must stay alive for the probe thread to emit output.
+/// Blocks the monitor thread in `poll(2)` against the scheduler's
+/// pidfd plus a stop-eventfd; the wait returns when either the
+/// child exits (pidfd POLLIN edge from the kernel's `do_notify_pidfd`)
+/// or the cleanup site fires the stop-eventfd. `/proc/{pid}` is
+/// re-checked post-wake to catch the rare "pidfd opened after kernel
+/// reaped" race. When `suppress_com2` is false (normal mode), writes
+/// MSG_TYPE_SCHED_EXIT to the bulk port and dumps the scheduler log
+/// to COM2. The host detects the bulk message and can terminate the
+/// VM early. When `suppress_com2` is true (probes active), both the
+/// SCHED_EXIT signal and COM2 dump are suppressed — the probe
+/// pipeline handles crash detection via tp_btf/sched_ext_exit
+/// instead, and the VM must stay alive for the probe thread to emit
+/// output.
 ///
 /// Uses procfs instead of waitpid because SIGCHLD is SIG_IGN (the kernel
 /// auto-reaps children, making waitpid return ECHILD).
+///
+/// The returned [`SchedExitStop`] carries both the `Arc<AtomicBool>` the
+/// monitor reads and an eventfd the cleanup site writes via
+/// [`SchedExitStop::wake`] to drop wake latency from 250 ms (legacy
+/// poll timeout) to microseconds.
 ///
 /// Returns None when no scheduler is running.
 fn start_sched_exit_monitor(
@@ -2108,12 +2850,59 @@ fn start_sched_exit_monitor(
     log_path: Option<&str>,
     suppress_com2: Arc<AtomicBool>,
     probe_output_done: Option<Arc<crate::sync::Latch>>,
-) -> Option<Arc<AtomicBool>> {
+) -> Option<SchedExitStop> {
     let pid = sched_pid?;
     let proc_path = format!("/proc/{pid}");
     let log_path = log_path.map(|s| s.to_string());
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = stop.clone();
+
+    // Allocate a stop-eventfd. Two fds are needed: one owned by the
+    // monitor thread (read + close on exit), one owned by the
+    // [`SchedExitStop`] writer (`wake` writes here). `dup(2)` shares
+    // the underlying counter so a write on either fd advances both
+    // sides' visibility. EFD_NONBLOCK so a doubled cleanup path can't
+    // stall behind a saturated counter; EFD_CLOEXEC so a future
+    // `Command::new` from this thread doesn't leak the fd into a
+    // child.
+    //
+    // `eventfd(2)` failure (extremely unlikely on KVM hosts — the
+    // syscall is unconditionally available since kernel 2.6.22) falls
+    // back to the legacy 250 ms `poll(2)` timeout: stop still works
+    // via the `Acquire`-loaded bool, just with a worst-case 250 ms
+    // wake latency instead of microseconds.
+    let (monitor_fd, writer_fd): (Option<OwnedFd>, Option<OwnedFd>) = {
+        let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if raw < 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                err = %err,
+                "ktstr-init: sched-exit-mon eventfd allocation failed; \
+                 falling back to 250 ms stop poll cadence"
+            );
+            (None, None)
+        } else {
+            // SAFETY: `eventfd(2)` returned a fresh non-negative fd
+            // owned by this caller. Wrapping in `OwnedFd` transfers
+            // close-on-drop responsibility; `try_clone` issues a
+            // `dup` so writer and monitor each carry an independent
+            // fd that addresses the same kernel-side counter. A
+            // dup failure leaves the monitor fd alive and disables
+            // the wake path (degrades to the no-eventfd branch).
+            let monitor_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            match monitor_fd.try_clone() {
+                Ok(writer_fd) => (Some(monitor_fd), Some(writer_fd)),
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        "ktstr-init: sched-exit-mon eventfd dup failed; \
+                         falling back to 250 ms stop poll cadence"
+                    );
+                    (Some(monitor_fd), None)
+                }
+            }
+        }
+    };
 
     std::thread::Builder::new()
         .name("sched-exit-mon".into())
@@ -2142,33 +2931,62 @@ fn start_sched_exit_monitor(
                 );
                 return;
             }
+            // The monitor-side stop fd's raw value, or `-1` when the
+            // caller's eventfd allocation or dup failed. `-1` in a
+            // pollfd entry is valid: the kernel ignores the slot
+            // (returns revents=0), so the same `poll(2)` call works
+            // on the degraded path with a finite timeout that
+            // re-checks `stop` periodically.
+            let stop_fd = monitor_fd.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
+            // Poll timeout policy: when the stop eventfd is live
+            // (`stop_fd >= 0`), a stop request fires the eventfd
+            // edge and the wait returns within microseconds — so an
+            // indefinite `-1` timeout is correct; the loop never has
+            // to wake just to re-check `stop`. When the eventfd
+            // allocation degraded to `None`, the legacy 250 ms
+            // cadence is the only path that pulls the thread out
+            // of the wait, so we fall back to that timeout.
+            let poll_timeout: i32 = if stop_fd >= 0 { -1 } else { 250 };
             while !stop_clone.load(Ordering::Acquire) {
                 let exited = {
-                    // pidfd is readable when the process exits.
-                    // Block on poll(POLLIN) so we wake within
-                    // microseconds of exit. Re-check stop every
-                    // 250 ms via timeout so a stop request
-                    // arriving while the scheduler is alive still
-                    // unblocks the loop quickly.
+                    // pidfd POLLIN fires at child exit (kernel
+                    // `pidfd_poll` in `fs/pidfs.c` checks
+                    // `exit_state`, woken via `do_notify_pidfd`
+                    // from `exit_notify`). Adding the stop eventfd
+                    // alongside makes a stop request also wake the
+                    // poll, so cleanup latency drops from the
+                    // legacy 250 ms (re-checking `stop` after each
+                    // `poll` timeout) to the kernel's eventfd
+                    // wakeup latency (microseconds).
                     //
-                    // 250 ms timeout: pidfd POLLIN fires at exit
-                    // time; the timeout exists only as the
-                    // upper-bound cadence at which the loop
-                    // re-checks `stop` (no event-source yet for
-                    // stop on this thread). Re-checking proc_path
-                    // is a belt-and-suspenders against the rare
+                    // Re-checking proc_path post-`poll` is a
+                    // belt-and-suspenders against the rare
                     // "pidfd was opened but the kernel reaped
-                    // before we entered poll" race.
-                    let mut pfd = libc::pollfd {
-                        fd: pidfd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // SAFETY: pfd is a single-element pollfd; nfds
-                    // is 1. Return value not consulted — the loop
-                    // re-checks the stop flag and the proc path
-                    // each iteration regardless.
-                    let _ = unsafe { libc::poll(&mut pfd, 1, 250) };
+                    // before we entered poll" race — an exited
+                    // child's pidfd POLLIN may already be latched
+                    // by the time we add it to the poll set;
+                    // checking proc_path independently catches
+                    // that case.
+                    let mut pfds = [
+                        libc::pollfd {
+                            fd: pidfd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: stop_fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: pfds is a 2-element pollfd array on
+                    // the local stack; nfds matches. A `stop_fd`
+                    // value of `-1` is valid per poll(2) — the
+                    // kernel skips that slot. Return value not
+                    // consulted — the loop re-checks the stop
+                    // flag and the proc path each iteration
+                    // regardless.
+                    let _ = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, poll_timeout) };
                     !Path::new(&proc_path).exists()
                 };
                 if exited {
@@ -2204,17 +3022,52 @@ fn start_sched_exit_monitor(
                     unsafe {
                         libc::close(pidfd);
                     }
+                    // `monitor_fd` (Option<OwnedFd>) drops here on
+                    // function return — the OwnedFd's Drop closes
+                    // the read side of the stop eventfd. The
+                    // writer-side `OwnedFd` lives on the
+                    // SchedExitStop returned to the caller.
                     return;
+                }
+                // Drain any pending stop-eventfd reads so the next
+                // `poll` doesn't immediately re-fire on the same
+                // edge. The `stop` AtomicBool is the source of
+                // truth (re-checked at the top of the loop); the
+                // eventfd is purely a wake-edge, so a missed read
+                // is benign — the next iteration's poll wakes
+                // either way. EAGAIN under EFD_NONBLOCK (counter
+                // already 0 from a racing reader, or no edge
+                // arrived) is the steady-state non-stop case.
+                if stop_fd >= 0 {
+                    let mut buf = [0u8; 8];
+                    // SAFETY: `stop_fd` is the borrowed read side
+                    // of an eventfd, valid for the lifetime of
+                    // this thread (the OwnedFd is owned by the
+                    // closure's `monitor_fd` and not dropped
+                    // until the closure returns). `buf` is an
+                    // 8-byte stack slot matching eventfd(2)'s
+                    // 8-byte read requirement.
+                    let _ = unsafe {
+                        libc::read(
+                            stop_fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            buf.len(),
+                        )
+                    };
                 }
             }
             // SAFETY: same as above — close on exit path.
             unsafe {
                 libc::close(pidfd);
             }
+            // `monitor_fd` drops here as the closure returns.
         })
         .ok();
 
-    Some(stop)
+    Some(SchedExitStop {
+        stop,
+        wake_fd: writer_fd,
+    })
 }
 
 /// Execute shell-script-like commands from a file.
@@ -2488,9 +3341,7 @@ mod tests {
     /// restored.
     #[test]
     fn with_sigchld_default_captures_real_exit_status() {
-        let _guard = SIGCHLD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
         // Sanity: under SIG_IGN, plain Command::status() returns
@@ -2530,9 +3381,7 @@ mod tests {
     /// every status under SIG_IGN.
     #[test]
     fn with_sigchld_default_captures_nonzero_exit_status() {
-        let _guard = SIGCHLD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
         let wrapped = with_sigchld_default(|| Command::new("/bin/false").status());
@@ -2556,9 +3405,7 @@ mod tests {
     /// which are signal-disposition independent.
     #[test]
     fn poll_startup_detects_death_under_sigchld_ignore() {
-        let _guard = SIGCHLD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
         let mut child = std::process::Command::new("/bin/true")
@@ -2584,9 +3431,7 @@ mod tests {
     /// anyway, but the new path must not regress that branch).
     #[test]
     fn poll_startup_reports_alive_under_sigchld_ignore() {
-        let _guard = SIGCHLD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = SigchldGuard::install(libc::SIG_IGN);
 
         let mut child = std::process::Command::new("/bin/sleep")
@@ -2636,9 +3481,7 @@ mod tests {
         // is already the chokepoint for "tests that touch
         // process-wide state" and serializing through it is
         // cheaper than introducing a second mutex for one test.
-        let _guard = SIGCHLD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let snapshot = SCHED_PID.load(Ordering::Acquire);
 
@@ -2667,9 +3510,7 @@ mod tests {
     /// `set_var` back, this test fails immediately.
     #[test]
     fn sched_pid_does_not_publish_via_env_var() {
-        let _guard = SIGCHLD_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = SIGCHLD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         // Clear any ambient env var — some test harnesses inherit
         // `SCHED_PID` from a parent shell. SAFETY: holding the

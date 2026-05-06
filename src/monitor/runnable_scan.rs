@@ -183,9 +183,17 @@ pub fn max_runnable_age(
     walk: WalkContext,
     watchdog_timestamp_pa: Option<u64>,
     start_kernel_map: u64,
+    phys_base: u64,
 ) -> u64 {
-    let global =
-        max_runnable_age_global(mem, scx_tasks_kva, offsets, jiffies, walk, start_kernel_map);
+    let global = max_runnable_age_global(
+        mem,
+        scx_tasks_kva,
+        offsets,
+        jiffies,
+        walk,
+        start_kernel_map,
+        phys_base,
+    );
     let mut per_rq_max: u64 = 0;
     for &rq_pa in rq_pas {
         let age = max_runnable_age_per_rq(mem, rq_pa, offsets, jiffies, walk);
@@ -292,6 +300,7 @@ pub fn max_runnable_age_global(
     jiffies: u64,
     walk: WalkContext,
     start_kernel_map: u64,
+    phys_base: u64,
 ) -> u64 {
     if scx_tasks_kva == 0 {
         return 0;
@@ -300,7 +309,8 @@ pub fn max_runnable_age_global(
     // KVA → PA via text_kva_to_pa_with_base. The first u64 at that PA
     // is list_head.next (the LIST_HEAD struct's first field).
     let head_kva = scx_tasks_kva;
-    let head_pa = super::symbols::text_kva_to_pa_with_base(scx_tasks_kva, start_kernel_map);
+    let head_pa =
+        super::symbols::text_kva_to_pa_with_base(scx_tasks_kva, start_kernel_map, phys_base);
 
     // Read head.next. struct list_head { next; prev; } — `next` at
     // offset 0. Empty list: head.next == &head, so the loop exits
@@ -658,6 +668,7 @@ mod tests {
             1_000,
             WalkContext::default(),
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(age, 0);
     }
@@ -689,6 +700,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(age, 0, "empty list must return age 0");
     }
@@ -746,6 +758,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(age, 50);
     }
@@ -792,6 +805,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(age, 0, "future runnable_at must saturate to age 0");
     }
@@ -842,6 +856,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 0,
@@ -900,6 +915,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(age, 70, "scan must take the max across the global list");
     }
@@ -969,6 +985,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 30,
@@ -1018,6 +1035,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         // Walker visited the task at least once, so it captured age 5
         // before bailing out; the test confirms termination (no
@@ -1080,6 +1098,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 80,
@@ -1154,6 +1173,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 42,
@@ -1220,6 +1240,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 0,
@@ -1283,6 +1304,7 @@ mod tests {
                 ..Default::default()
             },
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 50,
@@ -1294,19 +1316,26 @@ mod tests {
 
     /// Per-rq walker: empty `runnable_list` (head.next == &head)
     /// returns 0. Mirrors the global walker's empty-list test.
+    ///
+    /// `rq_pa` must be non-zero: the walker treats `rq_pa == 0`
+    /// as a sentinel meaning "no per-CPU rq PA available" and
+    /// short-circuits before the empty-list check, so a zero
+    /// `rq_pa` would make this test pass for the wrong reason
+    /// (sentinel return, not empty-list traversal). The sentinel
+    /// path is covered separately by `per_rq_zero_rq_pa_returns_zero`.
     #[test]
     fn per_rq_empty_list_returns_zero() {
         // Layout:
-        //   rq lives at PA 0 in the direct map (KVA = page_offset + 0).
+        //   rq lives at PA 64 in the direct map (KVA = page_offset + 64).
         //   rq.scx at offset 32; scx_rq.runnable_list at offset 8.
-        //   So the head_pa is rq_pa + 32 + 8 = 40.
+        //   So the head_pa is rq_pa + 32 + 8 = 104.
         //   head.next at head_kva (self-loop terminator) means empty.
         let rq_scx_off = 32usize;
         let scx_rq_runnable_list_off = 8usize;
         let head_offset = rq_scx_off + scx_rq_runnable_list_off;
         let page_offset = 0xffff_8880_0000_0000u64;
         let mut buf = vec![0u8; 4096];
-        let rq_pa: u64 = 0;
+        let rq_pa: u64 = 64;
         let head_pa = rq_pa + head_offset as u64;
         let head_kva = head_pa + page_offset;
         // head.next = &head (empty list).
@@ -1341,16 +1370,20 @@ mod tests {
     #[test]
     fn per_rq_single_stalled_task_age() {
         // Layout (chosen so each offset is distinct):
-        //   rq at PA 0 in direct map.
+        //   rq at PA 64 in direct map.
         //   rq.scx at offset 32. scx_rq.runnable_list at offset 8.
-        //   So the list_head for the per-rq list is at PA 40.
-        //   head_kva = page_offset + 40.
+        //   So the list_head for the per-rq list is at PA 104.
+        //   head_kva = page_offset + 104.
         //   task at PA 256 in direct map.
         //   task.scx at offset 0; see.runnable_node at offset 24.
         //   see.runnable_at at offset 16.
         // node_kva (the runnable_node pointer the kernel links into
         // the list) = task_kva + (task_struct_scx +
         // sched_ext_entity_runnable_node) = page_offset + 256 + 24.
+        //
+        // rq must live at a non-zero PA: the walker treats `rq_pa ==
+        // 0` as a sentinel meaning "no per-CPU rq PA available" and
+        // short-circuits to age 0 (see `per_rq_zero_rq_pa_returns_zero`).
         let task_scx = 0usize;
         let runnable_node_off = 24usize;
         let runnable_at_off = 16usize;
@@ -1360,7 +1393,7 @@ mod tests {
         let page_offset = 0xffff_8880_0000_0000u64;
 
         let mut buf = vec![0u8; 4096];
-        let rq_pa: u64 = 0;
+        let rq_pa: u64 = 64;
         let head_offset = rq_scx_off + scx_rq_runnable_list_off;
         let head_pa = rq_pa + head_offset as u64;
         let head_kva = head_pa + page_offset;
@@ -1524,6 +1557,7 @@ mod tests {
             },
             None,
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 70,
@@ -1577,6 +1611,7 @@ mod tests {
             },
             None,
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 42,
@@ -1627,6 +1662,7 @@ mod tests {
             },
             Some(watchdog_pa),
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 800,
@@ -1670,6 +1706,7 @@ mod tests {
             },
             Some(watchdog_pa),
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 0,
@@ -1720,6 +1757,7 @@ mod tests {
             },
             Some(watchdog_pa),
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(
             age, 0,
@@ -1766,6 +1804,7 @@ mod tests {
             },
             Some(watchdog_pa),
             START_KERNEL_MAP,
+            0,
         );
         assert_eq!(age, 0, "future watchdog_timestamp must saturate to age 0",);
     }

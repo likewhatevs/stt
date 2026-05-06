@@ -2638,6 +2638,7 @@ fn evaluate_suppresses_stall_when_vcpu_preempted() {
         summary,
         preemption_threshold_ns: 10_000_000,
         watchdog_observation: None,
+        page_offset: 0,
     };
     let v = t.evaluate(&report);
     assert!(
@@ -2706,6 +2707,7 @@ fn evaluate_catches_stall_when_vcpu_running() {
         summary,
         preemption_threshold_ns: 10_000_000,
         watchdog_observation: None,
+        page_offset: 0,
     };
     let v = t.evaluate(&report);
     assert!(!v.passed, "running vCPU stall must fail: {:?}", v.details);

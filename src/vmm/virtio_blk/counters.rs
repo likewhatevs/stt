@@ -281,18 +281,25 @@ impl VirtioBlkCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement the live "currently waiting for tokens" gauge.
-    /// Called by `drain_bracket_impl` when the worker observes a
-    /// successful drain after a prior stall — i.e. the
-    /// per-worker `currently_stalled` flag was true before this
-    /// drain finished without re-stalling. Saturating sub on the
-    /// underlying AtomicU64 would be safer against
-    /// double-decrement bugs, but the per-worker flag gates the
-    /// transition so a paired inc precedes every dec; a vanilla
-    /// `fetch_sub(1)` is correct under that invariant.
+    /// Decrement the live "currently waiting for tokens" gauge,
+    /// saturating at 0. Called by `drain_bracket_impl` when the
+    /// worker observes a successful drain after a prior stall, by
+    /// `reset_engine_*` on a reset that strands a stalled chain,
+    /// and by `Drop` on device destruction while the
+    /// rollback-stalled flag is still set. The per-worker
+    /// `currently_stalled` flag gates the transition so a paired
+    /// inc precedes every dec under correct operation; the
+    /// saturating CAS exists as a defence-in-depth against any
+    /// future caller that decrements an already-zero gauge —
+    /// vanilla `fetch_sub(1)` would wrap to `u64::MAX` and the
+    /// failure-dump renderer would then surface a 17-exabyte
+    /// "currently stalled" reading.
     pub(crate) fn record_throttle_pending_dec(&self) {
-        self.currently_throttled_gauge
-            .fetch_sub(1, Ordering::Relaxed);
+        let _ = self.currently_throttled_gauge.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |v| v.checked_sub(1),
+        );
     }
 
     /// Record one observed `Error::InvalidAvailRingIndex` event
@@ -400,5 +407,661 @@ impl VirtioBlkCounters {
     /// will not service IO until the guest issues a virtio reset.
     pub fn invalid_avail_idx_count(&self) -> u64 {
         self.invalid_avail_idx_count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Helper-level unit tests for the `record_*` mutators. These
+    //! pin per-helper invariants (paired-counter lockstep,
+    //! single-counter bumps, gauge inc/dec idempotence + saturating
+    //! decrement) directly on `VirtioBlkCounters` without crossing
+    //! the chain-parsing or worker-thread boundary. Cross-thread
+    //! atomicity and end-to-end production-path coverage live in
+    //! `tests_atomics.rs`; these helper-level tests catch regressions
+    //! to the helpers themselves before the chain-level tests would.
+    //!
+    //! Each test starts from a fresh `VirtioBlkCounters::default()`
+    //! so the pre-conditions are pinned at zero by the type
+    //! contract — no shared state leaks across tests.
+    use super::*;
+    /// Fresh counters initialise every field to zero. Pinned
+    /// here as a pre-condition for the rest of the helper tests
+    /// — they all rely on `default()` producing an
+    /// all-zero starting state. A regression that gave
+    /// `AtomicU64::new(non_zero)` to any field would surface
+    /// here before downstream tests' "increments by N" math
+    /// silently reads a stale base.
+    #[test]
+    fn default_counters_are_all_zero() {
+        let c = VirtioBlkCounters::default();
+        assert_eq!(c.reads_completed(), 0, "reads_completed must default to 0");
+        assert_eq!(
+            c.writes_completed(),
+            0,
+            "writes_completed must default to 0"
+        );
+        assert_eq!(
+            c.flushes_completed(),
+            0,
+            "flushes_completed must default to 0"
+        );
+        assert_eq!(c.bytes_read(), 0, "bytes_read must default to 0");
+        assert_eq!(c.bytes_written(), 0, "bytes_written must default to 0");
+        assert_eq!(c.throttled_count(), 0, "throttled_count must default to 0");
+        assert_eq!(c.io_errors(), 0, "io_errors must default to 0");
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "currently_throttled_gauge must default to 0",
+        );
+        assert_eq!(
+            c.invalid_avail_idx_count(),
+            0,
+            "invalid_avail_idx_count must default to 0",
+        );
+    }
+
+    /// `record_read(bytes)` bumps BOTH `reads_completed` AND
+    /// `bytes_read` in one call. The pairing is the helper's
+    /// reason to exist — a regression that dropped the
+    /// `bytes_read.fetch_add(bytes)` line (e.g. a refactor that
+    /// inlined just the completion bump) would let the
+    /// failure-dump renderer compute a misleading bytes-per-op
+    /// average. Pin both increments side-by-side so a half-fix
+    /// can't pass.
+    ///
+    /// Also pins that `record_read` does NOT touch any other
+    /// counter — write-side counters, flushes, throttle counters,
+    /// io_errors, and the gauge must stay at zero. A regression
+    /// that copy-pasted `record_read` from `record_write` and
+    /// left the wrong field name would be caught by the
+    /// "everything else stays zero" check.
+    #[test]
+    fn record_read_bumps_completion_and_bytes_in_lockstep() {
+        let c = VirtioBlkCounters::default();
+        c.record_read(512);
+        assert_eq!(
+            c.reads_completed(),
+            1,
+            "first record_read must bump reads_completed to 1",
+        );
+        assert_eq!(
+            c.bytes_read(),
+            512,
+            "first record_read must add bytes to bytes_read",
+        );
+        // Second call: counters increment in lockstep.
+        c.record_read(1024);
+        assert_eq!(
+            c.reads_completed(),
+            2,
+            "second record_read must bump reads_completed to 2",
+        );
+        assert_eq!(
+            c.bytes_read(),
+            512 + 1024,
+            "second record_read must accumulate bytes",
+        );
+        // Untouched counters stay at zero.
+        assert_eq!(
+            c.writes_completed(),
+            0,
+            "record_read must NOT bump writes_completed",
+        );
+        assert_eq!(
+            c.bytes_written(),
+            0,
+            "record_read must NOT bump bytes_written",
+        );
+        assert_eq!(
+            c.flushes_completed(),
+            0,
+            "record_read must NOT bump flushes_completed",
+        );
+        assert_eq!(
+            c.throttled_count(),
+            0,
+            "record_read must NOT bump throttled_count",
+        );
+        assert_eq!(c.io_errors(), 0, "record_read must NOT bump io_errors");
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "record_read must NOT touch the throttle gauge",
+        );
+        assert_eq!(
+            c.invalid_avail_idx_count(),
+            0,
+            "record_read must NOT bump invalid_avail_idx_count",
+        );
+    }
+
+    /// Zero-byte reads are valid: the helper bumps
+    /// `reads_completed` even when `bytes == 0`. The contract is
+    /// "one completion, n bytes," not "one completion conditional
+    /// on n > 0." A regression that gated the completion bump on
+    /// `bytes > 0` would mis-count completions in scenarios where
+    /// the chain returned zero data (e.g. an EOF-truncated read).
+    #[test]
+    fn record_read_zero_bytes_still_bumps_completion() {
+        let c = VirtioBlkCounters::default();
+        c.record_read(0);
+        assert_eq!(
+            c.reads_completed(),
+            1,
+            "zero-byte read must still increment reads_completed",
+        );
+        assert_eq!(
+            c.bytes_read(),
+            0,
+            "zero-byte read must leave bytes_read at 0",
+        );
+    }
+
+    /// `record_write(bytes)` bumps BOTH `writes_completed` AND
+    /// `bytes_written`, mirroring `record_read`. Same paired-
+    /// counter rationale: the failure-dump renderer's
+    /// bytes-per-write average becomes misleading if either
+    /// half is missing.
+    #[test]
+    fn record_write_bumps_completion_and_bytes_in_lockstep() {
+        let c = VirtioBlkCounters::default();
+        c.record_write(4096);
+        assert_eq!(
+            c.writes_completed(),
+            1,
+            "first record_write must bump writes_completed to 1",
+        );
+        assert_eq!(
+            c.bytes_written(),
+            4096,
+            "first record_write must add bytes to bytes_written",
+        );
+        c.record_write(8192);
+        assert_eq!(
+            c.writes_completed(),
+            2,
+            "second record_write must bump writes_completed to 2",
+        );
+        assert_eq!(
+            c.bytes_written(),
+            4096 + 8192,
+            "second record_write must accumulate bytes",
+        );
+        // Untouched counters stay at zero — pins that
+        // record_write doesn't accidentally bump read-side
+        // counters via a copy-paste regression.
+        assert_eq!(
+            c.reads_completed(),
+            0,
+            "record_write must NOT bump reads_completed",
+        );
+        assert_eq!(c.bytes_read(), 0, "record_write must NOT bump bytes_read");
+        assert_eq!(
+            c.flushes_completed(),
+            0,
+            "record_write must NOT bump flushes_completed",
+        );
+        assert_eq!(
+            c.throttled_count(),
+            0,
+            "record_write must NOT bump throttled_count",
+        );
+        assert_eq!(c.io_errors(), 0, "record_write must NOT bump io_errors");
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "record_write must NOT touch the throttle gauge",
+        );
+        assert_eq!(
+            c.invalid_avail_idx_count(),
+            0,
+            "record_write must NOT bump invalid_avail_idx_count",
+        );
+    }
+
+    /// Zero-byte writes parallel zero-byte reads: the completion
+    /// counter advances regardless. A guest issuing a zero-data
+    /// write (chain with header + status only and no data
+    /// segments) is rejected upstream by the
+    /// classify_pre_throttle gate, but the helper itself does
+    /// not enforce a non-zero invariant — pinned here so a
+    /// future refactor that adds defensive checks at the helper
+    /// layer is a deliberate decision, not an accidental
+    /// regression of the "one completion, n bytes" contract.
+    #[test]
+    fn record_write_zero_bytes_still_bumps_completion() {
+        let c = VirtioBlkCounters::default();
+        c.record_write(0);
+        assert_eq!(
+            c.writes_completed(),
+            1,
+            "zero-byte write must still increment writes_completed",
+        );
+        assert_eq!(
+            c.bytes_written(),
+            0,
+            "zero-byte write must leave bytes_written at 0",
+        );
+    }
+
+    /// `record_flush()` bumps `flushes_completed` and ONLY
+    /// `flushes_completed`. Distinct from read/write because
+    /// flush has no associated byte count — there's no paired
+    /// counter to keep in lockstep, only a single completion.
+    /// A regression that conflated flush with write (e.g. a
+    /// refactor that routed flush through `record_write(0)`)
+    /// would surface here as `writes_completed == 1` instead of
+    /// `flushes_completed == 1`.
+    #[test]
+    fn record_flush_bumps_only_flushes_completed() {
+        let c = VirtioBlkCounters::default();
+        c.record_flush();
+        assert_eq!(
+            c.flushes_completed(),
+            1,
+            "record_flush must bump flushes_completed to 1",
+        );
+        c.record_flush();
+        c.record_flush();
+        assert_eq!(
+            c.flushes_completed(),
+            3,
+            "three record_flush calls must accumulate to 3",
+        );
+        // Every other counter stays at zero — flush has no
+        // paired bytes counter and must not splash onto any
+        // other field.
+        assert_eq!(
+            c.reads_completed(),
+            0,
+            "record_flush must NOT bump reads_completed",
+        );
+        assert_eq!(c.bytes_read(), 0, "record_flush must NOT bump bytes_read");
+        assert_eq!(
+            c.writes_completed(),
+            0,
+            "record_flush must NOT bump writes_completed",
+        );
+        assert_eq!(
+            c.bytes_written(),
+            0,
+            "record_flush must NOT bump bytes_written",
+        );
+        assert_eq!(
+            c.throttled_count(),
+            0,
+            "record_flush must NOT bump throttled_count",
+        );
+        assert_eq!(c.io_errors(), 0, "record_flush must NOT bump io_errors");
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "record_flush must NOT touch the throttle gauge",
+        );
+        assert_eq!(
+            c.invalid_avail_idx_count(),
+            0,
+            "record_flush must NOT bump invalid_avail_idx_count",
+        );
+    }
+
+    /// `record_throttle_pending_inc()` bumps the live gauge by
+    /// exactly one per call. The helper itself is NOT idempotent
+    /// — back-to-back calls increment twice (gauge 0→1→2). The
+    /// production caller (`drain_bracket_impl`) gates each
+    /// invocation on the per-worker `currently_stalled` flag's
+    /// false→true transition; the helper relies on the caller
+    /// to enforce idempotence and faithfully bumps every time
+    /// it's invoked. Pinning this distinction matters: a
+    /// regression that pushed the flag-gate INTO the helper
+    /// would break the helper's contract with cross-cutting
+    /// callers (e.g. a future test seam that simulates back-
+    /// to-back stalls without going through the production
+    /// gate). The events-vs-requests semantic is a property of
+    /// the CALLER (which only invokes `record_throttle_pending_inc`
+    /// on transitions), NOT of the helper.
+    ///
+    /// The complementary "no double-inc on re-stall via the
+    /// production gate" invariant is pinned by
+    /// `currently_throttled_gauge_no_double_inc_on_re_stall` in
+    /// tests_atomics.rs which exercises the full
+    /// drain_bracket_impl path.
+    #[test]
+    fn record_throttle_pending_inc_increments_each_call() {
+        let c = VirtioBlkCounters::default();
+        c.record_throttle_pending_inc();
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            1,
+            "first inc must bump gauge from 0 to 1",
+        );
+        // Helper is not idempotent — the production caller's
+        // currently_stalled flag prevents the second call from
+        // happening, but the helper itself does increment again
+        // when invoked.
+        c.record_throttle_pending_inc();
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            2,
+            "second inc must bump gauge from 1 to 2 (helper itself \
+                 is not idempotent — caller must gate)",
+        );
+        c.record_throttle_pending_inc();
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            3,
+            "third inc must bump gauge from 2 to 3",
+        );
+        // The other counters stay at zero — gauge ops must not
+        // splash onto throttled_count (events) or any other
+        // field. throttled_count is bumped by `record_throttled`,
+        // a SEPARATE helper.
+        assert_eq!(
+            c.throttled_count(),
+            0,
+            "record_throttle_pending_inc must NOT bump throttled_count \
+                 (events vs gauge are separate counters with separate helpers)",
+        );
+        assert_eq!(
+            c.reads_completed(),
+            0,
+            "record_throttle_pending_inc must NOT bump reads_completed",
+        );
+        assert_eq!(
+            c.io_errors(),
+            0,
+            "record_throttle_pending_inc must NOT bump io_errors",
+        );
+    }
+
+    /// `record_throttle_pending_dec()` decrements the gauge by
+    /// one when it is non-zero, mirror of inc.
+    #[test]
+    fn record_throttle_pending_dec_decrements_when_positive() {
+        let c = VirtioBlkCounters::default();
+        c.record_throttle_pending_inc();
+        c.record_throttle_pending_inc();
+        c.record_throttle_pending_inc();
+        assert_eq!(c.currently_throttled_gauge(), 3, "pre-cond: gauge at 3");
+        c.record_throttle_pending_dec();
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            2,
+            "first dec must drop gauge from 3 to 2",
+        );
+        c.record_throttle_pending_dec();
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            1,
+            "second dec must drop gauge from 2 to 1",
+        );
+        c.record_throttle_pending_dec();
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "third dec must drop gauge from 1 to 0",
+        );
+    }
+
+    /// `record_throttle_pending_dec()` SATURATES at zero. The
+    /// implementation uses `fetch_update(|v| v.checked_sub(1))`
+    /// — if the gauge is already 0, the update returns `Err`
+    /// and the helper drops the result via `let _`. A regression
+    /// that swapped `checked_sub` for plain `fetch_sub(1)` would
+    /// wrap to `u64::MAX` and the failure-dump renderer would
+    /// surface a 17-exabyte "currently stalled" reading.
+    ///
+    /// Pin the saturating contract: dec on an already-zero gauge
+    /// MUST leave the gauge at 0, not wrap to u64::MAX.
+    #[test]
+    fn record_throttle_pending_dec_saturates_at_zero() {
+        let c = VirtioBlkCounters::default();
+        // Gauge starts at 0; multiple decs must NOT wrap.
+        c.record_throttle_pending_dec();
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "dec on a zero gauge MUST saturate at 0, not wrap to u64::MAX \
+                 (regression: fetch_sub instead of fetch_update + checked_sub)",
+        );
+        // Repeated dec stays at 0 — the failure mode is "wraps
+        // to u64::MAX on the first underflowing dec," so multiple
+        // decs each pin that the saturate-at-zero contract holds
+        // across consecutive calls.
+        for i in 0..5 {
+            c.record_throttle_pending_dec();
+            assert_eq!(
+                c.currently_throttled_gauge(),
+                0,
+                "dec on a zero gauge must stay 0 across {} repeated calls",
+                i + 1,
+            );
+        }
+    }
+
+    /// Inc-then-dec pair returns the gauge to zero. Pins the
+    /// matching-pair invariant the production caller depends on:
+    /// every chain that stalls (inc) and later succeeds (dec)
+    /// must net to a delta of zero on the gauge. A regression
+    /// to the inc/dec arithmetic that failed to undo the inc
+    /// would surface as a non-zero residual gauge after the
+    /// pair.
+    #[test]
+    fn record_throttle_pending_inc_then_dec_nets_to_zero() {
+        let c = VirtioBlkCounters::default();
+        c.record_throttle_pending_inc();
+        c.record_throttle_pending_dec();
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "inc-then-dec must net to 0 on the gauge",
+        );
+        // Also check N inc / N dec for N > 1 — pins that the
+        // counter-style accounting holds regardless of pair
+        // count.
+        for _ in 0..10 {
+            c.record_throttle_pending_inc();
+        }
+        assert_eq!(c.currently_throttled_gauge(), 10, "10 incs → gauge=10");
+        for _ in 0..10 {
+            c.record_throttle_pending_dec();
+        }
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "10 incs + 10 decs must net to 0",
+        );
+    }
+
+    /// `record_io_error()` bumps `io_errors` and ONLY `io_errors`.
+    /// The events-counter contract is at the call sites (a single
+    /// hostile chain can produce multiple bumps if it trips
+    /// several gates in sequence — pinned by the doc comment on
+    /// `record_io_error`); the helper itself faithfully bumps
+    /// per call. Pin that the bump lands on the right field and
+    /// no other counter is touched: a regression that copy-pasted
+    /// the helper from `record_throttled` and left the wrong
+    /// field name would surface as `throttled_count == 1` in
+    /// place of the expected `io_errors == 1`.
+    #[test]
+    fn record_io_error_increments_only_io_errors() {
+        let c = VirtioBlkCounters::default();
+        c.record_io_error();
+        assert_eq!(
+            c.io_errors(),
+            1,
+            "first record_io_error must bump io_errors to 1",
+        );
+        c.record_io_error();
+        c.record_io_error();
+        assert_eq!(
+            c.io_errors(),
+            3,
+            "three record_io_error calls must accumulate to 3 \
+                 (events counter, no per-request dedup)",
+        );
+        // Every other counter stays at zero — io_errors must not
+        // splash onto throttled_count, gauges, or completion
+        // counters.
+        assert_eq!(
+            c.reads_completed(),
+            0,
+            "record_io_error must NOT bump reads_completed",
+        );
+        assert_eq!(
+            c.writes_completed(),
+            0,
+            "record_io_error must NOT bump writes_completed",
+        );
+        assert_eq!(
+            c.flushes_completed(),
+            0,
+            "record_io_error must NOT bump flushes_completed",
+        );
+        assert_eq!(c.bytes_read(), 0, "record_io_error must NOT bump bytes_read");
+        assert_eq!(
+            c.bytes_written(),
+            0,
+            "record_io_error must NOT bump bytes_written",
+        );
+        assert_eq!(
+            c.throttled_count(),
+            0,
+            "record_io_error must NOT bump throttled_count \
+                 (events-vs-events distinction — IO errors and \
+                 throttle stalls are separately classified)",
+        );
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "record_io_error must NOT touch the throttle gauge",
+        );
+        assert_eq!(
+            c.invalid_avail_idx_count(),
+            0,
+            "record_io_error must NOT bump invalid_avail_idx_count",
+        );
+    }
+
+    /// `record_throttled()` bumps `throttled_count` and ONLY
+    /// `throttled_count`. Per-event counter, not per-request:
+    /// a single chain that stalls multiple times produces
+    /// multiple bumps. The events-vs-requests distinction lives
+    /// at the CALLER (drain_bracket_impl); the helper itself is
+    /// just an unconditional bump. Pin parity with the other
+    /// "single-counter" helpers — io_errors, flushes — so a
+    /// copy-paste regression that wrote to the wrong field
+    /// surfaces here.
+    #[test]
+    fn record_throttled_increments_only_throttled_count() {
+        let c = VirtioBlkCounters::default();
+        c.record_throttled();
+        assert_eq!(
+            c.throttled_count(),
+            1,
+            "first record_throttled must bump throttled_count to 1",
+        );
+        c.record_throttled();
+        assert_eq!(
+            c.throttled_count(),
+            2,
+            "second record_throttled must bump throttled_count to 2 \
+                 (events counter — same chain re-stalling produces \
+                 multiple bumps in production)",
+        );
+        // Crucially, the gauge is NOT touched — gauge has its own
+        // helper (record_throttle_pending_inc/dec). A regression
+        // that conflated the two would surface as gauge != 0.
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "record_throttled (events counter) must NOT touch \
+                 currently_throttled_gauge (live gauge — separate helper)",
+        );
+        // Other counters stay at zero.
+        assert_eq!(c.io_errors(), 0, "record_throttled must NOT bump io_errors");
+        assert_eq!(
+            c.reads_completed(),
+            0,
+            "record_throttled must NOT bump reads_completed",
+        );
+        assert_eq!(
+            c.writes_completed(),
+            0,
+            "record_throttled must NOT bump writes_completed",
+        );
+        assert_eq!(
+            c.flushes_completed(),
+            0,
+            "record_throttled must NOT bump flushes_completed",
+        );
+        assert_eq!(
+            c.invalid_avail_idx_count(),
+            0,
+            "record_throttled must NOT bump invalid_avail_idx_count",
+        );
+    }
+
+    /// `record_invalid_avail_idx()` bumps `invalid_avail_idx_count`
+    /// and ONLY that field. Per-event counter; the production
+    /// caller's queue-poison flag short-circuits subsequent kicks
+    /// so one guest fault produces exactly one bump regardless of
+    /// notification count. The helper itself is just an
+    /// unconditional bump; the no-double-bump invariant is a
+    /// property of the CALLER (gated on queue_poisoned), pinned
+    /// by `inflated_avail_idx_poisons_queue_no_livelock` and
+    /// `poisoned_queue_clears_on_reset` in tests_atomics.rs.
+    #[test]
+    fn record_invalid_avail_idx_increments_only_that_field() {
+        let c = VirtioBlkCounters::default();
+        c.record_invalid_avail_idx();
+        assert_eq!(
+            c.invalid_avail_idx_count(),
+            1,
+            "first record_invalid_avail_idx must bump counter to 1",
+        );
+        c.record_invalid_avail_idx();
+        assert_eq!(
+            c.invalid_avail_idx_count(),
+            2,
+            "second record_invalid_avail_idx must bump counter to 2 \
+                 (helper itself does not enforce single-bump; the \
+                 caller's poison gate does)",
+        );
+        // Every other counter stays at zero.
+        assert_eq!(
+            c.io_errors(),
+            0,
+            "record_invalid_avail_idx must NOT bump io_errors \
+                 (separate event class — guest spec violation \
+                 vs IO failure)",
+        );
+        assert_eq!(
+            c.throttled_count(),
+            0,
+            "record_invalid_avail_idx must NOT bump throttled_count",
+        );
+        assert_eq!(
+            c.currently_throttled_gauge(),
+            0,
+            "record_invalid_avail_idx must NOT touch the throttle gauge",
+        );
+        assert_eq!(
+            c.reads_completed(),
+            0,
+            "record_invalid_avail_idx must NOT bump reads_completed",
+        );
+        assert_eq!(
+            c.writes_completed(),
+            0,
+            "record_invalid_avail_idx must NOT bump writes_completed",
+        );
+        assert_eq!(
+            c.flushes_completed(),
+            0,
+            "record_invalid_avail_idx must NOT bump flushes_completed",
+        );
     }
 }

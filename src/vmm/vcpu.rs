@@ -49,6 +49,32 @@ use crate::sync::Latch;
 /// All writes go through `set` (single-byte `write_volatile`), so a value
 /// copy of `Self` is exactly equivalent to a borrowed reference for the
 /// access pattern KVM cares about.
+///
+/// # Liveness contract
+///
+/// The handle has no lifetime tie to the `VcpuFd` that owns the mmap.
+/// Cross-thread holders MUST gate every `set` on a paired liveness flag
+/// flipped before the owning `VcpuFd` drops:
+///   - BSP: `bsp_alive` AtomicBool, flipped to `false` AFTER the freeze
+///     coordinator joins in `run_vm` (and BEFORE the local `bsp` falls
+///     out of scope). The flag's primary defense is the join ordering;
+///     the gate at every `set` site is belt-and-braces for future
+///     restructuring.
+///   - APs: per-AP `VcpuThread::alive` AtomicBool, initialised to `true`
+///     and flipped to `false` by the AP's panic hook
+///     (`VcpuPanicCtx::alive`) BEFORE stack unwinding drops `vcpu`.
+///     Under `panic = "abort"` (release) the unwind never runs and
+///     `vcpu` is reaped via `libc::abort`; under `panic = "unwind"`
+///     (test profile) the AP's panic hook fires synchronously on the
+///     panicking thread before unwinding starts, so the Release
+///     store on `alive` happens-before the Drop of `vcpu` and any
+///     coordinator iterating its captured handle Vec observes
+///     `alive == false` ahead of the freed mmap.
+///
+/// Without these gates, an AP-thread panic-unwind during the
+/// coordinator's lifetime can produce a UAF when the coordinator's
+/// `freeze_and_capture` pass-1 loop or `arm_user_watchpoint` writes
+/// through a freed `kvm_run` page.
 #[derive(Clone, Copy)]
 pub(crate) struct ImmediateExitHandle {
     ptr: *mut u8,
@@ -76,6 +102,18 @@ impl ImmediateExitHandle {
         unsafe {
             std::ptr::write_volatile(self.ptr, val);
         }
+    }
+
+    /// Test-only read-back of the current `immediate_exit` byte
+    /// through the handle's pointer. Lets the kick gate's truth
+    /// table be observed cross-thread without a `VcpuFd::get_kvm_run`
+    /// call (used by tests that move the VcpuFd into a stub thread
+    /// to construct a real `JoinHandle<VcpuFd>` for `VcpuThread`).
+    #[cfg(test)]
+    pub(crate) fn read_byte(&self) -> u8 {
+        // SAFETY: same MAP_SHARED guarantees as `set`. Single-byte
+        // read is atomic on every supported KVM host.
+        unsafe { std::ptr::read_volatile(self.ptr) }
     }
 }
 
@@ -197,19 +235,49 @@ extern "C" fn vcpu_signal_handler(_: libc::c_int, _: *mut libc::siginfo_t, _: *m
 /// Follows Firecracker's register_kick_signal_handler + QEMU's
 /// kvm_init_cpu_signals: register SA_SIGINFO handler, then unblock via
 /// pthread_sigmask so the signal is deliverable inside KVM_RUN.
+///
+/// # Panics
+///
+/// Panics if `libc::sigaction` or `libc::pthread_sigmask` returns
+/// non-zero. Both calls are infallible for the SIGRTMIN argument we
+/// pass on every supported kernel (the signum is reserved by glibc
+/// for application use, the `SA_SIGINFO` handler shape is universally
+/// accepted, and `SIG_UNBLOCK` with a single-signal set has no error
+/// path beyond "invalid signum"). Silent failure here would leave the
+/// vCPU thread unable to break out of `KVM_RUN` on `SIGRTMIN` — every
+/// `VcpuThread::kick()` call becomes a no-op and the thread blocks
+/// forever, with no diagnostic. Panicking surfaces the broken
+/// invariant the moment it occurs and routes through the panic hook
+/// that ships a crash diagnostic to COM2 before reboot. Mirrors the
+/// `SigchldDispositionGuard::install` discipline in
+/// `crate::vmm::rust_init`.
 pub(crate) fn register_vcpu_signal_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = vcpu_signal_handler as *const () as usize;
         sa.sa_flags = libc::SA_SIGINFO;
         libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(vcpu_signal(), &sa, std::ptr::null_mut());
+        let rc = libc::sigaction(vcpu_signal(), &sa, std::ptr::null_mut());
+        assert_eq!(
+            rc,
+            0,
+            "register_vcpu_signal_handler: sigaction(SIGRTMIN, SA_SIGINFO) failed: {} \
+             — vCPU kicks would silently no-op and KVM_RUN would block forever",
+            std::io::Error::last_os_error(),
+        );
 
         // Unblock the signal in this thread so pthread_kill can deliver it.
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, vcpu_signal());
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        assert_eq!(
+            rc,
+            0,
+            "register_vcpu_signal_handler: pthread_sigmask(SIG_UNBLOCK, SIGRTMIN) failed: {} \
+             — signal would stay blocked and pthread_kick deliveries would queue forever",
+            std::io::Error::from_raw_os_error(rc),
+        );
     }
 }
 
@@ -458,6 +526,21 @@ pub(crate) struct VcpuThread {
     /// semaphore) — the value is unused; only the edge from 0 to
     /// non-zero matters.
     pub(crate) exit_evt: Arc<EventFd>,
+    /// kvm_run-mmap-liveness flag for the per-AP
+    /// [`ImmediateExitHandle`] copy held by the freeze coordinator
+    /// (and any other cross-thread holder of a Copy clone).
+    /// Initialised to `true` at spawn; flipped to `false` by the
+    /// AP's panic hook (`VcpuPanicCtx::alive`) BEFORE stack
+    /// unwinding drops the thread's `VcpuFd` and unmaps the
+    /// `kvm_run` page that backs every `ImmediateExitHandle`
+    /// pointing into it. Mirrors the BSP-side `bsp_alive` gate in
+    /// `freeze_coord::run_vm` — the primary defense against
+    /// AP-side UAF is the join ordering (the coordinator joins
+    /// before any `JoinHandle<VcpuFd>` is joined / dropped), and
+    /// this flag closes the panic-unwind window where `vcpu`
+    /// drops while the coordinator is still iterating its
+    /// captured handle Vec.
+    pub(crate) alive: Arc<AtomicBool>,
 }
 
 /// Per-AP freeze-rendezvous state held outside `VcpuThread`. Cloned
@@ -809,10 +892,11 @@ impl WatchpointArm {
 /// failures (transient — signal interrupted the ioctl, e.g.
 /// SIGRTMIN-driven kick race) do NOT count toward this cap. Only
 /// permanent errors (unsupported cap, EINVAL on the debug struct,
-/// hardware DR0 unavailable on this host) accumulate. Three is the
-/// retry budget the freeze-coord watchpoint suggests in CLAUDE.md;
-/// after that the BPF .bss fallback carries the trigger and the
-/// watchpoint stays disabled for the rest of the run.
+/// hardware DR0 unavailable on this host) accumulate. Three retries
+/// gives one cycle of headroom for transient ioctl interactions
+/// before falling back; after the budget is exhausted the BPF .bss
+/// latch path carries the late-trigger signal and the watchpoint
+/// stays disabled for the rest of the run.
 #[allow(dead_code)]
 pub(crate) const WATCHPOINT_MAX_NON_EINTR_FAILURES: u8 = 3;
 
@@ -1203,8 +1287,20 @@ impl VcpuThread {
     /// Kick a vCPU out of KVM_RUN. If immediate_exit is available, sets the
     /// flag before sending the signal (Firecracker pattern). Otherwise falls
     /// back to signal-only (the signal handler causes EINTR).
+    ///
+    /// `ie.set(1)` is gated on the per-AP `alive` Acquire load: under
+    /// `panic = "unwind"` the AP's panic hook flips `alive` to `false`
+    /// BEFORE stack unwinding drops `vcpu` (and unmaps the `kvm_run`
+    /// page that backs the IE handle), so a `false` reading here means
+    /// the next byte we'd write would land in freed memory. The
+    /// `pthread_kill` half is harmless against an exited tid (returns
+    /// ESRCH) and runs unconditionally — guarantees the wake even on
+    /// the rare alive-true-then-dropped TOCTOU window where the kick
+    /// path already raced past the gate.
     pub(crate) fn kick(&self) {
-        if let Some(ref ie) = self.immediate_exit {
+        if let Some(ref ie) = self.immediate_exit
+            && self.alive.load(Ordering::Acquire)
+        {
             ie.set(1);
             std::sync::atomic::fence(Ordering::Release);
         }
@@ -1471,6 +1567,136 @@ mod tests {
 
         vm.vcpus[0].set_kvm_immediate_exit(0);
         assert_eq!(vm.vcpus[0].get_kvm_run().immediate_exit, 0);
+    }
+
+    /// `VcpuThread::kick` MUST skip the `ie.set(1)` when its `alive`
+    /// flag is `false`. Pins the AP-side UAF gate that mirrors the
+    /// BSP's `bsp_alive`: an AP that panic-unwound (under
+    /// `panic = "unwind"`) flips this flag to `false` BEFORE its
+    /// stack drop unmaps `kvm_run`, and the coordinator's
+    /// `Vec<ImmediateExitHandle>` would otherwise `write_volatile`
+    /// through a freed mapping. The test stages the pre-flip state
+    /// (immediate_exit=0, alive=false) and asserts the byte stays
+    /// 0 across `kick()` — both `iec.set(1)` and the trailing
+    /// `pthread_kill` happen, but the byte write is suppressed.
+    /// `pthread_kill` against an exited tid is harmless (ESRCH);
+    /// the test thread sleeps long enough for `kick()` to run and
+    /// then exits, matching the join contract.
+    #[test]
+    fn vcpu_thread_kick_skips_ie_when_alive_false() {
+        use std::sync::Barrier;
+        // Register the SIGRTMIN handler before any `kick()` runs.
+        // Default disposition for realtime signals is "terminate
+        // process", and `kick()` calls `pthread_kill(tid, SIGRTMIN)`
+        // — without a registered handler the test would die with
+        // SIGRTMIN. Idempotent across repeated calls (sigaction is
+        // process-wide).
+        register_vcpu_signal_handler();
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
+        // Spawn a dummy thread we can hand into a `JoinHandle<VcpuFd>`.
+        // The thread parks on a barrier — kick() fires the signal at
+        // it; the signal-handler default for SIGRTMIN is no-op-with-
+        // EINTR, so the thread is unaffected. After we return from
+        // kick(), drop the barrier and let it exit.
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_thread = barrier.clone();
+        let probe_vcpu = vm.vcpus.remove(0);
+        let handle = std::thread::Builder::new()
+            .name("kick-test-stub".into())
+            .spawn(move || {
+                barrier_thread.wait();
+                probe_vcpu
+            })
+            .unwrap();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exit_evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let alive = Arc::new(AtomicBool::new(false));
+        let vt = VcpuThread {
+            handle,
+            exited,
+            immediate_exit: Some(ie),
+            exit_evt,
+            alive,
+        };
+        // Sanity: byte starts at 0 and alive is false — the test's
+        // pre-condition.
+        // Note: the spawned VcpuFd is moved into the closure above,
+        // so we read the byte through the same shared `ie` we
+        // captured before the move (handle dereferences the same
+        // MAP_SHARED page).
+        // SAFETY: read_volatile on the shared mmap; same access
+        // pattern as `ImmediateExitHandle::set`.
+        let read_byte = || vt.immediate_exit.as_ref().unwrap().read_byte();
+        assert_eq!(read_byte(), 0);
+        vt.kick();
+        // alive=false ⇒ ie.set(1) is gated off ⇒ byte stays 0.
+        assert_eq!(
+            read_byte(),
+            0,
+            "kick() must skip ie.set when alive == false (UAF gate)",
+        );
+        // Release the stub and drain.
+        barrier.wait();
+        let _ = vt.handle.join();
+    }
+
+    /// Counterpart pinning the kick semantics when alive is `true`:
+    /// the byte is written and observable. Together with
+    /// `vcpu_thread_kick_skips_ie_when_alive_false` this fully
+    /// pins the gate's truth table.
+    #[test]
+    fn vcpu_thread_kick_writes_ie_when_alive_true() {
+        use std::sync::Barrier;
+        register_vcpu_signal_handler();
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let mut vm = kvm::KtstrKvm::new(topo, 64, false).unwrap();
+        let ie = ImmediateExitHandle::from_vcpu(&mut vm.vcpus[0]);
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_thread = barrier.clone();
+        let probe_vcpu = vm.vcpus.remove(0);
+        let handle = std::thread::Builder::new()
+            .name("kick-test-stub-alive".into())
+            .spawn(move || {
+                barrier_thread.wait();
+                probe_vcpu
+            })
+            .unwrap();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exit_evt = Arc::new(EventFd::new(EFD_NONBLOCK).unwrap());
+        let alive = Arc::new(AtomicBool::new(true));
+        let vt = VcpuThread {
+            handle,
+            exited,
+            immediate_exit: Some(ie),
+            exit_evt,
+            alive,
+        };
+        let read_byte = || vt.immediate_exit.as_ref().unwrap().read_byte();
+        assert_eq!(read_byte(), 0);
+        vt.kick();
+        assert_eq!(
+            read_byte(),
+            1,
+            "kick() must write ie.set(1) when alive == true",
+        );
+        barrier.wait();
+        let _ = vt.handle.join();
     }
 
     // -- RT scheduling tests --

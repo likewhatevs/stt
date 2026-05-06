@@ -20,6 +20,27 @@ pub(crate) const COM2_IRQ: u32 = 3;
 #[cfg(any(target_arch = "x86_64", test))]
 const NUM_REGS: u16 = 8;
 
+/// Hard cap on the captured-output buffer (per Serial). A hostile or
+/// runaway guest can drive COM1/COM2 in a tight `outb` loop, pushing
+/// one byte per PIO exit into the inner Vec writer. Without a cap the
+/// writer grows without bound and the host process eventually OOMs —
+/// every Serial maps a single mutex-protected Vec, so even modest
+/// guest-side spam (a `yes` loop redirected to /dev/console) doubles
+/// the writer's allocation on every realloc step.
+///
+/// 4 MiB is large enough that no benign workload reaches the cap in
+/// practice: a verbose kernel boot log is on the order of 100–500 KiB,
+/// and the heaviest scheduler-trace tests observe peak captures under
+/// 2 MiB. Guests that exceed this cap are exhibiting unbounded
+/// behaviour the host must not allow to consume host memory.
+const OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
+/// Target length to trim back to once [`OUTPUT_CAP_BYTES`] is reached.
+/// Trimming to a value strictly below the cap (rather than exactly to
+/// the cap) amortises the O(N) `Vec::drain(0..N)` cost across the next
+/// `OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET` byte writes — without a
+/// gap, every subsequent byte would trigger another drain.
+const OUTPUT_TRIM_TARGET: usize = 3 * 1024 * 1024;
+
 /// EventFd-based interrupt trigger. Signals the eventfd on each
 /// interrupt, which KVM's irqfd mechanism delivers to the guest as
 /// the configured IRQ line assertion.
@@ -33,6 +54,13 @@ impl vm_superio::Trigger for EventFdTrigger {
 }
 
 /// Serial wrapper around vm-superio::Serial with output capture.
+///
+/// The captured-output writer is capped at [`OUTPUT_CAP_BYTES`].
+/// When the cap is reached, [`Serial::enforce_output_cap`] drains
+/// the oldest bytes back down to [`OUTPUT_TRIM_TARGET`]. This is the
+/// host-side defence against a hostile or runaway guest spamming
+/// COM1/COM2 — without the cap the inner `Vec<u8>` writer would
+/// grow unboundedly until the host process OOMs.
 pub struct Serial {
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     base: u16,
@@ -108,8 +136,60 @@ impl Serial {
         if self.inner.writer().len() > pre_len
             && let Some(evt) = &self.data_evt
         {
+            // Discarded Result: this is `EventFd::write(1)`. Counter
+            // mode (libc::EFD_NONBLOCK | counter, see
+            // [`Self::install_data_evt`]) — the only failure modes
+            // are (a) counter overflow at u64::MAX - 1, which would
+            // require the guest to write 2^64 bytes between
+            // consumer reads, and (b) EBADF if the consumer dropped
+            // its end. Both are recoverable: the consumer will see
+            // the buffer growth on its next `output()`/`drain_output`
+            // call regardless of the eventfd bump.
             let _ = evt.write(1);
         }
+    }
+
+    /// Enforce [`OUTPUT_CAP_BYTES`] on the captured-output writer.
+    ///
+    /// Called after every byte that vm-superio appends to the inner
+    /// Vec writer (the `handle_out` and `inner_write` paths). When
+    /// the writer exceeds the cap, drains the oldest
+    /// `writer.len() - OUTPUT_TRIM_TARGET` bytes via
+    /// `Vec::drain(0..N)`, leaving `OUTPUT_TRIM_TARGET` bytes of
+    /// the most recent output in place.
+    ///
+    /// **Cursor invalidation.** [`Self::contains_cursor`] caches
+    /// `(needle, scanned_len)` where `scanned_len` is an absolute
+    /// writer-buffer offset. A drain shifts every retained byte's
+    /// position backwards by the drained count, so the cached
+    /// offset no longer corresponds to any position in the new
+    /// buffer. Reset the cursor to `None`, matching the invariant
+    /// pinned by [`Self::drain_output`] and [`Self::clear`].
+    ///
+    /// **Visibility.** The trim is logged at debug level (matching
+    /// the pattern used elsewhere in this file for guest-driven
+    /// anomalies) with the byte count, so a host operator can
+    /// observe runaway guest output without flooding the log: each
+    /// trim retires `OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET` bytes
+    /// of capture, so the log rate is bounded to one entry per
+    /// `OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET` bytes of overflow.
+    #[inline]
+    fn enforce_output_cap(&mut self) {
+        let writer = self.inner.writer_mut();
+        let len = writer.len();
+        if len <= OUTPUT_CAP_BYTES {
+            return;
+        }
+        let drop_count = len - OUTPUT_TRIM_TARGET;
+        writer.drain(0..drop_count);
+        self.contains_cursor = None;
+        tracing::debug!(
+            base = self.base,
+            cap = OUTPUT_CAP_BYTES,
+            target = OUTPUT_TRIM_TARGET,
+            dropped = drop_count,
+            "captured-output buffer exceeded cap; oldest bytes dropped",
+        );
     }
 
     /// Handle a port I/O write from the guest. Returns true if the port
@@ -162,8 +242,38 @@ impl Serial {
             return true;
         }
         let pre = self.inner.writer().len();
+        // Discarded Result: vm-superio's `Serial::write` returns
+        // `Result<(), Error<EventFdTrigger::E>>` (vm-superio-0.8.1
+        // src/serial.rs::write). The two error variants reachable
+        // from this call site are both recoverable / unactionable:
+        //
+        // - `Error::IOError(io::Error)` arises from the inner
+        //   writer's `write_all` / `flush` (non-loopback DATA write
+        //   path). The writer is `Vec<u8>` (constructed in
+        //   `Serial::new` above); std's `impl Write for Vec<u8>`
+        //   always returns `Ok` and only fails by panicking on
+        //   allocation failure (OOM). The [`Self::enforce_output_cap`]
+        //   call below bounds the writer's capacity to
+        //   `OUTPUT_CAP_BYTES`, so allocation pressure is
+        //   host-controlled rather than guest-controlled.
+        // - `Error::Trigger(io::Error)` arises from the THRE
+        //   eventfd write inside `thr_empty_interrupt` (DATA writes)
+        //   or the RDA interrupt inside `received_data_interrupt`
+        //   (loopback DATA writes). Counter-mode eventfds only fail
+        //   on counter overflow (would require the guest to pend
+        //   2^64 unacked interrupts) or EBADF (KVM dropped the
+        //   irqfd). Both are recoverable: the guest re-polls IIR
+        //   and the next interrupt fires on the subsequent write.
+        //
+        // `Error::FullFifo` is unreachable from `Serial::write` —
+        // vm-superio guards loopback DATA pushes with
+        // `in_buffer.len() < FIFO_SIZE` and silently drops on
+        // overflow rather than returning the variant; `FullFifo`
+        // only escapes from `enqueue_raw_bytes`, which we do not
+        // call here.
         let _ = self.inner.write(offset, data[0]);
         self.signal_if_writer_grew(pre);
+        self.enforce_output_cap();
         true
     }
 
@@ -236,8 +346,16 @@ impl Serial {
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn inner_write(&mut self, offset: u8, byte: u8) {
         let pre = self.inner.writer().len();
+        // Discarded Result: same rationale as the x86_64 `handle_out`
+        // call site above. vm-superio's `Serial::write` over a
+        // `Vec<u8>` writer is effectively infallible — `IOError`
+        // only arises from allocation panic (host-controlled by
+        // [`Self::enforce_output_cap`] below) and `Trigger` is a
+        // recoverable eventfd-bump failure that the guest will
+        // re-observe on the next interrupt poll.
         let _ = self.inner.write(offset, byte);
         self.signal_if_writer_grew(pre);
+        self.enforce_output_cap();
     }
 
     /// Read a byte from a register at the given offset.
@@ -288,6 +406,7 @@ impl Serial {
     /// [`Self::clear`] also reset the cursor — both shrink the
     /// writer, after which the absolute byte offsets in the cursor
     /// no longer correspond to any positions in the new buffer.
+    #[allow(dead_code)]
     pub fn output_contains(&mut self, needle: &[u8]) -> bool {
         if needle.is_empty() {
             return true;
@@ -912,5 +1031,133 @@ mod tests {
         }
         assert!(s.output_contains(b"MARKER"));
         assert!(s.output_contains(b"MARKER"));
+    }
+
+    /// Writer length must stay bounded by `OUTPUT_CAP_BYTES` no matter
+    /// how many bytes the guest pushes. Drives `handle_out` past the
+    /// cap and asserts the post-write length never exceeds the cap.
+    /// Pre-fix, the inner `Vec<u8>` would grow to the full byte count
+    /// the test loop wrote — a hostile guest in production would push
+    /// the host into OOM.
+    #[test]
+    fn output_cap_bounds_writer_length() {
+        let mut s = Serial::default();
+        // Push enough bytes to trigger several drain cycles. Crossing
+        // the cap twice exercises the case where the trimmed writer
+        // grows back up to the cap and trims again. Each handle_out
+        // call writes a single DATA byte through the THR path.
+        let total = OUTPUT_CAP_BYTES + 2 * (OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET);
+        // Sample the writer length on a coarse interval to keep the
+        // test fast while still pinning the post-condition. The cap
+        // enforcement runs on every write, so any growth past the cap
+        // would only be visible immediately after the offending write
+        // — but `Vec::drain(0..N)` is O(N), so a missing trim would
+        // leave the writer permanently above the cap.
+        let sample_every = 1024;
+        for i in 0..total {
+            assert!(s.handle_out(COM1_BASE, b"x"));
+            if i % sample_every == 0 {
+                assert!(
+                    s.inner.writer().len() <= OUTPUT_CAP_BYTES,
+                    "writer must never exceed OUTPUT_CAP_BYTES; got {} at iter {}",
+                    s.inner.writer().len(),
+                    i,
+                );
+            }
+        }
+        // After the burst, the writer is between OUTPUT_TRIM_TARGET and
+        // OUTPUT_CAP_BYTES — the most recent trim left exactly
+        // OUTPUT_TRIM_TARGET bytes, then we wrote some more.
+        let final_len = s.inner.writer().len();
+        assert!(
+            final_len >= OUTPUT_TRIM_TARGET,
+            "final length {} below trim target {}",
+            final_len,
+            OUTPUT_TRIM_TARGET,
+        );
+        assert!(
+            final_len <= OUTPUT_CAP_BYTES,
+            "final length {} above cap {}",
+            final_len,
+            OUTPUT_CAP_BYTES,
+        );
+    }
+
+    /// Cap enforcement must drop OLDEST bytes (FIFO), keeping the most
+    /// recent guest output. Use a unique pattern at the start of the
+    /// stream and a different pattern at the tail; after the cap is
+    /// breached, the head pattern must be gone and the tail pattern
+    /// must remain.
+    #[test]
+    fn output_cap_drops_oldest_bytes() {
+        let mut s = Serial::default();
+        // Head marker — write OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET
+        // bytes of "H" so a single drain will remove all of them.
+        let head_count = OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET;
+        for _ in 0..head_count {
+            assert!(s.handle_out(COM1_BASE, b"H"));
+        }
+        // Body filler — write OUTPUT_TRIM_TARGET bytes of "B" so the
+        // writer is exactly at OUTPUT_CAP_BYTES afterwards.
+        for _ in 0..OUTPUT_TRIM_TARGET {
+            assert!(s.handle_out(COM1_BASE, b"B"));
+        }
+        assert_eq!(
+            s.inner.writer().len(),
+            OUTPUT_CAP_BYTES,
+            "writer should be exactly at the cap before the trigger byte",
+        );
+        // One more byte triggers the trim. After the trim,
+        // OUTPUT_TRIM_TARGET - 1 of the "B"s have been drained off the
+        // front along with all "H"s; the remaining buffer is the tail
+        // of "B"s plus the trigger byte.
+        assert!(s.handle_out(COM1_BASE, b"T"));
+        let writer = s.inner.writer();
+        assert!(
+            writer.len() <= OUTPUT_CAP_BYTES,
+            "post-trim length must be bounded by cap",
+        );
+        assert!(
+            !writer.contains(&b'H'),
+            "all 'H' bytes (oldest) should have been drained",
+        );
+        assert_eq!(
+            *writer.last().expect("buffer must be non-empty"),
+            b'T',
+            "trigger byte must be retained at the tail",
+        );
+    }
+
+    /// Cap enforcement must invalidate `contains_cursor` because the
+    /// cursor's `scanned_len` is an absolute writer-buffer offset that
+    /// no longer corresponds to any position once bytes are drained
+    /// from the front. Without invalidation, a subsequent
+    /// `output_contains` call would resume from a stale offset and
+    /// could miss a needle that lives in the retained tail.
+    #[test]
+    fn output_cap_invalidates_contains_cursor() {
+        let mut s = Serial::default();
+        // Prime the cursor with a miss so it caches scanned_len.
+        for c in b"prelude " {
+            s.handle_out(COM1_BASE, &[*c]);
+        }
+        assert!(!s.output_contains(b"NEEDLE"));
+        assert!(
+            s.contains_cursor.is_some(),
+            "miss should populate the cursor",
+        );
+        // Now push past the cap to force a trim. The cursor's
+        // scanned_len would be ~8 (length of "prelude "); after the
+        // trim, the writer's leading bytes are different content but
+        // the same absolute offsets, so the stale cursor would skip
+        // the wrong region. Cap enforcement clears the cursor.
+        let total = OUTPUT_CAP_BYTES + (OUTPUT_CAP_BYTES - OUTPUT_TRIM_TARGET);
+        for _ in 0..total {
+            assert!(s.handle_out(COM1_BASE, b"x"));
+        }
+        assert!(
+            s.contains_cursor.is_none(),
+            "cap enforcement must clear the contains_cursor",
+        );
     }
 }

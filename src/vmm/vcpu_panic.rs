@@ -107,6 +107,23 @@ fn make_hook(prev: Box<PanicHook>) -> Box<PanicHook> {
     Box::new(move |info| {
         VCPU_PANIC_CTX.with(|slot| {
             if let Some(ctx) = slot.borrow().as_ref() {
+                // Flip `alive` first so any cross-thread reader
+                // observing the unwind has a chance to see
+                // `alive == false` BEFORE this thread's `vcpu`
+                // local drops during stack unwinding (under
+                // `panic = "unwind"` test profile). The hook runs
+                // synchronously on the panicking thread before
+                // unwinding starts; every store here is
+                // happens-before the Drop of `vcpu` that frees the
+                // `kvm_run` mmap backing this thread's
+                // `ImmediateExitHandle` ptr. A coordinator that
+                // captures Copy clones of the handle gates each
+                // `ie.set` on `alive.load(Acquire)` — Release here
+                // pairs with that Acquire so the gate observes the
+                // flip ahead of the freed mmap.
+                if let Some(ref alive) = ctx.alive {
+                    alive.store(false, Ordering::Release);
+                }
                 ctx.kill.store(true, Ordering::Release);
                 ctx.exited.store(true, Ordering::Release);
                 // Wake the freeze coordinator's epoll loop. EventFd
@@ -202,6 +219,22 @@ pub(crate) struct VcpuPanicCtx {
     /// happen after `run.kill = true` covers all APs), so AP
     /// callers leave this `None`.
     pub(crate) exited_evt: Option<Arc<EventFd>>,
+    /// kvm_run-mmap-liveness flag. `true` means the thread's
+    /// `VcpuFd` (and its `MAP_SHARED` `kvm_run` mapping that
+    /// backs every cross-thread [`ImmediateExitHandle`] copy) is
+    /// still mapped. The hook flips it to `false` BEFORE the
+    /// stack unwind drops `vcpu` so a coordinator iterating a
+    /// captured `Vec<ImmediateExitHandle>` can gate each
+    /// `ie.set` on `alive.load(Acquire)` and skip the index
+    /// whose mmap is about to disappear. Mirrors the BSP-side
+    /// `bsp_alive` belt-and-braces gate.
+    ///
+    /// `None` for callers that do not share an
+    /// `ImmediateExitHandle` cross-thread (the interactive shell
+    /// path, where the BSP runs alone and no coordinator is
+    /// spawned). The hook treats `None` as "no liveness gate
+    /// participates" — equivalent to the pre-existing behaviour.
+    pub(crate) alive: Option<Arc<AtomicBool>>,
 }
 
 static HOOK_ONCE: Once = Once::new();
@@ -326,6 +359,7 @@ mod tests {
             exited: Arc::new(AtomicBool::new(false)),
             kill_evt: None,
             exited_evt: None,
+            alive: None,
         };
         std::thread::spawn(move || {
             with_vcpu_panic_ctx(ctx, || {});
@@ -356,6 +390,7 @@ mod tests {
             exited: Arc::new(AtomicBool::new(false)),
             kill_evt: None,
             exited_evt: None,
+            alive: None,
         };
         std::thread::spawn(move || {
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -386,6 +421,7 @@ mod tests {
             exited: exited.clone(),
             kill_evt: None,
             exited_evt: None,
+            alive: None,
         };
         let kill_c = kill.clone();
         let exited_c = exited.clone();
@@ -453,6 +489,7 @@ mod tests {
             exited: exited.clone(),
             kill_evt: None,
             exited_evt: None,
+            alive: None,
         };
         std::thread::spawn(move || {
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -501,5 +538,63 @@ mod tests {
         .unwrap();
         assert!(!kill_r, "kill must stay false when no ctx registered");
         assert!(!exited_r, "exited must stay false when no ctx registered");
+    }
+
+    /// The panic hook must flip `alive` to `false` BEFORE the
+    /// prev-hook chain runs — the coordinator's pass-1 kick loop
+    /// reads each AP's `alive` Acquire-bool to gate `ie.set` on a
+    /// kvm_run mmap that's about to disappear under
+    /// `panic = "unwind"` stack drop. Capture the value the prev
+    /// hook observes via the `alive` Arc, then assert it was
+    /// already false at the moment the prev hook ran. Together with
+    /// the existing `panic_inside_ctx_still_runs_prev_hook` test,
+    /// this pins the cross-thread visibility ordering: every
+    /// liveness flip happens inside the hook (synchronously,
+    /// before unwinding), not as a side effect of the unwind
+    /// itself.
+    #[test]
+    fn panic_inside_ctx_flips_alive_before_prev() {
+        let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::panic::take_hook();
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_seen_by_prev = Arc::new(AtomicBool::new(true));
+        let alive_for_prev = alive.clone();
+        let alive_seen_clone = alive_seen_by_prev.clone();
+        install_hook_with_prev_for_test(Box::new(move |_info| {
+            // Sample the flag at prev-hook time: our hook ran
+            // already, so this load must observe the Release flip.
+            alive_seen_clone.store(
+                alive_for_prev.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }));
+
+        let ctx = VcpuPanicCtx {
+            kill: Arc::new(AtomicBool::new(false)),
+            exited: Arc::new(AtomicBool::new(false)),
+            kill_evt: None,
+            exited_evt: None,
+            alive: Some(alive.clone()),
+        };
+        std::thread::spawn(move || {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                with_vcpu_panic_ctx(ctx, || panic!("test: alive flip"));
+            }));
+        })
+        .join()
+        .unwrap();
+
+        std::panic::set_hook(saved);
+
+        assert!(
+            !alive_seen_by_prev.load(Ordering::Acquire),
+            "prev hook must observe alive == false — our hook \
+             must flip alive synchronously before delegating",
+        );
+        assert!(
+            !alive.load(Ordering::Acquire),
+            "alive must remain false post-panic",
+        );
     }
 }

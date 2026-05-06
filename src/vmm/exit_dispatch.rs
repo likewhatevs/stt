@@ -259,6 +259,45 @@ pub(crate) fn read_tcr_el1(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
         .map(|_| u64::from_le_bytes(buf))
 }
 
+/// Read the BSP's kernel-half page-table root directly from a vCPU.
+/// On x86_64 this is `CR3` from `KVM_GET_SREGS`; on aarch64 it is
+/// `TTBR1_EL1` from `KVM_GET_ONE_REG`.
+///
+/// Used by the BSP loop's lazy-CAS to populate the
+/// [`super::freeze_coord::run_bsp_loop`] cr3 cache once the guest
+/// kernel has installed its post-randomization page tables. The
+/// monitor and BPF map writer threads consume the cached value to
+/// resolve `phys_base` via a page-table walk that breaks the
+/// chicken-and-egg with text-symbol PA translation.
+///
+/// Returns `None` on KVM_GET_SREGS / KVM_GET_ONE_REG failure
+/// (transient EINTR mid-shutdown); callers retry on the next
+/// iteration. A successful return of `0` means the kernel has not
+/// yet installed its page tables (very-early boot before
+/// `__startup_64` / `__cpu_setup`); callers MUST gate the CAS on a
+/// non-zero value so a stale `0` does not displace a previously
+/// latched non-zero CR3.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn read_cr3(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+    vcpu.get_sregs().ok().map(|s| s.cr3)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn read_cr3(vcpu: &mut kvm_ioctls::VcpuFd) -> Option<u64> {
+    // TTBR1_EL1 holds the kernel-half page-table base (matches the
+    // `page_table_root` field in `VcpuRegSnapshot`). Same encoding
+    // as `capture_vcpu_regs`: (Op0=3, Op1=0, CRn=2, CRm=0, Op2=1)
+    // under the KVM_REG_ARM64_SYSREG namespace.
+    const KVM_REG_ARM64: u64 = 0x6000_0000_0000_0000;
+    const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
+    const KVM_REG_ARM64_SYSREG: u64 = 0x0013_0000;
+    const TTBR1_EL1_ID: u64 = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG | 0xC101;
+    let mut buf = [0u8; 8];
+    vcpu.get_one_reg(TTBR1_EL1_ID, &mut buf)
+        .ok()
+        .map(|_| u64::from_le_bytes(buf))
+}
+
 impl std::fmt::Display for VcpuRegSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -281,7 +320,11 @@ impl std::fmt::Display for VcpuRegSnapshot {
 // ---------------------------------------------------------------------------
 
 /// Dispatch an MMIO write to serial and virtio devices.
-/// Returns `true` if the caller should exit (shutdown detected).
+///
+/// aarch64 reboot is signalled via PSCI (`VcpuExit::SystemEvent`), not
+/// MMIO, so there is no shutdown return distinct from the normal write
+/// path: this function always handles the write and returns to the
+/// run loop.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_mmio_write(
@@ -292,7 +335,7 @@ pub(crate) fn dispatch_mmio_write(
     virtio_net: Option<&PiMutex<virtio_net::VirtioNet>>,
     addr: u64,
     data: &[u8],
-) -> bool {
+) {
     if let Some(offset) = mmio_serial_offset(addr, kvm::SERIAL_MMIO_BASE) {
         if let Some(&byte) = data.first() {
             com1.lock().inner_write(offset, byte);
@@ -319,7 +362,6 @@ pub(crate) fn dispatch_mmio_write(
     {
         vn.lock().mmio_write(addr - kvm::VIRTIO_NET_MMIO_BASE, data);
     }
-    false
 }
 
 /// Dispatch an MMIO read from serial and virtio-console devices.
@@ -367,10 +409,45 @@ pub(crate) fn dispatch_mmio_read(
 }
 
 /// Compute register offset for an MMIO address within a serial region.
+///
+/// The serial MMIO region is page-sized (`kvm::SERIAL_MMIO_SIZE` =
+/// 0x1000) so each UART sits on its own guest page, but the
+/// underlying ns16550a register window is only 8 bytes wide
+/// (DATA/IER/IIR/LCR/MCR/LSR/MSR/SCR at offsets 0..=7 per the
+/// `vm-superio` `Serial::{read,write}` switch arms; out-of-range
+/// offsets fall through to `_ => 0` / `_ => {}`). The legal-input
+/// bound here is therefore the `u8` representable range, not the
+/// page size: an offset above 0xFF cannot fit in `u8` and the cast
+/// would silently wrap modulo 256 — a guest write to register 0x100
+/// would land at register 0x00 (DATA), corrupting the TX path.
+///
+/// Tightening the upper bound to `base + 256` returns `None` for
+/// the [0x100, SERIAL_MMIO_SIZE) sub-region, which falls through
+/// to the next dispatch arm (and ultimately to the unmapped-MMIO
+/// 0xFF fill on read / silent drop on write — the correct "no
+/// device here" semantics for the unused tail of the page). The
+/// kernel's 8250 driver only emits accesses to offsets 0..=7, so
+/// no production guest hits the > 0x100 region; this gate is a
+/// hostile-guest defense against truncation-induced register
+/// aliasing.
 #[cfg(target_arch = "aarch64")]
 fn mmio_serial_offset(addr: u64, base: u64) -> Option<u8> {
-    let size = kvm::SERIAL_MMIO_SIZE;
-    if addr >= base && addr < base + size {
+    // Bound is `u8::MAX as u64 + 1` (= 256) so the `as u8` cast
+    // is total within the kept range. The page-sized
+    // `SERIAL_MMIO_SIZE` is intentionally NOT used as the bound;
+    // see the rationale on this function.
+    const MAX_REG_OFFSET: u64 = u8::MAX as u64 + 1;
+    // Compile-time guarantee: the region we accept fits inside the
+    // declared MMIO window. If a future change shrinks
+    // `SERIAL_MMIO_SIZE` below 256, this constant breaks the
+    // build instead of letting the function admit offsets that
+    // step into a neighbouring device's region.
+    const _: () = assert!(
+        kvm::SERIAL_MMIO_SIZE >= MAX_REG_OFFSET,
+        "SERIAL_MMIO_SIZE must cover at least the 256-byte u8-representable \
+         register window mmio_serial_offset accepts"
+    );
+    if addr >= base && addr < base + MAX_REG_OFFSET {
         Some((addr - base) as u8)
     } else {
         None
@@ -1028,7 +1105,23 @@ pub(crate) fn handle_freeze(
     // guest instead of returning EINTR.
     if has_immediate_exit {
         vcpu.set_kvm_immediate_exit(1);
-        let _ = vcpu.run();
+        // Drain dance: KVM_RUN with immediate_exit=1 commits any
+        // pending PIO/MMIO from the prior exit and returns EINTR
+        // without entering the guest (per the KVM API contract). EINTR
+        // is the expected outcome; any other error means KVM rejected
+        // the ioctl (e.g. KVM_RUN unsupported state, vCPU corruption)
+        // and the freeze coordinator's subsequent guest-memory reads
+        // may observe partial state. Log non-EINTR explicitly so a
+        // real KVM regression is not silently swallowed.
+        if let Err(e) = vcpu.run()
+            && e.errno() != libc::EINTR
+        {
+            tracing::warn!(
+                err = %e,
+                "handle_freeze: drain KVM_RUN failed with non-EINTR — \
+                 pending PIO/MMIO may not have committed before park"
+            );
+        }
         vcpu.set_kvm_immediate_exit(0);
     }
 
@@ -1061,15 +1154,30 @@ pub(crate) fn handle_freeze(
     //
     // EAGAIN under EFD_NONBLOCK from a saturated counter is benign:
     // the AtomicBool is the source of truth, and any prior pending
-    // edge already wakes the coordinator. Log so a real eventfd
-    // breakage surfaces, but do not propagate.
+    // edge already wakes the coordinator. Other errnos (EBADF,
+    // EINVAL) signal real eventfd breakage and warrant a higher-
+    // severity log than the benign-saturation case. Either way we do
+    // not propagate — the parked AtomicBool is the source of truth
+    // for the freeze rendezvous, and the coordinator's epoll-wait
+    // backstop bounds wake latency without the eventfd edge.
     if let Some(evt) = parked_evt
         && let Err(e) = evt.write(1)
     {
-        tracing::debug!(
-            err = %e,
-            "handle_freeze: parked_evt write failed (EAGAIN expected on counter saturation)"
-        );
+        if e.raw_os_error() == Some(libc::EAGAIN) {
+            tracing::debug!(
+                err = %e,
+                "handle_freeze: parked_evt write returned EAGAIN \
+                 (eventfd counter saturated; benign — coordinator \
+                 already has a pending wake edge)"
+            );
+        } else {
+            tracing::warn!(
+                err = %e,
+                "handle_freeze: parked_evt write failed with non-EAGAIN \
+                 errno — eventfd may be broken; freeze coordinator wake \
+                 falls back to epoll backstop"
+            );
+        }
     }
 
     // Park until freeze clears or shutdown wins. The thaw_evt
@@ -1182,11 +1290,10 @@ pub(crate) fn classify_exit(
         }
         #[cfg(target_arch = "aarch64")]
         VcpuExit::MmioWrite(addr, data) => {
-            if dispatch_mmio_write(com1, com2, virtio_con, virtio_blk, virtio_net, *addr, data) {
-                Some(ExitAction::Shutdown)
-            } else {
-                Some(ExitAction::Continue)
-            }
+            // aarch64 has no MMIO-side shutdown signal — guest reboot
+            // arrives as VcpuExit::SystemEvent (PSCI), handled below.
+            dispatch_mmio_write(com1, com2, virtio_con, virtio_blk, virtio_net, *addr, data);
+            Some(ExitAction::Continue)
         }
         #[cfg(target_arch = "aarch64")]
         VcpuExit::MmioRead(addr, data) => {
@@ -1407,6 +1514,523 @@ mod tests {
         let mut data = [0xFFu8; 1];
         dispatch_io_in(&com1, &com2, 0x1234, &mut data);
         assert_eq!(data[0], 0xFF, "unknown port should not modify data");
+    }
+
+    // -- classify_exit per-variant coverage (x86_64) --
+    //
+    // These tests construct a synthetic VcpuExit and feed it to
+    // classify_exit, asserting the ExitAction variant returned. None
+    // of them require a real VcpuFd — VcpuExit is a public enum the
+    // kvm-ioctls crate exposes, so the test harness can pin the
+    // dispatch table without a KVM round-trip.
+
+    #[test]
+    fn classify_exit_hlt_returns_none() {
+        // VcpuExit::Hlt is the AP-thread idle marker — classify_exit
+        // returns None to signal "caller handles the kill-flag check
+        // and continues". Pinning here so a future change that
+        // accidentally maps Hlt to ExitAction::Continue (which would
+        // skip the per-iteration kill recheck) is caught.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut exit = VcpuExit::Hlt;
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(action.is_none(), "Hlt must classify as None");
+    }
+
+    #[test]
+    fn classify_exit_shutdown_variant_is_shutdown() {
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut exit = VcpuExit::Shutdown;
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Shutdown)),
+            "Shutdown variant must classify as ExitAction::Shutdown"
+        );
+    }
+
+    #[test]
+    fn classify_exit_system_event_shutdown_is_shutdown() {
+        // KVM_SYSTEM_EVENT_SHUTDOWN (1) is the PSCI-style clean shutdown
+        // signal both arches surface for guest-initiated reboot. Must
+        // classify as Shutdown so the run loop stops the BSP and APs.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data: [u64; 0] = [];
+        let mut exit = VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_SHUTDOWN, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Shutdown)),
+            "SystemEvent(SHUTDOWN=1) must classify as Shutdown"
+        );
+    }
+
+    #[test]
+    fn classify_exit_system_event_reset_is_shutdown() {
+        // KVM_SYSTEM_EVENT_RESET (2) is the guest reboot signal. ktstr
+        // treats reboot-as-shutdown — there is no warm-reboot path —
+        // so reset and shutdown collapse to the same ExitAction.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data: [u64; 0] = [];
+        let mut exit = VcpuExit::SystemEvent(KVM_SYSTEM_EVENT_RESET, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Shutdown)),
+            "SystemEvent(RESET=2) must classify as Shutdown"
+        );
+    }
+
+    #[test]
+    fn classify_exit_system_event_unknown_type_is_continue() {
+        // Unknown SystemEvent types (CRASH=3, WAKEUP=4, future codes)
+        // must NOT terminate the run loop — KVM may evolve the event
+        // namespace, and ktstr must not falsely shut down on a value
+        // it does not recognize. Pinning a non-{1,2} type returns
+        // Continue so the BSP polls forward.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data: [u64; 0] = [];
+        // 99 is well outside KVM_SYSTEM_EVENT_{SHUTDOWN, RESET, CRASH,
+        // WAKEUP, S2IDLE, SUSPEND} — picked to defend against future
+        // expansion of the legitimate set without flipping this test.
+        let mut exit = VcpuExit::SystemEvent(99, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "SystemEvent with unknown type must classify as Continue, \
+             not Shutdown — the run loop must not terminate on \
+             unknown KVM event codes"
+        );
+    }
+
+    #[test]
+    fn classify_exit_fail_entry_is_fatal_with_reason() {
+        // KVM_EXIT_FAIL_ENTRY surfaces a hardware-side entry failure
+        // (typically VMX/SVM consistency check failed). The reason
+        // must propagate through to ExitAction::Fatal so the failure
+        // dump records the architectural code an operator can decode.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut exit = VcpuExit::FailEntry(0xdead_beef, 7);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        match action {
+            Some(ExitAction::Fatal(Some(reason))) => assert_eq!(
+                reason, 0xdead_beef,
+                "FailEntry reason must round-trip into Fatal(Some(_))"
+            ),
+            other => panic!(
+                "FailEntry must classify as Fatal(Some(reason)); got tag {}",
+                action_tag(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_exit_internal_error_is_fatal_none() {
+        // KVM_EXIT_INTERNAL_ERROR has no architectural reason code —
+        // classify as Fatal(None) so the failure-dump emitter can
+        // distinguish it from FailEntry and emit the correct prose.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut exit = VcpuExit::InternalError;
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Fatal(None))),
+            "InternalError must classify as Fatal(None)"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_io_out_i8042_reset_is_shutdown() {
+        // Cross-checks the dispatch_io_out i8042-reset path through
+        // the classify_exit dispatch table — verifies the "true"
+        // return from dispatch_io_out maps to ExitAction::Shutdown.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data = [I8042_CMD_RESET_CPU];
+        let mut exit = VcpuExit::IoOut(I8042_CMD_PORT, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Shutdown)),
+            "IoOut(0x64, [0xFE]) — i8042 reset — must classify as Shutdown"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_io_out_serial_is_continue() {
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data = [b'Z'];
+        let mut exit = VcpuExit::IoOut(console::COM1_BASE, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "IoOut to COM1 must classify as Continue (no reboot)"
+        );
+        // Confirm the byte landed in COM1's output buffer — pins that
+        // the dispatch wired to the right port mutex, not COM2.
+        assert!(com1.lock().output().contains('Z'));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_io_in_serial_is_continue() {
+        // IoIn on COM1's data port returns a buffered byte if pending,
+        // 0 otherwise. classify_exit must map IoIn → Continue
+        // unconditionally — the run loop never terminates on a port
+        // read.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut data = [0xFFu8; 1];
+        let mut exit = VcpuExit::IoIn(console::COM1_BASE, &mut data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "IoIn to COM1 must classify as Continue"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_x86_mmio_read_unmapped_returns_0xff() {
+        // x86_64 MMIO read fallback: when a guest MMIO read addresses
+        // a region that is NOT in any of the virtio MMIO windows, the
+        // dispatch fills the data buffer with 0xFF (the canonical
+        // "no device responded" pattern — matches PCI/MMIO DECODE
+        // ERROR behaviour on real hardware). Pinning here so a future
+        // refactor cannot accidentally leave the buffer untouched
+        // (which would surface as the previous KVM_RUN's stale data
+        // appearing in the guest as a phantom value).
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        // Pick an address well below any virtio_*_MMIO_BASE so no
+        // device window matches it. 0x1000 is in the BIOS-EBDA area,
+        // which ktstr does not back with any MMIO device.
+        let mut buf = [0u8; 4];
+        let mut exit = VcpuExit::MmioRead(0x1000, &mut buf);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "Unmapped MMIO read must classify as Continue (not Fatal)"
+        );
+        assert_eq!(
+            buf,
+            [0xff, 0xff, 0xff, 0xff],
+            "Unmapped MMIO read must fill the data buffer with 0xFF — \
+             leaving stale bytes would surface as phantom guest reads"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn classify_exit_x86_mmio_write_unmapped_is_continue() {
+        // x86_64 MMIO write fallback: an unmapped write is silently
+        // dropped (no device matches → control falls through). Pin
+        // that the action is Continue so a future change that
+        // accidentally classifies "no virtio match" as Fatal would
+        // break this test.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data = [0xAAu8, 0xBB];
+        let mut exit = VcpuExit::MmioWrite(0x1000, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "Unmapped MMIO write must classify as Continue"
+        );
+    }
+
+    /// Helper: erase the inner data of an ExitAction so panic messages
+    /// don't try to format the reason payload (Fatal carries Option<u64>).
+    fn action_tag(a: &Option<ExitAction>) -> u8 {
+        match a {
+            None => 0,
+            Some(ExitAction::Continue) => 1,
+            Some(ExitAction::Shutdown) => 2,
+            Some(ExitAction::Fatal(_)) => 3,
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests_aarch64 {
+    use super::*;
+
+    // -- aarch64 dispatch_mmio_read / dispatch_mmio_write coverage --
+    //
+    // dispatch_mmio_write is unit-typed (always returns) — the aarch64
+    // shutdown signal arrives via VcpuExit::SystemEvent (PSCI), not an
+    // MMIO write. dispatch_mmio_read fills with 0xFF when no device
+    // window matches, so the guest sees a "no device responded" pattern
+    // rather than stale bytes.
+
+    #[test]
+    fn dispatch_mmio_read_unmapped_returns_0xff() {
+        // Pin the canonical "no device responded" fill at 0xFF for
+        // unmapped MMIO reads. A future regression that left the
+        // buffer untouched would surface as the previous KVM_RUN's
+        // stale data appearing as a phantom guest read.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut buf = [0u8; 4];
+        // 0x10_0000 is below SERIAL_MMIO_BASE (0x0900_0000) and inside
+        // no virtio device window — picked so no early-return matches.
+        dispatch_mmio_read(
+            &com1, &com2, None, None, None, /* addr */ 0x10_0000, &mut buf,
+        );
+        assert_eq!(
+            buf,
+            [0xff, 0xff, 0xff, 0xff],
+            "Unmapped MMIO read must fill the data buffer with 0xFF"
+        );
+    }
+
+    #[test]
+    fn dispatch_mmio_read_serial_does_not_fill_0xff() {
+        // Reads inside the SERIAL_MMIO_BASE window go through the COM1
+        // mutex — the 0xFF fallback fill must NOT run. Verifies the
+        // serial branch is taken (data[0] is whatever the LSR returns;
+        // we only assert "not 0xFF" because the precise LSR value is
+        // a console-internal detail and not what this test pins).
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut buf = [0xAAu8; 1];
+        // SERIAL_MMIO_BASE + 5 = LSR offset on the 8250 register map.
+        // The serial branch overwrites buf[0] with the LSR value;
+        // that value is non-0xFF for an idle Serial.
+        dispatch_mmio_read(
+            &com1,
+            &com2,
+            None,
+            None,
+            None,
+            kvm::SERIAL_MMIO_BASE + 5,
+            &mut buf,
+        );
+        assert_ne!(
+            buf[0], 0xFF,
+            "Serial MMIO read must invoke the COM1 LSR path, not the \
+             unmapped 0xFF fallback"
+        );
+    }
+
+    #[test]
+    fn classify_exit_aarch64_mmio_write_serial_is_continue() {
+        // aarch64 MmioWrite to the COM1 serial window must classify as
+        // Continue (no MMIO-side shutdown signal — reboot is PSCI via
+        // SystemEvent). The byte must reach the COM1 output buffer to
+        // pin the dispatch wire-up.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let data = [b'Q'];
+        let mut exit = VcpuExit::MmioWrite(kvm::SERIAL_MMIO_BASE, &data);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "aarch64 MmioWrite to serial must classify as Continue"
+        );
+        assert!(
+            com1.lock().output().contains('Q'),
+            "Serial MMIO write must land the byte in COM1 output"
+        );
+    }
+
+    #[test]
+    fn classify_exit_aarch64_mmio_read_unmapped_returns_0xff() {
+        // Cross-check: classify_exit + dispatch_mmio_read 0xFF fallback
+        // through the public dispatch path. Unmapped MMIO read must be
+        // Continue with the buffer overwritten to 0xFF.
+        let com1 = PiMutex::new(console::Serial::new(console::COM1_BASE));
+        let com2 = PiMutex::new(console::Serial::new(console::COM2_BASE));
+        let mut buf = [0u8; 4];
+        let mut exit = VcpuExit::MmioRead(0x10_0000, &mut buf);
+        let action = classify_exit(&com1, &com2, None, None, None, &mut exit);
+        assert!(
+            matches!(action, Some(ExitAction::Continue)),
+            "Unmapped aarch64 MMIO read must classify as Continue"
+        );
+        // Re-borrow `buf` to read it post-call — the &mut alias inside
+        // `exit` is dropped when `exit` is, but we can re-inspect the
+        // backing array here because classify_exit returned.
+        assert_eq!(
+            buf,
+            [0xff, 0xff, 0xff, 0xff],
+            "Unmapped aarch64 MMIO read must fill with 0xFF"
+        );
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod handle_freeze_tests {
+    //! Tests for `handle_freeze` that do require a real KVM VcpuFd —
+    //! they boot a minimal `KtstrKvm` (1 vCPU, 64 MB) so the freeze
+    //! drain dance and reg-capture paths exercise real KVM ioctls.
+    //!
+    //! These tests skip the parking loop by leaving `freeze=false`,
+    //! so the function falls straight through after the drain dance,
+    //! reg capture, and parked Release-store. That covers:
+    //!   - has_immediate_exit=true → vcpu.run() returns EINTR (the
+    //!     KVM_CAP_IMMEDIATE_EXIT contract) and the drain swallows it
+    //!   - capture_vcpu_regs writes a Some(_) to regs_slot
+    //!   - parked AtomicBool gets a Release-then-Release toggle
+    //!     (true on entry, false on exit)
+    //!   - parked_evt.write(1) writes one edge
+
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn handle_freeze_drain_swallows_eintr_and_resets_state() {
+        // Boot a minimal VM, set up sregs so capture_vcpu_regs has a
+        // valid CR3, then call handle_freeze. With freeze=false, the
+        // park loop falls through; the drain dance runs because we
+        // pass has_immediate_exit=true. The KVM_CAP_IMMEDIATE_EXIT
+        // contract returns EINTR from vcpu.run() — handle_freeze logs
+        // and continues, NOT panics.
+        use crate::vmm::kvm::KtstrKvm;
+        use crate::vmm::topology::Topology;
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
+        crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
+
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let freeze = std::sync::Arc::new(AtomicBool::new(false));
+        let parked = std::sync::Arc::new(AtomicBool::new(false));
+        let regs_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        // freeze=false → the park loop exits immediately; the function
+        // returns after the drain + reg capture + parked toggle.
+        handle_freeze(
+            &mut vm.vcpus[0],
+            true, // has_immediate_exit — exercise the EINTR drain path
+            &kill,
+            &freeze,
+            &parked,
+            &regs_slot,
+            None,
+            None,
+            None,
+        );
+
+        // After handle_freeze returns:
+        //   - parked must be false (Released on exit so subsequent
+        //     freeze cycles are observable).
+        //   - regs_slot must hold Some(_) — capture_vcpu_regs ran
+        //     successfully on the freshly-init'd vCPU.
+        assert!(
+            !parked.load(Ordering::Acquire),
+            "parked must be cleared on exit so subsequent freeze \
+             cycles can observe a fresh true→false edge"
+        );
+        let snapshot = regs_slot.lock().unwrap();
+        assert!(
+            snapshot.is_some(),
+            "capture_vcpu_regs must populate regs_slot for a freshly-\
+             init'd vCPU — None means KVM_GET_REGS failed unexpectedly"
+        );
+    }
+
+    #[test]
+    fn handle_freeze_no_drain_when_immediate_exit_unsupported() {
+        // With has_immediate_exit=false, the drain dance is skipped
+        // entirely (the doc explains: calling vcpu.run() with the cap
+        // absent would re-enter the guest instead of returning EINTR).
+        // Verify the function still completes, captures regs, and
+        // toggles parked correctly.
+        use crate::vmm::kvm::KtstrKvm;
+        use crate::vmm::topology::Topology;
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
+        crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
+
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let freeze = std::sync::Arc::new(AtomicBool::new(false));
+        let parked = std::sync::Arc::new(AtomicBool::new(false));
+        let regs_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        handle_freeze(
+            &mut vm.vcpus[0],
+            false, // has_immediate_exit=false → drain dance skipped
+            &kill,
+            &freeze,
+            &parked,
+            &regs_slot,
+            None,
+            None,
+            None,
+        );
+
+        assert!(!parked.load(Ordering::Acquire));
+        assert!(regs_slot.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn handle_freeze_writes_parked_evt_edge() {
+        // The parked_evt write is a wake edge for the freeze
+        // coordinator's epoll loop. Verify exactly one byte/edge gets
+        // written by reading back the eventfd counter post-call —
+        // an EFD_NONBLOCK eventfd returns the accumulated count on
+        // read and resets to 0.
+        use crate::vmm::kvm::KtstrKvm;
+        use crate::vmm::topology::Topology;
+        let topo = Topology {
+            llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let mut vm = KtstrKvm::new(topo, 64, false).unwrap();
+        crate::vmm::x86_64::boot::setup_sregs(&vm.guest_mem, &vm.vcpus[0], false).unwrap();
+
+        let kill = std::sync::Arc::new(AtomicBool::new(false));
+        let freeze = std::sync::Arc::new(AtomicBool::new(false));
+        let parked = std::sync::Arc::new(AtomicBool::new(false));
+        let regs_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        // EFD_NONBLOCK matches production usage in freeze_coord.
+        let parked_evt = EventFd::new(vmm_sys_util::eventfd::EFD_NONBLOCK).unwrap();
+
+        handle_freeze(
+            &mut vm.vcpus[0],
+            false,
+            &kill,
+            &freeze,
+            &parked,
+            &regs_slot,
+            Some(&parked_evt),
+            None,
+            None,
+        );
+
+        // EventFd::read returns the accumulated counter and resets it.
+        // We expect exactly 1 (one edge from the write(1) inside
+        // handle_freeze).
+        let counter = parked_evt.read().unwrap();
+        assert_eq!(
+            counter, 1,
+            "handle_freeze must write exactly one wake edge to \
+             parked_evt — coordinator depends on this to advance \
+             from epoll_wait without spurious extra wakes"
+        );
     }
 }
 

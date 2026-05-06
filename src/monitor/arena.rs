@@ -409,7 +409,17 @@ pub fn snapshot_arena(
         // in arena_alloc_pages — since the user_vm window is capped
         // at SZ_4G and aligned so the low 32 bits cover the whole
         // span uniquely. Match the same truncation here.
-        let user_addr = user_vm_start.wrapping_add(pgoff * page_size);
+        //
+        // pgoff and page_size both originate from BPF map metadata
+        // and the guest TCR_EL1; pgoff*page_size in u64 can overflow
+        // when a corrupt map advertises a huge declared_pages count.
+        // Skip the page on multiplication overflow — wrapping_add on
+        // user_vm_start is intentional (matches kernel truncation),
+        // but only when the multiplicand was correctly computed.
+        let Some(byte_off) = pgoff.checked_mul(page_size) else {
+            return;
+        };
+        let user_addr = user_vm_start.wrapping_add(byte_off);
         let kaddr = kern_vm_start.wrapping_add(user_addr & 0xFFFF_FFFF);
         let Some(pa) = mem.translate_kva(walk.cr3_pa, Kva(kaddr), walk.l5, walk.tcr_el1) else {
             return;

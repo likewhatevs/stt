@@ -408,3 +408,38 @@ fn plan_benchmarks_iteration_rate_via_assert_cgroup() {
     assert!(!r.passed, "2/s < 1000/s floor");
     assert!(r.details.iter().any(|d| d.contains("iteration rate")));
 }
+
+#[test]
+fn assert_throughput_parity_all_zero_cpu_time_fails_when_cv_set() {
+    // When every worker recorded zero cpu_time the per-worker rate
+    // is zero, the mean is zero, and CV is mathematically
+    // undefined. The previous gate (`mean > 0.0`) silently skipped
+    // the check and reported a pass — masking a workload that
+    // never accumulated any CPU time. The fix surfaces it as a
+    // failure so the operator sees the broken run.
+    let mut a = rpt(1, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    let mut b = rpt(2, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    a.cpu_time_ns = 0;
+    b.cpu_time_ns = 0;
+    let r = assert_throughput_parity(&[a, b], Some(0.5), None);
+    assert!(!r.passed, "all-zero cpu_time must fail when max_cv set");
+    assert!(
+        r.details.iter().any(|d| d.contains("CV undefined")),
+        "diagnostic must surface the undefined-CV root cause: {:?}",
+        r.details
+    );
+}
+
+#[test]
+fn assert_throughput_parity_all_zero_cpu_time_passes_without_cv() {
+    // No CV check requested → no failure. The min_rate floor is
+    // also unset, so the function has nothing to evaluate and
+    // passes. This pins the gate scope: the new failure is
+    // specific to the configured-CV-with-zero-mean case.
+    let mut a = rpt(1, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    let mut b = rpt(2, 0, 5_000_000_000, 5_000_000_000, &[0], 0);
+    a.cpu_time_ns = 0;
+    b.cpu_time_ns = 0;
+    let r = assert_throughput_parity(&[a, b], None, None);
+    assert!(r.passed, "no CV configured → no failure: {:?}", r.details);
+}

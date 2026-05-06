@@ -39,8 +39,9 @@ pub(crate) fn find_struct_ops_progs(
     prog_idr_kva: u64,
     offsets: &BpfProgOffsets,
     start_kernel_map: u64,
+    phys_base: u64,
 ) -> Vec<ProgVerifierStats> {
-    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map);
+    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
 
     let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
     if xa_head == 0 {
@@ -237,8 +238,9 @@ pub(crate) fn walk_struct_ops_runtime_stats(
     offsets: &BpfProgOffsets,
     per_cpu_offsets: &[u64],
     start_kernel_map: u64,
+    phys_base: u64,
 ) -> Vec<ProgRuntimeStats> {
-    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map);
+    let idr_pa = text_kva_to_pa_with_base(prog_idr_kva, start_kernel_map, phys_base);
 
     let xa_head = mem.read_u64(idr_pa, offsets.idr_xa_head);
     if xa_head == 0 {
@@ -377,7 +379,8 @@ pub(crate) fn walk_struct_ops_runtime_stats(
                         // original semantics.
                         cnt = cnt.saturating_add(mem.read_u64(stats_pa, offsets.stats_cnt));
                         nsecs = nsecs.saturating_add(mem.read_u64(stats_pa, offsets.stats_nsecs));
-                        misses = misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
+                        misses =
+                            misses.saturating_add(mem.read_u64(stats_pa, offsets.stats_misses));
                     }
                 } else {
                     // Span exceeds the inline buffer. Should be
@@ -471,6 +474,7 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
             self.prog_idr_kva,
             self.offsets,
             self.kernel.start_kernel_map(),
+            self.kernel.phys_base(),
         )
     }
 
@@ -491,6 +495,7 @@ impl BpfProgAccessor for GuestMemProgAccessor<'_> {
             self.offsets,
             per_cpu_offsets,
             self.kernel.start_kernel_map(),
+            self.kernel.phys_base(),
         )
     }
 }
@@ -527,8 +532,9 @@ impl<'a> GuestMemProgAccessorOwned<'a> {
         mem: &'a super::reader::GuestMem,
         vmlinux: &std::path::Path,
         tcr_el1: u64,
+        cr3_pa: u64,
     ) -> anyhow::Result<Self> {
-        let kernel = super::guest::GuestKernel::new(mem, vmlinux, tcr_el1)?;
+        let kernel = super::guest::GuestKernel::new(mem, vmlinux, tcr_el1, cr3_pa)?;
         let offsets = BpfProgOffsets::from_vmlinux(vmlinux)?;
         let prog_idr_kva = kernel
             .symbol_kva("prog_idr")
@@ -867,9 +873,9 @@ mod tests {
     ///
     /// 1. Laying out a synthetic IDR + bpf_prog + bpf_prog_aux
     ///    + per-CPU stats slot in a flat buffer, using the
-    ///    direct-mapping `kva = page_offset + pa` shortcut so
-    ///    `translate_any_kva` resolves through the direct path
-    ///    without building a page table.
+    ///      direct-mapping `kva = page_offset + pa` shortcut so
+    ///      `translate_any_kva` resolves through the direct path
+    ///      without building a page table.
     /// 2. Writing known u64 values at the three stats offsets.
     /// 3. Running the walker end-to-end and asserting the parsed
     ///    `cnt`/`nsecs`/`misses` match the bytes the bulk read
@@ -945,9 +951,21 @@ mod tests {
         write_u32(&mut buf, idr_pa + offsets.idr_next as u64, 1);
 
         // bpf_prog: type = STRUCT_OPS, aux = aux_kva, stats = stats_kva.
-        write_u32(&mut buf, prog_pa + offsets.prog_type as u64, BPF_PROG_TYPE_STRUCT_OPS);
-        write_u64(&mut buf, prog_pa + offsets.prog_aux as u64, pa_to_kva(aux_pa));
-        write_u64(&mut buf, prog_pa + offsets.prog_stats as u64, pa_to_kva(stats_pa));
+        write_u32(
+            &mut buf,
+            prog_pa + offsets.prog_type as u64,
+            BPF_PROG_TYPE_STRUCT_OPS,
+        );
+        write_u64(
+            &mut buf,
+            prog_pa + offsets.prog_aux as u64,
+            pa_to_kva(aux_pa),
+        );
+        write_u64(
+            &mut buf,
+            prog_pa + offsets.prog_stats as u64,
+            pa_to_kva(stats_pa),
+        );
 
         // bpf_prog_aux: verified_insns + name. Name must NUL-
         // terminate within BPF_OBJ_NAME_LEN so the walker's
@@ -965,7 +983,11 @@ mod tests {
         let known_misses: u64 = 0x3333_3333_3333_3333;
         write_u64(&mut buf, stats_pa + offsets.stats_cnt as u64, known_cnt);
         write_u64(&mut buf, stats_pa + offsets.stats_nsecs as u64, known_nsecs);
-        write_u64(&mut buf, stats_pa + offsets.stats_misses as u64, known_misses);
+        write_u64(
+            &mut buf,
+            stats_pa + offsets.stats_misses as u64,
+            known_misses,
+        );
 
         // SAFETY: buf is a live local Vec<u8> whose backing storage
         // outlives the GuestMem use.
@@ -989,6 +1011,7 @@ mod tests {
             &offsets,
             &per_cpu_offsets,
             START_KERNEL_MAP,
+            0,
         );
 
         assert_eq!(stats.len(), 1, "single STRUCT_OPS prog must surface");

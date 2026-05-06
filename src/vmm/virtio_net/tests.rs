@@ -1,6 +1,6 @@
 //! Tests for virtio-net device.
 //!
-//! Three layers per project CLAUDE.md:
+//! Three layers, each isolating a different failure surface:
 //!   - MMIO state-machine tests (status FSM, feature negotiation,
 //!     queue config gating).
 //!   - Config-space layout tests (offsets, byte ordering, MAC delivery).

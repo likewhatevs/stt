@@ -999,7 +999,20 @@ impl MetricCheck {
 
     /// Fail when the named metric falls outside `[lo, hi]` (inclusive
     /// on both ends). Missing metric fails loudly.
+    ///
+    /// Panics at construction when `lo > hi` — a reversed-bounds
+    /// range describes an empty interval that no finite metric can
+    /// satisfy, almost certainly a user error rather than an
+    /// intentional always-fails check. Failing at the constructor
+    /// surfaces the typo at the call site instead of letting the
+    /// evaluator run an unsatisfiable check against every probe
+    /// value. NaN bounds also trip this gate because `lo <= hi`
+    /// is false for any NaN argument.
     pub const fn range(metric: &'static str, lo: f64, hi: f64) -> MetricCheck {
+        assert!(
+            lo <= hi,
+            "MetricCheck::range: lo must be <= hi (reversed bounds are an empty interval)"
+        );
         MetricCheck::Range { metric, lo, hi }
     }
 
@@ -1650,27 +1663,47 @@ mod tests {
         assert!(serde_json::from_str::<Polarity>("{\"TargetValue\":-Infinity}").is_err());
     }
 
-    /// `MetricCheck::Range { lo: hi, hi: lo }` — i.e. reversed bounds that
-    /// make `lo > hi` — produces an empty interval that every finite
-    /// metric fails against. The MetricCheck API has no runtime validation
-    /// for `lo <= hi`, so the failure manifests as "metric outside
-    /// [lo, hi]" for any probe value. Pin that current behavior so a
-    /// future validation pass (which SHOULD exist, since a reversed
-    /// range is almost certainly a bug on the user's side) surfaces
-    /// here instead of quietly flipping semantics.
+    /// `MetricCheck::range(metric, lo, hi)` panics when `lo > hi`.
+    /// A reversed-bounds range describes an empty interval that no
+    /// finite metric can satisfy — almost always a user error.
+    /// Failing loudly at the constructor surfaces the typo at the
+    /// call site rather than letting the evaluator run an
+    /// unsatisfiable check against every probe value.
     #[test]
-    fn check_range_reversed_bounds_fails_every_finite_value() {
-        let reversed = MetricCheck::range("iops", 100.0, 50.0); // lo=100, hi=50
-        match reversed {
+    #[should_panic(expected = "lo must be <= hi")]
+    fn check_range_reversed_bounds_panics_at_construction() {
+        let _ = MetricCheck::range("iops", 100.0, 50.0);
+    }
+
+    /// Equal bounds (`lo == hi`) describe a single-point interval —
+    /// allowed; the metric must equal that exact value. Pins the
+    /// `<=` (not `<`) gate in the constructor.
+    #[test]
+    fn check_range_equal_bounds_construct() {
+        let r = MetricCheck::range("iops", 50.0, 50.0);
+        match r {
             MetricCheck::Range { metric, lo, hi } => {
                 assert_eq!(metric, "iops");
-                assert!(
-                    lo > hi,
-                    "constructor does not reorder bounds: lo={lo}, hi={hi}",
-                );
+                assert_eq!(lo, 50.0);
+                assert_eq!(hi, 50.0);
             }
             _ => panic!("expected Range variant"),
         }
+    }
+
+    /// NaN as either bound trips the `lo <= hi` gate (NaN comparisons
+    /// always return false), so the constructor panics. Prevents an
+    /// always-fails check from slipping into the evaluator pipeline.
+    #[test]
+    #[should_panic(expected = "lo must be <= hi")]
+    fn check_range_nan_lo_panics() {
+        let _ = MetricCheck::range("iops", f64::NAN, 50.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "lo must be <= hi")]
+    fn check_range_nan_hi_panics() {
+        let _ = MetricCheck::range("iops", 50.0, f64::NAN);
     }
 
     // Debug + helper method surface.
@@ -1759,9 +1792,11 @@ mod tests {
             ],
             metric_bounds: None,
         };
-        let bytes = serde_json::to_vec(&original).expect("RawPayloadOutput must always serialize");
-        let restored: RawPayloadOutput =
-            serde_json::from_slice(&bytes).expect("wire format must round-trip");
+        let bytes = bincode::serde::encode_to_vec(&original, bincode::config::standard())
+            .expect("RawPayloadOutput must always bincode-serialize");
+        let (restored, _consumed): (RawPayloadOutput, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("wire format must round-trip");
 
         assert_eq!(restored.payload_index, original.payload_index);
         assert_eq!(

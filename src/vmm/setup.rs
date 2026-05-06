@@ -199,7 +199,7 @@ impl KtstrVm {
         //    hands the open `File` to the `VirtioBlk` device. See
         //    [`crate::vmm::disk_template`] module docs.
         let backing = if let Some(staging) = self.template_staging_image.as_ref() {
-            std::fs::OpenOptions::new()
+            let f = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(staging)
@@ -208,7 +208,22 @@ impl KtstrVm {
                         "open template staging image {} for virtio-blk",
                         staging.display(),
                     )
-                })?
+                })?;
+            // Enforce the file-size = advertised-capacity invariant.
+            // The in-tree caller (`disk_template::build_template_via_vm`)
+            // sizes the staging file via
+            // `create_and_size_staging_image` before invoking the
+            // builder, so this is normally a no-op. Calling `set_len`
+            // here makes the contract local to the device-init path
+            // — a caller-supplied staging image that is too small or
+            // too large is normalised to `capacity` instead of
+            // letting virtio-blk advertise a size that disagrees with
+            // the backing file. Sparse-file semantics match the Raw
+            // branch above: holes don't consume disk space until
+            // written.
+            f.set_len(capacity)
+                .context("set template staging image length to capacity")?;
+            f
         } else {
             match disk.filesystem {
                 disk_config::Filesystem::Raw => {
@@ -697,7 +712,6 @@ impl KtstrVm {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
-
         };
         let min_mb = initramfs_min_memory_mb(&budget);
         if memory_mb < min_mb {
@@ -772,7 +786,6 @@ impl KtstrVm {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
-
         };
         let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
         tracing::debug!(
@@ -1072,7 +1085,6 @@ impl KtstrVm {
         //   pci=off              — no PCI devices emulated; shave boot time by skipping the scan.
         //   reboot=k             — use keyboard-controller reset method.
         //   panic=-1             — reboot immediately on panic; host detects via exit.
-        //   nokaslr              — deterministic kernel addresses for symbol/offset resolution.
         //   lockdown=none        — permit /dev/mem and unrestricted BPF needed by the test runtime.
         //   sysctl.kernel.unprivileged_bpf_disabled=0 — allow BPF load from the test runtime.
         //   sysctl.kernel.sched_schedstats=1          — enable /proc/schedstat for workload reports.
@@ -1111,7 +1123,7 @@ impl KtstrVm {
             "no_timer_check clocksource=kvm-clock ",
             "random.trust_cpu=on swiotlb=noforce ",
             "i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd ",
-            "pci=off reboot=k panic=-1 nokaslr lockdown=none ",
+            "pci=off reboot=k panic=-1 lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
             "delayacct ",
@@ -1390,7 +1402,6 @@ impl KtstrVm {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
-
         };
         let min_mb = initramfs_min_memory_mb(&budget);
         if memory_mb < min_mb {
@@ -1457,7 +1468,6 @@ impl KtstrVm {
             uncompressed_initramfs_bytes: uncompressed_size as u64,
             compressed_initrd_bytes: compressed_size as u64,
             kernel_init_size,
-
         };
         let memory_mb = initramfs_min_memory_mb(&budget).max(self.memory_min_mb);
         tracing::debug!(
@@ -1502,7 +1512,7 @@ impl KtstrVm {
             "console=ttyS0 ",
             "nomodules mitigations=off ",
             "random.trust_cpu=on swiotlb=noforce ",
-            "panic=-1 nokaslr lockdown=none ",
+            "panic=-1 lockdown=none ",
             "sysctl.kernel.unprivileged_bpf_disabled=0 ",
             "sysctl.kernel.sched_schedstats=1 ",
             "delayacct sysctl.kernel.task_delayacct=1 ",
@@ -1526,6 +1536,19 @@ impl KtstrVm {
         }
         if self.init_binary.is_some() {
             cmdline.push_str(" rdinit=/init initramfs_options=size=90%");
+        }
+        // Auto-mount tokens for the configured disk. aarch64 advertises
+        // the virtio-blk MMIO transport via FDT (see
+        // `create_fdt(..., !self.disks.is_empty(), ...)` below), so the
+        // `virtio_mmio.device=` cmdline form used on x86_64 is omitted.
+        // The `KTSTR_DISK0_*` tokens, however, are env-style markers
+        // consumed by the guest init at
+        // `crate::vmm::rust_init::auto_mount_data_disks` — they are
+        // arch-neutral and required on aarch64 for the same auto-mount
+        // contract as x86_64.
+        if !self.disks.is_empty() {
+            let disk = &self.disks[0];
+            cmdline.push_str(&disk_auto_mount_cmdline_tokens(disk));
         }
         if self.topology.has_memory_only_nodes() {
             cmdline.push_str(" numa_balancing=enable");

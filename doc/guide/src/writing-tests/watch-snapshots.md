@@ -21,7 +21,8 @@ use [`Op::snapshot`](snapshots.md) instead.
 
 The full pipeline is implemented and tested end-to-end:
 
-1. `Op::watch_snapshot(symbol)` registers the symbol via SHM.
+1. `Op::watch_snapshot(symbol)` registers the symbol via the
+   virtio-console port 1 `MSG_TYPE_SNAPSHOT_REQUEST` TLV frame.
 2. The freeze coordinator resolves the KVA from the vmlinux ELF,
    validates 4-byte alignment, and arms a free user watchpoint slot
    via `KVM_SET_GUEST_DEBUG`.
@@ -71,7 +72,8 @@ produces one capture, tagged with the symbol path itself.
 > automatically.** Use `post_vm` to read captures from
 > `VmResult::snapshot_bridge`. Do **not** install a thread-local
 > bridge inside the scenario function — the in-VM
-> `Op::watch_snapshot` registers via SHM, the host coordinator
+> `Op::watch_snapshot` registers via the virtio-console port 1
+> `MSG_TYPE_SNAPSHOT_REQUEST` TLV frame, the host coordinator
 > arms the watchpoint and stores captures on the bridge it owns,
 > and the test reads them after the VM exits.
 >

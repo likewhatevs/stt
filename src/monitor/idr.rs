@@ -68,6 +68,18 @@ pub(crate) fn xa_load(
     let mut shift = xa_node_shift(mem, page_offset, node_kva, shift_off);
 
     loop {
+        // Guest-supplied shift is read from `xa_node.shift` (u8) so the
+        // attacker controls 0..=255. `index >> shift` is UB in Rust when
+        // `shift >= 64` (debug panic, release wrap), so refuse to deref a
+        // node whose advertised shift is out of range. A real kernel-side
+        // xa_node never holds shift >= 64 (XA_CHUNK_SHIFT is 6 and the
+        // tree depth is bounded by ulong width), so a value here means
+        // either guest memory corruption or a hostile guest writing a
+        // crafted xa_node — return Some(0) to surface "no entry" rather
+        // than tripping the host on bogus input.
+        if shift >= 64 {
+            return Some(0);
+        }
         let slot_idx = (index >> shift) & (XA_CHUNK_SIZE - 1);
         let slot_pa = kva_to_pa(node_kva + slots_off as u64 + slot_idx * 8, page_offset);
         let entry = mem.read_u64(slot_pa, 0);

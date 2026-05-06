@@ -21,13 +21,17 @@
 //!     drain is also capped (`TX_PER_CALL_MAX`) so a hostile guest
 //!     cannot grow the host accumulator without bound on a single
 //!     notify.
-//!   * Host→guest RX (port 0 + port 1): unbounded by design. Pending
-//!     bytes accumulate in `port0_pending_rx` / `port1_pending_rx`
-//!     until a guest descriptor chain is available. The host alone
-//!     produces these bytes (kernel scheduler signals, terminal
-//!     paste, snapshot replies), so a hostile guest cannot grow them.
-//!     Losing a host→guest byte would silently strand a wake signal
-//!     or truncate a reply, which is worse than a host-side OOM.
+//!   * Host→guest RX (port 0 + port 1): the byte accumulators
+//!     (`port0_pending_rx` / `port1_pending_rx`) are unbounded by
+//!     design — the host alone produces these bytes (kernel scheduler
+//!     signals, terminal paste, snapshot replies), so a hostile guest
+//!     cannot grow them; losing a host→guest byte would silently
+//!     strand a wake signal or truncate a reply, which is worse than
+//!     a host-side OOM. The per-call CHAIN drain is capped
+//!     (`RX_CHAINS_PER_CALL_MAX`) so a hostile guest publishing many
+//!     zero-progress descriptor chains cannot hold the vCPU MMIO
+//!     handler in `drain_port{0,1}_pending_rx` for an unbounded number
+//!     of iterations on a single notify.
 //!
 //! Features: `VIRTIO_F_VERSION_1 | VIRTIO_CONSOLE_F_MULTIPORT`.
 //! Config space: `cols=0, rows=0, max_nr_ports=2, emerg_wr=0` (cols/rows
@@ -148,6 +152,27 @@ const TX_PER_CALL_MAX: usize = 256 * 1024;
 /// adversarial case.
 const CONTROL_CHAINS_PER_CALL_MAX: usize = 32;
 
+/// Maximum host→guest RX chains drained per `drain_port0_pending_rx`
+/// or `drain_port1_pending_rx` call. Unlike TX (byte-driven via
+/// `TX_PER_CALL_MAX`), RX progress is chain-shaped: each chain
+/// absorbs `min(pending_rx_len, sum_of_write_only_desc_lens)`
+/// bytes. A hostile guest publishing many zero-length write-only
+/// descriptors (or chains lacking any write-only desc — unusual
+/// but legal) makes `consumed_offset` stay 0; the `drain(..0)`
+/// at the bottom of the loop is then a no-op and the outer
+/// `while !pending_rx.is_empty()` reissues `pop_descriptor_chain`
+/// without progress until the avail ring is exhausted. With
+/// `QUEUE_MAX_SIZE = 256` chains × 256 descriptors per chain that's
+/// ~65k iterations per notify, parked on a vCPU thread that is
+/// expected to bound MMIO-handler latency. Cap drains at 64 chains
+/// per call: legitimate traffic posts a small number of multi-KB
+/// chains (kernel virtio-console driver allocates PAGE_SIZE buffers
+/// per chain for hvc0, larger for `/dev/vport0p1`); 64 is well
+/// above any single-notify legitimate fan-out while still bounding
+/// the adversarial latency. Remaining chains stay in the avail
+/// ring for the next QUEUE_NOTIFY (or the next host-side push).
+const RX_CHAINS_PER_CALL_MAX: usize = 64;
+
 /// Status bits required before each phase.
 const S_ACK: u32 = VIRTIO_CONFIG_S_ACKNOWLEDGE;
 const S_DRV: u32 = S_ACK | VIRTIO_CONFIG_S_DRIVER;
@@ -220,9 +245,9 @@ enum ControlOut {
     /// (drivers/char/virtio_console.c `handle_control_message`
     /// PORT_NAME case) computes `name_size = buf->len - buf->offset
     /// - sizeof(*cpkt) + 1` and `strscpy`s into a kmalloc'd buffer,
-    /// which works either way but expects the QEMU layout. Sending
-    /// the NUL keeps the wire format byte-identical to QEMU so any
-    /// downstream tooling that snoops the frame sees the same shape.
+    ///   which works either way but expects the QEMU layout. Sending
+    ///   the NUL keeps the wire format byte-identical to QEMU so any
+    ///   downstream tooling that snoops the frame sees the same shape.
     Name { id: u32, name: &'static str },
 }
 
@@ -559,8 +584,7 @@ impl VirtioConsole {
                             self.tx_scratch.resize(dlen, 0);
                             match mem.read_slice(&mut self.tx_scratch, guest_addr) {
                                 Ok(()) => {
-                                    self.port1_tx_buf
-                                        .extend(self.tx_scratch.iter().copied());
+                                    self.port1_tx_buf.extend(self.tx_scratch.iter().copied());
                                     true
                                 }
                                 Err(e) => {
@@ -579,7 +603,25 @@ impl VirtioConsole {
                         }
                         _ => unreachable!("process_tx_into called on non-tx queue {queue_idx}"),
                     };
-                    if read_ok {
+                    // Gate had_data and cumulative_bytes on dlen > 0.
+                    // A zero-length descriptor's read_slice trivially
+                    // succeeds (read_ok = true) but contributes no
+                    // bytes — neither cumulative_bytes (which feeds
+                    // the per-call cap at TX_PER_CALL_MAX) nor the
+                    // accumulator grows. Setting had_data=true on a
+                    // zero-byte chain would still trigger
+                    // signal_used (IRQ to guest) and the tx_evt
+                    // wake — a hostile guest publishing N
+                    // zero-length chains gets N IRQs without any
+                    // host-observable byte progress, an
+                    // amplification primitive that bypasses the
+                    // TX_PER_CALL_MAX bound (cumulative_bytes stays
+                    // 0 forever). The kernel's virtio_console TX
+                    // path always emits non-empty data segments
+                    // (drivers/char/virtio_console.c
+                    // __send_to_port via sg_set_buf with non-zero
+                    // length), so legitimate guests are unaffected.
+                    if read_ok && dlen > 0 {
                         had_data = true;
                         cumulative_bytes = cumulative_bytes.saturating_add(dlen);
                     }
@@ -641,6 +683,133 @@ impl VirtioConsole {
         let _ = self.process_tx_into(PORT1_TXQ, "port1");
     }
 
+    /// Drain-only TX walk for the device-reset path. Pops pending
+    /// avail-ring chains for `queue_idx`, copies their bytes into the
+    /// matching `port{0,1}_tx_buf`, and `add_used`s each chain — but
+    /// emits NO `signal_used` (no IRQ to a guest that is rebooting)
+    /// and NO `tx_evt.write` (no host wake; `collect_results`'s
+    /// `final_drain` walks the buffer synchronously after the
+    /// coordinator has already exited).
+    ///
+    /// Reset is called from `mmio_write` while the vCPU thread holds
+    /// the device's outer mutex. Calling `process_tx_into` here would
+    /// fire `tx_evt`, waking the freeze coordinator's TOKEN_TX handler
+    /// which races to acquire the same mutex — a lock-contention
+    /// feedback loop under burst workloads where 16 workers / 8 vCPUs
+    /// flood the bulk port. The drain-only variant breaks the loop:
+    /// the coord is never woken about a drain it doesn't need to do
+    /// (the bytes are already captured for `final_drain` to surface).
+    ///
+    /// The DRIVER_OK and F_MULTIPORT gates from `process_tx_into` are
+    /// preserved verbatim — `reset()` invokes this BEFORE clearing
+    /// `device_status` and `driver_features`, so both gates pass on
+    /// the legitimate reboot path. Calling this method post-reset
+    /// (when both gates would fail) is a no-op, mirroring
+    /// `process_tx_into`'s behaviour.
+    ///
+    /// Per-call byte cap (`TX_PER_CALL_MAX`) is preserved as a
+    /// defensive bound against a hostile guest that publishes a
+    /// massive avail-ring backlog right before the reboot — the
+    /// remainder is left in the avail ring and is unreachable post-
+    /// reset (queue GPAs get reset to sentinels), exactly the same
+    /// data-loss surface as before this change. Test runs with the
+    /// kernel's virtio_console driver never exercise this bound on
+    /// the reset path; the cap is hostile-guest defence-in-depth.
+    fn drain_tx_into_capture_buf(&mut self, queue_idx: usize, port_label: &'static str) {
+        if self.device_status & VIRTIO_CONFIG_S_DRIVER_OK == 0 {
+            return;
+        }
+        if queue_idx == PORT1_TXQ && !self.multiport_negotiated() {
+            return;
+        }
+        let mem = match self.mem.as_ref() {
+            Some(m) => m,
+            None => return,
+        };
+        let mut cumulative_bytes: usize = 0;
+        let q = &mut self.queues[queue_idx];
+        while let Some(chain) = q.pop_descriptor_chain(mem) {
+            let head = chain.head_index();
+            for desc in chain {
+                if !desc.is_write_only() {
+                    let guest_addr = desc.addr();
+                    let dlen = (desc.len() as usize).min(TX_DESC_MAX);
+                    let read_ok = match queue_idx {
+                        PORT0_TXQ => {
+                            let dst = &mut self.port0_tx_buf;
+                            let start = dst.len();
+                            dst.resize(start + dlen, 0);
+                            match mem.read_slice(&mut dst[start..], guest_addr) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    dst.truncate(start);
+                                    tracing::warn!(
+                                        port = port_label,
+                                        head,
+                                        dlen,
+                                        %e,
+                                        "virtio-console reset-drain: read_slice failed \
+                                         (descriptor addr likely unmapped); dropping \
+                                         segment from this chain"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        PORT1_TXQ => {
+                            self.tx_scratch.clear();
+                            self.tx_scratch.resize(dlen, 0);
+                            match mem.read_slice(&mut self.tx_scratch, guest_addr) {
+                                Ok(()) => {
+                                    self.port1_tx_buf.extend(self.tx_scratch.iter().copied());
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        port = port_label,
+                                        head,
+                                        dlen,
+                                        %e,
+                                        "virtio-console reset-drain: read_slice failed \
+                                         (descriptor addr likely unmapped); dropping \
+                                         segment from this chain"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        _ => unreachable!(
+                            "drain_tx_into_capture_buf called on non-tx queue {queue_idx}"
+                        ),
+                    };
+                    if read_ok && dlen > 0 {
+                        cumulative_bytes = cumulative_bytes.saturating_add(dlen);
+                    }
+                }
+            }
+            if let Err(e) = q.add_used(mem, head, 0) {
+                tracing::warn!(
+                    port = port_label,
+                    head,
+                    %e,
+                    "virtio-console reset-drain: add_used failed (used-ring \
+                     address likely unmapped); descriptor leaks but the guest \
+                     is rebooting so the leak has no observer"
+                );
+            }
+            if cumulative_bytes >= TX_PER_CALL_MAX {
+                tracing::debug!(
+                    port = port_label,
+                    cumulative_bytes,
+                    cap = TX_PER_CALL_MAX,
+                    "virtio-console reset-drain: per-call byte cap reached; \
+                     remaining chains lost to queue reset"
+                );
+                break;
+            }
+        }
+    }
+
     /// Return and clear accumulated port-0 TX output (guest console →
     /// host stdout).
     ///
@@ -668,6 +837,37 @@ impl VirtioConsole {
         let cap = self.port1_tx_buf.capacity().min(256 * 1024);
         let old = std::mem::replace(&mut self.port1_tx_buf, VecDeque::with_capacity(cap));
         Vec::from(old)
+    }
+
+    /// Final post-VM-exit port-1 TX drain. Walks the avail ring once
+    /// to convert any descriptor chains the guest published without
+    /// a corresponding QUEUE_NOTIFY MMIO arrival into bytes in
+    /// `port1_tx_buf`, then returns the accumulated buffer.
+    ///
+    /// `pub fn drain_bulk` alone catches only what `process_tx_into`
+    /// has already deposited; on the eevdf-style failure path the
+    /// guest writes a `MSG_TYPE_LIFECYCLE` and a `MSG_TYPE_EXIT`
+    /// frame to `/dev/vport0p1` and immediately calls `force_reboot`,
+    /// and the userspace write's `virtqueue_kick` MMIO can lag
+    /// behind so the chains land in the avail ring without a
+    /// matching host-side notify. A single explicit
+    /// `process_tx_into` call from the host side picks them up.
+    ///
+    /// Synchronous call from `collect_results`; the underlying
+    /// `process_tx_into` is the same code path MMIO QUEUE_NOTIFY
+    /// uses, including the per-call `TX_PER_CALL_MAX` byte cap and
+    /// the `DRIVER_OK` / `F_MULTIPORT` gates. If the guest already
+    /// wrote 0 to VIRTIO_MMIO_STATUS, [`Self::reset`] has run; that
+    /// path drains both ports' TX queues via
+    /// [`Self::drain_tx_into_capture_buf`] at its top (before the
+    /// `device_status = 0` clobber and the `Queue::reset` GPA
+    /// clobber) so any chains pending at reset time are already in
+    /// `port1_tx_buf`. The `process_port1_tx` call below short-
+    /// circuits on `DRIVER_OK == 0` and `drain_bulk` returns the
+    /// captured bytes.
+    pub(crate) fn final_drain(&mut self) -> Vec<u8> {
+        self.process_port1_tx();
+        self.drain_bulk()
     }
 
     /// Push raw bytes back onto the head of the port-1 TX buffer.
@@ -773,6 +973,7 @@ impl VirtioConsole {
         }
         let q = &mut self.queues[PORT0_RXQ];
         let mut total_written = 0u32;
+        let mut chains_drained = 0usize;
         while !self.port0_pending_rx.is_empty() {
             let Some(chain) = q.pop_descriptor_chain(mem) else {
                 break;
@@ -850,6 +1051,25 @@ impl VirtioConsole {
             }
             self.port0_pending_rx.drain(..consumed_offset);
             total_written += written;
+            chains_drained += 1;
+            // Per-call chain count cap: bound the per-vCPU
+            // MMIO-handler latency under a hostile guest that
+            // publishes many zero-progress chains (zero-length or
+            // missing-write-only descriptors). Remaining chains
+            // stay in the avail ring; the next QUEUE_NOTIFY (or the
+            // next host-side push) picks them up. Mirrors the
+            // `CONTROL_CHAINS_PER_CALL_MAX` pattern in
+            // `process_control_tx`.
+            if chains_drained >= RX_CHAINS_PER_CALL_MAX {
+                tracing::debug!(
+                    chains_drained,
+                    cap = RX_CHAINS_PER_CALL_MAX,
+                    pending = self.port0_pending_rx.len(),
+                    "virtio-console drain_port0_pending_rx: per-call chain \
+                     cap reached; remaining chains deferred to next notify"
+                );
+                break;
+            }
         }
         if total_written > 0 {
             tracing::debug!(
@@ -935,6 +1155,7 @@ impl VirtioConsole {
         }
         let q = &mut self.queues[PORT1_RXQ];
         let mut total_written = 0u32;
+        let mut chains_drained = 0usize;
         while !self.port1_pending_rx.is_empty() {
             let Some(chain) = q.pop_descriptor_chain(mem) else {
                 break;
@@ -1009,6 +1230,23 @@ impl VirtioConsole {
             }
             self.port1_pending_rx.drain(..consumed_offset);
             total_written += written;
+            chains_drained += 1;
+            // Per-call chain count cap: bound the per-vCPU
+            // MMIO-handler latency under a hostile guest that
+            // publishes many zero-progress chains. Mirrors the
+            // port-0 RX path and `CONTROL_CHAINS_PER_CALL_MAX` in
+            // `process_control_tx`. Remaining chains stay in the
+            // avail ring for the next notify.
+            if chains_drained >= RX_CHAINS_PER_CALL_MAX {
+                tracing::debug!(
+                    chains_drained,
+                    cap = RX_CHAINS_PER_CALL_MAX,
+                    pending = self.port1_pending_rx.len(),
+                    "virtio-console drain_port1_pending_rx: per-call chain \
+                     cap reached; remaining chains deferred to next notify"
+                );
+                break;
+            }
         }
         if total_written > 0 {
             tracing::debug!(
@@ -1046,6 +1284,15 @@ impl VirtioConsole {
         // Move work into local Vec so we can release the queue borrow
         // before calling back into self for control_out enqueue.
         let mut events: Vec<VirtioConsoleControl> = Vec::new();
+        // Track whether any add_used call succeeded so the
+        // unconditional `signal_used` below becomes conditional —
+        // mirrors `drain_control_in`'s `any_published` discipline.
+        // A QUEUE_NOTIFY that finds the avail ring empty pops zero
+        // chains, publishes zero used entries, and must NOT raise
+        // an interrupt: an unprovoked irq turns every spurious
+        // notify into work for the guest's vring_interrupt path
+        // (which then re-checks an empty used ring and returns).
+        let mut any_published = false;
         {
             let mem = match self.mem.as_ref() {
                 Some(m) => m,
@@ -1080,13 +1327,16 @@ impl VirtioConsole {
                 {
                     events.push(c);
                 }
-                if let Err(e) = q.add_used(mem, head, total) {
-                    tracing::warn!(
-                        head,
-                        total,
-                        %e,
-                        "virtio-console c_ovq add_used failed"
-                    );
+                match q.add_used(mem, head, total) {
+                    Ok(()) => any_published = true,
+                    Err(e) => {
+                        tracing::warn!(
+                            head,
+                            total,
+                            %e,
+                            "virtio-console c_ovq add_used failed"
+                        );
+                    }
                 }
                 chains_drained += 1;
                 // Per-call chain count cap: bound the per-vCPU
@@ -1109,11 +1359,18 @@ impl VirtioConsole {
         for c in events {
             self.handle_control_event(c);
         }
-        // Always ensure the guest sees an irq for any used-ring
-        // entries we just published, then attempt to push pending
+        // Only kick the guest when the used ring actually advanced —
+        // if no chain was popped (empty avail ring) or every add_used
+        // failed, there is nothing for the guest to consume. Mirrors
+        // the `if any_published { self.signal_used(); }` gate at the
+        // tail of `drain_control_in`. Then attempt to push pending
         // outbound control messages onto c_ivq (which may have been
-        // refilled by the guest after this notify).
-        self.signal_used();
+        // refilled by the guest after this notify) — `drain_control_in`
+        // owns its own conditional `signal_used` so it remains correct
+        // even when this branch skipped the kick.
+        if any_published {
+            self.signal_used();
+        }
         self.drain_control_in();
     }
 
@@ -1717,14 +1974,48 @@ impl VirtioConsole {
     }
 
     fn reset(&mut self) {
+        // Drain pending guest TX chains BEFORE clearing device state.
+        // The kernel's `kernel_restart` → `device_shutdown` path on
+        // `force_reboot()` writes 0 to `VIRTIO_MMIO_STATUS` (the
+        // caller of this reset) after the userspace `send_exit` /
+        // `send_lifecycle` writes have published descriptor chains
+        // into the avail ring but before the host has observed the
+        // matching QUEUE_NOTIFY MMIO. Once we run the field-clear
+        // sequence below, the queue's `desc_table` / `avail_ring`
+        // GuestAddresses are reset to virtio-queue 0.17.0's
+        // `DEFAULT_*_ADDR` sentinels (see `Queue::reset` in the
+        // virtio-queue crate), making the original avail-ring GPA
+        // unreachable. Walk both ports' TX queues here while their
+        // GPAs and the DRIVER_OK / F_MULTIPORT gates are still
+        // valid; the bytes land in `port{0,1}_tx_buf`, which we
+        // deliberately do NOT clear below so `collect_results`'s
+        // `final_drain` can still surface them.
+        //
+        // `drain_tx_into_capture_buf` is the side-effect-free variant
+        // of `process_tx_into` — no `signal_used` (the rebooting
+        // guest will not consume the IRQ), no `tx_evt.write` (the
+        // freeze coordinator must NOT be woken to drain the bulk
+        // port here: this reset call site already holds the device's
+        // outer mutex, and the coord's TOKEN_TX handler races to
+        // acquire the same mutex when `tx_evt` fires — under burst
+        // workloads where 16 workers / 8 vCPUs flood the port, that
+        // wake-and-block pattern stalls coord teardown for the
+        // duration of every reset-time drain). The captured bytes
+        // are surfaced post-reset via `final_drain` instead.
+        self.drain_tx_into_capture_buf(PORT0_TXQ, "port0");
+        self.drain_tx_into_capture_buf(PORT1_TXQ, "port1");
         self.device_status = 0;
         self.interrupt_status = 0;
         self.queue_select = 0;
         self.device_features_sel = 0;
         self.driver_features_sel = 0;
         self.driver_features = 0;
-        self.port0_tx_buf.clear();
-        self.port1_tx_buf.clear();
+        // `port0_tx_buf` and `port1_tx_buf` are host-side capture
+        // buffers; clearing them here would discard bytes the guest
+        // already published but the host hasn't drained yet. Pending
+        // RX buffers are queue-side (host-prepared bytes waiting to
+        // travel back into the guest's RX ring) and have no
+        // post-reset consumer, so they are still cleared.
         self.port0_pending_rx.clear();
         self.port1_pending_rx.clear();
         self.control_out.clear();
@@ -1741,6 +2032,7 @@ impl VirtioConsole {
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+    use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use virtio_bindings::virtio_mmio::VIRTIO_MMIO_INT_CONFIG;
     use virtio_queue::desc::{RawDescriptor, split::Descriptor as SplitDescriptor};
     use virtio_queue::mock::MockSplitQueue;
@@ -2095,8 +2387,20 @@ mod tests {
         assert_eq!(dev.queue_select, 0);
         assert_eq!(dev.device_features_sel, 0);
         assert_eq!(dev.driver_features, 0);
-        assert!(dev.port0_tx_buf.is_empty(), "port0_tx_buf must be cleared");
-        assert!(dev.port1_tx_buf.is_empty(), "port1_tx_buf must be cleared");
+        // `port{0,1}_tx_buf` survive reset by design — they are
+        // host-side capture buffers `collect_results` drains via
+        // `final_drain` after the guest's reboot path has clobbered
+        // device state. The pre-existing leftover bytes must remain
+        // observable so the post-reset drain still surfaces them.
+        assert_eq!(
+            dev.port0_tx_buf, b"leftover0",
+            "port0_tx_buf must survive reset (host-side capture buffer)"
+        );
+        assert_eq!(
+            dev.port1_tx_buf.iter().copied().collect::<Vec<u8>>(),
+            b"leftover1",
+            "port1_tx_buf must survive reset (host-side capture buffer)"
+        );
         assert_eq!(dev.port_opened, [false; NUM_PORTS as usize]);
         assert!(!dev.device_ready);
         assert_eq!(dev.port_readied, [false; NUM_PORTS as usize]);
@@ -2396,9 +2700,14 @@ mod tests {
     // The handler-level tests above bypass the queue walker and only
     // pin MMIO/FSM/control surface; these tests pin the production
     // bulk TX path the host-side `bulk_drain` consumer depends on.
-    // Per CLAUDE.md VMM convergence: "chain-level MockSplitQueue
-    // tests mandatory — exercises the actual process_requests
-    // production path through descriptor chains."
+    // Chain-level MockSplitQueue coverage is mandatory because the
+    // chain-parsing logic is the highest-risk code on the bulk path:
+    // a hostile or malformed chain that handler-level tests can't
+    // construct (multi-segment, mixed-direction, length-cap edges)
+    // is exactly what the production `process_tx_into` walker has
+    // to reject without panicking. Without these chain tests every
+    // chain-shape regression has to wait for an end-to-end VM run
+    // to surface.
     // ----------------------------------------------------------------
 
     /// Single-descriptor TX chain on port 1: one device-readable
@@ -2970,6 +3279,1529 @@ mod tests {
             "used.idx must be 9 after second notify — every chain \
              eventually drains, the cap only spreads them across \
              multiple notifies"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Hostile-guest control message defenses (handle_control_event).
+    //
+    // The kernel's virtio-console driver
+    // (drivers/char/virtio_console.c `virtcons_probe`) sends
+    // DEVICE_READY exactly once and PORT_READY exactly once per port.
+    // A hostile or buggy guest that re-sends either message would
+    // re-enqueue PORT_ADD / CONSOLE_PORT / PORT_OPEN / PORT_NAME and
+    // grow `control_out` without bound, exhausting host memory. The
+    // device gates each repeat behind `device_ready` / `port_readied`
+    // flags; these tests pin the gates against regressions.
+    // ----------------------------------------------------------------
+
+    /// DEVICE_READY repeats must be ignored — the second message
+    /// must NOT enqueue a second batch of PORT_ADD frames. Pins the
+    /// `if self.device_ready` early-return at handle_control_event
+    /// (the DEVICE_READY arm). Without the gate, a guest spamming
+    /// DEVICE_READY would grow `control_out` by NUM_PORTS entries
+    /// per message until the host OOMs.
+    #[test]
+    fn handle_device_ready_repeat_ignored() {
+        let mut dev = VirtioConsole::new();
+        // First DEVICE_READY: enqueues NUM_PORTS PORT_ADD frames.
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0,
+            event: VIRTIO_CONSOLE_DEVICE_READY,
+            value: 1,
+        });
+        assert!(dev.device_ready, "device_ready must be set after first message");
+        let after_first = dev.control_out.len();
+        assert_eq!(
+            after_first, NUM_PORTS as usize,
+            "first DEVICE_READY must enqueue exactly NUM_PORTS PORT_ADD frames",
+        );
+
+        // Second DEVICE_READY: the gate must reject; control_out
+        // must NOT grow.
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0,
+            event: VIRTIO_CONSOLE_DEVICE_READY,
+            value: 1,
+        });
+        assert_eq!(
+            dev.control_out.len(),
+            after_first,
+            "DEVICE_READY repeat must be a no-op — control_out length must \
+             remain at NUM_PORTS, otherwise a hostile guest can grow it \
+             unboundedly",
+        );
+        // device_ready stays true — the repeat does not flip it back.
+        assert!(dev.device_ready, "device_ready must remain set after repeat");
+    }
+
+    /// PORT_READY repeat for the same port must be ignored — the
+    /// second message must NOT re-enqueue
+    /// CONSOLE_PORT/PORT_NAME/PORT_OPEN. Pins the
+    /// `if self.port_readied[id as usize]` early-return at
+    /// handle_control_event (the PORT_READY arm). Mirrors the
+    /// DEVICE_READY gate but per-port — readying port 0 twice would
+    /// otherwise enqueue 6 frames (3 per call) instead of 3.
+    #[test]
+    fn handle_port_ready_repeat_ignored_port0() {
+        let mut dev = VirtioConsole::new();
+        // First PORT_READY for port 0: enqueues 3 frames
+        // (CONSOLE_PORT, PORT_NAME, PORT_OPEN).
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 1,
+        });
+        assert!(dev.port_readied[0], "port_readied[0] must be set after first PORT_READY");
+        let after_first = dev.control_out.len();
+        assert_eq!(
+            after_first, 3,
+            "first PORT_READY for port 0 must enqueue 3 frames \
+             (CONSOLE_PORT, PORT_NAME, PORT_OPEN)",
+        );
+
+        // Second PORT_READY for port 0: the gate must reject;
+        // control_out must NOT grow.
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 1,
+        });
+        assert_eq!(
+            dev.control_out.len(),
+            after_first,
+            "PORT_READY repeat for the same port must be a no-op — \
+             control_out length must remain at 3, otherwise a hostile \
+             guest can re-enqueue announce frames unboundedly",
+        );
+    }
+
+    /// PORT_READY repeat for port 1 must be ignored — symmetric to
+    /// the port-0 case but exercises the port-1 branch (PORT_NAME
+    /// then PORT_OPEN, 2 frames per legitimate message). A regression
+    /// that scoped the gate per port-0 only would surface here.
+    #[test]
+    fn handle_port_ready_repeat_ignored_port1() {
+        let mut dev = VirtioConsole::new();
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 1,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 1,
+        });
+        assert!(dev.port_readied[1]);
+        let after_first = dev.control_out.len();
+        assert_eq!(
+            after_first, 2,
+            "first PORT_READY for port 1 must enqueue 2 frames (PORT_NAME, PORT_OPEN)",
+        );
+
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 1,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 1,
+        });
+        assert_eq!(
+            dev.control_out.len(),
+            after_first,
+            "PORT_READY repeat for port 1 must be a no-op",
+        );
+    }
+
+    /// PORT_READY for port 0 must NOT inhibit a subsequent PORT_READY
+    /// for port 1 — the gate is per-port, not global. Pins the array
+    /// indexing in `port_readied[id as usize]`. A regression that
+    /// used a single global flag would let only one port's announce
+    /// frames go through.
+    #[test]
+    fn handle_port_ready_per_port_not_global() {
+        let mut dev = VirtioConsole::new();
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 1,
+        });
+        let after_port0 = dev.control_out.len();
+        assert_eq!(after_port0, 3, "port 0 announce: 3 frames");
+
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 1,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 1,
+        });
+        // Now both ports have enqueued: 3 (port 0) + 2 (port 1) = 5.
+        assert_eq!(
+            dev.control_out.len(),
+            5,
+            "PORT_READY for port 1 after PORT_READY for port 0 must \
+             enqueue port 1's announce frames — the gate is per-port",
+        );
+        assert!(dev.port_readied[0]);
+        assert!(dev.port_readied[1]);
+    }
+
+    /// PORT_READY with value=0 must log an error and skip the
+    /// announce-frame enqueue. value=0 is the kernel's
+    /// `add_port` failed signal (drivers/char/virtio_console.c
+    /// `add_port` error path). Pins the early-return without
+    /// setting `port_readied[id]` so a future legitimate PORT_READY
+    /// (after recovery) is not blocked by the gate.
+    #[test]
+    fn handle_port_ready_value_zero_skipped() {
+        let mut dev = VirtioConsole::new();
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 0,
+        });
+        assert!(
+            dev.control_out.is_empty(),
+            "PORT_READY value=0 must NOT enqueue announce frames",
+        );
+        // port_readied[0] must remain false — the early-return for
+        // value=0 happens BEFORE the gate flag is set, so a future
+        // PORT_READY value=1 can still complete.
+        assert!(
+            !dev.port_readied[0],
+            "PORT_READY value=0 must NOT set port_readied — the kernel \
+             may legitimately retry with value=1 after the host fixes \
+             the underlying issue",
+        );
+    }
+
+    /// PORT_READY value=0 must NOT block a subsequent PORT_READY
+    /// value=1 from completing the handshake. Pins the rule that
+    /// the value=0 early-return precedes the `port_readied` flag
+    /// flip.
+    #[test]
+    fn handle_port_ready_value_zero_then_one_completes() {
+        let mut dev = VirtioConsole::new();
+        // value=0 first: skipped, no announce frames.
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 0,
+        });
+        assert!(dev.control_out.is_empty());
+        assert!(!dev.port_readied[0]);
+        // value=1 next: must fire the announce as normal.
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0,
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 1,
+        });
+        assert!(dev.port_readied[0]);
+        assert_eq!(
+            dev.control_out.len(),
+            3,
+            "PORT_READY value=1 after value=0 must enqueue the announce \
+             — the value=0 path must not poison the per-port gate",
+        );
+    }
+
+    /// PORT_READY for an unknown port id (>= NUM_PORTS) must be
+    /// ignored. The existing `handle_port_ready_unknown_port_ignored`
+    /// covers value=1; this pins the port id bounds check is the
+    /// outer gate (rejected before the value-check or repeat-check).
+    /// Verifies port_readied stays all-false and control_out is empty.
+    #[test]
+    fn handle_port_ready_unknown_port_state_unchanged() {
+        let mut dev = VirtioConsole::new();
+        dev.handle_control_event(VirtioConsoleControl {
+            id: NUM_PORTS, // first invalid id (NUM_PORTS == 2)
+            event: VIRTIO_CONSOLE_PORT_READY,
+            value: 1,
+        });
+        assert!(dev.control_out.is_empty());
+        assert_eq!(
+            dev.port_readied,
+            [false; NUM_PORTS as usize],
+            "unknown-port PORT_READY must not flip any port_readied flag",
+        );
+    }
+
+    /// PORT_OPEN for an unknown port id (>= NUM_PORTS) must be
+    /// ignored. Pins the `if id >= NUM_PORTS` gate at the head of
+    /// the PORT_OPEN arm. Without the gate, an out-of-bounds
+    /// `port_opened[id as usize]` index would panic with
+    /// "index out of bounds" — far worse than a tracing warning.
+    #[test]
+    fn handle_port_open_unknown_port_ignored() {
+        let mut dev = VirtioConsole::new();
+        // Try multiple invalid ids — anything >= NUM_PORTS.
+        dev.handle_control_event(VirtioConsoleControl {
+            id: NUM_PORTS,
+            event: VIRTIO_CONSOLE_PORT_OPEN,
+            value: 1,
+        });
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 0xFFFF_FFFF,
+            event: VIRTIO_CONSOLE_PORT_OPEN,
+            value: 1,
+        });
+        // No panic. `port_opened` stays at the initial all-false.
+        assert_eq!(
+            dev.port_opened,
+            [false; NUM_PORTS as usize],
+            "unknown-port PORT_OPEN must not flip any port_opened flag — \
+             the gate prevents out-of-bounds array access on a hostile id",
+        );
+    }
+
+    /// Unhandled c_ovq event values must be absorbed silently — the
+    /// `other` arm in handle_control_event logs a debug line and
+    /// returns. The kernel today only sends DEVICE_READY, PORT_READY,
+    /// and PORT_OPEN on c_ovq (drivers/char/virtio_console.c
+    /// `send_control_msg` callers); a future kernel may add new
+    /// event types. Pins that an unrecognised event does not panic,
+    /// does not enqueue control_out, and does not flip any FSM flag.
+    #[test]
+    fn handle_unhandled_event_absorbed() {
+        let mut dev = VirtioConsole::new();
+        // Pick events that are valid wire values but the device
+        // does not act on. PORT_ADD is the kernel's PORT_ADD —
+        // the host emits it (PORT_ADD on c_ivq), the guest does not
+        // send it back on c_ovq, so seeing it here is "the guest
+        // sent something we don't handle." PORT_REMOVE / RESIZE
+        // / PORT_NAME / CONSOLE_PORT round out the wire-defined
+        // events that hit the `other` arm.
+        let unhandled = [
+            VIRTIO_CONSOLE_PORT_ADD,
+            VIRTIO_CONSOLE_PORT_REMOVE,
+            VIRTIO_CONSOLE_CONSOLE_PORT,
+            VIRTIO_CONSOLE_RESIZE,
+            VIRTIO_CONSOLE_PORT_NAME,
+            // Completely synthetic event id — pins that even values
+            // beyond the wire-defined set fall through cleanly.
+            0xBEEF,
+        ];
+        for ev in unhandled {
+            dev.handle_control_event(VirtioConsoleControl {
+                id: 0,
+                event: ev,
+                value: 1,
+            });
+        }
+        // Nothing must have been enqueued, no FSM flag must have
+        // been flipped.
+        assert!(
+            dev.control_out.is_empty(),
+            "unhandled events must NOT enqueue control_out",
+        );
+        assert!(
+            !dev.device_ready,
+            "unhandled events must NOT flip device_ready",
+        );
+        assert_eq!(
+            dev.port_opened,
+            [false; NUM_PORTS as usize],
+            "unhandled events must NOT flip port_opened",
+        );
+        assert_eq!(
+            dev.port_readied,
+            [false; NUM_PORTS as usize],
+            "unhandled events must NOT flip port_readied",
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // set_status monotone defense.
+    //
+    // virtio-v1.2 §3.1.1 requires status bits to advance monotonically
+    // within a driver session — the driver MUST NOT clear bits except
+    // by writing 0 (which triggers reset). A hostile or buggy guest
+    // that clears bits mid-session would otherwise let the device
+    // backslide through the FSM (e.g. drop FEATURES_OK while
+    // queues are configured) and produce undefined behaviour.
+    //
+    // The handler enforces monotonicity via:
+    //   `if val & self.device_status != self.device_status { reject }`
+    // i.e. `val` must be a SUPERSET of `device_status`. These tests
+    // pin every facet of that check.
+    // ----------------------------------------------------------------
+
+    /// Clearing ACKNOWLEDGE alone must be rejected. Driver advances
+    /// to ACK, then writes 0 of all other bits while clearing ACK —
+    /// the monotone gate must reject because the new value is not
+    /// a superset of the current device_status.
+    #[test]
+    fn set_status_clear_acknowledge_rejected() {
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        assert_eq!(dev.device_status, S_ACK);
+        // Try to clear ACK by writing DRIVER alone (no ACK bit).
+        // val = DRIVER; current = ACK. val & current = 0 != ACK → reject.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, VIRTIO_CONFIG_S_DRIVER);
+        assert_eq!(
+            dev.device_status, S_ACK,
+            "writing a value that clears ACKNOWLEDGE must be rejected — \
+             monotone gate (virtio-v1.2 §3.1.1)",
+        );
+    }
+
+    /// Clearing DRIVER while keeping ACKNOWLEDGE must be rejected.
+    /// Driver advances to ACK | DRIVER, then writes ACK alone — the
+    /// monotone gate must reject because DRIVER would silently drop.
+    #[test]
+    fn set_status_clear_driver_keeps_ack_rejected() {
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        assert_eq!(dev.device_status, S_DRV);
+        // val = S_ACK; current = S_DRV (= ACK | DRIVER).
+        // val & current = ACK != DRV → reject.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        assert_eq!(
+            dev.device_status, S_DRV,
+            "writing ACK alone after advancing to DRIVER must be \
+             rejected — clears DRIVER bit",
+        );
+    }
+
+    /// Clearing FEATURES_OK from a fully-initialised device must be
+    /// rejected. Driver advances all the way to S_OK, then tries to
+    /// write S_FEAT (= ACK|DRIVER|FEATURES_OK, no DRIVER_OK) — the
+    /// monotone gate rejects because DRIVER_OK would be cleared.
+    #[test]
+    fn set_status_clear_driver_ok_rejected() {
+        let mut dev = VirtioConsole::new();
+        init_device(&mut dev);
+        assert_eq!(dev.device_status, S_OK);
+        // val = S_FEAT; current = S_OK. S_FEAT is missing DRIVER_OK.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
+        assert_eq!(
+            dev.device_status, S_OK,
+            "writing S_FEAT after S_OK must be rejected — \
+             clears DRIVER_OK",
+        );
+    }
+
+    /// Writing the SAME value (no new bits, no cleared bits) must
+    /// not panic and must leave device_status unchanged. This is
+    /// not a hostile case but it exercises the boundary: `val ==
+    /// device_status` is a superset of itself, so the monotone
+    /// gate does not reject; `new_bits == 0` then falls through to
+    /// the `_ => false` arm in the valid-transition match, which
+    /// rejects the write. Pins that the device is idempotent
+    /// against duplicate writes — the kernel does not retry, but
+    /// hostile guests might.
+    #[test]
+    fn set_status_idempotent_same_value_no_change() {
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        assert_eq!(dev.device_status, S_ACK);
+        // Re-write S_ACK — superset check passes (val==current),
+        // but no NEW bits, so the valid-transition match falls
+        // through to the catch-all rejection.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        assert_eq!(
+            dev.device_status, S_ACK,
+            "re-writing the same status must leave device_status \
+             unchanged — no advance, no regression",
+        );
+    }
+
+    /// Setting two new bits in one write (e.g. FEATURES_OK + DRIVER_OK
+    /// jumped together) must be rejected — the FSM advances one bit
+    /// at a time. Pins the `match new_bits` valid-transition arm:
+    /// only single-bit advances are accepted.
+    #[test]
+    fn set_status_two_bits_at_once_rejected() {
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        // val = S_OK = ACK|DRIVER|FEATURES_OK|DRIVER_OK; current = S_DRV.
+        // new_bits = FEATURES_OK | DRIVER_OK. The valid-transition
+        // match has no arm for the union; falls through to false.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+        assert_eq!(
+            dev.device_status, S_DRV,
+            "advancing two FSM bits at once (FEATURES_OK + DRIVER_OK) \
+             must be rejected — the FSM advances one bit at a time",
+        );
+    }
+
+    /// Writing a status value with an unrecognised bit set (e.g. an
+    /// undefined flag at 0x40) must be rejected. virtio-v1.2 §2.1
+    /// defines bits 0x01 (ACK), 0x02 (DRIVER), 0x04 (DRIVER_OK),
+    /// 0x08 (FEATURES_OK), 0x40 (NEEDS_RESET, device-set only),
+    /// 0x80 (FAILED). 0x10 and 0x20 are reserved. NEEDS_RESET (0x40)
+    /// is device-set only, so a guest that writes it is misbehaving;
+    /// the value is also a non-canonical FSM advance. Pins that
+    /// these unknown bits land in the `_ => false` valid arm and
+    /// device_status remains unchanged.
+    #[test]
+    fn set_status_unknown_bit_rejected() {
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        assert_eq!(dev.device_status, S_ACK);
+        // val = S_ACK | 0x10 (reserved/unknown bit). new_bits = 0x10.
+        // The valid-transition match has no arm for 0x10 → reject.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK | 0x10);
+        assert_eq!(
+            dev.device_status, S_ACK,
+            "writing a status with an unrecognised bit (0x10) must \
+             be rejected — only the defined ACK/DRIVER/FEATURES_OK/\
+             DRIVER_OK/FAILED transitions are accepted",
+        );
+    }
+
+    /// FAILED (bit 0x80) must be accepted on top of any FSM state.
+    /// virtio-v1.2 §2.1.1 — `virtio_add_status(dev,
+    /// VIRTIO_CONFIG_S_FAILED)` is the kernel's exit path on probe
+    /// failure (drivers/virtio/virtio.c). Pins the FAILED early-accept
+    /// branch in `set_status`. Verified at every FSM rung.
+    #[test]
+    fn set_status_failed_accepted_at_every_fsm_state() {
+        // From device_status = 0.
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, VIRTIO_CONFIG_S_FAILED);
+        assert_eq!(
+            dev.device_status, VIRTIO_CONFIG_S_FAILED,
+            "FAILED from status=0 must be accepted",
+        );
+
+        // From device_status = ACK.
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK | VIRTIO_CONFIG_S_FAILED);
+        assert_eq!(
+            dev.device_status,
+            S_ACK | VIRTIO_CONFIG_S_FAILED,
+            "FAILED from status=ACK must be accepted (ACK preserved)",
+        );
+
+        // From device_status = DRV.
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV | VIRTIO_CONFIG_S_FAILED);
+        assert_eq!(
+            dev.device_status,
+            S_DRV | VIRTIO_CONFIG_S_FAILED,
+            "FAILED from status=DRV must be accepted (DRV preserved)",
+        );
+
+        // From device_status = S_OK.
+        let mut dev = VirtioConsole::new();
+        init_device(&mut dev);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK | VIRTIO_CONFIG_S_FAILED);
+        assert_eq!(
+            dev.device_status,
+            S_OK | VIRTIO_CONFIG_S_FAILED,
+            "FAILED from status=S_OK must be accepted (S_OK preserved)",
+        );
+    }
+
+    /// FAILED combined with a non-FAILED unrecognised new bit must
+    /// be rejected — the FAILED early-accept only triggers when
+    /// `new_bits == VIRTIO_CONFIG_S_FAILED` (FAILED alone, no other
+    /// new bits). A guest mixing FAILED with garbage extra bits is
+    /// misbehaving in a way unrelated to the legitimate FAILED signal.
+    #[test]
+    fn set_status_failed_plus_unknown_bit_rejected() {
+        let mut dev = VirtioConsole::new();
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        // val = ACK | FAILED | 0x10. new_bits = FAILED | 0x10 ≠
+        // FAILED alone, so the early-accept branch does NOT trigger;
+        // the regular valid-transition match has no arm for the
+        // union → reject.
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_STATUS,
+            S_ACK | VIRTIO_CONFIG_S_FAILED | 0x10,
+        );
+        assert_eq!(
+            dev.device_status, S_ACK,
+            "FAILED combined with a non-FAILED unknown bit must be \
+             rejected — the early-accept is gated on FAILED alone",
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // mmio_read non-4-byte and config_read out-of-range defenses.
+    //
+    // virtio-v1.2 §4.2.2 specifies 4-byte register access for the MMIO
+    // control registers. A misbehaving guest issuing 1/2/8-byte reads
+    // would otherwise let the device return stale stack contents (the
+    // `data` buffer is the caller's, not zero-initialised by the
+    // device path). The defensive 0xff-fill makes the protocol
+    // violation visible — distinct from a register that legitimately
+    // reads as zero.
+    // ----------------------------------------------------------------
+
+    /// 8-byte mmio_read (above the 4-byte register width) must fill
+    /// every byte with 0xff. The existing `non_4byte_read_returns_ff`
+    /// covers the 2-byte case at offset 0; this extends coverage to
+    /// the upper boundary so a regression that only checked
+    /// `data.len() < 4` (instead of `!= 4`) would surface here.
+    #[test]
+    fn mmio_read_oversized_fills_0xff() {
+        let dev = VirtioConsole::new();
+        let mut buf = [0u8; 8];
+        dev.mmio_read(VIRTIO_MMIO_VERSION as u64, &mut buf);
+        assert_eq!(
+            buf,
+            [0xff; 8],
+            "8-byte read must fill with 0xff — the device is 4-byte \
+             register width per virtio-v1.2 §4.2.2",
+        );
+    }
+
+    /// 1-byte mmio_read must fill the byte with 0xff. Pins the
+    /// boundary at the low end (data.len() == 1 < 4). A regression
+    /// that special-cased 0-length or skipped the fill on 1-byte
+    /// reads would surface here.
+    #[test]
+    fn mmio_read_1byte_fills_0xff() {
+        let dev = VirtioConsole::new();
+        let mut buf = [0u8; 1];
+        dev.mmio_read(VIRTIO_MMIO_VERSION as u64, &mut buf);
+        assert_eq!(
+            buf, [0xff],
+            "1-byte read must fill with 0xff",
+        );
+    }
+
+    /// 3-byte mmio_read (one short of the 4-byte register width)
+    /// must fill every byte with 0xff. Pins the strict equality
+    /// against `data.len() != 4` — a regression using `< 4` would
+    /// reject this but the test still passes; using `> 4` would
+    /// accept this and copy stale data.
+    #[test]
+    fn mmio_read_3byte_fills_0xff() {
+        let dev = VirtioConsole::new();
+        let mut buf = [0u8; 3];
+        dev.mmio_read(VIRTIO_MMIO_VERSION as u64, &mut buf);
+        assert_eq!(
+            buf, [0xff, 0xff, 0xff],
+            "3-byte read must fill with 0xff — the device is exactly \
+             4-byte register width, not 'at least 4'",
+        );
+    }
+
+    /// 4-byte mmio_read at a known register (VERSION) returns the
+    /// register's actual value — pins that the 0xff-fill defense
+    /// is gated on len != 4 specifically, NOT applied to legitimate
+    /// 4-byte reads. Without this control test, a regression that
+    /// always filled 0xff would still pass the misalignment tests.
+    #[test]
+    fn mmio_read_4byte_returns_register_value() {
+        let dev = VirtioConsole::new();
+        let mut buf = [0u8; 4];
+        dev.mmio_read(VIRTIO_MMIO_VERSION as u64, &mut buf);
+        assert_eq!(
+            u32::from_le_bytes(buf),
+            MMIO_VERSION,
+            "4-byte read at VIRTIO_MMIO_VERSION must return the \
+             actual register value, NOT the 0xff-fill defense",
+        );
+    }
+
+    /// `config_read` out-of-range fill: a read that starts inside
+    /// the 12-byte config struct but extends past byte 11 must fill
+    /// with 0xff. Pins the `if end > cfg.len()` defense — without
+    /// it, the `data.copy_from_slice(&cfg[start..end])` would
+    /// panic with "index out of bounds." A guest that issues a
+    /// 4-byte read at config offset 10 (i.e. straddling the end of
+    /// the struct) is misbehaving; the device must absorb without
+    /// panicking.
+    #[test]
+    fn config_read_out_of_range_fills_0xff() {
+        let dev = VirtioConsole::new();
+        let mut buf = [0u8; 4];
+        // Config space starts at 0x100; offset 10 inside config
+        // (i.e. mmio offset 0x10A) puts start=10, end=14 → out of
+        // range (cfg.len() = 12).
+        dev.mmio_read(0x100 + 10, &mut buf);
+        assert_eq!(
+            buf,
+            [0xff; 4],
+            "config_read past byte 11 must fill 0xff — the defense \
+             prevents a panic from cfg[start..end] when end > 12",
+        );
+    }
+
+    /// `config_read` at the exact end boundary (read straddles
+    /// struct end by 1 byte) still triggers the 0xff fill. Pins
+    /// the `>` (strict) comparison — `end == cfg.len()` is in
+    /// range; `end == cfg.len() + 1` is not.
+    #[test]
+    fn config_read_one_byte_past_end_fills_0xff() {
+        let dev = VirtioConsole::new();
+        let mut buf = [0u8; 4];
+        // Offset 9 inside config: start=9, end=13. cfg.len()=12,
+        // so end=13 > 12 → 0xff fill.
+        dev.mmio_read(0x100 + 9, &mut buf);
+        assert_eq!(
+            buf, [0xff; 4],
+            "config_read with end one byte past struct must fill 0xff",
+        );
+    }
+
+    /// `config_read` reading the LAST 4 valid bytes (offset 8..12
+    /// inside config, the emerg_wr field) must return the actual
+    /// data (zeros, since we don't advertise F_EMERG_WRITE), NOT the
+    /// 0xff fill. Pins the strict-greater-than boundary in the
+    /// reverse direction: end == 12 is allowed.
+    #[test]
+    fn config_read_at_exact_end_returns_data() {
+        let dev = VirtioConsole::new();
+        let mut buf = [0u8; 4];
+        // Offset 8 inside config: start=8, end=12. cfg.len()=12,
+        // so end == cfg.len() → in range, returns emerg_wr (0).
+        dev.mmio_read(0x100 + 8, &mut buf);
+        assert_eq!(
+            buf, [0; 4],
+            "read at the last 4-byte slot of the config struct \
+             (emerg_wr, offset 8..12) must return actual data, NOT \
+             the 0xff out-of-range fill",
+        );
+    }
+
+    /// `config_read` 1-byte read at offset 0 (cols low byte) must
+    /// return the actual data (0). Pins that the out-of-range
+    /// defense does not over-trigger on small reads inside the
+    /// struct. Without F_SIZE we never populate cols, so the byte
+    /// is 0 by initialisation in `let mut cfg = [0u8; 12];`.
+    #[test]
+    fn config_read_1byte_inside_struct_returns_data() {
+        let dev = VirtioConsole::new();
+        let mut buf = [0u8; 1];
+        // Offset 0 inside config (cols low byte). start=0, end=1.
+        // 1 <= 12, so in range; returns cfg[0] = 0.
+        dev.mmio_read(0x100, &mut buf);
+        assert_eq!(
+            buf, [0],
+            "1-byte read inside config struct must return actual \
+             data, not 0xff fill",
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Chain-level MockSplitQueue tests for `drain_port1_pending_rx`.
+    //
+    // These pin the host->guest port-1 RX path: snapshot reply payloads
+    // the freeze coordinator queues via `queue_input_port1` get
+    // delivered into guest write-only descriptors on q4 (PORT1_RXQ).
+    //
+    // Two concerns covered:
+    //
+    //   1. Deferral gates. Each early-return must hold pending bytes
+    //      in `port1_pending_rx` without touching the queue, the used
+    //      ring, or `interrupt_status`. A regression that lifted any
+    //      gate would either:
+    //        - publish a chain the guest has not committed (pre-
+    //          DRIVER_OK / queue-not-ready);
+    //        - publish bytes the kernel discards (port not yet
+    //          opened by the guest's PORT_OPEN handshake);
+    //        - walk a queue that does not exist for the negotiated
+    //          features (F_MULTIPORT not negotiated).
+    //
+    //   2. Torn-write recovery. When a multi-descriptor write-only
+    //      chain has one descriptor pointing at unmapped guest memory,
+    //      `mem.write_slice` fails mid-chain. The function must:
+    //        - publish the chain head with `len=0` (so the guest
+    //          reclaims the descriptor; without this the head leaks
+    //          from the avail ring until reset);
+    //        - leave bytes in `port1_pending_rx` unchanged (the
+    //          per-chain `drain(..consumed_offset)` is in the
+    //          non-torn branch, so a torn chain does NOT consume
+    //          bytes from the deque);
+    //        - break out of the drain loop (further chains for this
+    //          notify are NOT processed; the next notify retries).
+    //
+    // The torn-write fixture exploits write_slice's bounds check by
+    // pointing one descriptor at a GPA past the 2 MiB
+    // `make_chain_test_mem` map.
+    // ----------------------------------------------------------------
+
+    /// Wire q4 (PORT1_RXQ) to a MockSplitQueue and drive the FSM to
+    /// DRIVER_OK with F_MULTIPORT negotiated. Variant of
+    /// `wire_console_queue_to_mock` that targets q4 specifically; used
+    /// by every drain_port1 test below.
+    fn wire_port1_rxq_to_mock(
+        dev: &mut VirtioConsole,
+        mock: &MockSplitQueue<GuestMemoryMmap>,
+    ) {
+        wire_console_queue_to_mock(dev, mock, PORT1_RXQ as u32);
+    }
+
+    /// Mark port 1 as opened by sending PORT_OPEN(value=1) on c_ovq.
+    /// This sets `port_opened[1] = true` so the gate in
+    /// `drain_port1_pending_rx` lets bytes through. The same call
+    /// invokes `drain_port1_pending_rx` internally on the open
+    /// transition, but with no pending bytes that is a no-op — the
+    /// caller pushes pending bytes AFTER opening the port (or relies
+    /// on the open handler's own deferred-drain trigger).
+    fn open_port1(dev: &mut VirtioConsole) {
+        dev.handle_control_event(VirtioConsoleControl {
+            id: 1,
+            event: VIRTIO_CONSOLE_PORT_OPEN,
+            value: 1,
+        });
+        assert!(
+            dev.port_opened[1],
+            "open_port1 helper precondition: PORT_OPEN(value=1) must \
+             set port_opened[1]"
+        );
+    }
+
+    /// Empty pending-rx → drain is a no-op. No queue access, no
+    /// add_used, no signal_used. Pins the `if pending.is_empty()`
+    /// fast-exit at the head of `drain_port1_pending_rx`.
+    #[test]
+    fn drain_port1_pending_rx_empty_pending_is_noop() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        dev.set_mem(mem.clone());
+        wire_port1_rxq_to_mock(&mut dev, &mock);
+        open_port1(&mut dev);
+
+        // Plant a write-only chain that would be popped IF the
+        // function walked the queue; the empty-pending fast-exit
+        // must skip the queue entirely.
+        let data_addr = GuestAddress(0x10000);
+        let descs = [RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            64,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        ))];
+        mock.build_desc_chain(&descs).expect("build chain");
+
+        assert!(
+            dev.port1_pending_rx.is_empty(),
+            "precondition: port1_pending_rx must start empty"
+        );
+        let int_before = dev.interrupt_status;
+
+        dev.drain_port1_pending_rx();
+
+        // No add_used → used.idx still 0.
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(
+            used_idx, 0,
+            "empty-pending fast-exit must not touch the queue"
+        );
+        assert_eq!(
+            dev.interrupt_status, int_before,
+            "empty-pending fast-exit must not call signal_used"
+        );
+    }
+
+    /// DRIVER_OK gate: bytes pushed before DRIVER_OK stay in
+    /// `port1_pending_rx`. A regression that walked the queue
+    /// pre-DRIVER_OK would let the device read descriptor addresses
+    /// the driver has not yet committed (virtio-v1.2 §3.1.1).
+    #[test]
+    fn drain_port1_pending_rx_defers_without_driver_ok() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let data_addr = GuestAddress(0x10000);
+        let descs = [RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            64,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        ))];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        // Walk FSM up to S_FEAT only — STOP before S_OK. Configure
+        // q4 and mark it ready (allowed in S_FEAT..S_OK per
+        // `queue_config_allowed`). The DRIVER_OK gate at the head of
+        // `drain_port1_pending_rx` must still defer.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0);
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_DRIVER_FEATURES,
+            1 << VIRTIO_CONSOLE_F_MULTIPORT,
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_DRIVER_FEATURES,
+            1 << (VIRTIO_F_VERSION_1 - 32),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, PORT1_RXQ as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NUM, 16);
+        let desc = mock.desc_table_addr().0;
+        let avail = mock.avail_addr().0;
+        let used = mock.used_addr().0;
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, desc as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_HIGH, (desc >> 32) as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, avail as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (avail >> 32) as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_LOW, used as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_HIGH, (used >> 32) as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_READY, 1);
+        // Cannot call `open_port1` — `handle_control_event(PORT_OPEN)`
+        // works regardless of FSM state but unrelated to the gate
+        // under test. Set the field directly.
+        dev.port_opened[1] = true;
+
+        let payload = b"snapshot reply bytes";
+        dev.port1_pending_rx.extend(payload.iter().copied());
+
+        dev.drain_port1_pending_rx();
+
+        // Bytes preserved verbatim in pending_rx — no consumption.
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len(),
+            "DRIVER_OK gate must hold bytes in pending_rx"
+        );
+        // No add_used → used.idx still 0.
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(
+            used_idx, 0,
+            "DRIVER_OK gate must skip add_used"
+        );
+    }
+
+    /// F_MULTIPORT runtime gate: even with DRIVER_OK and the queue
+    /// ready, if the driver did not negotiate F_MULTIPORT then q4
+    /// should not be walked. Pins the
+    /// `if !self.multiport_negotiated()` guard at line ~903.
+    #[test]
+    fn drain_port1_pending_rx_defers_without_multiport() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let data_addr = GuestAddress(0x10000);
+        let descs = [RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            64,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        ))];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+
+        // Walk FSM to DRIVER_OK negotiating ONLY VIRTIO_F_VERSION_1
+        // (no F_MULTIPORT). `wire_console_queue_to_mock` always
+        // negotiates both, so inline a custom version here.
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_ACK);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_DRV);
+        write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 1);
+        write_reg(
+            &mut dev,
+            VIRTIO_MMIO_DRIVER_FEATURES,
+            1 << (VIRTIO_F_VERSION_1 - 32),
+        );
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_FEAT);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_SEL, PORT1_RXQ as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_NUM, 16);
+        let desc = mock.desc_table_addr().0;
+        let avail = mock.avail_addr().0;
+        let used = mock.used_addr().0;
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_LOW, desc as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_DESC_HIGH, (desc >> 32) as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_LOW, avail as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_AVAIL_HIGH, (avail >> 32) as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_LOW, used as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_USED_HIGH, (used >> 32) as u32);
+        write_reg(&mut dev, VIRTIO_MMIO_QUEUE_READY, 1);
+        write_reg(&mut dev, VIRTIO_MMIO_STATUS, S_OK);
+        assert_eq!(
+            dev.device_status, S_OK,
+            "precondition: FSM must reach DRIVER_OK"
+        );
+        assert!(
+            !dev.multiport_negotiated(),
+            "precondition: F_MULTIPORT must NOT be negotiated"
+        );
+        // Set port_opened[1] directly so the multiport gate is the
+        // ONLY gate the test exercises (hostile guest pretend-state).
+        dev.port_opened[1] = true;
+
+        let payload = b"reply bytes that must not leak";
+        dev.port1_pending_rx.extend(payload.iter().copied());
+
+        dev.drain_port1_pending_rx();
+
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len(),
+            "F_MULTIPORT gate must hold bytes in pending_rx"
+        );
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(
+            used_idx, 0,
+            "F_MULTIPORT gate must skip add_used"
+        );
+    }
+
+    /// `port_opened[1]` gate: with DRIVER_OK + F_MULTIPORT but BEFORE
+    /// the guest has sent `PORT_OPEN(id=1, value=1)` on c_ovq, port 1
+    /// has no userspace reader. The kernel's port-1 buffer-pool
+    /// allocation only completes after PORT_OPEN; pushing bytes
+    /// through descriptors that exist before the open lets the
+    /// kernel discard them with no userspace consumer (per
+    /// drivers/char/virtio_console.c `port_fops_open`). Pins the
+    /// `if !self.port_opened[1]` guard at line ~911.
+    ///
+    /// After the guest opens the port via PORT_OPEN, the deferred
+    /// drain runs (the open transition itself triggers it at line
+    /// ~1268); the bytes must then land in the queue.
+    #[test]
+    fn drain_port1_pending_rx_defers_until_port_open() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let data_addr = GuestAddress(0x10000);
+        let payload = b"deferred snapshot reply";
+        let descs = [RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            64,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        ))];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_port1_rxq_to_mock(&mut dev, &mock);
+
+        // Port 1 not yet opened — the `port_opened[1]` gate must
+        // defer.
+        assert!(
+            !dev.port_opened[1],
+            "precondition: port_opened[1] must be false"
+        );
+
+        dev.port1_pending_rx.extend(payload.iter().copied());
+        dev.drain_port1_pending_rx();
+
+        // Bytes still pending; queue untouched.
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len(),
+            "port_opened[1] gate must defer when guest has not opened port 1"
+        );
+        let used_idx_before: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx before open");
+        assert_eq!(
+            used_idx_before, 0,
+            "port_opened[1] gate must skip add_used"
+        );
+
+        // Now drive PORT_OPEN(id=1, value=1). The handler at line
+        // ~1268 calls drain_port1_pending_rx on the closed→open
+        // transition, which now must drain.
+        open_port1(&mut dev);
+
+        assert!(
+            dev.port1_pending_rx.is_empty(),
+            "after PORT_OPEN, deferred bytes must drain"
+        );
+        let used_idx_after: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx after open");
+        assert_eq!(
+            used_idx_after, 1,
+            "after PORT_OPEN, the deferred chain must add_used"
+        );
+        // Bytes landed in the guest descriptor buffer.
+        let mut readback = vec![0u8; payload.len()];
+        mem.read_slice(&mut readback, data_addr)
+            .expect("read back delivered payload");
+        assert_eq!(
+            readback, payload,
+            "delivered bytes must match the queued payload verbatim"
+        );
+    }
+
+    /// No-mem gate: a device whose `mem` field is None (the freeze
+    /// coordinator may push reply bytes during the brief window
+    /// before `set_mem` lands) must not crash and must hold the
+    /// bytes for retry. Pins the `match self.mem.as_ref() { ... None
+    /// => return }` arm at line ~918.
+    #[test]
+    fn drain_port1_pending_rx_defers_without_mem() {
+        let mut dev = VirtioConsole::new();
+        // Walk FSM to DRIVER_OK with F_MULTIPORT but DO NOT call
+        // set_mem. `init_device` reaches S_OK without touching mem.
+        init_device(&mut dev);
+        assert!(dev.mem.is_none(), "precondition: mem must be None");
+        dev.port_opened[1] = true;
+
+        let payload = b"reply bytes pre-set_mem";
+        dev.port1_pending_rx.extend(payload.iter().copied());
+
+        // No panic, no crash.
+        dev.drain_port1_pending_rx();
+
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len(),
+            "no-mem gate must hold bytes in pending_rx"
+        );
+    }
+
+    /// Queue-not-ready gate: bytes stay pending if PORT1_RXQ has not
+    /// been marked ready by the driver. Pins the
+    /// `!self.queues[PORT1_RXQ].ready()` guard at line ~928. The
+    /// driver writes QUEUE_READY=1 only after the desc/avail/used
+    /// addresses are committed; reading the queue before that point
+    /// would walk uninitialized state.
+    #[test]
+    fn drain_port1_pending_rx_defers_when_queue_not_ready() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        dev.set_mem(mem);
+        // Walk FSM to DRIVER_OK with F_MULTIPORT, but DO NOT
+        // configure or ready q4. `init_device` reaches DRIVER_OK
+        // without configuring any queue.
+        init_device(&mut dev);
+        assert!(
+            !dev.queues[PORT1_RXQ].ready(),
+            "precondition: q4 must NOT be ready"
+        );
+        dev.port_opened[1] = true;
+
+        let payload = b"reply bytes before queue ready";
+        dev.port1_pending_rx.extend(payload.iter().copied());
+
+        dev.drain_port1_pending_rx();
+
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len(),
+            "queue-not-ready gate must hold bytes in pending_rx"
+        );
+    }
+
+    /// Single-descriptor write-only chain: happy-path baseline for
+    /// the torn-write tests below. Pins that a normal drain delivers
+    /// the payload to the descriptor buffer, drains
+    /// `port1_pending_rx`, advances `used.idx`, and signals the
+    /// guest via INT_VRING + irq_evt.
+    #[test]
+    fn drain_port1_pending_rx_single_descriptor_happy_path() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let data_addr = GuestAddress(0x10000);
+        let payload = b"snapshot reply payload bytes";
+        let descs = [RawDescriptor::from(SplitDescriptor::new(
+            data_addr.0,
+            payload.len() as u32,
+            VRING_DESC_F_WRITE as u16,
+            0,
+        ))];
+        mock.build_desc_chain(&descs).expect("build chain");
+        dev.set_mem(mem.clone());
+        wire_port1_rxq_to_mock(&mut dev, &mock);
+        open_port1(&mut dev);
+
+        dev.port1_pending_rx.extend(payload.iter().copied());
+        dev.drain_port1_pending_rx();
+
+        // pending_rx fully drained.
+        assert!(
+            dev.port1_pending_rx.is_empty(),
+            "happy-path drain must consume all pending bytes"
+        );
+        // Bytes landed in the guest descriptor.
+        let mut readback = vec![0u8; payload.len()];
+        mem.read_slice(&mut readback, data_addr)
+            .expect("read back delivered payload");
+        assert_eq!(
+            readback, payload,
+            "delivered bytes must equal the queued payload"
+        );
+        // Used ring reflects exactly one completion.
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(
+            used_idx, 1,
+            "happy-path drain must add_used exactly once"
+        );
+        // signal_used set INT_VRING.
+        assert_ne!(
+            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            0,
+            "INT_VRING must be set after a non-zero drain"
+        );
+        let irq_count = dev.irq_evt.read().expect("irq_evt was written");
+        assert!(
+            irq_count > 0,
+            "irq_evt counter must be non-zero after signal_used"
+        );
+    }
+
+    /// Multi-descriptor torn-write recovery: a chain with two
+    /// write-only descriptors where the second points at unmapped
+    /// guest memory (GPA past `make_chain_test_mem`'s 2 MiB cap).
+    /// `mem.write_slice` fails on the second descriptor, triggering
+    /// the torn-write branch.
+    ///
+    /// Pins the four invariants of the torn-write recovery (lines
+    /// ~983-997):
+    /// (a) `chain_torn = true` triggers `q.add_used(mem, head, 0)`
+    ///     — used.idx advances to 1, but the published `len` is 0;
+    /// (b) bytes stay in `port1_pending_rx` (the
+    ///     `drain(..consumed_offset)` is in the non-torn branch, so
+    ///     a torn chain does NOT consume bytes);
+    /// (c) the drain loop breaks (no further chains processed for
+    ///     this notify even if more are available);
+    /// (d) `total_written` stays 0 for the torn chain — combined
+    ///     with the absence of any prior successful chain in this
+    ///     test, signal_used is NOT called and INT_VRING stays 0.
+    ///
+    /// Without `add_used(0)` the chain head would leak from the
+    /// avail ring until reset (the c_ivq, port-0 RX, and port-1 RX
+    /// torn paths all share this recovery convention).
+    #[test]
+    fn drain_port1_pending_rx_torn_write_publishes_head_with_zero_len() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        // Valid GPA for the first descriptor.
+        let valid_addr = GuestAddress(0x10000);
+        // GPA past the 2 MiB map → write_slice fails. 4 MiB chosen
+        // for clarity; any value >= 2 MiB works.
+        let unmapped_addr = GuestAddress(4 << 20);
+        // Two descriptors, both write-only, chained via NEXT.
+        // First desc at index 0 (chain head); second at index 1.
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                valid_addr.0,
+                32,
+                (VRING_DESC_F_WRITE | VRING_DESC_F_NEXT) as u16,
+                1,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                unmapped_addr.0,
+                32,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.build_desc_chain(&descs).expect("build torn chain");
+        dev.set_mem(mem.clone());
+        wire_port1_rxq_to_mock(&mut dev, &mock);
+        open_port1(&mut dev);
+
+        // 64-byte payload: first 32 bytes will write to valid_addr,
+        // the next 32 will attempt to write to unmapped_addr and
+        // fail.
+        let payload: Vec<u8> = (0..64u8).collect();
+        dev.port1_pending_rx.extend(payload.iter().copied());
+        let int_before = dev.interrupt_status;
+        // Drain irq_evt so the post-drain assertion can detect a
+        // spurious signal_used call.
+        let _ = dev.irq_evt.read();
+
+        dev.drain_port1_pending_rx();
+
+        // (a) used.idx == 1: torn chain head was add_used'd with
+        // len=0.
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(
+            used_idx, 1,
+            "torn-write recovery must add_used the chain head (with len=0)"
+        );
+        // The published len for that head must be 0. used-ring
+        // entry layout: u16 flags, u16 idx, then array of
+        // VRING_USED_ELEM { u32 id; u32 len }. The first entry's
+        // `len` field sits at used_addr + 4 (flags+idx) + 4 (id).
+        let used_elem_len: u32 = mem
+            .read_obj(mock.used_addr().checked_add(8).unwrap())
+            .expect("read used elem 0 len");
+        assert_eq!(
+            used_elem_len, 0,
+            "torn-write recovery must publish len=0 for the chain head \
+             — a non-zero len would tell the guest the descriptor was \
+             fully filled, leading to data corruption"
+        );
+
+        // (b) Bytes stay in pending_rx. The first descriptor's
+        // partial write does not consume bytes from the deque
+        // because the torn branch skips the
+        // `drain(..consumed_offset)` call (line ~1009 is in the
+        // success branch, after the `if chain_torn { ... break; }`
+        // arm at line ~983).
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len(),
+            "torn-write recovery must preserve bytes in pending_rx \
+             for retry on the next drain cycle"
+        );
+        // Verify byte identity, not just length: a regression that
+        // partially drained then re-extended could mask itself.
+        let preserved: Vec<u8> = dev.port1_pending_rx.iter().copied().collect();
+        assert_eq!(
+            preserved, payload,
+            "preserved bytes must be the original payload verbatim"
+        );
+
+        // (d) signal_used must NOT have been called: total_written
+        // stays 0 for the torn chain, so the
+        // `if total_written > 0 { signal_used() }` branch at line
+        // ~1012 is skipped.
+        assert_eq!(
+            dev.interrupt_status, int_before,
+            "torn-only chain must not trigger signal_used (total_written=0)"
+        );
+        match dev.irq_evt.read() {
+            Ok(n) => panic!("irq_evt must NOT have been written, got {n}"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("unexpected irq_evt read error: {e}"),
+        }
+    }
+
+    /// Torn-write breaks the drain loop: even when MORE chains are
+    /// available in the avail ring, a torn first chain stops the
+    /// drain immediately. Pins the `break` after `add_used(0)` at
+    /// line ~996. A regression that continued to the next chain
+    /// would (1) interleave torn-recovery with success traffic,
+    /// confusing failure-mode analysis, and (2) potentially deliver
+    /// bytes out of order if the torn chain's bytes were retried
+    /// after a later chain landed.
+    ///
+    /// Two chains:
+    ///   - chain 0: torn (second desc unmapped)
+    ///   - chain 1: fully valid single descriptor
+    ///
+    /// After drain, used.idx must be exactly 1 (only the torn head),
+    /// chain 1 must remain in the avail ring un-consumed (its data
+    /// region still holds zeros, never the payload), and a follow-up
+    /// drain cycle must process chain 1.
+    #[test]
+    fn drain_port1_pending_rx_torn_write_breaks_drain_loop() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let valid_addr_a = GuestAddress(0x10000);
+        let unmapped_addr = GuestAddress(4 << 20);
+        let valid_addr_b = GuestAddress(0x20000);
+
+        // `add_desc_chains` publishes one chain head per descriptor
+        // entry in the slice that does NOT carry F_NEXT (entries
+        // with F_NEXT are linked tails of the prior head). With
+        // descs[0] carrying F_NEXT->1 and descs[1]/descs[2] without
+        // F_NEXT, two chain heads land in the avail ring:
+        //   chain 0 = descs[0] -> descs[1]   (torn: descs[1] unmapped)
+        //   chain 1 = descs[2]               (valid, single desc)
+        let descs = [
+            // Chain 0 head (idx 0): valid + NEXT to idx 1.
+            RawDescriptor::from(SplitDescriptor::new(
+                valid_addr_a.0,
+                32,
+                (VRING_DESC_F_WRITE | VRING_DESC_F_NEXT) as u16,
+                1,
+            )),
+            // Chain 0 tail (idx 1): unmapped.
+            RawDescriptor::from(SplitDescriptor::new(
+                unmapped_addr.0,
+                32,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            // Chain 1 (idx 2): single valid descriptor.
+            RawDescriptor::from(SplitDescriptor::new(
+                valid_addr_b.0,
+                32,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.add_desc_chains(&descs, 0)
+            .expect("publish two chains");
+        dev.set_mem(mem.clone());
+        wire_port1_rxq_to_mock(&mut dev, &mock);
+        open_port1(&mut dev);
+
+        // 64-byte payload — enough that the second descriptor of
+        // chain 0 would be filled if the unmapped write succeeded.
+        let payload: Vec<u8> = (0..64u8).collect();
+        dev.port1_pending_rx.extend(payload.iter().copied());
+
+        dev.drain_port1_pending_rx();
+
+        // used.idx == 1: ONLY chain 0's head was add_used'd (with
+        // len=0); chain 1 was NOT processed because the torn-write
+        // recovery broke the drain loop.
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(
+            used_idx, 1,
+            "torn-write recovery must break the drain loop — chain 1 \
+             must remain unconsumed even though its descriptor is valid"
+        );
+
+        // Chain 1's data region must be untouched: read back
+        // valid_addr_b — it must be all zeros (the test memory's
+        // initial state), NOT any byte from `payload`.
+        let mut readback_b = vec![0u8; 32];
+        mem.read_slice(&mut readback_b, valid_addr_b)
+            .expect("read back chain 1 data region");
+        assert!(
+            readback_b.iter().all(|&b| b == 0),
+            "chain 1's data region must be untouched — the drain loop \
+             must NOT have reached chain 1 after the torn break"
+        );
+
+        // Bytes still in pending_rx for retry.
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len(),
+            "all bytes must remain in pending_rx (torn chain consumed nothing)"
+        );
+
+        // A second drain cycle must process chain 1 successfully —
+        // chain 0's head was already add_used'd, so chain 1 is the
+        // next chain to pop.
+        dev.drain_port1_pending_rx();
+
+        let used_idx_after: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx after second drain");
+        assert_eq!(
+            used_idx_after, 2,
+            "second drain must process chain 1 (used.idx 1 -> 2)"
+        );
+        // Chain 1 received the first 32 bytes of the still-pending
+        // payload.
+        let mut readback_b2 = vec![0u8; 32];
+        mem.read_slice(&mut readback_b2, valid_addr_b)
+            .expect("read chain 1 data after second drain");
+        assert_eq!(
+            readback_b2,
+            payload[..32],
+            "chain 1 must hold the first 32 bytes of the preserved payload"
+        );
+        // 32 bytes consumed from pending_rx; 32 remain.
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len() - 32,
+            "second drain must consume only chain 1's capacity (32 bytes)"
+        );
+    }
+
+    /// Torn-write after a successful prior chain in the SAME drain
+    /// call: the prior chain's `total_written` accumulates, then the
+    /// torn chain breaks the loop. signal_used MUST be called
+    /// because `total_written > 0` from the prior chain. Pins that
+    /// the torn-write break does not suppress the signal for
+    /// successfully-delivered chains earlier in the same call.
+    ///
+    /// Two chains:
+    ///   - chain 0: valid single descriptor → drains 32 bytes
+    ///   - chain 1: torn (second desc unmapped) → publishes head=0,
+    ///              breaks loop
+    ///
+    /// After drain: used.idx==2, INT_VRING set, irq_evt non-zero,
+    /// 32 bytes consumed from pending_rx (chain 0 only).
+    #[test]
+    fn drain_port1_pending_rx_torn_after_success_still_signals() {
+        let mut dev = VirtioConsole::new();
+        let mem = make_chain_test_mem();
+        let mock = MockSplitQueue::create(&mem, GuestAddress(0), 16);
+        let valid_addr_a = GuestAddress(0x10000);
+        let valid_addr_b = GuestAddress(0x20000);
+        let unmapped_addr = GuestAddress(4 << 20);
+
+        // Layout (no F_NEXT means chain end; F_NEXT means link to
+        // the named index):
+        //   idx 0 = chain 0 (valid, single, no NEXT)
+        //   idx 1 = chain 1 head (valid + NEXT -> idx 2)
+        //   idx 2 = chain 1 tail (unmapped)
+        let descs = [
+            RawDescriptor::from(SplitDescriptor::new(
+                valid_addr_a.0,
+                32,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                valid_addr_b.0,
+                32,
+                (VRING_DESC_F_WRITE | VRING_DESC_F_NEXT) as u16,
+                2,
+            )),
+            RawDescriptor::from(SplitDescriptor::new(
+                unmapped_addr.0,
+                32,
+                VRING_DESC_F_WRITE as u16,
+                0,
+            )),
+        ];
+        mock.add_desc_chains(&descs, 0)
+            .expect("publish success+torn chains");
+        dev.set_mem(mem.clone());
+        wire_port1_rxq_to_mock(&mut dev, &mock);
+        open_port1(&mut dev);
+
+        let payload: Vec<u8> = (0..96u8).collect();
+        dev.port1_pending_rx.extend(payload.iter().copied());
+        // Drain irq_evt so the post-drain check sees only the new
+        // signal_used call.
+        let _ = dev.irq_evt.read();
+
+        dev.drain_port1_pending_rx();
+
+        // used.idx == 2: chain 0 add_used with len=32, chain 1
+        // (torn) add_used with len=0.
+        let used_idx: u16 = mem
+            .read_obj(mock.used_addr().checked_add(2).unwrap())
+            .expect("read used.idx");
+        assert_eq!(
+            used_idx, 2,
+            "drain must add_used both chain 0 (len=32) and chain 1 \
+             (torn, len=0)"
+        );
+        // INT_VRING must be set: total_written > 0 from chain 0.
+        assert_ne!(
+            dev.interrupt_status & VIRTIO_MMIO_INT_VRING,
+            0,
+            "signal_used must have been called because chain 0 \
+             delivered 32 bytes"
+        );
+        let irq_count = dev.irq_evt.read().expect("irq_evt was written");
+        assert!(
+            irq_count > 0,
+            "irq_evt counter must be non-zero after signal_used"
+        );
+
+        // Chain 0 received the first 32 bytes.
+        let mut readback_a = vec![0u8; 32];
+        mem.read_slice(&mut readback_a, valid_addr_a)
+            .expect("read chain 0 data");
+        assert_eq!(
+            readback_a,
+            payload[..32],
+            "chain 0 must hold the first 32 bytes of the payload"
+        );
+        // pending_rx: 32 bytes from chain 0 consumed; bytes 32-95
+        // remain (chain 1's torn write consumed nothing).
+        assert_eq!(
+            dev.port1_pending_rx.len(),
+            payload.len() - 32,
+            "only chain 0's bytes were consumed from pending_rx"
+        );
+        let preserved: Vec<u8> = dev.port1_pending_rx.iter().copied().collect();
+        assert_eq!(
+            preserved,
+            payload[32..],
+            "preserved bytes must be exactly the suffix not delivered \
+             to chain 0 (chain 1's first descriptor's partial write \
+             does NOT consume from the deque)"
         );
     }
 }

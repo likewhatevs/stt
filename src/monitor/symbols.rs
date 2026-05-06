@@ -163,6 +163,30 @@ pub(crate) struct KernelSymbols {
     /// The runtime value must be read from guest memory via
     /// `resolve_page_offset`.
     pub page_offset_base_kva: Option<u64>,
+    /// Kernel virtual address of `phys_base`
+    /// (`arch/x86/kernel/head_64.S`). Holds the runtime physical
+    /// address offset between the kernel image's compile-time
+    /// VA (`__START_KERNEL_map`) and its load PA: the kernel sets
+    /// `phys_base = load_delta = __START_KERNEL_map + p2v_offset`
+    /// (see `arch/x86/boot/startup/map_kernel.c:__startup_64`).
+    /// Used by `__phys_addr` (`arch/x86/mm/physaddr.c:15-32`):
+    /// `pa = (kva - __START_KERNEL_map) + phys_base`.
+    ///
+    /// On a non-KASLR build `phys_base == 0` and the formula
+    /// collapses to `pa = kva - __START_KERNEL_map`. With KASLR
+    /// enabled, the kernel is loaded at a randomized PA above
+    /// `0x10_0000` (the `LOAD_PHYSICAL_ADDR` floor), so `phys_base`
+    /// holds the post-randomization PA of the kernel image. The
+    /// monitor walks the page tables to translate this symbol's KVA
+    /// into a PA without a circular dependency on `phys_base`
+    /// itself; the resolved value then feeds every subsequent
+    /// text/data symbol translation.
+    ///
+    /// `None` when the symbol is absent (aarch64 kernels do not
+    /// define `phys_base`; their analogue is `kimage_voffset` which
+    /// the boot-time `start_kernel_map_for_tcr` derivation already
+    /// covers).
+    pub phys_base_kva: Option<u64>,
     /// Kernel virtual address of `scx_root` (pointer to active scx_sched).
     /// None when the symbol is absent: pre-6.16 kernels with sched_ext
     /// (older `scx_ops` API predates `scx_root`), and kernels built
@@ -267,10 +291,19 @@ impl KernelSymbols {
             std::fs::read(path).with_context(|| format!("read vmlinux: {}", path.display()))?;
         let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
 
+        // SHN_UNDEF = 0 (ELF spec): undefined symbols (linker
+        // placeholders) carry st_shndx == 0 and must be skipped
+        // here. We DO NOT filter `st_value != 0` because the cached-
+        // vmlinux strip pipeline rewrites `.data..percpu` sh_addr to
+        // 0, leaving percpu st_value as a section-relative offset.
+        // A percpu symbol legitimately at offset 0 (e.g. the first
+        // entry in `.data..percpu`) would be silently dropped by an
+        // st_value filter, masquerading as an absent symbol.
+        const SHN_UNDEF: u16 = 0;
         let sym_addr = |name: &str| -> Option<u64> {
             elf.syms
                 .iter()
-                .find(|s| s.st_value != 0 && elf.strtab.get_at(s.st_name) == Some(name))
+                .find(|s| s.st_shndx as u16 != SHN_UNDEF && elf.strtab.get_at(s.st_name) == Some(name))
                 .map(|s| s.st_value)
         };
 
@@ -280,6 +313,10 @@ impl KernelSymbols {
             .context("symbol '__per_cpu_offset' not found in vmlinux")?;
 
         let page_offset_base_kva = sym_addr("page_offset_base");
+        // x86_64-only KASLR randomization base; absent on aarch64
+        // kernels (their kimage_voffset analogue is derived from
+        // `start_kernel_map_for_tcr`, not a static symbol).
+        let phys_base_kva = sym_addr("phys_base");
 
         let scx_root = sym_addr("scx_root");
         // scx_tasks is `static LIST_HEAD(scx_tasks)` in
@@ -327,6 +364,7 @@ impl KernelSymbols {
             runqueues,
             per_cpu_offset,
             page_offset_base_kva,
+            phys_base_kva,
             scx_root,
             scx_tasks,
             init_top_pgt,
@@ -369,7 +407,7 @@ pub(crate) fn resolve_page_offset(
     symbols: &KernelSymbols,
     start_kernel_map: u64,
 ) -> u64 {
-    resolve_page_offset_with_tcr(mem, symbols, start_kernel_map, 0)
+    resolve_page_offset_with_tcr(mem, symbols, start_kernel_map, 0, 0)
 }
 
 /// Like [`resolve_page_offset`] but uses
@@ -390,11 +428,12 @@ pub(crate) fn resolve_page_offset_with_tcr(
     symbols: &KernelSymbols,
     start_kernel_map: u64,
     tcr_el1: u64,
+    phys_base: u64,
 ) -> u64 {
     let Some(pob_kva) = symbols.page_offset_base_kva else {
         return default_page_offset_for_tcr(tcr_el1);
     };
-    let pob_pa = text_kva_to_pa_with_base(pob_kva, start_kernel_map);
+    let pob_pa = text_kva_to_pa_with_base(pob_kva, start_kernel_map, phys_base);
     let val = mem.read_u64(pob_pa, 0);
     // Valid PAGE_OFFSET has bit 63 set (upper-half virtual address).
     // Kernels with CONFIG_RANDOMIZE_MEMORY use values like
@@ -407,21 +446,80 @@ pub(crate) fn resolve_page_offset_with_tcr(
     }
 }
 
+/// Resolve the kernel's runtime `phys_base` value via a page-table
+/// walk.
+///
+/// Breaks the chicken-and-egg between text-symbol PA translation
+/// and KASLR: every text/data translate normally needs `phys_base`
+/// (`pa = (kva - start_kernel_map) + phys_base`) but `phys_base`
+/// itself lives in `.data` whose PA we'd need `phys_base` to find.
+/// The page table walker takes a CR3 (already a PA, read from KVM
+/// SREGS) and produces PAs directly from PTE entries — no
+/// `phys_base` involved — so we can walk the symbol's KVA to a PA,
+/// then read the live `phys_base` value.
+///
+/// `cr3_pa` is the BSP's CR3 (KVM_GET_SREGS, masked to a PA per
+/// Intel SDM §4.5: bits [11:0] hold PCID/PCD/PWT control bits and
+/// must be cleared). `l5` selects the walker variant; resolve
+/// once via [`resolve_pgtable_l5`] BEFORE the first
+/// `resolve_phys_base` call (the L5 read uses `phys_base = 0` and
+/// is therefore correct only when KASLR is disabled — for the
+/// boot-time pgtable mode probe that requirement is met because
+/// `__pgtable_l5_enabled` is zeroed at compile time on every
+/// non-LA57 build, and on LA57 builds the value is set by
+/// `__startup_64` BEFORE `phys_base` is randomized).
+///
+/// Returns `None` when:
+/// - `phys_base` symbol is absent (aarch64, stripped vmlinux);
+/// - the page-table walk for the symbol KVA fails (CR3 not yet
+///   populated, page tables not yet initialised, or the symbol's
+///   KVA is unmapped — none of which should happen post-boot but
+///   the walker returns `None` defensively).
+///
+/// On a non-KASLR kernel the resolved value is `0`; with KASLR
+/// enabled it carries the post-randomization PA of the kernel
+/// image. Either result is correct: the
+/// [`text_kva_to_pa_with_base`] formula collapses to
+/// `pa = kva - start_kernel_map` when `phys_base == 0`.
+pub(crate) fn resolve_phys_base(
+    mem: &super::reader::GuestMem,
+    symbols: &KernelSymbols,
+    cr3_pa: u64,
+    l5: bool,
+    tcr_el1: u64,
+) -> Option<u64> {
+    let kva = symbols.phys_base_kva?;
+    // CR3 carries PCID/PCD/PWT control bits in [11:0]; mask them off
+    // before treating the value as a PA. The walker's `ADDR_MASK`
+    // already does this internally for descriptor entries, but the
+    // initial CR3 we're handed by KVM SREGS is the raw register
+    // value.
+    let cr3_pa_masked = cr3_pa & !0xFFFu64;
+    let pa = mem.translate_kva(cr3_pa_masked, super::Kva(kva), l5, tcr_el1)?;
+    Some(mem.read_u64(pa, 0))
+}
+
 /// Read the runtime value of `__pgtable_l5_enabled` from guest memory.
 ///
 /// Returns `true` when the guest kernel uses 5-level paging (LA57),
 /// `false` when the symbol is absent or the value is 0.
 /// `start_kernel_map` is the runtime kernel image base used to
 /// translate the symbol KVA — see [`resolve_page_offset`].
+/// `phys_base` is the kernel's runtime KASLR offset; pass `0`
+/// during the boot-time bootstrap (the L5 mode is set by
+/// `__startup_64` BEFORE `phys_base` is randomized, so a
+/// `phys_base = 0` read still finds a populated value at the
+/// expected PA on x86_64 KASLR boots).
 pub(crate) fn resolve_pgtable_l5(
     mem: &super::reader::GuestMem,
     symbols: &KernelSymbols,
     start_kernel_map: u64,
+    phys_base: u64,
 ) -> bool {
     let Some(kva) = symbols.pgtable_l5_enabled else {
         return false;
     };
-    let pa = text_kva_to_pa_with_base(kva, start_kernel_map);
+    let pa = text_kva_to_pa_with_base(kva, start_kernel_map, phys_base);
     mem.read_u32(pa, 0) != 0
 }
 
@@ -444,25 +542,53 @@ pub(crate) fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
 ///
 /// Kernel text and data symbols (.text, .data, .bss) are mapped via
 /// `__START_KERNEL_map` (x86_64) / `KIMAGE_VADDR` (aarch64), not
-/// the direct mapping. The kernel's `__kimg_to_phys(addr)` is
-/// `addr - kimage_voffset`, where `kimage_voffset = map_base - phys_base`.
+/// the direct mapping. The kernel's `__phys_addr` formula
+/// (`arch/x86/mm/physaddr.c:15-32`) is
+/// `pa = (kva - __START_KERNEL_map) + phys_base`, and the aarch64
+/// equivalent (`__kimg_to_phys(addr) = addr - kimage_voffset`) is
+/// `pa = (kva - KIMAGE_VADDR) + DRAM_START` because
+/// `kimage_voffset = KIMAGE_VADDR - phys_base` and on aarch64
+/// `phys_base = DRAM_START` for non-KASLR builds.
 ///
-/// On x86_64: `phys_base = 0`, so GPA = `VA - __START_KERNEL_map`,
-/// and DRAM starts at GPA 0, so DRAM offset = GPA.
-/// On aarch64: `phys_base = DRAM_START = 0x4000_0000`, so
-/// `kimage_voffset = KIMAGE_VADDR - 0x4000_0000`, and
-/// GPA = `VA - KIMAGE_VADDR + 0x4000_0000`. DRAM offset =
-/// `GPA - DRAM_START = VA - KIMAGE_VADDR`. The two cancel.
+/// On x86_64 the runtime `phys_base` value comes from the kernel's
+/// `phys_base` static, set by `__startup_64`
+/// (`arch/x86/boot/startup/map_kernel.c:122`). Without KASLR
+/// `phys_base == 0` and the formula collapses to
+/// `pa = kva - __START_KERNEL_map`. With KASLR the kernel image
+/// loads at a randomized PA above `LOAD_PHYSICAL_ADDR` (16 MiB
+/// floor) and `phys_base` carries that PA so the formula above
+/// resolves text/data symbols correctly.
 ///
-/// Both cases require `nokaslr` on the guest cmdline.
+/// On aarch64 callers pass `phys_base = DRAM_START`; the aarch64
+/// build does not export a `phys_base` symbol. With KASLR on
+/// aarch64 the kernel image still maps to `KIMAGE_VADDR` (the
+/// virtual address is fixed by the linker); the post-KASLR
+/// physical-side delta is captured by the kernel's
+/// `kimage_voffset` runtime variable, which we do not resolve
+/// here — `start_kernel_map_for_tcr` already returns the runtime
+/// VA base, and `phys_base = DRAM_START` cancels out the
+/// PHYS_OFFSET term identically to the original formula. Aarch64
+/// KASLR support is therefore a follow-up that resolves
+/// `kimage_voffset` from a parallel page-table walk; the current
+/// callers pass `phys_base = DRAM_START` and the result is correct
+/// for non-KASLR aarch64 boots.
 ///
 /// `start_kernel_map` is the runtime kernel image base — pass
 /// [`START_KERNEL_MAP`] on x86_64 and the value derived via
-/// [`start_kernel_map_for_tcr`] on aarch64. Most callers funnel
-/// through [`super::guest::GuestKernel::text_kva_to_pa`] which
-/// carries the resolved base alongside the symbol map.
-pub(crate) fn text_kva_to_pa_with_base(kva: u64, start_kernel_map: u64) -> u64 {
-    kva.wrapping_sub(start_kernel_map)
+/// [`start_kernel_map_for_tcr`] on aarch64.
+///
+/// `phys_base` is the kernel's runtime `phys_base` (x86_64) or
+/// `DRAM_START` (aarch64). The boot-time bootstrap value is
+/// `0` (x86_64) / `DRAM_START` (aarch64); production callers
+/// pass the resolved value once the BSP has established the
+/// kernel image mapping (see [`resolve_phys_base`]).
+///
+/// Most callers funnel through
+/// [`super::guest::GuestKernel::text_kva_to_pa`] which carries
+/// both the resolved base and `phys_base` alongside the symbol
+/// map.
+pub(crate) fn text_kva_to_pa_with_base(kva: u64, start_kernel_map: u64, phys_base: u64) -> u64 {
+    kva.wrapping_sub(start_kernel_map).wrapping_add(phys_base)
 }
 
 /// Derive the aarch64 kernel image base (`KIMAGE_VADDR`) from
@@ -606,6 +732,18 @@ pub(crate) fn read_per_cpu_offsets(
 ///
 /// Each CPU's rq is at `runqueues_kva + per_cpu_offset[cpu]` in kernel
 /// virtual space; subtracting PAGE_OFFSET yields the guest physical address.
+///
+/// `per_cpu_offsets` slots that are zero produce a PA at
+/// `kva_to_pa(runqueues_kva, page_offset)`, which on a typical
+/// `runqueues` percpu offset (small, far below `page_offset`)
+/// wraps via `wrapping_sub` into the upper-half KVA region — far
+/// outside any guest DRAM region. [`super::reader::GuestMem::read_u64`]
+/// silently bounds-rejects such reads to zero, so callers get
+/// zero-filled `CpuSnapshot`s when this function is fed a stale
+/// (BSS-zero) per-CPU offset table. Callers that need to dodge
+/// the host-monitor / guest-BSP boot race should refresh the
+/// offset table per sample (see
+/// [`super::reader::RqRefresh`]).
 pub(crate) fn compute_rq_pas(
     runqueues_kva: u64,
     per_cpu_offsets: &[u64],
@@ -664,10 +802,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "aarch64")]
     fn start_kernel_map_for_tcr_returns_none_on_zero() {
         // tcr_el1 = 0 means the BSP loop has not yet read the
         // register; the derivation cannot proceed and the result
-        // must be None so retry loops keep polling.
+        // must be None so retry loops keep polling. On x86_64
+        // tcr_el1 has no meaning and the function returns the
+        // compile-time START_KERNEL_MAP unconditionally — see
+        // start_kernel_map_for_tcr_x86_64_constant.
         assert_eq!(start_kernel_map_for_tcr(0), None);
     }
 
@@ -868,13 +1010,21 @@ mod tests {
 
     #[test]
     fn text_kva_to_pa_with_base_basic() {
+        // phys_base=0 (non-KASLR / aarch64-after-DRAM-cancel): formula
+        // collapses to `kva - start_kernel_map`.
         assert_eq!(
-            text_kva_to_pa_with_base(START_KERNEL_MAP + 0x10_0000, START_KERNEL_MAP),
+            text_kva_to_pa_with_base(START_KERNEL_MAP + 0x10_0000, START_KERNEL_MAP, 0),
             0x10_0000
         );
         assert_eq!(
-            text_kva_to_pa_with_base(START_KERNEL_MAP, START_KERNEL_MAP),
+            text_kva_to_pa_with_base(START_KERNEL_MAP, START_KERNEL_MAP, 0),
             0
+        );
+        // phys_base != 0 (KASLR): the offset shifts every text symbol
+        // PA by the post-randomization kernel image PA.
+        assert_eq!(
+            text_kva_to_pa_with_base(START_KERNEL_MAP + 0x10_0000, START_KERNEL_MAP, 0x4000_0000),
+            0x4010_0000
         );
     }
 
@@ -924,6 +1074,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
             init_top_pgt: None,
@@ -956,6 +1107,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
             init_top_pgt: None,
@@ -990,6 +1142,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
             init_top_pgt: None,
@@ -1027,6 +1180,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
             init_top_pgt: None,
@@ -1067,6 +1221,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: Some(pob_kva),
+            phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
             init_top_pgt: None,
@@ -1103,6 +1258,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
             init_top_pgt: None,
@@ -1117,7 +1273,7 @@ mod tests {
             node_data: None,
         };
 
-        assert!(resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP));
+        assert!(resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
     }
 
     #[test]
@@ -1136,6 +1292,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
             init_top_pgt: None,
@@ -1150,7 +1307,7 @@ mod tests {
             node_data: None,
         };
 
-        assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP));
+        assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
     }
 
     #[test]
@@ -1165,6 +1322,7 @@ mod tests {
             runqueues: 0,
             per_cpu_offset: 0,
             page_offset_base_kva: None,
+            phys_base_kva: None,
             scx_root: None,
             scx_tasks: None,
             init_top_pgt: None,
@@ -1179,7 +1337,7 @@ mod tests {
             node_data: None,
         };
 
-        assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP));
+        assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
     }
 
     /// `default_page_offset_for_tcr` derives `-(1 << VA_BITS)` from
@@ -1216,7 +1374,10 @@ mod tests {
             assert_eq!(default_page_offset_for_tcr(tcr_t1sz_0), DEFAULT_PAGE_OFFSET);
             // T1SZ > 60 (out of range): fallback.
             let tcr_t1sz_63 = 63u64 << 16;
-            assert_eq!(default_page_offset_for_tcr(tcr_t1sz_63), DEFAULT_PAGE_OFFSET);
+            assert_eq!(
+                default_page_offset_for_tcr(tcr_t1sz_63),
+                DEFAULT_PAGE_OFFSET
+            );
         }
     }
 }

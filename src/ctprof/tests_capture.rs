@@ -783,6 +783,101 @@ fn capture_with_missing_sched_zeroes_sched_fields() {
     );
 }
 
+/// G4f — sched file present but `sum_block_runtime` line
+/// absent: `voluntary_sleep_ns` must collapse to 0, not fall
+/// back to `sum_sleep_runtime`. Pins the field-doc contract:
+/// the kernel's `sum_sleep_runtime` is the FULL off-CPU total
+/// (voluntary + involuntary block); subtracting block leaves
+/// the voluntary residual. If `sum_block_runtime` parses to
+/// `None`, the residual is uncomputable. Falling back to
+/// `sleep_sum - 0` would mislabel involuntary block as
+/// voluntary sleep and break every consumer that treats
+/// `voluntary_sleep_ns` as a clean signal. The fix at
+/// `capture_thread_at_with_tally` matches both halves with
+/// `Some(_)` and falls through to 0 otherwise.
+#[test]
+fn capture_with_block_runtime_absent_zeroes_voluntary_sleep_not_sleep_sum() {
+    let proc_tmp = tempfile::TempDir::new().unwrap();
+    let cgroup_tmp = tempfile::TempDir::new().unwrap();
+    let sys_tmp = tempfile::TempDir::new().unwrap();
+    let tgid: i32 = 2020;
+    let tid: i32 = 2021;
+    stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+    // Overwrite the sched file with one that has sum_sleep_runtime
+    // but NO sum_block_runtime line. Pre-fix code would silently
+    // use the full sleep_sum as voluntary_sleep_ns; the fix
+    // collapses to 0.
+    let sched_path = proc_tmp
+        .path()
+        .join(tgid.to_string())
+        .join("task")
+        .join(tid.to_string())
+        .join("sched");
+    let sched_no_block = "\
+         sum_sleep_runtime                              :    3200.50\n\
+         se.statistics.sleep_max                        :     180.25\n";
+    std::fs::write(&sched_path, sched_no_block).unwrap();
+
+    let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
+    assert_eq!(snap.threads.len(), 1);
+    let t = &snap.threads[0];
+    use crate::metric_types::MonotonicNs;
+    // Pre-fix: voluntary_sleep_ns would be 3_200_500_000 (the
+    // full sleep_sum), mislabelling any involuntary-block
+    // component buried inside as voluntary sleep. Post-fix:
+    // 0 because block_sum is None and the residual is
+    // uncomputable.
+    assert_eq!(
+        t.voluntary_sleep_ns,
+        MonotonicNs(0),
+        "block_sum absent → voluntary_sleep_ns must collapse to 0; \
+         falling back to sum_sleep_runtime would mislabel \
+         involuntary block as voluntary sleep",
+    );
+    // block_sum itself also zero from the same parse miss —
+    // confirms the test set up the missing-block scenario.
+    assert_eq!(t.block_sum, MonotonicNs(0));
+}
+
+/// Symmetric coverage of G4f — `sum_sleep_runtime` line
+/// absent but `sum_block_runtime` present: voluntary_sleep_ns
+/// must also be 0. Pre-fix code would compute
+/// `0.saturating_sub(real_block) = 0` here purely by
+/// saturating-arithmetic luck, but the new explicit
+/// both-Some gate is what the doc actually promises and the
+/// test pins.
+#[test]
+fn capture_with_sleep_runtime_absent_zeroes_voluntary_sleep() {
+    let proc_tmp = tempfile::TempDir::new().unwrap();
+    let cgroup_tmp = tempfile::TempDir::new().unwrap();
+    let sys_tmp = tempfile::TempDir::new().unwrap();
+    let tgid: i32 = 2030;
+    let tid: i32 = 2031;
+    stage_synthetic_proc(proc_tmp.path(), tgid, tid, "p", "live");
+    let sched_path = proc_tmp
+        .path()
+        .join(tgid.to_string())
+        .join("task")
+        .join(tid.to_string())
+        .join("sched");
+    let sched_no_sleep = "\
+         sum_block_runtime                              :    1100.75\n\
+         se.statistics.block_max                        :      60.75\n";
+    std::fs::write(&sched_path, sched_no_sleep).unwrap();
+
+    let snap = capture_with(proc_tmp.path(), cgroup_tmp.path(), sys_tmp.path(), false);
+    assert_eq!(snap.threads.len(), 1);
+    let t = &snap.threads[0];
+    use crate::metric_types::MonotonicNs;
+    assert_eq!(
+        t.voluntary_sleep_ns,
+        MonotonicNs(0),
+        "sleep_sum absent → voluntary_sleep_ns must be 0",
+    );
+    // block_sum still parses; surfaces as itself.
+    assert_eq!(t.block_sum, MonotonicNs(1_100_750_000));
+}
+
 /// G5 — selectively delete EVERY non-comm file under one tid
 /// to simulate a partial mid-capture race (readdir saw the
 /// dir, then the kernel completed exit cleanup before our
