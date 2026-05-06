@@ -146,8 +146,8 @@ fn resolve_shared_libs_inner(binary: &Path, extra_interp_hints: &[PathBuf]) -> R
     // (nextest parallelism). Hints are part of the key so a second
     // call on the same binary with different hint sets does not return
     // the prior result.
-    static CACHE: LazyLock<std::sync::Mutex<HashMap<(PathBuf, Vec<PathBuf>), SharedLibs>>> =
-        LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    type LibCache = LazyLock<std::sync::Mutex<HashMap<(PathBuf, Vec<PathBuf>), SharedLibs>>>;
+    static CACHE: LibCache = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
     let canon = std::fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
     let cache_key = (canon.clone(), extra_interp_hints.to_vec());

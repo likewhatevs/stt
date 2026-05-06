@@ -4690,7 +4690,7 @@ mod tests {
     /// Two chains:
     ///   - chain 0: valid single descriptor → drains 32 bytes
     ///   - chain 1: torn (second desc unmapped) → publishes head=0,
-    ///              breaks loop
+    ///     breaks loop
     ///
     /// After drain: used.idx==2, INT_VRING set, irq_evt non-zero,
     /// 32 bytes consumed from pending_rx (chain 0 only).

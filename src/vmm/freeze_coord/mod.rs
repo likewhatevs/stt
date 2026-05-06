@@ -2246,7 +2246,7 @@ impl KtstrVm {
                             last_sched_kva,
                             sched_offs.exit_kind as u32,
                             &freeze_coord_watchpoint,
-                            &kernel_for_root,
+                            kernel_for_root,
                             mem,
                         ) {
                             WatchpointPublishResult::Unchanged => {}

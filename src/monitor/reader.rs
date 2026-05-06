@@ -3495,8 +3495,8 @@ mod tests {
     ///     `runqueues_kva`; we set `runqueues_kva = 0` so the offset
     ///     IS the PA).
     ///   - rq buffers follow the offset table.
-    /// With `page_offset = 0`, `kva_to_pa(off + 0, 0) = off` so the
-    /// recomputed `rq_pas[cpu]` equals the offset slot.
+    ///     With `page_offset = 0`, `kva_to_pa(off + 0, 0) = off` so the
+    ///     recomputed `rq_pas[cpu]` equals the offset slot.
     #[test]
     fn monitor_loop_rq_refresh_drives_pas() {
         let offsets = test_offsets();
@@ -3575,7 +3575,7 @@ mod tests {
     fn monitor_loop_rq_refresh_zero_offsets_no_panic() {
         let offsets = test_offsets();
         // 16 zero bytes simulating BSS __per_cpu_offset[2].
-        let mem_buf = vec![0u8; 64];
+        let mem_buf = [0u8; 64];
         // SAFETY: mem_buf is a live local buffer whose backing
         // storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(mem_buf.as_ptr() as *mut u8, mem_buf.len() as u64) };

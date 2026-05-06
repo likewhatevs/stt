@@ -1753,8 +1753,10 @@ fn collect_and_print_probe_data(
             } else {
                 "<non-string panic>".to_string()
             };
-            let mut diag = crate::probe::process::ProbeDiagnostics::default();
-            diag.host_thread_panic = Some(msg);
+            let diag = crate::probe::process::ProbeDiagnostics {
+                host_thread_panic: Some(msg),
+                ..Default::default()
+            };
             (Vec::new(), diag, Vec::new())
         }
     };

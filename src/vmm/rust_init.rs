@@ -235,9 +235,9 @@ fn proc_pid_alive(pid: u32) -> bool {
 /// bytes) directly.
 fn u64_to_hex_asm(value: u64, buf: &mut [u8; 16]) -> &[u8] {
     static HEX: &[u8; 16] = b"0123456789abcdef";
-    for i in 0..16 {
+    for (i, slot) in buf.iter_mut().enumerate() {
         let nibble = (value >> ((15 - i) * 4)) & 0xf;
-        buf[i] = HEX[nibble as usize];
+        *slot = HEX[nibble as usize];
     }
     &buf[..]
 }
@@ -733,7 +733,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
         // for forwarder-join plumbing.
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
-        crate::vmm::guest_comms::send_exit(code as i32);
+        crate::vmm::guest_comms::send_exit(code);
         // The bulk-port write inside `send_exit` commits via MMIO
         // before userspace returns from KVM_RUN — the EXIT frame is
         // in the host's port-1 RX buffer the moment `send_exit`
