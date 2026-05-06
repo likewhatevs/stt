@@ -5655,6 +5655,16 @@ impl KtstrVm {
         let Some(vmlinux) = find_vmlinux(&self.kernel) else {
             return Ok(None);
         };
+        // Read the vmlinux bytes once and feed both the BTF loader
+        // and the ELF symbol parser. The previous structure called
+        // `load_btf_from_path` and `KernelSymbols::from_vmlinux` back
+        // to back, each running its own `std::fs::read` — on a debug
+        // vmlinux that is two ~1 GB reads through the page cache for
+        // a single byte slice's worth of work.
+        let vmlinux_data = match std::fs::read(&vmlinux) {
+            Ok(d) => d,
+            Err(_) => return Ok(None),
+        };
         // Single BTF parse for both `KernelOffsets` and
         // `BpfProgOffsets`. The previous structure parsed BTF twice
         // (KernelOffsets up here, BpfProgOffsets inside the spawned
@@ -5665,13 +5675,13 @@ impl KtstrVm {
         // window so early samples saw the rq's pre-AP-online state.
         // One parse, two `from_btf` consumers, both share the
         // resolved offsets.
-        let btf = match monitor::btf_offsets::load_btf_from_path(&vmlinux) {
+        let btf = match monitor::btf_offsets::load_btf_from_bytes(&vmlinux_data, &vmlinux) {
             Ok(b) => b,
             Err(_) => return Ok(None),
         };
         let offsets = monitor::btf_offsets::KernelOffsets::from_btf(&btf);
         let prog_offsets = monitor::btf_offsets::BpfProgOffsets::from_btf(&btf).ok();
-        let symbols = monitor::symbols::KernelSymbols::from_vmlinux(&vmlinux);
+        let symbols = monitor::symbols::KernelSymbols::from_vmlinux_bytes(&vmlinux_data);
 
         let (Ok(offsets), Ok(symbols)) = (offsets, symbols) else {
             return Ok(None);
