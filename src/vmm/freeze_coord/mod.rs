@@ -7048,9 +7048,12 @@ impl KtstrVm {
             crate::test_support::extract_panic_message(&app_output).map(|s| s.to_string());
 
         // Collect BPF verifier stats from host-side memory reads.
-        // Skip when no scheduler was loaded — struct_ops programs
-        // only exist when a sched_ext scheduler attached.
-        let verifier_stats = if self.scheduler_binary.is_some() {
+        // Skip when no scheduler is active — struct_ops programs
+        // only exist when a sched_ext scheduler attached (either via
+        // a userspace binary or kernel-built enable commands).
+        let has_scheduler =
+            self.scheduler_binary.is_some() || !self.sched_enable_cmds.is_empty();
+        let verifier_stats = if has_scheduler {
             self.collect_verifier_stats(&run.vm, run.tcr_el1.as_ref(), &run.cr3)
         } else {
             Vec::new()
