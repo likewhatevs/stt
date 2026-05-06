@@ -186,7 +186,12 @@ impl KtstrVm {
     /// failure path (the parked-vCPU poll cadence). Healthy runs
     /// never enter the freeze path; the latch only fires on an
     /// error-class scheduler exit.
-    pub(super) fn run_vm(&self, run_start: Instant, mut vm: kvm::KtstrKvm) -> Result<VmRunState> {
+    pub(super) fn run_vm(
+        &self,
+        run_start: Instant,
+        mut vm: kvm::KtstrKvm,
+        default_cpu_mask: Option<&[usize]>,
+    ) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
 
@@ -441,7 +446,11 @@ impl KtstrVm {
         // No-perf + --cpu-cap: flat CPU list from the LLC plan gets
         // sched_setaffinity'd on every vCPU thread as a mask (not a
         // hard pin). Mutually exclusive with perf-mode's pin_targets.
-        let no_perf_mask: Option<&[usize]> = self.no_perf_plan.as_ref().map(|p| p.cpus.as_slice());
+        let no_perf_mask: Option<&[usize]> = self
+            .no_perf_plan
+            .as_ref()
+            .map(|p| p.cpus.as_slice())
+            .or(default_cpu_mask);
 
         // Per-AP TID slots — each AP thread stamps gettid() into its
         // `AtomicI32` and fires the paired `Latch` at startup so the

@@ -739,13 +739,22 @@ fn pid_window_offset(pid: u32, max_start: usize) -> usize {
 ///
 /// `total_host_cpus` bounds the search space. Single non-blocking pass;
 /// callers rely on nextest retry backoff for contention resolution.
+#[derive(Debug)]
+pub struct CpuLockResult {
+    pub locks: Vec<std::os::fd::OwnedFd>,
+    pub cpus: Vec<usize>,
+}
+
 pub fn acquire_cpu_locks(
     count: usize,
     total_host_cpus: usize,
     host_topo: Option<&HostTopology>,
-) -> Result<Vec<std::os::fd::OwnedFd>> {
+) -> Result<CpuLockResult> {
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(CpuLockResult {
+            locks: Vec::new(),
+            cpus: Vec::new(),
+        });
     }
 
     // No window can fit if the request exceeds the host. Bail before
@@ -777,20 +786,17 @@ pub fn acquire_cpu_locks(
         let offset = (start_offset + step) % max_start;
         match try_acquire_cpu_window(offset, count) {
             Ok(mut locks) => {
-                // Acquire shared LLC locks so perf VMs cannot take
-                // exclusive access to LLCs we are using.
+                let cpus: Vec<usize> = (offset..offset + count).collect();
                 if let Some(topo) = host_topo {
-                    let cpus: Vec<usize> = (offset..offset + count).collect();
                     match acquire_llc_shared_locks(topo, &cpus) {
                         Ok(llc_locks) => locks.extend(llc_locks),
                         Err(_) => {
-                            // LLC lock busy — drop CPU locks and try next window.
                             drop(locks);
                             continue;
                         }
                     }
                 }
-                return Ok(locks);
+                return Ok(CpuLockResult { locks, cpus });
             }
             Err(_) => continue,
         }

@@ -1452,8 +1452,9 @@ fn cpu_lock_window_contention_all_or_nothing() {
 
 #[test]
 fn cpu_lock_zero_count() {
-    let locks = acquire_cpu_locks(0, 4, None).unwrap();
-    assert!(locks.is_empty());
+    let result = acquire_cpu_locks(0, 4, None).unwrap();
+    assert!(result.locks.is_empty());
+    assert!(result.cpus.is_empty());
 }
 
 #[test]
@@ -1483,14 +1484,15 @@ fn cpu_lock_contention_slides_window() {
 
 #[test]
 fn cpu_lock_acquire_success() {
-    let locks = match acquire_cpu_locks(3, 100, None) {
-        Ok(l) => l,
+    let result = match acquire_cpu_locks(3, 100, None) {
+        Ok(r) => r,
         Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
             panic!("{e}");
         }
         Err(e) => panic!("{e:#}"),
     };
-    assert_eq!(locks.len(), 3);
+    assert_eq!(result.locks.len(), 3);
+    assert_eq!(result.cpus.len(), 3);
 }
 
 /// `pid_window_offset` must diffuse adjacent pids across the
@@ -1634,8 +1636,8 @@ fn cpu_lock_acquire_slides_past_held() {
         .unwrap()
         .unwrap();
 
-    let locks = match acquire_cpu_locks(2, 100, None) {
-        Ok(l) => l,
+    let result = match acquire_cpu_locks(2, 100, None) {
+        Ok(r) => r,
         Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
             drop(holder);
             cleanup_lock("/tmp/ktstr-cpu-0.lock");
@@ -1643,9 +1645,10 @@ fn cpu_lock_acquire_slides_past_held() {
         }
         Err(e) => panic!("{e:#}"),
     };
-    assert_eq!(locks.len(), 2);
+    assert_eq!(result.locks.len(), 2);
+    assert_eq!(result.cpus.len(), 2);
 
-    drop(locks);
+    drop(result);
     drop(holder);
     cleanup_lock("/tmp/ktstr-cpu-0.lock");
 }
@@ -1682,14 +1685,15 @@ fn cpu_lock_acquire_with_llc_shared() {
 
     let topo = HostTopology::new_for_tests(&[((0..100).collect(), 0)]);
 
-    let locks = match acquire_cpu_locks(2, 100, Some(&topo)) {
-        Ok(l) => l,
+    let result = match acquire_cpu_locks(2, 100, Some(&topo)) {
+        Ok(r) => r,
         Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
             panic!("{e}");
         }
         Err(e) => panic!("{e:#}"),
     };
-    assert_eq!(locks.len(), 3);
+    assert_eq!(result.locks.len(), 3);
+    assert_eq!(result.cpus.len(), 2);
 
     // The LLC lock is shared — another shared should coexist.
     let llc_path = llc_lock_path(0);
@@ -1704,7 +1708,7 @@ fn cpu_lock_acquire_with_llc_shared() {
     );
 
     drop(shared2);
-    drop(locks);
+    drop(result);
     drop(cpu_prefix_dir);
 }
 

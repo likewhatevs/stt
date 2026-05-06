@@ -604,11 +604,21 @@ impl KtstrVmBuilder {
     /// `ResourceContention`, which callers typically treat as a
     /// skip rather than a failure).
     pub fn build(mut self) -> Result<KtstrVm> {
-        if self.no_perf_mode {
+        let no_perf_mode = self.no_perf_mode;
+        if no_perf_mode {
             self.performance_mode = false;
         }
 
-        let (pinning_plan, mbind_node_map, cpu_locks, no_perf_plan) = if self.no_perf_mode {
+        // `host_topo` is cached on KtstrVm so `KtstrVm::run`'s
+        // default-else branch (neither perf-mode nor no-perf-mode)
+        // can call `acquire_cpu_locks` without re-reading sysfs.
+        // The no-perf-mode and perf-mode branches reuse their
+        // stored plans' `locked_llcs` / `llc_indices` directly
+        // through `acquire_resource_locks` and do not need the
+        // topology at run time.
+        let mut cached_host_topo: Option<host_topology::HostTopology> = None;
+
+        let (pinning_plan, mbind_node_map, no_perf_plan) = if no_perf_mode {
             // No-perf-mode VMs would otherwise have unrestricted vCPU
             // affinity — the host kernel places their threads on any
             // online CPU, including ones a perf-mode peer has flocked
@@ -626,8 +636,11 @@ impl KtstrVmBuilder {
             // list + flat `cpus` (intersection with allowed) + RAII
             // flock fds. The `cpus` are threaded into `no_perf_plan`
             // so `run_vm` can `sched_setaffinity` every vCPU thread
-            // onto that pool. `cpu_locks` stays empty — the plan
-            // owns the flocks.
+            // onto that pool. `KtstrVm::run` re-acquires fresh
+            // flocks just before vCPU spawn — `build()` does not
+            // hold flocks across the post-build setup window so
+            // concurrent peers see the LLCs free until the run
+            // actually starts.
             //
             // When the cap is absent (`CpuCap::resolve(None) ==
             // Ok(None)`), the planner applies the 30%-of-allowed
@@ -664,12 +677,25 @@ impl KtstrVmBuilder {
                          disables the contract entirely."
                     );
                 }
-                (None, Vec::new(), Vec::new(), None)
+                (None, Vec::new(), None)
             } else if let Ok(host_topo) = host_topology::HostTopology::from_sysfs() {
                 let test_topo = crate::topology::TestTopology::from_system()?;
-                let plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, cpu_cap)?;
+                // Compute the plan and immediately drop the flocks:
+                // we want the plan SHAPE on KtstrVm but not the
+                // RAII fds. `run()` re-takes fresh `LOCK_SH` on
+                // `plan.locked_llcs` via `acquire_resource_locks`
+                // just before vCPU spawn so the build-to-run
+                // setup window holds no flocks.
+                let mut plan = host_topology::acquire_llc_plan(&host_topo, &test_topo, cpu_cap)?;
                 host_topology::warn_if_cross_node_spill(&plan, &host_topo);
-                (None, Vec::new(), Vec::new(), Some(plan))
+                // Strip the flock fds — they release on drop. The
+                // plan's `cpus` / `locked_llcs` / `mems` fields
+                // stay populated for build-time setup paths
+                // (no_perf_cpus on virtio-blk worker, mask
+                // computation in run_vm/freeze_coord).
+                drop(std::mem::take(&mut plan.locks));
+                cached_host_topo = Some(host_topo);
+                (None, Vec::new(), Some(plan))
             } else {
                 if cpu_cap.is_some() {
                     anyhow::bail!(
@@ -684,22 +710,29 @@ impl KtstrVmBuilder {
                      skipping CPU-budget LLC reservation. Concurrent perf-mode \
                      runs on this host will NOT be serialized against this VM"
                 );
-                (None, Vec::new(), Vec::new(), None)
+                (None, Vec::new(), None)
             }
         } else if self.performance_mode {
-            let (plan, host_topo) = self.validate_performance_mode()?;
+            let (mut plan, host_topo) = self.validate_performance_mode()?;
             let node_map = build_per_node_map(&plan, &host_topo, &self.topology);
-            (Some(plan), node_map, Vec::new(), None)
+            // Strip the flock fds — `run()` re-acquires via
+            // `acquire_resource_locks` using `plan.llc_indices`.
+            // The build-time setup paths read `assignments` /
+            // `service_cpu` / `llc_indices`, which all stay
+            // populated.
+            drop(std::mem::take(&mut plan.locks));
+            cached_host_topo = Some(host_topo);
+            (Some(plan), node_map, None)
         } else {
-            let total_cpus = self.topology.total_cpus() as usize;
-            let host_topo = host_topology::HostTopology::from_sysfs().ok();
-            let host_cpus = host_topo
-                .as_ref()
-                .map(|h| h.total_cpus())
-                .unwrap_or(total_cpus);
-            let locks =
-                host_topology::acquire_cpu_locks(total_cpus, host_cpus, host_topo.as_ref())?;
-            (None, Vec::new(), locks, None)
+            // Default else: no perf-mode and no no-perf-mode. The
+            // legacy path acquired a per-CPU flock window via
+            // `acquire_cpu_locks` for the VM's lifetime; the
+            // deferred-lock contract pushes that into `KtstrVm::run`
+            // so the build-to-run setup window holds no flocks.
+            // Cache `host_topo` so `run()` can pass it to
+            // `acquire_cpu_locks` without re-reading sysfs.
+            cached_host_topo = host_topology::HostTopology::from_sysfs().ok();
+            (None, Vec::new(), None)
         };
 
         let kernel = self.kernel.context("kernel path required")?;
@@ -748,10 +781,11 @@ impl KtstrVmBuilder {
             watchdog_timeout: self.watchdog_timeout,
             bpf_map_writes: self.bpf_map_writes,
             performance_mode: self.performance_mode,
+            no_perf_mode,
             pinning_plan,
             mbind_node_map,
-            cpu_locks,
             no_perf_plan,
+            host_topo: cached_host_topo,
             sched_enable_cmds: self.sched_enable_cmds,
             sched_disable_cmds: self.sched_disable_cmds,
             include_files: self.include_files,

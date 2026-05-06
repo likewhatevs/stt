@@ -107,18 +107,18 @@ fn note_value_survives_serde_roundtrip() {
     assert_eq!(r2.measurements["name"], NoteValue::Text("fio".to_string()));
 }
 
-/// Empty `measurements` is omitted from the wire format — the
-/// `skip_serializing_if` attribute keeps wire size minimal when
-/// nothing was measured. Pin so a regression that dropped the
-/// attribute (and started emitting `"measurements":{}` on every
-/// passing result) trips here.
+/// Empty `measurements` is present in the wire format as `{}`.
+/// `skip_serializing_if` was removed because AssertResult is
+/// serialized with bincode (positional) — skipping a field on
+/// serialize misaligns the deserializer. `#[serde(default)]`
+/// handles old sidecars that lack the key.
 #[test]
-fn empty_measurements_omitted_from_wire_format() {
+fn empty_measurements_present_in_wire_format() {
     let r = AssertResult::pass();
     let json = serde_json::to_string(&r).unwrap();
     assert!(
-        !json.contains("measurements"),
-        "empty measurements must be skipped from JSON: {json}",
+        json.contains("\"measurements\":{}"),
+        "empty measurements must be present in JSON for bincode compat: {json}",
     );
 }
 

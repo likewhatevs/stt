@@ -241,26 +241,45 @@ pub struct KtstrVm {
     /// MSR_KVM_POLL_CONTROL). Oversubscription validation at build
     /// time on both architectures.
     pub(crate) performance_mode: bool,
-    /// Pinning plan computed during build() when performance_mode is enabled.
-    /// Stored so topology is read once and the plan is reused at VM start.
+    /// Whether the builder was invoked with `no_perf_mode(true)`. The
+    /// flag is needed at `run()` time so the lock-acquisition switch
+    /// can distinguish "no-perf-mode bypass / degraded-sysfs" (no
+    /// locks, no plans, no acquire) from the default-else path that
+    /// reserves a per-CPU window via `acquire_cpu_locks` whenever
+    /// neither `performance_mode` nor `no_perf_mode` is in effect.
+    /// Persisted on KtstrVm so the deferred-lock contract in
+    /// `KtstrVm::run` does not need to re-read the env every spawn.
+    pub(crate) no_perf_mode: bool,
+    /// Pinning plan computed during build() when performance_mode is
+    /// enabled. The flock fds carried by the plan are stripped at
+    /// build time — `KtstrVm::run` re-acquires the LLC flocks via
+    /// [`host_topology::acquire_resource_locks`] just before
+    /// spawning vCPU threads and releases them on return, so
+    /// concurrent peers see the LLCs free as soon as the run
+    /// completes (and the entire setup window between `build()`
+    /// and `run()` carries no locks). The `assignments` /
+    /// `service_cpu` / `llc_indices` payload is what `setup` and
+    /// `freeze_coord` consume during the run.
     pub(crate) pinning_plan: Option<host_topology::PinningPlan>,
     /// Per-guest-NUMA-node host NUMA nodes for mbind. Indexed by guest
     /// node ID. Each entry is the set of host NUMA nodes that the guest
     /// node's vCPUs are pinned to. Empty when performance_mode is off.
     pub(crate) mbind_node_map: Vec<Vec<usize>>,
-    /// CPU flock fds for non-perf VMs. Held for the VM's lifetime to
-    /// prevent other VMs from double-booking the same CPUs.
-    #[allow(dead_code)]
-    pub(crate) cpu_locks: Vec<std::os::fd::OwnedFd>,
     /// No-perf-mode resource plan. Populated for every no-perf-mode
     /// VM — either the operator-set CPU count
     /// (`--cpu-cap N` / `KTSTR_CPU_CAP=N`) or the 30%-of-allowed
-    /// default when neither is present. Holds the flat CPU list +
-    /// RAII flock fds returned by
-    /// [`host_topology::acquire_llc_plan`]. `run_vm` reads the CPU
-    /// list to `sched_setaffinity` every vCPU thread onto the
-    /// reserved host CPUs, and `Drop` releases the LLC flocks with
-    /// the VM.
+    /// default when neither is present. The flock fds are stripped
+    /// at build time; `KtstrVm::run` re-takes `LOCK_SH` on the
+    /// stored `locked_llcs` via
+    /// [`host_topology::acquire_resource_locks`] just before vCPU
+    /// spawn to take fresh locks scoped to the run. Reusing the
+    /// stored plan (instead of replanning at run time) keeps the
+    /// affinity mask consumed by `setup` in lock-step with the LLC
+    /// indices the run-scoped fds protect; otherwise a TOCTOU
+    /// replan could shift the LLC selection out from under the
+    /// already-bound `sched_setaffinity` masks. The stored plan's
+    /// `cpus` slice drives the build-time `setup` paths that must
+    /// know the no-perf CPU mask before `run()` is called.
     ///
     /// `None` only in the degraded-sysfs case (no-perf-mode on a
     /// host whose `/sys/devices/system/cpu` cannot be read AND no
@@ -271,6 +290,14 @@ pub struct KtstrVm {
     /// soft-masks a pool.
     #[allow(dead_code)]
     pub(crate) no_perf_plan: Option<host_topology::LlcPlan>,
+    /// Cached host topology snapshot read once at `build()` time
+    /// from `/sys/devices/system/cpu`. `KtstrVm::run`'s default-else
+    /// branch threads this through `acquire_cpu_locks` to take a
+    /// fresh per-CPU window without re-reading sysfs. `None` only on
+    /// the degraded-sysfs no-perf-mode branch, where no LLC
+    /// reservation is possible to begin with — `KtstrVm::run`
+    /// short-circuits to "no locks" in that case.
+    pub(crate) host_topo: Option<host_topology::HostTopology>,
     /// Shell commands to run in the guest to enable a kernel-built scheduler.
     pub(crate) sched_enable_cmds: Vec<String>,
     /// Shell commands to run in the guest to disable a kernel-built scheduler.
@@ -355,6 +382,12 @@ pub struct KtstrVm {
     pub(crate) dual_snapshot: bool,
 }
 
+struct RunLocks {
+    #[allow(dead_code)]
+    locks: Vec<std::os::fd::OwnedFd>,
+    default_cpu_mask: Option<Vec<usize>>,
+}
+
 impl KtstrVm {
     pub fn builder() -> KtstrVmBuilder {
         KtstrVmBuilder::default()
@@ -414,7 +447,9 @@ impl KtstrVm {
         // timeout budget.
         let run_start = Instant::now();
 
-        let run = self.run_vm(run_start, vm)?;
+        let run_locks = self.acquire_run_locks()?;
+        let run = self.run_vm(run_start, vm, run_locks.default_cpu_mask.as_deref())?;
+        drop(run_locks);
 
         let mut result = self.collect_results(start, run)?;
 
@@ -424,6 +459,120 @@ impl KtstrVm {
         }
 
         Ok(result)
+    }
+
+    /// Acquire the run-scoped flock fds the VM needs for the
+    /// duration of [`Self::run`] / [`Self::run_interactive`].
+    /// `build()` strips every flock from the cached pinning /
+    /// LLC plan; this fn re-takes them just before vCPU spawn so
+    /// the post-build setup window holds no host-side locks.
+    /// The returned `Vec<OwnedFd>` is dropped at the end of the
+    /// run, releasing every lock for concurrent peers.
+    ///
+    /// Branch table (mirrors `build()`'s plan switch):
+    /// * `no_perf_mode` + cached `no_perf_plan`: reuses the stored
+    ///   plan's `locked_llcs` to take `LOCK_SH` via
+    ///   `acquire_resource_locks`. Same fds the legacy
+    ///   `try_acquire_llc_plan_locks` path took, just deferred to
+    ///   run-start.
+    /// * `no_perf_mode` + missing plan (bypass / degraded sysfs):
+    ///   returns an empty Vec — `build()` already warned, no
+    ///   coordination is possible on this host.
+    /// * `performance_mode` + `pinning_plan`: reuses the stored
+    ///   plan's `llc_indices` to take `LOCK_EX` via
+    ///   `acquire_resource_locks`. ResourceContention surfaces
+    ///   verbatim so callers route it to the existing
+    ///   `skip_on_contention!` path.
+    /// * default else: re-acquires the per-CPU window via
+    ///   `acquire_cpu_locks` with the cached `host_topo`. This is
+    ///   the path test fixtures take when neither `--perf-mode`
+    ///   nor `--no-perf-mode` is in effect.
+    fn acquire_run_locks(&self) -> Result<RunLocks> {
+        if self.no_perf_mode {
+            // Reuse the build-time plan's LLC selection rather than
+            // re-running DISCOVER+PLAN. Setup paths (`init_virtio_blk`,
+            // run_vm's pin/mask computation) read `self.no_perf_plan`
+            // for affinity decisions; run-time replanning could pick
+            // a different LLC set under TOCTOU pressure and leave the
+            // affinity masks pointing at CPUs that are now in a
+            // different LLC than the locks. Using the stored plan's
+            // `locked_llcs` keeps mask + lock identities aligned
+            // through every code path. When the plan is `None`
+            // (degraded-sysfs branch in `build()`), no coordination
+            // is possible — return an empty Vec; `build()` already
+            // emitted the diagnostic.
+            if let Some(ref plan) = self.no_perf_plan {
+                // `acquire_resource_locks` operates on a
+                // `&PinningPlan`; the LLC plan's selection is
+                // forwarded through a shape-only stub whose
+                // `assignments` is empty. With `LlcLockMode::Shared`,
+                // empty `assignments` means no per-CPU locks — only
+                // the LLC `LOCK_SH` set fires, which is exactly the
+                // legacy `try_acquire_llc_plan_locks` semantics.
+                let stub = host_topology::PinningPlan {
+                    assignments: Vec::new(),
+                    service_cpu: None,
+                    llc_indices: plan.locked_llcs.clone(),
+                    locks: Vec::new(),
+                };
+                match host_topology::acquire_resource_locks(
+                    &stub,
+                    &stub.llc_indices,
+                    host_topology::LlcLockMode::Shared,
+                )? {
+                    host_topology::LockOutcome::Acquired { locks, .. } => Ok(RunLocks {
+                        locks,
+                        default_cpu_mask: None,
+                    }),
+                    host_topology::LockOutcome::Unavailable(reason) => {
+                        Err(anyhow::Error::new(host_topology::ResourceContention {
+                            reason,
+                        }))
+                    }
+                }
+            } else {
+                Ok(RunLocks {
+                    locks: Vec::new(),
+                    default_cpu_mask: None,
+                })
+            }
+        } else if self.performance_mode {
+            if let Some(ref plan) = self.pinning_plan {
+                match host_topology::acquire_resource_locks(
+                    plan,
+                    &plan.llc_indices,
+                    host_topology::LlcLockMode::Exclusive,
+                )? {
+                    host_topology::LockOutcome::Acquired { locks, .. } => Ok(RunLocks {
+                        locks,
+                        default_cpu_mask: None,
+                    }),
+                    host_topology::LockOutcome::Unavailable(reason) => {
+                        Err(anyhow::Error::new(host_topology::ResourceContention {
+                            reason,
+                        }))
+                    }
+                }
+            } else {
+                Ok(RunLocks {
+                    locks: Vec::new(),
+                    default_cpu_mask: None,
+                })
+            }
+        } else {
+            let total_cpus = self.topology.total_cpus() as usize;
+            let host_cpus = self
+                .host_topo
+                .as_ref()
+                .map(|h| h.total_cpus())
+                .unwrap_or(total_cpus);
+            let result =
+                host_topology::acquire_cpu_locks(total_cpus, host_cpus, self.host_topo.as_ref())?;
+            Ok(RunLocks {
+                locks: result.locks,
+                default_cpu_mask: Some(result.cpus),
+            })
+        }
     }
 
     /// Boot the VM with bidirectional stdin/stdout forwarding via virtio-console.
@@ -571,6 +720,14 @@ impl KtstrVm {
         let mut bsp = vcpus.remove(0);
 
         let ap_pins = vec![None; vcpus.len()];
+        // Acquire run-scoped flock fds via the same path
+        // [`Self::run`] uses. `build()` strips the locks from the
+        // cached plan; this re-take covers exactly the vCPU
+        // thread lifetime, releasing every fd when the function
+        // returns. Held via a binding so RAII drop fires on
+        // every exit path (including the `?` early-returns
+        // below).
+        let _run_locks = self.acquire_run_locks()?;
         // Shell/interactive path mirrors run_vm: no-perf + --cpu-cap
         // applies the LlcPlan's CPU list as a sched_setaffinity mask
         // on every vCPU thread. Perf-mode's pin_targets doesn't
