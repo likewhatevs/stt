@@ -308,6 +308,11 @@ pub(super) fn wait_for_file_or_panic(
 /// past the deadline.
 pub(super) fn ignores_sigusr1_fn(stop: &AtomicBool) -> WorkerReport {
     let tid = ignore_sigusr1_and_get_pid();
+    // SIG_IGN is now installed. Clear any STOP set by the
+    // framework's handler during the handshake window (between
+    // mask unblock and this point). This worker deliberately
+    // ignores SIGUSR1 — the parent must escalate to SIGKILL.
+    stop.store(false, Ordering::Relaxed);
     // Readiness handshake: after SIG_IGN is installed, write a
     // zero-byte ready file so the parent can proceed without
     // waiting on a fixed-duration sleep. Without the handshake

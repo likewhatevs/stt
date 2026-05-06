@@ -54,7 +54,7 @@ jobs:
         run: cargo install --path . --locked
       - name: Build test kernel
         run: cargo ktstr kernel build ${{ matrix.kernel-version }}
-      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
+      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration -j $(( $(nproc) * 5 ))
       - name: sccache stats
         if: ${{ !cancelled() }}
         run: sccache --show-stats
@@ -92,7 +92,7 @@ jobs:
         run: cargo install --path . --locked
       - name: Build test kernel
         run: cargo ktstr kernel build ${{ matrix.kernel-version }}
-      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration
+      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration -j $(( $(nproc) * 5 ))
       - name: sccache stats
         if: ${{ !cancelled() }}
         run: sccache --show-stats
