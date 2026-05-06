@@ -2701,11 +2701,19 @@ impl WorkloadHandle {
                             let mut f = unsafe { std::fs::File::from_raw_fd(start_fds[0]) };
                             let _ = f.read_exact(&mut buf);
                             drop(f);
-                            // Reset stop flag in case SIGUSR1 arrived during wait.
-                            // The forked child has its own (CoW) copy of the
-                            // global STOP, so resetting it here only affects
-                            // this worker, not its siblings.
-                            STOP.store(false, Ordering::Relaxed);
+                            // Do NOT reset STOP here. STOP is initialized to
+                            // false at the pre-handshake site above (after the
+                            // signal-handler install) and a SIGUSR1 delivered
+                            // between the mask unblock and this point reflects
+                            // a legitimate parent-issued stop request — the
+                            // explicit-start path in `stop_and_collect` skips
+                            // the readiness barrier and races
+                            // `kill(pid, SIGUSR1)` against the worker's start-
+                            // byte read here, so any STOP=true observed at
+                            // this point must propagate into the work loop.
+                            // Clobbering it would lose the stop and produce a
+                            // worker that loops until the killpg/SIGKILL
+                            // escalation.
                             // Publish a single "ready" byte on the report pipe
                             // BEFORE entering `worker_main`. The parent's
                             // auto-start barrier in `stop_and_collect` polls
@@ -2713,7 +2721,7 @@ impl WorkloadHandle {
                             // bounded deadline and consumes this byte as the
                             // explicit signal that the worker has finished
                             // its post-fork init (cgroup placement, SIGUSR1
-                            // unblock, STOP reset) and is about to enter the
+                            // unblock) and is about to enter the
                             // work loop. Replaces the prior 500 ms blind
                             // sleep — under host CPU contention, real worker
                             // start latency can exceed that sleep, dropping

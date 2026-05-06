@@ -3562,20 +3562,25 @@ mod tests {
     /// the per-CPU offset table is all-zero (mirrors host monitor
     /// spawn time before guest BSP runs `setup_per_cpu_areas`). With
     /// `runqueues_kva = 0` and `page_offset = 0`, the recomputed PAs
-    /// are 0; the rq buffer starts at PA 0 with a non-zero
-    /// `rq_clock` field, but only because we placed it there. The
-    /// real boot race produces zero-filled snapshots because the
-    /// recomputed PA falls outside guest memory; we can't reproduce
-    /// the OOB silent-zero in a single-region GuestMem test, but we
-    /// CAN verify the loop tolerates a transient empty offset
-    /// table without panicking and recovers when subsequent reads
-    /// see populated values. Asserts the loop survives at least
-    /// one sample with the BSS-zero state.
+    /// are 0. The real boot race produces phantom-zero snapshots
+    /// because the recomputed PA falls outside guest memory; the
+    /// `data_valid` gate inside `monitor_loop` (which requires every
+    /// `__per_cpu_offset[]` slot to be non-zero before walking guest
+    /// memory) prevents those phantom-zero walks. We can't reproduce
+    /// the OOB silent-zero in a single-region `GuestMem` test, but
+    /// we CAN verify that the loop tolerates a transient empty
+    /// offset table without panicking AND that the gate keeps
+    /// `cpus` empty for as long as the offsets are invalid. The
+    /// assertion that `cpus` stays empty is the regression check —
+    /// if the gate ever loosened (e.g. accepted partial zero
+    /// offsets), the `read_rq_stats` walks would resume on stale
+    /// zeros and surface as populated `cpus` with bogus counters.
     #[test]
     fn monitor_loop_rq_refresh_zero_offsets_no_panic() {
         let offsets = test_offsets();
         // 16 zero bytes simulating BSS __per_cpu_offset[2].
-        let mem_buf = [0u8; 64];
+        #[allow(clippy::useless_vec)]
+        let mem_buf = vec![0u8; 64];
         // SAFETY: mem_buf is a live local buffer whose backing
         // storage outlives the GuestMem use.
         let mem = unsafe { GuestMem::new(mem_buf.as_ptr() as *mut u8, mem_buf.len() as u64) };
@@ -3614,12 +3619,21 @@ mod tests {
         );
         handle.join().unwrap();
 
-        // Loop produces samples even when offsets are all zero —
-        // they just contain zero counters because every rq read
-        // lands at PA 0 (which has a zeroed rq).
+        // Loop survives the zero-offset state without panicking and
+        // pushes one sample per timerfd tick. The `data_valid` gate
+        // inside `monitor_loop` keeps `cpus` empty until every slot
+        // of `__per_cpu_offset[]` is non-zero — which never happens
+        // here because the buffer stays zeroed for the entire run.
+        // Asserting `cpus.is_empty()` for every sample pins the gate:
+        // if it ever loosened (e.g. accepted partial zero offsets),
+        // the walks would resume on zero PAs and `cpus` would carry
+        // bogus counters.
         assert!(!samples.is_empty());
         for s in &samples {
-            assert_eq!(s.cpus.len(), 2);
+            assert!(
+                s.cpus.is_empty(),
+                "data_valid gate should keep cpus empty when __per_cpu_offset[] is all-zero"
+            );
         }
     }
 

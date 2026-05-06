@@ -536,6 +536,7 @@ pub struct AssertResult {
     /// triage, `measurements` carries typed `(key, NoteValue)` pairs
     /// for programmatic consumption (sidecar parsers, `stats
     /// compare`, regression dashboards).
+    #[serde(default)]
     pub measurements: std::collections::BTreeMap<String, NoteValue>,
 }
 

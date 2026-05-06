@@ -921,11 +921,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
     tracing::debug!("dispatching test");
     crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::PayloadStarting, "");
     let code = if let Some(pa) = probe_phase_a {
-        // Phase A/B split path: Phase A already attached, dispatch
-        // with Phase B for BPF fentry after scheduler is running.
         crate::test_support::maybe_dispatch_vm_test_with_phase_a(&args, pa).unwrap_or(1)
     } else {
-        // Non-split path: standard dispatch.
         crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1)
     };
     drop(_s_phase5);

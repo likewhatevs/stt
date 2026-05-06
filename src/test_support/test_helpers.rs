@@ -329,6 +329,32 @@ pub(crate) fn make_vm_result_with_assert(
     r
 }
 
+/// Build a [`crate::vmm::host_comms::BulkDrainResult`] that carries
+/// only `MSG_TYPE_LIFECYCLE` entries — one per supplied
+/// [`crate::vmm::wire::LifecyclePhase`], in arrival order. Each entry
+/// has a single-byte payload (the phase wire value) and `crc_ok: true`.
+///
+/// Mirrors the guest-side
+/// [`crate::vmm::guest_comms::send_lifecycle`] frame layout for
+/// every phase whose payload is the bare 1-byte discriminant
+/// (`InitStarted`, `PayloadStarting`, `SchedulerDied`); the
+/// `SchedulerNotAttached` reason suffix is not modelled here because
+/// none of the current `evaluate_vm_result` / `classify_init_stage`
+/// call sites need it.
+pub(crate) fn lifecycle_drain(
+    phases: &[crate::vmm::wire::LifecyclePhase],
+) -> crate::vmm::host_comms::BulkDrainResult {
+    let entries = phases
+        .iter()
+        .map(|p| crate::vmm::wire::ShmEntry {
+            msg_type: crate::vmm::wire::MSG_TYPE_LIFECYCLE,
+            payload: vec![p.wire_value()],
+            crc_ok: true,
+        })
+        .collect();
+    crate::vmm::host_comms::BulkDrainResult { entries }
+}
+
 /// Build a `KtstrTestEntry` with overridden memory/duration/workers
 /// for `KtstrTestEntry::validate` tests. Everything else inherits
 /// from `DEFAULT`.

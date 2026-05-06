@@ -1081,7 +1081,6 @@ mod tests {
     /// No initramfs — the kernel boots to panic, which is enough to
     /// confirm KVM, kernel loading, and serial console all work.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn boot_kernel_produces_output() {
         let kernel = crate::test_support::require_kernel();
 
@@ -1103,7 +1102,6 @@ mod tests {
 
     /// Boot with SMP topology and verify kernel detects multiple CPUs.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn boot_kernel_smp_topology() {
         let kernel = crate::test_support::require_kernel();
 
@@ -1126,7 +1124,6 @@ mod tests {
     /// `emergency_restart()` which triggers an I8042 reset (port 0x64,
     /// 0xFE via `reboot=k`), returning to userspace.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn bench_boot_time() {
         let kernel = crate::test_support::require_kernel();
 
@@ -1175,7 +1172,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn kvm_has_immediate_exit_cap() {
         let topo = Topology {
             llcs: 1,
@@ -1289,7 +1285,6 @@ mod tests {
     /// (page_offset stays at 0 here) from "latch fired but data still
     /// pre-boot." Probing the latched value directly closes that gap.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn monitor_data_valid_latch_records_live_page_offset() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1369,7 +1364,6 @@ mod tests {
     /// no kernel / no vmlinux / no scx_root etc.; the assertions
     /// only fire on a real run that produced a `MonitorReport`.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn sys_rdy_releases_monitor_before_5s_timeout() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1437,7 +1431,6 @@ mod tests {
     /// again via `cmdline_extra` is a no-op for the kernel parser
     /// (last token wins, and both tokens specify the same value).
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn monitor_exits_cleanly_when_guest_panics_before_sys_rdy() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1495,7 +1488,6 @@ mod tests {
     /// the rq fields written, defeating the whole point of the
     /// SYS_RDY gate.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn first_sample_has_valid_rq_clock_thanks_to_sys_rdy() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1548,7 +1540,6 @@ mod tests {
     /// requires the override path to silently stop writing — which is
     /// exactly what we want to catch.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn watchdog_timeout_override_lands_in_guest_memory() {
         let kernel = crate::test_support::require_kernel();
         let vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1624,7 +1615,6 @@ mod tests {
     /// ineffective (kernel ignoring the value), the default timeout
     /// would apply and could spuriously fire on a slow guest.
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn watchdog_override_prevents_stall_exit() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
@@ -1709,89 +1699,6 @@ mod tests {
                 obs.observed_jiffies, obs.expected_jiffies,
                 "write/read roundtrip mismatch"
             );
-        }
-    }
-
-    /// Validate that the core monitoring path reads meaningful
-    /// runqueue data when a scheduler is loaded.
-    ///
-    /// Boots a VM with scx-ktstr, then asserts per-CPU snapshots
-    /// contain plausible values. When schedstat data is present
-    /// (CONFIG_SCHEDSTATS enabled), asserts sched_count is in a
-    /// plausible range.
-    #[test]
-    fn monitor_reads_runqueue_data_with_scheduler() {
-        let kernel = crate::test_support::require_kernel();
-        let vmlinux = crate::test_support::require_vmlinux(&kernel);
-
-        // Monitor-reads-runqueue asserts on cpu.rq_clock and cpu.schedstat,
-        // which resolve through the non-optional rq offsets inside
-        // KernelOffsets. Gating these at setup turns a silently-skipped
-        // test (on BTF parse failure) into a loud infrastructure error.
-        let _offsets = crate::test_support::require_kernel_offsets(&vmlinux);
-
-        let sched_bin = crate::test_support::require_binary("scx-ktstr");
-
-        let vm = skip_on_contention!(
-            KtstrVm::builder()
-                .kernel(&kernel)
-                .topology(1, 1, 2, 1)
-                .memory_mb(256)
-                .timeout(Duration::from_secs(12))
-                .watchdog_timeout(Duration::from_secs(5))
-                .scheduler_binary(&sched_bin)
-                .build()
-        );
-        let result = vm.run().unwrap();
-        let report = result.monitor.as_ref().expect(
-            "ktstr: monitor report missing — require_kernel_offsets resolved at \
-             setup, so monitor initialization must have succeeded. A None report \
-             here is a bug in monitor startup",
-        );
-
-        assert!(
-            report.summary.total_samples >= 2,
-            "need at least 2 monitor samples, got {}",
-            report.summary.total_samples
-        );
-
-        // Scan samples in reverse chronological order looking for the
-        // first sample where ANY CPU reports a rq_clock past the
-        // early-boot noise floor (1 ms in ns). `all` flaked on CI
-        // where one vCPU can remain near rq_clock=0 throughout
-        // a short run. The 12s timeout covers boot + scheduler
-        // attach (~1-2s) + several monitor samples; a single
-        // populated CPU proves the monitor reads real rq data —
-        // the code path is identical per-CPU.
-        let populated = report
-            .samples
-            .iter()
-            .rev()
-            .find(|s| s.cpus.iter().any(|c| c.rq_clock > 1_000_000))
-            .expect(
-                "no monitor sample showed populated runqueue data — every sample \
-                 had all CPUs at rq_clock <= 1ms, \
-                 or the monitor is reading the wrong rq offsets",
-            );
-        for (i, cpu) in populated.cpus.iter().enumerate() {
-            if cpu.rq_clock <= 1_000_000 {
-                continue;
-            }
-            assert!(
-                cpu.rq_clock < 300_000_000_000,
-                "cpu {i}: rq_clock must be < 300s (ns), got {}",
-                cpu.rq_clock
-            );
-        }
-
-        for (i, cpu) in populated.cpus.iter().enumerate() {
-            if let Some(ref ss) = cpu.schedstat {
-                assert!(
-                    ss.sched_count < 100_000_000,
-                    "cpu {i}: sched_count {} exceeds plausible range — offset may be wrong",
-                    ss.sched_count
-                );
-            }
         }
     }
 

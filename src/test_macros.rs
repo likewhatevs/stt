@@ -58,6 +58,27 @@ macro_rules! skip_on_contention {
     };
 }
 
+/// Skip the calling test when the current process lacks a Linux
+/// capability. Uses `prctl(PR_CAPBSET_READ, cap)` to probe the
+/// capability bounding set — returns 1 when the cap is present, 0
+/// when absent, -1 on EINVAL (unknown cap number).
+///
+/// Typical use: `require_capability!(libc::CAP_SYS_RESOURCE);` at the
+/// top of a test that calls `setrlimit` to raise a hard limit.
+#[allow(unused_macros)]
+macro_rules! require_capability {
+    ($cap:expr) => {{
+        let ret = unsafe { libc::prctl(libc::PR_CAPBSET_READ, $cap, 0, 0, 0) };
+        if ret != 1 {
+            skip!(
+                "missing capability {} (prctl PR_CAPBSET_READ returned {})",
+                stringify!($cap),
+                ret
+            );
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use crate::vmm::host_topology::ResourceContention;

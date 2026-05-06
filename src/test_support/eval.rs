@@ -2599,8 +2599,9 @@ mod tests {
         STAGE_INIT_NOT_STARTED, STAGE_INIT_STARTED_NO_PAYLOAD, STAGE_PAYLOAD_STARTED_NO_RESULT,
     };
     use super::super::test_helpers::{
-        EVAL_TOPO, EnvVarGuard, build_assert_result, eevdf_entry, isolated_cache_dir, lock_env,
-        make_vm_result, make_vm_result_with_assert, no_repro, sched_entry,
+        EVAL_TOPO, EnvVarGuard, build_assert_result, eevdf_entry, isolated_cache_dir,
+        lifecycle_drain, lock_env, make_vm_result, make_vm_result_with_assert, no_repro,
+        sched_entry,
     };
     use super::*;
     use crate::assert::{AssertDetail, DetailKind};
@@ -3828,7 +3829,16 @@ mod tests {
         let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_init_only__");
-        let result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
+        // `classify_init_stage` walks `MSG_TYPE_LIFECYCLE` entries
+        // from the bulk drain (the COM2 sentinel-string path is
+        // gone), so the test must publish the lifecycle phase
+        // through `guest_messages` rather than seed it via stdout.
+        // The `output` argument still flows to the sched-log /
+        // panic scrapers downstream of this classification.
+        let mut result = make_vm_result("KTSTR_INIT_STARTED\n", "boot log", 1, false);
+        result.guest_messages = Some(lifecycle_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+        ]));
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
@@ -3845,7 +3855,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains(STAGE_INIT_STARTED_NO_PAYLOAD),
-            "init sentinel only should indicate cgroup/scheduler setup failure, got: {msg}",
+            "init lifecycle phase only should indicate cgroup/scheduler setup failure, got: {msg}",
         );
     }
 
@@ -3854,8 +3864,18 @@ mod tests {
         let _lock = lock_env();
         let _env_bt = EnvVarGuard::set("RUST_BACKTRACE", "1");
         let entry = eevdf_entry("__eval_payload_start__");
+        // Same migration as `eval_init_started_but_no_payload`:
+        // `classify_init_stage` reads `MSG_TYPE_LIFECYCLE` entries
+        // from `guest_messages`, not the COM2 sentinel strings the
+        // legacy fixture seeded via stdout. Publish both
+        // `InitStarted` and `PayloadStarting` so the classifier
+        // resolves to the deepest reached stage.
         let output = "KTSTR_INIT_STARTED\nKTSTR_PAYLOAD_STARTING\ngarbage";
-        let result = make_vm_result(output, "", 1, false);
+        let mut result = make_vm_result(output, "", 1, false);
+        result.guest_messages = Some(lifecycle_drain(&[
+            crate::vmm::wire::LifecyclePhase::InitStarted,
+            crate::vmm::wire::LifecyclePhase::PayloadStarting,
+        ]));
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let err = evaluate_vm_result(
             &entry,
@@ -3872,7 +3892,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains(STAGE_PAYLOAD_STARTED_NO_RESULT),
-            "both sentinels should indicate payload ran but failed, got: {msg}",
+            "both lifecycle phases should indicate payload ran but failed, got: {msg}",
         );
     }
 
