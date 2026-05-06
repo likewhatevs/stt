@@ -6872,9 +6872,47 @@ impl KtstrVm {
         if let Some(h) = run.freeze_coordinator {
             let _ = h.join();
         }
-        for vt in run.ap_threads {
-            vt.wait_for_exit(Duration::from_secs(5));
-            let _ = vt.handle.join();
+        {
+            let mut remaining = run.ap_threads.len();
+            if remaining > 0
+                && let Ok(epoll) = Epoll::new()
+            {
+                for (i, vt) in run.ap_threads.iter().enumerate() {
+                    if vt.exited.load(Ordering::Acquire) {
+                        remaining -= 1;
+                        continue;
+                    }
+                    let _ = epoll.ctl(
+                        ControlOperation::Add,
+                        vt.exit_evt.as_raw_fd(),
+                        EpollEvent::new(EventSet::IN, i as u64),
+                    );
+                }
+                if remaining > 0 {
+                    let mut events = vec![EpollEvent::default(); remaining];
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while remaining > 0 {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        let ms = left.as_millis().min(i32::MAX as u128) as i32;
+                        match epoll.wait(ms, &mut events) {
+                            Ok(0) => break,
+                            Ok(n) => remaining = remaining.saturating_sub(n),
+                            Err(_) => break,
+                        }
+                        for vt in &run.ap_threads {
+                            if !vt.exited.load(Ordering::Acquire) {
+                                vt.kick();
+                            }
+                        }
+                    }
+                }
+            }
+            for vt in run.ap_threads {
+                let _ = vt.handle.join();
+            }
         }
         eprintln!("CLEANUP: all AP threads joined");
 

@@ -37,8 +37,8 @@ use super::{KtstrVm, disk_config};
 ///
 /// Field defaults applied by [`Default::default`]:
 /// - `memory_mb` — 256 MB (overridden by [`memory_mb`](Self::memory_mb))
-/// - `timeout` — 60 s (overridden by [`timeout`](Self::timeout))
-/// - `watchdog_timeout` — 4 s (overridden by [`watchdog_timeout`](Self::watchdog_timeout))
+/// - `timeout` — 12 s (overridden by [`timeout`](Self::timeout))
+/// - `watchdog_timeout` — 5 s (overridden by [`watchdog_timeout`](Self::watchdog_timeout))
 /// - `topology` — 1 NUMA node × 1 LLC × 1 core × 1 thread (overridden
 ///   by [`topology`](Self::topology) or [`with_topology`](Self::with_topology))
 /// - `performance_mode` — `false` (operator opts in via
