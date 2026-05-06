@@ -1048,9 +1048,30 @@ impl BpfMapOffsets {
     };
 
     /// Parse BTF from a vmlinux ELF and resolve BPF map field offsets.
+    #[allow(dead_code)]
     pub fn from_vmlinux(path: &Path) -> Result<Self> {
         let btf =
             load_btf_from_path(path).with_context(|| format!("btf: open {}", path.display()))?;
+        Self::from_btf(&btf)
+    }
+
+    /// Same as [`Self::from_vmlinux`] but accepts pre-read vmlinux
+    /// bytes. `path` is used only for BTF sidecar caching and
+    /// diagnostic messages — the bytes are not re-read from disk.
+    #[allow(dead_code)]
+    pub fn from_vmlinux_bytes(data: &[u8], path: &Path) -> Result<Self> {
+        let btf = load_btf_from_bytes(data, path)?;
+        Self::from_btf(&btf)
+    }
+
+    /// Same as [`Self::from_vmlinux_bytes`] but accepts a pre-parsed
+    /// `goblin::elf::Elf`. When the BTF sidecar is fresh (the common
+    /// case), the sidecar fast path returns without touching the
+    /// ELF; on a cache miss the supplied `elf` is reused so the
+    /// `.BTF`-section extraction does not re-run
+    /// `goblin::elf::Elf::parse(data)`.
+    pub fn from_elf(elf: &goblin::elf::Elf<'_>, data: &[u8], path: &Path) -> Result<Self> {
+        let btf = load_btf_from_elf(elf, data, path)?;
         Self::from_btf(&btf)
     }
 
@@ -1190,6 +1211,7 @@ impl BpfProgOffsets {
     }
 
     /// Parse BTF from a vmlinux ELF and resolve BPF program field offsets.
+    #[allow(dead_code)]
     pub fn from_vmlinux(path: &Path) -> Result<Self> {
         let data =
             std::fs::read(path).with_context(|| format!("read vmlinux: {}", path.display()))?;
@@ -1199,6 +1221,7 @@ impl BpfProgOffsets {
     /// Same as [`Self::from_vmlinux`] but accepts pre-read vmlinux
     /// bytes. `path` is used only for BTF sidecar caching and
     /// diagnostic messages — the bytes are not re-read from disk.
+    #[allow(dead_code)]
     pub fn from_vmlinux_bytes(data: &[u8], path: &Path) -> Result<Self> {
         let btf = load_btf_from_bytes(data, path)?;
         Self::from_btf(&btf)

@@ -14,6 +14,8 @@
 //! - Per-CPU values (`BPF_MAP_TYPE_PERCPU_ARRAY`) are in the direct mapping:
 //!   use `kva_to_pa` with `__per_cpu_offset[cpu]`.
 
+use anyhow::Context;
+
 use super::btf_offsets::BpfMapOffsets;
 use super::idr::{translate_any_kva, xa_load};
 use super::reader::GuestMem;
@@ -1630,8 +1632,20 @@ impl<'a> GuestMemMapAccessorOwned<'a> {
         tcr_el1: u64,
         cr3_pa: u64,
     ) -> anyhow::Result<Self> {
-        let kernel = super::guest::GuestKernel::new(mem, vmlinux, tcr_el1, cr3_pa)?;
-        let offsets = BpfMapOffsets::from_vmlinux(vmlinux)?;
+        // Read the vmlinux file and parse its ELF once, then share
+        // the parse between `GuestKernel::from_elf` (kernel symbols
+        // + paging state) and `BpfMapOffsets::from_elf` (BTF section
+        // extraction on sidecar cache miss). The previous structure
+        // ran `std::fs::read` and `goblin::elf::Elf::parse` twice —
+        // once inside `GuestKernel::new` and once again inside
+        // `BpfMapOffsets::from_vmlinux` — and the freeze coordinator
+        // calls this in a retry loop until the boot-time symbols
+        // settle, multiplying that cost across every retry tick.
+        let data = std::fs::read(vmlinux)
+            .with_context(|| format!("read vmlinux: {}", vmlinux.display()))?;
+        let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
+        let kernel = super::guest::GuestKernel::from_elf(mem, &elf, tcr_el1, cr3_pa)?;
+        let offsets = BpfMapOffsets::from_elf(&elf, &data, vmlinux)?;
 
         let map_idr_kva = kernel
             .symbol_kva("map_idr")

@@ -5,6 +5,8 @@
 //! No guest cooperation is needed — all reads go through the guest
 //! physical memory mapping.
 
+use anyhow::Context;
+
 use super::btf_offsets::BpfProgOffsets;
 use super::idr::{translate_any_kva, xa_load};
 use super::reader::{GuestMem, WalkContext};
@@ -534,8 +536,19 @@ impl<'a> GuestMemProgAccessorOwned<'a> {
         tcr_el1: u64,
         cr3_pa: u64,
     ) -> anyhow::Result<Self> {
-        let kernel = super::guest::GuestKernel::new(mem, vmlinux, tcr_el1, cr3_pa)?;
-        let offsets = BpfProgOffsets::from_vmlinux(vmlinux)?;
+        // Read vmlinux once and parse the ELF once. Both
+        // `GuestKernel::from_elf` and `BpfProgOffsets::from_elf`
+        // borrow from the same `data`/`elf` pair, eliminating the
+        // redundant `std::fs::read` + `goblin::elf::Elf::parse` that
+        // an inline `GuestKernel::new` + `BpfProgOffsets::from_vmlinux`
+        // pair would incur on every scan tick (the freeze coordinator
+        // calls this from `try_init_owned_prog_accessor` until the
+        // accessor lands).
+        let data = std::fs::read(vmlinux)
+            .with_context(|| format!("read vmlinux: {}", vmlinux.display()))?;
+        let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
+        let kernel = super::guest::GuestKernel::from_elf(mem, &elf, tcr_el1, cr3_pa)?;
+        let offsets = BpfProgOffsets::from_elf(&elf, &data, vmlinux)?;
         let prog_idr_kva = kernel
             .symbol_kva("prog_idr")
             .ok_or_else(|| anyhow::anyhow!("prog_idr symbol not found in vmlinux"))?;
