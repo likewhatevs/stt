@@ -5793,8 +5793,8 @@ impl KtstrVm {
                     // Upfront kill check: BSP can exit before the
                     // monitor thread is scheduled (fast 1-CPU tests
                     // that fall through `test_main` in milliseconds).
-                    // In that case `collect_results` has already
-                    // stored kill + written kill_evt; entering the
+                    // In that case `run_vm` has already stored
+                    // kill + written kill_evt; entering the
                     // boot epoll would still wake immediately on
                     // kill_fd, but skipping the syscall trip
                     // entirely is cheaper and avoids the small
@@ -5942,7 +5942,7 @@ impl KtstrVm {
                 // with cold caches the resolution path can spend
                 // multiple seconds in `resolve_phys_base` /
                 // `resolve_pgtable_l5` / `text_kva_to_pa_with_base`,
-                // and `collect_results`'s `kill_evt.write(1)` cannot
+                // and `run_vm`'s `kill_evt.write(1)` cannot
                 // interrupt code that is not blocked on epoll. Sample
                 // the kill flag at every major boundary so a VM that
                 // exits during setup tears the monitor down within
@@ -6797,10 +6797,15 @@ impl KtstrVm {
         let mut exit_code = run.exit_code;
         let timed_out = run.timed_out;
         // Belt-and-braces: kill + kill_evt are already set by run_vm
-        // immediately after BSP exits (so the monitor and bpf-write
-        // threads stop promptly). Re-assert here in case a future
-        // code path reaches collect_results without the run_vm
-        // early-kill having fired.
+        // immediately after BSP exits. Re-assert here in case a
+        // future code path reaches collect_results without the
+        // early-kill having fired. The two consumers that observe
+        // kill_evt via epoll are the monitor sampler (reader.rs
+        // monitor_loop) and the bpf-map-write thread (start_bpf_map_write).
+        // The freeze coordinator is NOT alive here — run_vm joins it
+        // before returning VmRunState. kill_evt is level-triggered
+        // (EFD_NONBLOCK eventfd); the AtomicBool kill flag is the
+        // source of truth that breaks each thread's outer loop.
         run.kill.store(true, Ordering::Release);
         let _ = run.kill_evt.write(1);
         // Clear freeze before kicking APs so any vCPU still in the
