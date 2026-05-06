@@ -223,11 +223,17 @@ volatile u32 ktstr_err_exit_detected = 0;
  * the rest of the sample series. Sticky: stays at the first value. */
 u64 ktstr_last_trigger_ts = 0;
 
-/* System-wide SCX_EV_* event counter snapshot captured at the
- * first error-class `sched_ext_exit` fire via `scx_bpf_events`
- * (kernel/sched/ext.c:9417). Mirrors `struct scx_event_stats` from
- * `kernel/sched/ext_internal.h:867` (13 s64 counters in declaration
- * order). The Datasec walker on the host side renders this struct
+/* Forward-compat shadow of `struct scx_event_stats` (13 s64 counters,
+ * kernel/sched/ext_internal.h:867). Uses the `___fwd` CO-RE naming
+ * convention so the definition compiles on kernels where vmlinux.h
+ * only carries a forward declaration of the type (pre-6.16 kernels
+ * that lack the `scx_bpf_events` kfunc). libbpf strips the `___fwd`
+ * suffix during BTF matching and relocates against the un-suffixed
+ * `struct scx_event_stats` in the target kernel's BTF when present.
+ * On kernels without the type, the kfunc is `__weak` and never
+ * called — the fields stay at their zero defaults.
+ *
+ * The Datasec walker on the host side renders this struct
  * by name in the failure-dump's `.bss` map output, so an operator
  * sees the system-wide counter values exactly when the scheduler
  * errored. Cross-CPU aggregation happens kernel-side
@@ -240,7 +246,23 @@ u64 ktstr_last_trigger_ts = 0;
  * matching populated `ktstr_exit_event_stats`. Subsequent fires
  * (which might come from racing `scx_sched` instances) skip the
  * write to keep the snapshot causally tied to the first error. */
-struct scx_event_stats ktstr_exit_event_stats = {};
+struct scx_event_stats___fwd {
+	s64 SCX_EV_SELECT_CPU_FALLBACK;
+	s64 SCX_EV_DISPATCH_LOCAL_DSQ_OFFLINE;
+	s64 SCX_EV_DISPATCH_KEEP_LAST;
+	s64 SCX_EV_ENQ_SKIP_EXITING;
+	s64 SCX_EV_ENQ_SKIP_MIGRATION_DISABLED;
+	s64 SCX_EV_REENQ_IMMED;
+	s64 SCX_EV_REENQ_LOCAL_REPEAT;
+	s64 SCX_EV_REFILL_SLICE_DFL;
+	s64 SCX_EV_BYPASS_DURATION;
+	s64 SCX_EV_BYPASS_DISPATCH;
+	s64 SCX_EV_BYPASS_ACTIVATE;
+	s64 SCX_EV_INSERT_NOT_OWNED;
+	s64 SCX_EV_SUB_BYPASS_DISPATCH;
+} __attribute__((preserve_access_index));
+
+struct scx_event_stats___fwd ktstr_exit_event_stats = {};
 
 /* `KTSTR_PCPU_TIMELINE_COUNT` / `KTSTR_PCPU_TIMELINE_DROPS` are
  * per-CPU slots in the array above. The timeline producers
@@ -368,15 +390,16 @@ u32 ktstr_miss_log_idx = 0;
  * `kernel/sched/ext.c:9417`; the kfunc takes a writable pointer
  * to a `struct scx_event_stats` plus its size (the kernel uses
  * `min(events__sz, sizeof(*events))` so passing a smaller-or-equal
- * size is always safe — same vmlinux.h here as the running kernel
- * means the size match is exact, but the `__sz` suffix is required
- * by the BPF verifier convention for size-paired kfunc params).
+ * size is always safe, but the `__sz` suffix is required by the BPF
+ * verifier convention for size-paired kfunc params).
  *
- * Declared `extern` so the BPF loader resolves it via kfunc symbol
- * lookup at attach time; the static assert below catches a vmlinux.h
- * desync that would land bytes in the wrong fields. */
-extern void scx_bpf_events(struct scx_event_stats *events,
-			   __u64 events__sz) __ksym;
+ * Uses `struct scx_event_stats___fwd` to match the local CO-RE
+ * shadow type defined above. `__weak` so the BPF loader succeeds on
+ * kernels that predate the kfunc (pre-6.16). The call site gates on
+ * `bpf_ksym_exists(scx_bpf_events)` to skip the call entirely on
+ * those kernels. */
+extern void scx_bpf_events(struct scx_event_stats___fwd *events,
+			   __u64 events__sz) __ksym __weak;
 
 /* `scx_root` data-symbol extern. The kernel definition is a global
  * `struct scx_sched __rcu *scx_root` (kernel/sched/ext.c:22). Taking
@@ -596,8 +619,9 @@ int BPF_PROG(ktstr_trigger_tp, unsigned int kind)
 	 * want — every racing fire's snapshot is a valid system-wide
 	 * view at its own ktime.
 	 */
-	scx_bpf_events(&ktstr_exit_event_stats,
-		       sizeof(ktstr_exit_event_stats));
+	if (bpf_ksym_exists(scx_bpf_events))
+		scx_bpf_events(&ktstr_exit_event_stats,
+			       sizeof(ktstr_exit_event_stats));
 
 	/*
 	 * Snapshot scheduler scalars BEFORE the latch CAS so a host-side
