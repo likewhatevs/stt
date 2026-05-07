@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.4.16"
+version = "0.4.17"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -250,6 +250,7 @@ netlink-packet-generic = "0.3"
 # inside the guest. Disambiguates host-thread idle/spin/productive
 # work without any in-guest overhead.
 perf-event-open-sys = "6"
+gxhash = "3.5.0"
 
 [profile.release]
 lto = "thin"

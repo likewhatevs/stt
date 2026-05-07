@@ -765,8 +765,6 @@ impl KtstrVm {
             "build_suffix",
         );
 
-        // Compress before computing memory so the formula uses actual
-        // compressed size instead of guessing.
         let t0_compress = Instant::now();
         let lz4_base = self.get_or_compress_base(base_bytes, &key)?;
         let lz4_suffix = initramfs::lz4_legacy_compress(&suffix);

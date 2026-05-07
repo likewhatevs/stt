@@ -26,6 +26,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use gxhash::GxHasher;
+
 use super::initramfs;
 
 /// Cache key for base initramfs. Derived from content hashes of the
@@ -50,34 +52,23 @@ struct HashFileKey {
     mtime_nsecs: i64,
 }
 
-/// Process-local cache: file identity + mtime → SipHash13 of contents.
+/// Process-local cache: file identity + mtime → gxhash of contents.
 fn hash_file_cache() -> &'static Mutex<HashMap<HashFileKey, u64>> {
     static CACHE: OnceLock<Mutex<HashMap<HashFileKey, u64>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Hash a file's content for cache keying via streaming reads.
+/// Hash a file's content for cache keying via mmap + gxhash.
 ///
-/// Uses [`siphasher::sip::SipHasher13`] with fixed zero keys rather
-/// than [`std::hash::DefaultHasher`]. DefaultHasher's concrete
-/// algorithm is explicitly not guaranteed stable across Rust
-/// toolchain versions, so cache keys computed with it would silently
-/// shift when the compiler was upgraded — invalidating every cached
-/// initramfs blob. SipHash13 with pinned keys is version-stable by
-/// the siphasher crate's contract.
-///
-/// Reads via [`std::io::BufReader`] and feeds the hasher in chunks so
-/// the full file never sits in memory at once — a 50 MB stripped
-/// scheduler binary streams through an 8 KB buffer instead of a 50 MB
-/// `Vec<u8>`. Process-local memoisation keyed on `(path, dev, ino,
-/// mtime)` short-circuits repeat calls within the same run; the
-/// inode-plus-mtime tuple invalidates the cached hash whenever the
-/// underlying file changes.
+/// Uses gxhash for speed — hardware-accelerated via AES-NI (x86_64)
+/// and AES intrinsics (aarch64). The file is memory-mapped read-only
+/// so the kernel handles I/O via page faults against the page cache;
+/// no intermediate buffer copies. Process-local memoisation keyed on
+/// `(path, dev, ino, mtime)` short-circuits repeat calls within the
+/// same run; the inode-plus-mtime tuple invalidates the cached hash
+/// whenever the underlying file changes.
 pub(crate) fn hash_file(path: &Path) -> Result<u64> {
-    use siphasher::sip::SipHasher13;
     use std::fs::File;
-    use std::hash::Hasher;
-    use std::io::{BufReader, Read};
     use std::os::unix::fs::MetadataExt;
 
     let file = File::open(path).with_context(|| format!("open for hash: {}", path.display()))?;
@@ -95,19 +86,10 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
         return Ok(cached);
     }
 
-    let mut reader = BufReader::new(file);
-    let mut hasher = SipHasher13::new_with_keys(0, 0);
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .with_context(|| format!("read for hash: {}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.write(&buf[..n]);
-    }
-    let digest = hasher.finish();
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file).with_context(|| format!("mmap for hash: {}", path.display()))?
+    };
+    let digest = gxhash::gxhash64(&mmap, 0);
     hash_file_cache().lock().unwrap().insert(cache_key, digest);
     Ok(digest)
 }
@@ -133,8 +115,7 @@ impl BaseKey {
         probe: Option<&Path>,
         worker: Option<&Path>,
     ) -> Result<Self> {
-        use siphasher::sip::SipHasher13;
-        let mut hasher = SipHasher13::new_with_keys(0, 0);
+        let mut hasher = GxHasher::with_seed(0);
 
         hash_file(payload)?.hash(&mut hasher);
         Self::hash_shared_libs(payload, &mut hasher);
@@ -183,8 +164,7 @@ impl BaseKey {
         include_files: &[(String, PathBuf)],
         busybox: bool,
     ) -> Result<Self> {
-        use siphasher::sip::SipHasher13;
-        let mut hasher = SipHasher13::new_with_keys(0, 0);
+        let mut hasher = GxHasher::with_seed(0);
 
         "ktstr-shell".hash(&mut hasher);
         busybox.hash(&mut hasher);
@@ -238,7 +218,7 @@ impl BaseKey {
 
     /// Hash shared library paths and content samples for a binary so
     /// the cache key changes when any shared lib is updated on the host.
-    fn hash_shared_libs(binary: &Path, hasher: &mut siphasher::sip::SipHasher13) {
+    fn hash_shared_libs(binary: &Path, hasher: &mut GxHasher) {
         if let Ok(result) = initramfs::resolve_shared_libs(binary) {
             let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
             entries.sort();
@@ -694,11 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn hash_file_is_siphash13_stable_golden() {
-        // hash_file must use SipHasher13 with zero keys so the value
-        // is stable across Rust toolchain versions. Golden check
-        // pins the concrete algorithm — if this value changes, the
-        // cache is about to silently invalidate every prior artifact.
+    fn hash_file_is_gxhash_stable_golden() {
+        // hash_file must use gxhash64 so the value is stable across
+        // Rust toolchain versions. Golden check pins the concrete
+        // algorithm — if this value changes, the cache silently
+        // invalidates every prior artifact.
         let tmp =
             std::env::temp_dir().join(format!("ktstr-hash-golden-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -706,16 +686,10 @@ mod tests {
         std::fs::write(&f, b"ktstr cache key probe").unwrap();
         let observed = hash_file(&f).unwrap();
 
-        // Cross-check against a direct SipHasher13 invocation so the
-        // test will fail loudly if someone swaps the algorithm.
-        use siphasher::sip::SipHasher13;
-        use std::hash::Hasher;
-        let mut h = SipHasher13::new_with_keys(0, 0);
-        h.write(b"ktstr cache key probe");
-        let expected = h.finish();
+        let expected = gxhash::gxhash64(b"ktstr cache key probe", 0);
         assert_eq!(
             observed, expected,
-            "hash_file must match SipHasher13::new_with_keys(0, 0)"
+            "hash_file must match gxhash::gxhash64(data, 0)"
         );
 
         std::fs::remove_dir_all(&tmp).unwrap();
@@ -727,8 +701,7 @@ mod tests {
             std::env::temp_dir().join(format!("ktstr-hash-sample-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let f = tmp.join("big");
-        // 16KB file — exceeds the 8 KB BufReader buffer so the read
-        // loop iterates more than once.
+        // 16KB file — spans multiple pages in the mmap.
         let data: Vec<u8> = (0..16384).map(|i| (i % 256) as u8).collect();
         std::fs::write(&f, &data).unwrap();
         let h = hash_file(&f).unwrap();

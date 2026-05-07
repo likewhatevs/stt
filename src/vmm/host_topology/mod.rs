@@ -718,17 +718,16 @@ fn try_acquire_all(
 /// lands within a small contiguous range, every `pid % max_start`
 /// lands within an equally small contiguous slice of the offset
 /// space, and they all probe overlapping windows on the first
-/// pass. SipHash13 avalanche on the pid bytes diffuses adjacent
+/// pass. GxHasher avalanche on the pid bytes diffuses adjacent
 /// pids across the whole `[0, max_start)` range, so the
 /// walk-around-once loop in [`acquire_cpu_locks`] has a fair
 /// chance of finding a free window without burning the entire
 /// lockfile pool.
 ///
-/// The hash key is the SipHash13 default (`SipHasher13::new()`,
-/// equivalent to `new_with_keys(0, 0)`) — a per-run random key
-/// would defeat reproducibility for unit-test fixtures and for
-/// any future debug logging that wants to confirm "pid X picks
-/// offset Y for window N".
+/// The hash key is `GxHasher::with_seed(0)` — a per-run random
+/// seed would defeat reproducibility for unit-test fixtures and
+/// for any future debug logging that wants to confirm "pid X
+/// picks offset Y for window N".
 ///
 /// Caller invariant: `max_start >= 1`. Panics on `max_start == 0`
 /// (modulo-by-zero); callers must enforce this upstream — the
@@ -736,9 +735,9 @@ fn try_acquire_all(
 /// is the production guarantee.
 #[allow(dead_code)]
 fn pid_window_offset(pid: u32, max_start: usize) -> usize {
-    use siphasher::sip::SipHasher13;
+    use gxhash::GxHasher;
     use std::hash::Hasher;
-    let mut hasher = SipHasher13::new();
+    let mut hasher = GxHasher::with_seed(0);
     hasher.write(&pid.to_le_bytes());
     (hasher.finish() as usize) % max_start
 }

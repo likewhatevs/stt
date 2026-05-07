@@ -242,9 +242,7 @@ pub(super) fn dispatch_bulk_message(
                 && let Some((reset_ns, duration, run_start)) = sinks.watchdog_reset.as_ref()
             {
                 let elapsed = run_start.elapsed();
-                let target_ns = elapsed
-                    .as_nanos()
-                    .saturating_add(duration.as_nanos());
+                let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
                 let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
                 reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
             }
