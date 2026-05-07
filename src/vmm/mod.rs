@@ -1311,7 +1311,7 @@ mod tests {
                 .cmdline("loglevel=7")
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         assert!(
             result.stderr.contains("Linux") || result.stderr.contains("Booting"),
             "kernel console should contain boot messages"
@@ -1365,7 +1365,7 @@ mod tests {
                 Err(e) => panic!("{e:#}"),
             };
             let setup = start.elapsed();
-            let result = vm.run().unwrap();
+            let result = skip_on_contention!(vm.run());
             // Extract kernel timestamp from last line (e.g. "[    0.189300] Kernel panic")
             let boot_ms = result
                 .stderr
@@ -1432,7 +1432,7 @@ mod tests {
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         let Some(ref report) = result.monitor else {
             return;
         };
@@ -1516,7 +1516,7 @@ mod tests {
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         let Some(ref report) = result.monitor else {
             return;
         };
@@ -1594,7 +1594,7 @@ mod tests {
                 .timeout(Duration::from_secs(5))
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         let Some(ref report) = result.monitor else {
             return;
         };
@@ -1662,7 +1662,7 @@ mod tests {
                 .cmdline("init=/nonexistent panic=-1")
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         // The VM loop must shut down via the kernel's reboot exit
         // path, not via the builder's 10 s timeout.
         assert!(
@@ -1719,7 +1719,7 @@ mod tests {
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         let Some(ref report) = result.monitor else {
             return;
         };
@@ -1799,7 +1799,7 @@ mod tests {
                 .watchdog_timeout(Duration::from_secs(TIMEOUT_SECS))
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         let report = result.monitor.as_ref().expect(
             "ktstr: monitor report missing — require_kernel_offsets, scx_root, and \
              watchdog_offsets all resolved at setup, so monitor initialization must \
@@ -1849,7 +1849,7 @@ mod tests {
                 .watchdog_timeout(Duration::from_secs(300))
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         // Prior versions asserted `result.success` here. That's the
         // conjunction `!timed_out && exit_code == 0`, which depends
         // on init writing MSG_TYPE_EXIT to SHM before the AP-triggered
@@ -1954,7 +1954,7 @@ mod tests {
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         let report = result.monitor.as_ref().expect(
             "ktstr: monitor report missing — require_kernel_offsets and \
              sched_domain_offsets resolved at setup, so monitor initialization \

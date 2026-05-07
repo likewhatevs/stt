@@ -2486,23 +2486,9 @@ pub(crate) fn monitor_loop(
         // independently of `watchdog_override`: a kernel without
         // a resolvable `scx_sched.watchdog_timeout` BTF field
         // still gets a correct outer kill timer.
-        if !watchdog_reset_signaled && let Some(reset) = cfg.watchdog_reset.as_ref() {
+        if let Some(reset) = cfg.watchdog_reset.as_ref() {
             let scx_sched_kva = mem.read_u64(reset.scx_root_pa, 0);
-            if scx_sched_kva != 0 {
-                // Encode as ns since `run_start` so the watchdog
-                // thread can decode via `run_start +
-                // Duration::from_nanos(value)`. Saturate to
-                // u64::MAX on overflow rather than wrapping —
-                // the watchdog caps at the original
-                // `hard_deadline` anyway, so a saturated value
-                // just lets the original ceiling win, which is
-                // the correct fallback. `0` is the "no reset
-                // requested" sentinel; ensure a genuine attach
-                // observation never collides with it by clamping
-                // to a minimum of 1 ns (workload_duration is
-                // conventionally >= 1 ms so this branch
-                // effectively never fires, but the sentinel
-                // guarantee is independent of policy).
+            if scx_sched_kva != 0 && !watchdog_reset_signaled {
                 let elapsed = run_start.elapsed();
                 let target_ns = elapsed
                     .as_nanos()

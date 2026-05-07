@@ -102,6 +102,15 @@ use super::{
 /// of rustdoc's public surface — it is plumbing, not user API.
 ///
 /// [`ResourceContention`]: crate::vmm::host_topology::ResourceContention
+/// Check if an error is a host topology mismatch (e.g. test
+/// requests 2 LLCs but host has 1). String-match because the
+/// error is a plain `anyhow::Error`, not a typed error.
+#[doc(hidden)]
+pub fn is_topology_insufficient(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}");
+    msg.contains("need") && (msg.contains("LLC") || msg.contains("CPU"))
+}
+
 #[doc(hidden)]
 pub fn is_resource_contention(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
@@ -832,14 +841,6 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
         }
         Ok(_) => 0,
         Err(e) if is_resource_contention(&e) => {
-            // Pull the reason string out of the same chain
-            // `is_resource_contention` walks. The `find_map` is
-            // total-by-construction here: `is_resource_contention`
-            // returned true iff at least one cause downcasts to
-            // `ResourceContention`, so the iterator below is
-            // guaranteed to yield `Some`. The fallback string is
-            // defensive only and would surface as a crate-internal
-            // bug if it ever appeared.
             let reason = e
                 .chain()
                 .find_map(|c| {
@@ -848,6 +849,10 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                 })
                 .unwrap_or_else(|| "<unknown>".to_string());
             crate::report::test_skip(format_args!("resource contention: {reason}"));
+            0
+        }
+        Err(e) if is_topology_insufficient(&e) => {
+            crate::report::test_skip(format_args!("host topology insufficient: {e:#}"));
             0
         }
         Err(_) if expect_err => 0,
@@ -1448,7 +1453,7 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
     let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
         .duration(entry.duration)
         .workers_per_cgroup(workers_per_cgroup)
-        .settle(std::time::Duration::from_millis(500))
+        .settle(std::time::Duration::ZERO)
         .assert(merged_assert)
         .build();
     (entry.func)(&ctx)

@@ -72,11 +72,6 @@ pub(super) enum BspExitReason {
     /// `bsp.run()` returned a non-EINTR/EAGAIN errno. Indicates a
     /// permanent KVM_RUN failure on the BSP vCPU fd.
     RunError,
-    /// The wall-clock timeout (`run_start.elapsed() > timeout`) ran
-    /// out before any other exit condition fired. Returned with
-    /// `timed_out=true`. Logged from the early-return branch at the
-    /// top of the loop.
-    Timeout,
 }
 
 /// Decoded contents of a guest-side `MSG_TYPE_SNAPSHOT_REQUEST` TLV

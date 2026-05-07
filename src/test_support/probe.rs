@@ -1236,7 +1236,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         .duration(entry.duration)
         .workers_per_cgroup(entry.workers_per_cgroup as usize)
         .sched_pid(sched_pid)
-        .settle(Duration::from_millis(500))
+        .settle(Duration::ZERO)
         .work_type_override(work_type_override)
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())

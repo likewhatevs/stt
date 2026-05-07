@@ -856,11 +856,14 @@ fn run_scenario(
             &mut sched_died_during_hold,
         );
 
-        // Per-Step teardown ALWAYS runs — on success and on error.
-        // This is the core of the "Step is fully bounded" invariant:
-        // cgroups created this step go away, workload handles are
-        // collected into the result, payload handles are killed
-        // with metric emission. Backdrop state is untouched.
+        // Signal hold-complete so the host watchdog resets its
+        // deadline. Teardown (collect_step) runs in the fresh
+        // budget, not the hold budget.
+        if guest_comms::is_guest() {
+            let elapsed = scenario_start.elapsed().as_millis() as u64;
+            crate::vmm::guest_comms::send_scenario_end(elapsed);
+        }
+
         let step_result = collect_step(&mut step_state, effective_checks, ctx.topo, ctx.cgroups);
         result.merge(step_result);
 
@@ -1194,6 +1197,9 @@ fn run_step<'a>(
                 HoldSpec::Fixed(d) => *d,
                 HoldSpec::Loop { .. } => unreachable!(),
             };
+            let remaining = (scenario_start + ctx.duration)
+                .saturating_duration_since(std::time::Instant::now());
+            let hold_dur = hold_dur.min(remaining);
             if sleep_or_sched_died(hold_dur, ctx.sched_pid) {
                 *sched_died_during_hold = true;
                 return Ok(());

@@ -2503,7 +2503,12 @@ fn start_trace_pipe() -> (Option<Arc<AtomicBool>>, Option<std::thread::JoinHandl
 
                     let mut pollfds = [PollFd::new(trace.as_fd(), PollFlags::POLLIN)];
                     match poll(&mut pollfds, PollTimeout::from(200u16)) {
-                        Ok(0) => continue,
+                        Ok(0) => {
+                            if drain_deadline.is_some() {
+                                break;
+                            }
+                            continue;
+                        }
                         Ok(_) => {}
                         Err(nix::errno::Errno::EINTR) => continue,
                         Err(_) => break,

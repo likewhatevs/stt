@@ -70,6 +70,15 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// Guest-reported `phys_base + 1`. Stored by the KERN_ADDRS arm
     /// so the monitor thread can pick it up via Acquire load.
     pub kern_phys_base: &'a Arc<std::sync::atomic::AtomicU64>,
+    /// Watchdog reset atomic + workload duration. SCENARIO_START
+    /// stores `(now - run_start + duration).as_nanos()` so the
+    /// watchdog starts the workload clock from scenario start, not
+    /// from boot or SYS_RDY.
+    pub watchdog_reset: Option<(
+        &'a std::sync::atomic::AtomicU64,
+        std::time::Duration,
+        std::time::Instant,
+    )>,
 }
 
 /// Classify and dispatch a single [`BulkMessage`] from the port-1
@@ -213,9 +222,41 @@ pub(super) fn dispatch_bulk_message(
             // reply ships over port-1 RX. Do NOT bucket.
             None
         }
+        Some(crate::vmm::wire::MsgType::ScenarioStart) => {
+            if msg.crc_ok
+                && let Some((reset_ns, duration, run_start)) = sinks.watchdog_reset.as_ref()
+            {
+                let elapsed = run_start.elapsed();
+                let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
+                let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
+                reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+            }
+            Some(crate::vmm::wire::ShmEntry {
+                msg_type: msg.msg_type,
+                payload: msg.payload.to_vec(),
+                crc_ok: msg.crc_ok,
+            })
+        }
+        Some(crate::vmm::wire::MsgType::ScenarioEnd) => {
+            if msg.crc_ok
+                && let Some((reset_ns, duration, run_start)) = sinks.watchdog_reset.as_ref()
+            {
+                let elapsed = run_start.elapsed();
+                let target_ns = elapsed
+                    .as_nanos()
+                    .saturating_add(duration.as_nanos());
+                let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
+                reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+            }
+            Some(crate::vmm::wire::ShmEntry {
+                msg_type: msg.msg_type,
+                payload: msg.payload.to_vec(),
+                crc_ok: msg.crc_ok,
+            })
+        }
         Some(other) if !other.is_coordinator_internal() => {
             // Every other typed verdict-bearing variant (Stimulus,
-            // ScenarioStart, ScenarioEnd, Exit, TestResult, Crash,
+            // ScenarioEnd, Exit, TestResult, Crash,
             // PayloadMetrics, RawPayloadOutput, Profraw, Stdout,
             // Stderr, SchedLog, Lifecycle, ExecExit, Dmesg,
             // ProbeOutput) accumulates into the bucket verbatim.

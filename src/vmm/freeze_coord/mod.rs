@@ -612,6 +612,8 @@ impl KtstrVm {
             watchdog_reset_ns.clone(),
             kern_phys_base.clone(),
         )?;
+        let watchdog_reset_for_coord = watchdog_reset_ns.clone();
+        let workload_duration_for_coord = self.workload_duration;
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
         let bpf_write_handle = self.start_bpf_map_write(
@@ -1974,6 +1976,9 @@ impl KtstrVm {
                                         snapshot_requests_pending:
                                             &mut snapshot_requests_pending,
                                         kern_phys_base: &kern_phys_base,
+                                        watchdog_reset: workload_duration_for_coord.map(|d| {
+                                            (watchdog_reset_for_coord.as_ref(), d, run_start)
+                                        }),
                                     };
                                     for msg in &drained.messages {
                                         if let Some(entry) =
@@ -5356,33 +5361,29 @@ impl KtstrVm {
                     // workload duration was not configured (no
                     // distinct workload budget; `hard_deadline`
                     // is the only deadline that matters).
-                    if reset_deadline.is_none() && workload_duration_for_wd.is_some() {
+                    if workload_duration_for_wd.is_some() {
                         let stored_ns = watchdog_reset_for_wd.load(Ordering::Acquire);
                         if stored_ns != 0 {
                             let candidate = run_start
                                 .checked_add(Duration::from_nanos(stored_ns))
                                 .unwrap_or(hard_deadline);
-                            // Cap at the original `hard_deadline`
-                            // so a late-attaching scheduler whose
-                            // `now + duration` would slide past
-                            // the outer kill timer is clamped to
-                            // the ceiling. `min(reset,
-                            // hard_deadline)` is the
-                            // user-specified semantics.
-                            reset_deadline = Some(candidate.min(hard_deadline));
-                            eprintln!(
-                                "watchdog: scheduler attach observed, hard \
-                                 deadline reset to {:?} from VM start",
-                                reset_deadline.unwrap().saturating_duration_since(run_start),
-                            );
+                            if reset_deadline.is_none()
+                                || reset_deadline.is_some_and(|prev| candidate > prev)
+                            {
+                                reset_deadline = Some(candidate);
+                                eprintln!(
+                                    "watchdog: scheduler attach observed, hard \
+                                     deadline reset to {:?} from VM start",
+                                    candidate.saturating_duration_since(run_start),
+                                );
+                            }
                         }
                     }
                     // Effective deadline: the reset value when
                     // present, otherwise the original boot-time
-                    // deadline. The reset value is already capped
-                    // at `hard_deadline` at decode time, so a
-                    // single compare against the chosen `Instant`
-                    // suffices.
+                    // deadline. The reset extends past
+                    // hard_deadline so boot time does not eat
+                    // into the workload budget.
                     let effective_deadline = reset_deadline.unwrap_or(hard_deadline);
                     if kill_for_watchdog.load(Ordering::Acquire)
                         || Instant::now() >= effective_deadline
@@ -6990,8 +6991,8 @@ impl KtstrVm {
         bsp_parked: &Arc<AtomicBool>,
         bsp_regs: &Arc<std::sync::Mutex<Option<exit_dispatch::VcpuRegSnapshot>>>,
         has_immediate_exit: bool,
-        run_start: Instant,
-        timeout: Duration,
+        _run_start: Instant,
+        _timeout: Duration,
         parked_evt: Option<&Arc<EventFd>>,
         thaw_evt: Option<&Arc<EventFd>>,
         kill_evt: Option<&Arc<EventFd>>,
@@ -7036,13 +7037,6 @@ impl KtstrVm {
         let mut armed_single_step: bool = false;
 
         loop {
-            if run_start.elapsed() > timeout {
-                eprintln!(
-                    "BSP: loop exit reason={reason:?} (timed_out)",
-                    reason = BspExitReason::Timeout
-                );
-                return (exit_code, true);
-            }
             if kill.load(Ordering::Acquire) {
                 break;
             }

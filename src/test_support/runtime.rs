@@ -165,9 +165,9 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
 }
 
 /// Headroom added to the test's base duration to derive the
-/// host-side VM kill timer. Zero: the freeze coordinator's
-/// rendezvous and dump render complete within the watchdog
-/// window itself, so no additional headroom is needed.
+/// host-side VM kill timer. Zero: the watchdog_duration reset
+/// handles the workload phase. Tests that need more time set
+/// their own duration/timeout via the #[ktstr_test] attribute.
 const VM_TIMEOUT_HEADROOM: Duration = Duration::ZERO;
 
 /// Derive the host-side VM timeout from the test entry's watchdog

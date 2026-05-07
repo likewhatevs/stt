@@ -3282,6 +3282,20 @@ impl WorkloadHandle {
         let children = std::mem::take(&mut self.children);
         let threads = std::mem::take(&mut self.threads);
 
+        // Drain the 'r' ready byte from each worker's report pipe
+        // so the collect poll below waits for the JSON report, not
+        // the already-present ready byte. The barrier section above
+        // consumes it for auto-started workers; explicitly-started
+        // workers (was_started=true) skip the barrier.
+        if was_started {
+            for &(_, read_fd, _) in &children {
+                let mut byte: u8 = 0;
+                unsafe {
+                    libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1);
+                }
+            }
+        }
+
         // Signal all fork-mode children to stop via SIGUSR1; the
         // signal handler flips the global STOP that worker_main's
         // `stop.load(Relaxed)` checks read.
@@ -3313,6 +3327,7 @@ impl WorkloadHandle {
             let mut buf = Vec::new();
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut poll_ready = false;
             if ms > 0 {
                 let mut pfd = libc::pollfd {
                     fd: read_fd,
@@ -3320,110 +3335,33 @@ impl WorkloadHandle {
                     revents: 0,
                 };
                 let ready = unsafe { libc::poll(&mut pfd, 1, ms) };
-                if ready > 0 {
-                    let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
-                    let _ = f.read_to_end(&mut buf);
-                    drop(f);
-                } else {
-                    let _ = nix::unistd::close(read_fd);
-                }
-            } else {
-                let _ = nix::unistd::close(read_fd);
+                poll_ready = ready > 0;
             }
 
-            // Pre-reap killpg — sweep the worker's process group
-            // BEFORE any WNOHANG so the leader's pid is still in
-            // the kernel's process table when killpg runs. The
-            // previous code path (killpg AFTER WNOHANG) had a
-            // pid-recycling race: a worker that exited cleanly
-            // before the WNOHANG check is reaped by that call,
-            // freeing its pid for reuse; a subsequent
-            // killpg(recycled-pid, SIGKILL) would deliver SIGKILL
-            // to an unrelated process group elsewhere on the
-            // host that happened to inherit the recycled pid via
-            // an unrelated fork+setpgid sequence. Issuing killpg
-            // first closes the race because the leader is
-            // guaranteed to still occupy `npid` at this point —
-            // either alive or as a zombie awaiting our reap, and
-            // in both cases the kernel still reserves the pid.
-            // After this killpg, any descendant forked by the
-            // worker (Custom workloads, ForkExit caught
-            // mid-fork) is dying in parallel; the WNOHANG below
-            // then reaps the leader and the still-alive
-            // escalation path takes over if the leader hasn't
-            // exited yet.
-            //
-            // Behavior preserved: descendants of a graceful-exit
-            // worker are still SIGKILL'd by this sweep, matching
-            // the previous unconditional behavior. The only
-            // observable difference for an already-exited leader
-            // is that killpg now races with the SIGABRT/_exit
-            // sequence the leader was about to complete — but
-            // for an already-zombie leader killpg is a no-op
-            // against its exit status (the kernel does not
-            // re-deliver signals to zombies), and for a
-            // mid-panic leader the close race window is a few
-            // microseconds against a 500ms+ collection deadline.
-            // The sentinel-path tests in `tests_grandchild` that
-            // pin both branches (StillAlive vs graceful) still
-            // observe descendant cleanup.
-            //
-            // ESRCH-convention: this call intentionally discards
-            // the killpg return via `let _ =`. The outcome
-            // depends on the SIGCHLD disposition:
-            //
-            // SIG_DFL / handler (host `cargo test`): the leader
-            // is a zombie occupying its pgid until the WNOHANG
-            // below reaps it, so killpg returns 0 (signals to
-            // zombies are no-ops, not ESRCH).
-            //
-            // SIG_IGN (production guest — PID 1 sets SIG_IGN at
-            // rust_init.rs): the kernel auto-reaps via
-            // `do_notify_parent` → `release_task` →
-            // `__unhash_process`, detaching the leader from
-            // PIDTYPE_PGID before we reach killpg. If the
-            // worker has no descendants, the pgrp is empty and
-            // killpg returns ESRCH. This is the common case in
-            // production.
-            //
-            // Either outcome is acceptable: 0 means the signal
-            // was delivered (no-op to zombie or descendants),
-            // ESRCH means the group is already gone.
-            // Discarding the return preserves the previous
-            // logging behavior on the collect path: Drop
-            // (`WorkloadHandle::drop`) is the place that logs
-            // killpg errors via `tracing::warn!`, since Drop
-            // runs on every handle teardown including panic-
-            // unwind paths and surfacing errors there is more
-            // valuable than on the normal collect flow.
-            //
-            // `pid` is `libc::pid_t` (= i32 on Linux), which
-            // passes straight into `Pid::from_raw` without a
-            // sign cast — the old u32→i32 session-wide-reap
-            // hazard is avoided.
             let npid = nix::unistd::Pid::from_raw(pid);
-            // Direct-kill first: same-UID, no process-group
-            // lookup, works even when setpgid(0,0) failed or
-            // the runner's security policy restricts killpg.
-            let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
-            // Sweep descendants via killpg. ESRCH is fine —
-            // the pgrp may not exist if setpgid failed.
-            let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
+            if !poll_ready {
+                // Deadline expired — worker didn't write a report.
+                // Kill first so read_to_end doesn't block on the
+                // pipe's write end (the worker may have written
+                // only the 'r' ready byte but no JSON).
+                let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::unistd::close(read_fd);
+            } else {
+                // Worker responded — read the report, then kill.
+                let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
+                let _ = f.read_to_end(&mut buf);
+                drop(f);
+                let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
+            }
             let waited = nix::sys::wait::waitpid(npid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
-            let still_running = matches!(waited, Ok(nix::sys::wait::WaitStatus::StillAlive),);
+            let still_running = matches!(waited, Ok(nix::sys::wait::WaitStatus::StillAlive));
             let exit_info_source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno> =
                 if still_running {
                     let _ = nix::sys::wait::waitpid(npid, None);
                     Ok(nix::sys::wait::WaitStatus::StillAlive)
                 } else {
-                    // Graceful-exit branch: the leader was
-                    // reaped by the WNOHANG above. The pre-reap
-                    // killpg already swept the worker's pgrp
-                    // (including any descendants), so no
-                    // post-reap kill is needed and the
-                    // pid-recycling race is avoided —
-                    // `kill(npid, …)` after a zombie reap could
-                    // hit a recycled pid; that path is gone.
                     waited
                 };
 
