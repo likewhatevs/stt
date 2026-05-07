@@ -6244,7 +6244,32 @@ impl KtstrVm {
                     if biased != 0 {
                         biased.wrapping_sub(1)
                     } else {
-                        0
+                        // KERN_ADDRS not received (aarch64, or guest
+                        // hasn't booted far enough). Fall back to the
+                        // page-table walk — needs CR3, so wait briefly.
+                        let cr3_val = {
+                            let mut v = cr3.load(std::sync::atomic::Ordering::Acquire);
+                            let mut w = 0u32;
+                            while v == 0 && w < 500 {
+                                if kill_clone.load(std::sync::atomic::Ordering::Acquire) {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                v = cr3.load(std::sync::atomic::Ordering::Acquire);
+                                w += 1;
+                            }
+                            v
+                        };
+                        if cr3_val != 0 {
+                            let l5 = monitor::symbols::resolve_pgtable_l5(
+                                &mem, &symbols, start_kernel_map_for_thread, 0,
+                            );
+                            monitor::symbols::resolve_phys_base(
+                                &mem, &symbols, cr3_val, l5, tcr_el1_value,
+                            ).unwrap_or(0)
+                        } else {
+                            0
+                        }
                     }
                 };
 
