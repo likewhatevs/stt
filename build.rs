@@ -287,8 +287,8 @@ int main(void) {{
         // Download busybox source: try tarball first, fall back to git clone.
         // Warning before network access so a hang is diagnosable.
         if !busybox_src.join("Makefile").exists() {
-            println!("cargo:warning=downloading busybox source (requires network)...");
             let tarball_url = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
+            println!("cargo:warning=downloading busybox source tarball from {tarball_url} (requires network)");
             let tarball_err = (|| -> Result<(), String> {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
@@ -320,9 +320,10 @@ int main(void) {{
             // Fall back to shallow git clone if tarball failed.
             if !busybox_src.join("Makefile").exists() {
                 let tarball_err = tarball_err.unwrap_or_else(|| "unknown".to_string());
+                let git_url = "https://github.com/mirror/busybox.git";
                 println!(
-                    "cargo:warning=tarball download failed ({tarball_err}), \
-                     trying git clone..."
+                    "cargo:warning=busybox tarball failed ({tarball_err}), \
+                     cloning {git_url} (requires network)"
                 );
 
                 // Clean up any partial state from failed tarball extraction.
@@ -334,7 +335,6 @@ int main(void) {{
                     std::fs::remove_dir_all(&extract_dir).ok();
                 }
 
-                let git_url = "https://github.com/mirror/busybox.git";
                 let interrupt = std::sync::atomic::AtomicBool::new(false);
                 let clone_err = (|| -> Result<(), Box<dyn std::error::Error>> {
                     let mut prep = gix::prepare_clone(git_url, &busybox_src)?

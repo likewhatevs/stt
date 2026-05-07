@@ -655,6 +655,7 @@ const SHA256SUMS_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// available" and downgrades verification to a warning.
 fn fetch_stable_sha256sums(client: &Client, major: u32) -> Result<String> {
     let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/sha256sums.asc");
+    tracing::info!(%url, "fetching kernel tarball sha256sums (requires network)");
     let response = client
         .get(&url)
         .timeout(SHA256SUMS_REQUEST_TIMEOUT)
@@ -838,7 +839,7 @@ fn download_stable_tarball(
 
     let expected_sha256 = resolve_expected_sha256(client, major, &tarball_name, skip_sha256);
 
-    tracing::info!(%url, "downloading kernel tarball (requires network)");
+    tracing::info!(%url, "downloading stable kernel tarball (requires network)");
     let response = client
         .get(&url)
         .timeout(DOWNLOAD_REQUEST_READ_TIMEOUT)
@@ -949,6 +950,7 @@ fn download_rc_tarball(
     cli_label: &str,
 ) -> Result<PathBuf> {
     let url = format!("https://git.kernel.org/torvalds/t/linux-{version}.tar.gz");
+    tracing::info!(%url, "downloading RC kernel tarball (requires network)");
 
     let response = client
         .get(&url)
@@ -1069,7 +1071,7 @@ pub(crate) const RELEASES_URL: &str = "https://www.kernel.org/releases.json";
 /// and a localhost URL pointed at a TcpListener-backed mock that
 /// returns canned `releases.json` content.
 pub(crate) fn fetch_releases(client: &Client, url: &str) -> Result<Vec<Release>> {
-    tracing::debug!(%url, "fetching kernel releases (requires network)");
+    tracing::info!(%url, "fetching kernel.org releases index (requires network)");
     let response = client
         .get(url)
         .send()
