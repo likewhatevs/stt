@@ -754,19 +754,11 @@ impl KtstrVmBuilder {
             cached_host_topo = Some(host_topo);
             (Some(plan), node_map, None)
         } else {
-            // Default else: 1:1 vCPU→host CPU pin like perf-mode,
-            // but with LOCK_SH (shared) so multiple VMs can overlap.
-            // Topology-aware: assigns within LLC groups for cache
-            // coherence. No service CPU reservation.
-            if let Ok(host_topo) = host_topology::HostTopology::cached() {
-                let mut plan = host_topo.compute_pinning(&self.topology, false, 0)?;
-                drop(std::mem::take(&mut plan.locks));
-                cached_host_topo = Some(host_topo);
-                (Some(plan), Vec::new(), None)
-            } else {
-                cached_host_topo = None;
-                (None, Vec::new(), None)
-            }
+            // Default: defer pinning to run() which tries each LLC
+            // offset with LOCK_SH. Cache the host topology so run()
+            // can compute plans; no plan or locks at build time.
+            cached_host_topo = host_topology::HostTopology::cached().ok();
+            (None, Vec::new(), None)
         };
 
         let kernel = self.kernel.context("kernel path required")?;

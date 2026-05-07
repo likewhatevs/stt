@@ -399,6 +399,7 @@ struct RunLocks {
     #[allow(dead_code)]
     locks: Vec<std::os::fd::OwnedFd>,
     default_cpu_mask: Option<Vec<usize>>,
+    pinning_plan: Option<host_topology::PinningPlan>,
 }
 
 impl KtstrVm {
@@ -461,7 +462,16 @@ impl KtstrVm {
         let run_start = Instant::now();
 
         let run_locks = self.acquire_run_locks()?;
-        let run = self.run_vm(run_start, vm, run_locks.default_cpu_mask.as_deref())?;
+        let effective_plan = run_locks
+            .pinning_plan
+            .as_ref()
+            .or(self.pinning_plan.as_ref());
+        let run = self.run_vm(
+            run_start,
+            vm,
+            run_locks.default_cpu_mask.as_deref(),
+            effective_plan,
+        )?;
         drop(run_locks);
 
         let mut result = self.collect_results(start, run)?;
@@ -536,6 +546,7 @@ impl KtstrVm {
                     host_topology::LockOutcome::Acquired { locks, .. } => Ok(RunLocks {
                         locks,
                         default_cpu_mask: None,
+                        pinning_plan: None,
                     }),
                     host_topology::LockOutcome::Unavailable(reason) => {
                         Err(anyhow::Error::new(host_topology::ResourceContention {
@@ -547,6 +558,7 @@ impl KtstrVm {
                 Ok(RunLocks {
                     locks: Vec::new(),
                     default_cpu_mask: None,
+                    pinning_plan: None,
                 })
             }
         } else if self.performance_mode {
@@ -559,6 +571,7 @@ impl KtstrVm {
                     host_topology::LockOutcome::Acquired { locks, .. } => Ok(RunLocks {
                         locks,
                         default_cpu_mask: None,
+                        pinning_plan: None,
                     }),
                     host_topology::LockOutcome::Unavailable(reason) => {
                         Err(anyhow::Error::new(host_topology::ResourceContention {
@@ -570,30 +583,54 @@ impl KtstrVm {
                 Ok(RunLocks {
                     locks: Vec::new(),
                     default_cpu_mask: None,
+                    pinning_plan: None,
                 })
             }
         } else {
-            // Default else: 1:1 pin with LOCK_SH on the plan's LLCs.
-            if let Some(ref plan) = self.pinning_plan {
-                match host_topology::acquire_resource_locks(
-                    plan,
-                    &plan.llc_indices,
-                    host_topology::LlcLockMode::Shared,
-                )? {
-                    host_topology::LockOutcome::Acquired { locks, .. } => Ok(RunLocks {
-                        locks,
-                        default_cpu_mask: None,
-                    }),
-                    host_topology::LockOutcome::Unavailable(reason) => {
-                        Err(anyhow::Error::new(host_topology::ResourceContention {
-                            reason,
-                        }))
+            // Default: try each LLC offset with LOCK_SH until one
+            // succeeds. LOCK_SH is compatible with other LOCK_SH
+            // holders (multiple non-perf VMs share), but blocked by
+            // perf-mode's LOCK_EX. On contention, move to the next
+            // offset. If all offsets busy, ResourceContention →
+            // nextest retries after the perf-mode test finishes.
+            if let Some(ref host_topo) = self.host_topo {
+                let num_llcs = host_topo.llc_groups.len();
+                let llcs_needed = (self.topology.llcs as usize).max(1);
+                let max_slots = num_llcs.checked_div(llcs_needed).unwrap_or(1).max(1);
+
+                for slot in 0..max_slots {
+                    let offset = slot * llcs_needed;
+                    let Ok(candidate) = host_topo.compute_pinning(&self.topology, false, offset)
+                    else {
+                        continue;
+                    };
+                    match host_topology::acquire_resource_locks(
+                        &candidate,
+                        &candidate.llc_indices,
+                        host_topology::LlcLockMode::Shared,
+                    )? {
+                        host_topology::LockOutcome::Acquired { locks, .. } => {
+                            return Ok(RunLocks {
+                                locks,
+                                default_cpu_mask: None,
+                                pinning_plan: Some(candidate),
+                            });
+                        }
+                        host_topology::LockOutcome::Unavailable(_) => continue,
                     }
                 }
+                Err(anyhow::Error::new(host_topology::ResourceContention {
+                    reason: format!(
+                        "all {max_slots} LLC slots busy (LOCK_SH)\n  \
+                         hint: a performance_mode test may hold LOCK_EX; \
+                         nextest retry will resolve after it finishes"
+                    ),
+                }))
             } else {
                 Ok(RunLocks {
                     locks: Vec::new(),
                     default_cpu_mask: None,
+                    pinning_plan: None,
                 })
             }
         }

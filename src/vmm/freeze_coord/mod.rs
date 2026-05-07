@@ -192,6 +192,7 @@ impl KtstrVm {
         run_start: Instant,
         mut vm: kvm::KtstrKvm,
         default_cpu_mask: Option<&[usize]>,
+        effective_pinning_plan: Option<&super::host_topology::PinningPlan>,
     ) -> Result<VmRunState> {
         let com1 = Arc::new(PiMutex::new(console::Serial::new(console::COM1_BASE)));
         let com2 = Arc::new(PiMutex::new(console::Serial::new(console::COM2_BASE)));
@@ -424,7 +425,7 @@ impl KtstrVm {
 
         // Build per-vCPU pin targets from the stored pinning plan.
         // Index i holds the host CPU for vCPU i. BSP is index 0.
-        let pin_targets: Vec<Option<usize>> = if let Some(ref plan) = self.pinning_plan {
+        let pin_targets: Vec<Option<usize>> = if let Some(plan) = effective_pinning_plan {
             let total = self.topology.total_cpus() as usize;
             let mut targets = vec![None; total];
             for &(vcpu_id, host_cpu) in &plan.assignments {
@@ -664,7 +665,7 @@ impl KtstrVm {
         let kill_evt_for_watchdog = kill_evt.clone();
         let bsp_done_evt_for_wd = bsp_done_evt.clone();
         let rt_watchdog = self.performance_mode;
-        let wd_service_cpu = self.pinning_plan.as_ref().and_then(|p| p.service_cpu);
+        let wd_service_cpu = effective_pinning_plan.and_then(|p| p.service_cpu);
         // Clone the virtio-console Arc into the watchdog so the
         // soft-deadline path can push `SIGNAL_VC_SHUTDOWN` to
         // `/dev/hvc0` for graceful shutdown. The guest's
