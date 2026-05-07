@@ -1332,7 +1332,7 @@ mod tests {
                 .cmdline("loglevel=7")
                 .build()
         );
-        let result = vm.run().unwrap();
+        let result = skip_on_contention!(vm.run());
         assert!(!result.stderr.is_empty(), "no console output from SMP boot");
     }
 

@@ -53,6 +53,14 @@ macro_rules! skip_on_contention {
             {
                 skip!("resource contention: {e:#}");
             }
+            Err(e)
+                if {
+                    let msg = format!("{e:#}");
+                    msg.contains("need") && (msg.contains("LLC") || msg.contains("CPU"))
+                } =>
+            {
+                skip!("host topology insufficient: {e:#}");
+            }
             Err(e) => panic!("{e:#}"),
         }
     };
