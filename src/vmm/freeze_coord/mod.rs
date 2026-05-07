@@ -6238,27 +6238,12 @@ impl KtstrVm {
                 // visible by the time SYS_RDY fires. No KASLR/PTI
                 // page-table walking is needed.
                 let phys_base = {
-                    let mut biased = kern_phys_base_shared.load(
+                    let biased = kern_phys_base_shared.load(
                         std::sync::atomic::Ordering::Acquire,
                     );
-                    let mut waited = 0u32;
-                    while biased == 0 && waited < 3000 {
-                        if kill_clone.load(std::sync::atomic::Ordering::Acquire) {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        biased = kern_phys_base_shared.load(
-                            std::sync::atomic::Ordering::Acquire,
-                        );
-                        waited += 1;
-                    }
                     if biased != 0 {
                         biased.wrapping_sub(1)
                     } else {
-                        tracing::warn!(
-                            "monitor: kern_phys_base not received from guest \
-                             after 3s — falling back to 0"
-                        );
                         0
                     }
                 };
