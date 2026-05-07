@@ -3402,38 +3402,17 @@ impl WorkloadHandle {
             // sign cast — the old u32→i32 session-wide-reap
             // hazard is avoided.
             let npid = nix::unistd::Pid::from_raw(pid);
+            // Direct-kill first: same-UID, no process-group
+            // lookup, works even when setpgid(0,0) failed or
+            // the runner's security policy restricts killpg.
+            let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
+            // Sweep descendants via killpg. ESRCH is fine —
+            // the pgrp may not exist if setpgid failed.
             let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
-            // Wait for child (WNOHANG first, then SIGKILL the
-            // leader directly if still alive). The killpg above
-            // has already started dying every member of the
-            // pgrp; this WNOHANG is a fast-path reap that
-            // returns the leader's already-set exit status when
-            // the leader had exited gracefully before killpg
-            // arrived (zombie-but-not-yet-reaped — its
-            // `Exited(0)` / `Signaled(SIGABRT)` status survives
-            // the killpg because the kernel does not re-set the
-            // exit status of a zombie).
             let waited = nix::sys::wait::waitpid(npid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
             let still_running = matches!(waited, Ok(nix::sys::wait::WaitStatus::StillAlive),);
-            // Preserve the reap shape for the sentinel path
-            // below: the WNOHANG attempt tells us "exited /
-            // signaled / still running" on the fast path; the
-            // SIGKILL + blocking waitpid below collapses "still
-            // running" into `WorkerExitInfo::TimedOut` without
-            // retaining the final status (the reap itself is
-            // the diagnostic — the child was past its deadline).
             let exit_info_source: Result<nix::sys::wait::WaitStatus, nix::errno::Errno> =
                 if still_running {
-                    // Leader still up post-killpg: direct-kill
-                    // the leader as a single-process fallback
-                    // when the worker's `setpgid(0, 0)` at fork
-                    // time somehow failed (so killpg above did
-                    // not reach it), then blocking-reap. `npid`
-                    // is safe here because the leader has not
-                    // been reaped (the WNOHANG observation
-                    // above returned StillAlive), so its pid
-                    // cannot be recycled mid-sequence.
-                    let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
                     let _ = nix::sys::wait::waitpid(npid, None);
                     Ok(nix::sys::wait::WaitStatus::StillAlive)
                 } else {
