@@ -622,10 +622,8 @@ pub(crate) fn ktstr_guest_init() -> ! {
     // safe — the BSS-zero rejection in
     // [`super::super::monitor::reader`]'s sample loop tolerates
     // pre-boot zeros for as long as needed.
-    #[cfg(target_arch = "x86_64")]
     let kern_phys_base = crate::vmm::guest_comms::read_phys_base_from_iomem().unwrap_or(0);
     for attempt in 0..100 {
-        #[cfg(target_arch = "x86_64")]
         crate::vmm::guest_comms::send_kern_addrs(kern_phys_base, 0);
         if crate::vmm::guest_comms::send_sys_rdy() {
             break;

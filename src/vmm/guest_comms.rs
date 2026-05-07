@@ -434,42 +434,59 @@ pub fn send_kern_addrs(phys_base: u64, page_offset_base: u64) -> bool {
     write_msg(super::wire::MSG_TYPE_KERN_ADDRS, &payload)
 }
 
-/// Read `phys_base` from `/proc/kallsyms` by finding the symbol
-/// address, then reading its value via the kernel's own
-/// `/proc/kcore` (which handles KASLR VA→PA translation
-/// internally).
+/// Derive the KASLR physical displacement from `/proc/iomem`.
 ///
-/// Simpler alternative: just peek the value from the running
-/// kernel via a trivial kernel module or eBPF. But the simplest
-/// path that works today: `/proc/kallsyms` gives the KVA, and
-/// we can read the value through `/proc/kcore` which the kernel
-/// provides as a virtual ELF that maps kernel VAs directly.
+/// On both x86_64 and aarch64 the kernel registers a "Kernel code"
+/// resource in `/proc/iomem` whose start address is the physical
+/// load address of `_text`. The KASLR offset is the difference
+/// between this runtime PA and the default (non-KASLR) load PA.
 ///
-/// Actually, even simpler: use inline asm or a helper to just
-/// read the symbol directly since we're running IN the kernel's
-/// address space as PID 1.
+/// x86_64: default load PA = `LOAD_PHYSICAL_ADDR` (0x100_0000,
+/// CONFIG_PHYSICAL_START). `phys_base = code_pa - 0x100_0000`.
 ///
-/// Fallback: parse `/proc/iomem` for "Kernel code" to derive
-/// the physical load address and compute phys_base from that.
-#[cfg(target_arch = "x86_64")]
+/// aarch64: default load PA = DRAM base (`System RAM` start from
+/// iomem) + `TEXT_OFFSET`. `TEXT_OFFSET` is 0 on kernels since
+/// v5.8 (commit 2b5fcc5), so `phys_base = code_pa - ram_start`.
+/// Older kernels with `TEXT_OFFSET = 0x80000` (or randomized via
+/// `CONFIG_ARM64_RANDOMIZE_TEXT_OFFSET`) would produce a biased
+/// value; ktstr.kconfig targets 6.x where `TEXT_OFFSET = 0`.
 pub fn read_phys_base_from_iomem() -> Option<u64> {
-    // /proc/iomem contains lines like:
-    //   01000000-0394afff : Kernel code
-    // The start address is the physical load address of the kernel.
-    // phys_base = physical_load_addr - LOAD_PHYSICAL_ADDR (0x1000000)
     let iomem = std::fs::read_to_string("/proc/iomem").ok()?;
-    for line in iomem.lines() {
-        let line = line.trim();
-        if line.ends_with(": Kernel code") {
-            let range = line.split(':').next()?.trim();
-            let start = range.split('-').next()?.trim();
-            let phys_load = u64::from_str_radix(start, 16).ok()?;
-            // LOAD_PHYSICAL_ADDR = CONFIG_PHYSICAL_START = 0x1000000
-            // phys_base = phys_load - LOAD_PHYSICAL_ADDR
-            return Some(phys_load.wrapping_sub(0x100_0000));
+    #[cfg(target_arch = "x86_64")]
+    {
+        for line in iomem.lines() {
+            let line = line.trim();
+            if line.ends_with(": Kernel code") {
+                let range = line.split(':').next()?.trim();
+                let start = range.split('-').next()?.trim();
+                let phys_load = u64::from_str_radix(start, 16).ok()?;
+                return Some(phys_load.wrapping_sub(0x100_0000));
+            }
         }
+        None
     }
-    None
+    #[cfg(target_arch = "aarch64")]
+    {
+        // First "System RAM" entry = lowest-addressed DRAM region.
+        // KERNEL_LOAD_ADDR == DRAM_START by construction in our VMM,
+        // so the kernel always loads at this base.
+        let mut ram_start: Option<u64> = None;
+        let mut code_start: Option<u64> = None;
+        for line in iomem.lines() {
+            let line = line.trim();
+            if ram_start.is_none() && line.ends_with(": System RAM") {
+                let range = line.split(':').next()?.trim();
+                let start = range.split('-').next()?.trim();
+                ram_start = Some(u64::from_str_radix(start, 16).ok()?);
+            }
+            if line.ends_with(": Kernel code") {
+                let range = line.split(':').next()?.trim();
+                let start = range.split('-').next()?.trim();
+                code_start = Some(u64::from_str_radix(start, 16).ok()?);
+            }
+        }
+        Some(code_start?.wrapping_sub(ram_start?))
+    }
 }
 
 /// Send a stdout chunk to the host. Payload: opaque UTF-8 bytes.

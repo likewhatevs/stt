@@ -572,46 +572,32 @@ pub(crate) fn kva_to_pa(kva: u64, page_offset: u64) -> u64 {
 ///
 /// Kernel text and data symbols (.text, .data, .bss) are mapped via
 /// `__START_KERNEL_map` (x86_64) / `KIMAGE_VADDR` (aarch64), not
-/// the direct mapping. The kernel's `__phys_addr` formula
-/// (`arch/x86/mm/physaddr.c:15-32`) is
-/// `pa = (kva - __START_KERNEL_map) + phys_base`, and the aarch64
-/// equivalent (`__kimg_to_phys(addr) = addr - kimage_voffset`) is
-/// `pa = (kva - KIMAGE_VADDR) + DRAM_START` because
-/// `kimage_voffset = KIMAGE_VADDR - phys_base` and on aarch64
-/// `phys_base = DRAM_START` for non-KASLR builds.
+/// the direct mapping. The formula is
+/// `dram_offset = (link_va - start_kernel_map) + phys_base`.
 ///
-/// On x86_64 the runtime `phys_base` value comes from the kernel's
-/// `phys_base` static, set by `__startup_64`
-/// (`arch/x86/boot/startup/map_kernel.c:122`). Without KASLR
-/// `phys_base == 0` and the formula collapses to
-/// `pa = kva - __START_KERNEL_map`. With KASLR the kernel image
-/// loads at a randomized PA above `LOAD_PHYSICAL_ADDR` (16 MiB
-/// floor) and `phys_base` carries that PA so the formula above
-/// resolves text/data symbols correctly.
+/// x86_64: `phys_base` comes from the kernel's `phys_base` static,
+/// set by `__startup_64` (`arch/x86/boot/startup/map_kernel.c`).
+/// Without KASLR `phys_base == 0`; with KASLR the kernel image
+/// loads at a randomized PA and `phys_base` carries the offset.
 ///
-/// On aarch64 callers pass `phys_base = DRAM_START`; the aarch64
-/// build does not export a `phys_base` symbol. With KASLR on
-/// aarch64 the kernel image still maps to `KIMAGE_VADDR` (the
-/// virtual address is fixed by the linker); the post-KASLR
-/// physical-side delta is captured by the kernel's
-/// `kimage_voffset` runtime variable, which we do not resolve
-/// here — `start_kernel_map_for_tcr` already returns the runtime
-/// VA base, and `phys_base = DRAM_START` cancels out the
-/// PHYS_OFFSET term identically to the original formula. Aarch64
-/// KASLR support is therefore a follow-up that resolves
-/// `kimage_voffset` from a parallel page-table walk; the current
-/// callers pass `phys_base = DRAM_START` and the result is correct
-/// for non-KASLR aarch64 boots.
+/// aarch64: `phys_base` is always 0. The kernel's
+/// `__kimg_to_phys(addr) = addr - kimage_voffset`
+/// (`arch/arm64/include/asm/memory.h:336`) uses `kimage_voffset`
+/// (which encodes the VA-PA delta), but since KASLR on arm64
+/// randomizes only the virtual address (`early_map_kernel` at
+/// `arch/arm64/kernel/pi/map_kernel.c:241`), and we use ELF
+/// link-time VAs (not runtime VAs), the virtual KASLR offset
+/// cancels exactly. The formula collapses to
+/// `dram_offset = link_va - KIMAGE_VADDR`.
 ///
 /// `start_kernel_map` is the runtime kernel image base — pass
 /// [`START_KERNEL_MAP`] on x86_64 and the value derived via
 /// [`start_kernel_map_for_tcr`] on aarch64.
 ///
-/// `phys_base` is the kernel's runtime `phys_base` (x86_64) or
-/// `DRAM_START` (aarch64). The boot-time bootstrap value is
-/// `0` (x86_64) / `DRAM_START` (aarch64); production callers
-/// pass the resolved value once the BSP has established the
-/// kernel image mapping (see [`resolve_phys_base`]).
+/// `phys_base` is the KASLR physical displacement. `0` on
+/// aarch64 (always) and on non-KASLR x86_64. Production callers
+/// pass the resolved value from the guest's KERN_ADDRS message
+/// or from [`resolve_phys_base`] (x86_64 page-table walk).
 ///
 /// Most callers funnel through
 /// [`super::guest::GuestKernel::text_kva_to_pa`] which carries

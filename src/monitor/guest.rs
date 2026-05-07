@@ -88,24 +88,26 @@ pub struct GuestKernel {
     ///   and 52-bit-VA configurations both translate symbol KVAs to
     ///   the right PAs.
     start_kernel_map: u64,
-    /// Kernel runtime `phys_base` (x86_64) used by every text/data
-    /// symbol translation: `pa = (kva - start_kernel_map) + phys_base`
-    /// (`arch/x86/mm/physaddr.c:15-32`). On a non-KASLR kernel this is
-    /// `0` and the formula collapses to the historical
-    /// `pa = kva - start_kernel_map`. On a KASLR kernel the value
-    /// carries the post-randomization PA of the kernel image. Resolved
-    /// at construction time via [`resolve_phys_base`] which walks the
-    /// guest page tables (CR3 → PA chase, no `phys_base` involvement)
-    /// to find the symbol's PA, breaking the chicken-and-egg with the
-    /// text-symbol translation.
+    /// KASLR physical displacement used by every text/data symbol
+    /// translation: `dram_offset = (kva - start_kernel_map) + phys_base`
+    /// (`arch/x86/mm/physaddr.c:15-32` on x86_64). Without KASLR this
+    /// is `0` and the formula collapses to `kva - start_kernel_map`.
     ///
-    /// On aarch64 the symbol is absent and the field stays `0`. The
-    /// existing aarch64 derivation (`text_kva_to_pa_with_base` with
-    /// `phys_base = 0` plus `start_kernel_map_for_tcr`-derived base)
-    /// remains correct for non-KASLR aarch64 boots; KASLR-aware
-    /// aarch64 support is a follow-up that resolves
-    /// `kimage_voffset` from a symbol read via the same page-table
-    /// walk.
+    /// x86_64: resolved from the kernel's `phys_base` symbol via a
+    /// page-table walk (CR3 → PTE chain, no `phys_base` involvement),
+    /// or from the guest-reported `/proc/iomem` hint.
+    ///
+    /// aarch64: always 0. Arm64 KASLR (`early_map_kernel` in
+    /// `arch/arm64/kernel/pi/map_kernel.c`) randomizes only the
+    /// virtual address (`va_base = KIMAGE_VADDR + kaslr_offset`);
+    /// the physical address stays where the PE loader placed it
+    /// (`pa_base = &_text`, set by the bootloader, not modified).
+    /// Since the monitor uses ELF link-time VAs (relative to
+    /// `KIMAGE_VADDR`), and the physical layout is unchanged,
+    /// `phys_base = 0` is correct with or without KASLR. The guest
+    /// still reads `/proc/iomem` and computes `kernel_code_pa -
+    /// system_ram_start` as a cross-check — this produces 0 on any
+    /// system where the kernel loads at the start of DRAM.
     phys_base: u64,
 }
 
