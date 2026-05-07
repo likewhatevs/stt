@@ -485,6 +485,10 @@ pub(crate) struct VmRunState {
     /// When present, `collect_verifier_stats` skips the ~4s
     /// ELF/BTF parse and uses this directly.
     pub(crate) prog_accessor: Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned>,
+    /// Guest-reported phys_base (biased +1). Used by
+    /// `collect_verifier_stats` fallback when the pre-built prog
+    /// accessor is unavailable.
+    pub(crate) kern_phys_base: u64,
     /// Virtio-console device shared with vCPU threads. Carries the
     /// port-1 (`/dev/vport0p1`) bulk TLV stream from guest to host;
     /// `collect_results` calls `drain_bulk()` after the run to feed

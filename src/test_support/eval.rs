@@ -1651,7 +1651,18 @@ fn evaluate_vm_result(
     let sched_log_section = parse_sched_output(sched_log_input)
         .map(|s| {
             let collapsed = crate::verifier::collapse_cycles(s);
-            format!("\n\n--- scheduler log ---\n{collapsed}")
+            let is_verifier = collapsed.contains("processed") && collapsed.contains("insns");
+            let lines: Vec<&str> = collapsed.lines().collect();
+            let tail = if !is_verifier && lines.len() > 200 {
+                let skipped = lines.len() - 200;
+                format!(
+                    "[{skipped} lines truncated]\n{}",
+                    lines[lines.len() - 200..].join("\n")
+                )
+            } else {
+                collapsed
+            };
+            format!("\n\n--- scheduler log ---\n{tail}")
         })
         .unwrap_or_default();
     let fingerprint_line = sched_log_fingerprint(sched_log_input)

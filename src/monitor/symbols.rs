@@ -791,7 +791,9 @@ pub(crate) fn compute_rq_pas(
     per_cpu_offsets
         .iter()
         .map(|&offset| {
-            let kva = runtime_start.wrapping_add(section_offset).wrapping_add(offset);
+            let kva = runtime_start
+                .wrapping_add(section_offset)
+                .wrapping_add(offset);
             kva_to_pa(kva, page_offset)
         })
         .collect()
@@ -838,7 +840,7 @@ mod tests {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
         let offsets = vec![0, 0x4_0000]; // CPU 0 at base, CPU 1 at +256KB
-        let pas = compute_rq_pas(runqueues, &offsets, page_offset, 0);
+        let pas = compute_rq_pas(runqueues, &offsets, page_offset, 0, 0);
         assert_eq!(pas[0], 0x20_0000);
         assert_eq!(pas[1], 0x24_0000);
     }
@@ -1083,7 +1085,7 @@ mod tests {
     fn compute_rq_pas_empty_offsets() {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
-        let pas = compute_rq_pas(runqueues, &[], page_offset, 0);
+        let pas = compute_rq_pas(runqueues, &[], page_offset, 0, 0);
         assert!(pas.is_empty());
     }
 
@@ -1091,7 +1093,7 @@ mod tests {
     fn compute_rq_pas_single_cpu() {
         let page_offset = DEFAULT_PAGE_OFFSET;
         let runqueues = page_offset.wrapping_add(0x20_0000);
-        let pas = compute_rq_pas(runqueues, &[0], page_offset, 0);
+        let pas = compute_rq_pas(runqueues, &[0], page_offset, 0, 0);
         assert_eq!(pas.len(), 1);
         assert_eq!(pas[0], 0x20_0000);
     }
@@ -1129,6 +1131,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1162,6 +1165,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1197,6 +1201,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1235,6 +1240,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1276,6 +1282,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            per_cpu_start: 0,
         };
 
         assert_eq!(
@@ -1313,6 +1320,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            per_cpu_start: 0,
         };
 
         assert!(resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -1347,6 +1355,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            per_cpu_start: 0,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));
@@ -1377,6 +1386,7 @@ mod tests {
             kstat: None,
             tick_cpu_sched: None,
             node_data: None,
+            per_cpu_start: 0,
         };
 
         assert!(!resolve_pgtable_l5(&mem, &symbols, START_KERNEL_MAP, 0));

@@ -823,7 +823,13 @@ mod tests {
 
         let mut buf = vec![0u8; 0x1000];
         let mem = unsafe { GuestMem::new(buf.as_mut_ptr(), buf.len() as u64) };
-        let kernel = GuestKernel::new_for_test(std::sync::Arc::new(mem), symbols, TEST_PAGE_OFFSET, 0, false);
+        let kernel = GuestKernel::new_for_test(
+            std::sync::Arc::new(mem),
+            symbols,
+            TEST_PAGE_OFFSET,
+            0,
+            false,
+        );
         let r = SchedClassRegistry::from_guest_kernel(&kernel);
         assert_eq!(r.fair, Some(fair_kva));
         assert_eq!(r.ext, Some(0xffff_ffff_8000_1300));
@@ -1105,7 +1111,7 @@ mod tests {
 
         // Runnable_list walk produces n1.
         let runnable_kvas = walk_runnable_list(
-            &*mem,
+            &mem,
             crate::monitor::reader::WalkContext::default(),
             head as u64,
             head as u64,
@@ -1283,7 +1289,7 @@ mod tests {
         // Runnable_list walk surfaces n1 (task.scx + see.runnable_node = 0
         // here, so task_kva == node_kva).
         let runnable_kvas = walk_runnable_list(
-            &*mem,
+            &mem,
             crate::monitor::reader::WalkContext::default(),
             head as u64,
             head as u64,

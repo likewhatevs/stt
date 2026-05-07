@@ -60,7 +60,8 @@ mod bss_tests;
 use self::dispatch::{BulkDispatchSinks, dispatch_bulk_message};
 #[allow(unused_imports)]
 use self::lazy_init::{
-    try_init_owned_accessor, try_init_owned_prog_accessor, try_init_prog_per_cpu_offsets,
+    try_init_owned_accessor_with_hint, try_init_owned_prog_accessor_with_hint,
+    try_init_prog_per_cpu_offsets,
 };
 #[allow(unused_imports)]
 use self::snapshot::{
@@ -619,6 +620,7 @@ impl KtstrVm {
             tcr_el1_cache.clone(),
             cr3_cache.clone(),
             virtio_con.clone(),
+            kern_phys_base.clone(),
         )?;
 
         // Run BSP on this thread.
@@ -804,19 +806,20 @@ impl KtstrVm {
         // dump_cpu_time_symbols) and VmRunState (for
         // collect_verifier_stats). Eliminates the 14-28s cold-cache
         // re-read that caused cleanup hangs.
-        let vmlinux_data_shared: Option<Arc<Vec<u8>>> = freeze_coord_vmlinux
-            .as_ref()
-            .and_then(|p| match std::fs::read(p) {
-                Ok(d) => Some(Arc::new(d)),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %p.display(),
-                        err = %e,
-                        "run_vm: vmlinux read failed"
-                    );
-                    None
-                }
-            });
+        let vmlinux_data_shared: Option<Arc<Vec<u8>>> =
+            freeze_coord_vmlinux
+                .as_ref()
+                .and_then(|p| match std::fs::read(p) {
+                    Ok(d) => Some(Arc::new(d)),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %p.display(),
+                            err = %e,
+                            "run_vm: vmlinux read failed"
+                        );
+                        None
+                    }
+                });
         // Cached `name -> KVA` map for `Op::WatchSnapshot` arming.
         // Build once here at run_vm scope so every TLV-driven
         // WATCH request is an O(1) HashMap lookup instead of a
@@ -826,8 +829,9 @@ impl KtstrVm {
         // the closure so the spawn-time parse cost is paid once
         // even when the run ends without any WATCH requests.
         let vmlinux_data_for_result = vmlinux_data_shared.clone();
-        let prog_accessor_slot: Arc<std::sync::Mutex<Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let prog_accessor_slot: Arc<
+            std::sync::Mutex<Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned>>,
+        > = Arc::new(std::sync::Mutex::new(None));
         let prog_accessor_slot_for_coord = prog_accessor_slot.clone();
         let freeze_coord_symbol_cache: Option<Arc<VmlinuxSymbolCache>> = freeze_coord_vmlinux
             .as_deref()
@@ -882,31 +886,31 @@ impl KtstrVm {
         // accessor-borrow paths share the same backing mapping.
         // `Arc<GuestMem>` is `Send` because `GuestMem` is `Send + Sync`
         // (see `unsafe impl Send for GuestMem` in `monitor::reader`).
-        let freeze_coord_mem: Option<Arc<monitor::reader::GuestMem>> =
-            match vm.numa_layout.as_ref() {
-                Some(layout) => Some(Arc::new(monitor::reader::GuestMem::from_layout(
-                    layout,
-                    &vm.guest_mem,
-                ))),
-                None => {
-                    use vm_memory::GuestMemoryRegion;
-                    if let Ok(host_base) = vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE))
-                        && let Some(r) = vm.guest_mem.iter().next()
-                    {
-                        let mem_size = r.len();
-                        // SAFETY: host_base came from GuestMemoryMmap's
-                        // get_host_address; mapping outlives this GuestMem
-                        // (vm.guest_mem outlives the coordinator thread —
-                        // collect_results joins the coordinator before vm
-                        // is dropped).
-                        Some(Arc::new(unsafe {
-                            monitor::reader::GuestMem::new(host_base, mem_size)
-                        }))
-                    } else {
-                        None
-                    }
+        let freeze_coord_mem: Option<Arc<monitor::reader::GuestMem>> = match vm.numa_layout.as_ref()
+        {
+            Some(layout) => Some(Arc::new(monitor::reader::GuestMem::from_layout(
+                layout,
+                &vm.guest_mem,
+            ))),
+            None => {
+                use vm_memory::GuestMemoryRegion;
+                if let Ok(host_base) = vm.guest_mem.get_host_address(GuestAddress(DRAM_BASE))
+                    && let Some(r) = vm.guest_mem.iter().next()
+                {
+                    let mem_size = r.len();
+                    // SAFETY: host_base came from GuestMemoryMmap's
+                    // get_host_address; mapping outlives this GuestMem
+                    // (vm.guest_mem outlives the coordinator thread —
+                    // collect_results joins the coordinator before vm
+                    // is dropped).
+                    Some(Arc::new(unsafe {
+                        monitor::reader::GuestMem::new(host_base, mem_size)
+                    }))
+                } else {
+                    None
                 }
-            };
+            }
+        };
         // Extract a fresh ImmediateExitHandle for the freeze coord —
         // the watchdog grabs another one below for its own kick path.
         // Both views address the same kvm_run.immediate_exit byte
@@ -1084,6 +1088,7 @@ impl KtstrVm {
             }
         }
 
+        let kern_phys_base_for_result = kern_phys_base.clone();
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
@@ -1183,7 +1188,6 @@ impl KtstrVm {
                 // slow.
                 let _tvmr = std::time::Instant::now();
                 let vmlinux_data: Option<Arc<Vec<u8>>> = vmlinux_data_shared.clone();
-                eprintln!("DIAG: vmlinux shared, size={}", vmlinux_data.as_deref().map(|d| d.len()).unwrap_or(0));
                 // Worker-populated accessor pair. Built off the freeze
                 // coordinator thread so the slow ELF + BTF parse +
                 // symbol HashMap (~4 s on debug vmlinux) does not
@@ -1288,21 +1292,47 @@ impl KtstrVm {
                                         );
                                         return;
                                     }
-                                    let map_res = try_init_owned_accessor(
+                                    // Use the guest-reported phys_base
+                                    // (includes kaslr_offset) as a hint
+                                    // so GuestKernel gets the correct
+                                    // value instead of 0 from the
+                                    // failing page-table walk.
+                                    let biased = kern_phys_base_for_worker
+                                        .load(Ordering::Acquire);
+                                    if biased == 0 {
+                                        let mut pfd = [libc::pollfd {
+                                            fd: kill_fd,
+                                            events: libc::POLLIN,
+                                            revents: 0,
+                                        }];
+                                        unsafe {
+                                            libc::poll(
+                                                pfd.as_mut_ptr(),
+                                                1,
+                                                200,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    let pb_hint = biased.wrapping_sub(1);
+                                    let map_res = try_init_owned_accessor_with_hint(
                                         mem_for_worker.clone(),
                                         &data_for_worker,
                                         &vmlinux_for_worker,
                                         tcr_for_worker.as_ref(),
                                         &cr3_for_worker,
+                                        pb_hint,
                                     );
                                     if kill_for_worker.load(Ordering::Acquire) {
                                         return;
                                     }
-                                    let prog_res = try_init_owned_prog_accessor(
+                                    let prog_res = try_init_owned_prog_accessor_with_hint(
                                         mem_for_worker.clone(),
+                                        &data_for_worker,
                                         &vmlinux_for_worker,
                                         tcr_for_worker.as_ref(),
                                         &cr3_for_worker,
+                                        pb_hint,
                                     );
                                     if let (Ok(map), Ok(prog)) =
                                         (map_res, prog_res)
@@ -1359,10 +1389,8 @@ impl KtstrVm {
                 // ELF-to-BTF parse runs exactly once per coordinator
                 // — a second `from_vmlinux` would re-read and
                 // re-parse the same file.
-                let t0 = std::time::Instant::now();
                 let dump_btf = vmlinux_data.as_deref().zip(freeze_coord_vmlinux.as_ref())
                     .and_then(|(data, path)| crate::monitor::btf_offsets::load_btf_from_bytes(data, path).ok());
-                eprintln!("DIAG: dump_btf took {:?}", t0.elapsed());
                 let dump_arena_offsets = dump_btf
                     .as_ref()
                     .and_then(|btf| crate::monitor::arena::BpfArenaOffsets::from_btf(btf).ok());
@@ -1379,10 +1407,8 @@ impl KtstrVm {
                 let dump_cpu_time_offsets = dump_btf
                     .as_ref()
                     .and_then(|btf| crate::monitor::btf_offsets::CpuTimeOffsets::from_btf(btf).ok());
-                let t1 = std::time::Instant::now();
                 let dump_cpu_time_symbols = vmlinux_data.as_deref()
                     .and_then(|data| crate::monitor::symbols::KernelSymbols::from_vmlinux_bytes(data).ok());
-                eprintln!("DIAG: dump_cpu_time_symbols took {:?}", t1.elapsed());
                 // SCX walker BTF sub-group offsets. Resolved once at
                 // coord start; per-sub-group resolution failures land
                 // inside the composite as None so the walker's
@@ -1796,9 +1822,16 @@ impl KtstrVm {
                 // the next wake on heavy bss-PA / scan_ctx work.
                 let mut scan_tick: bool;
                 let mut first_iter = true;
-                'coord: while !freeze_coord_kill.load(Ordering::Acquire) {
+                let mut bsp_done_final_pass = false;
+                'coord: while !freeze_coord_kill.load(Ordering::Acquire)
+                    || (freeze_coord_bsp_done.load(Ordering::Acquire)
+                        && !bsp_done_final_pass)
+                {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
-                        break 'coord;
+                        if bsp_done_final_pass {
+                            break 'coord;
+                        }
+                        bsp_done_final_pass = true;
                     }
                     // Unified event dispatch: epoll.wait on EVERY
                     // iteration. iter1 uses timeout=0 (non-blocking)
@@ -1834,22 +1867,9 @@ impl KtstrVm {
                         // body (WATCHPOINT).
                         for ev in &events_buf[..event_count] {
                             match ev.data() {
-                                TOKEN_KILL => {
-                                    // Drain the kill_evt counter
-                                    // so a future re-enter (none in
-                                    // this design) wouldn't see a
-                                    // stale wake. Failure (counter
-                                    // already at 0 from a racing
-                                    // reader, EAGAIN) is benign —
-                                    // the AtomicBool is the source
-                                    // of truth and the outer
-                                    // `while` re-checks it.
+                                TOKEN_KILL | TOKEN_BSP_DONE => {
                                     let _ = freeze_coord_kill_evt.read();
-                                    break 'coord;
-                                }
-                                TOKEN_BSP_DONE => {
                                     let _ = freeze_coord_bsp_done_evt.read();
-                                    break 'coord;
                                 }
                                 TOKEN_SCANNER => {
                                     // Drain the timerfd's expiry
@@ -1916,11 +1936,6 @@ impl KtstrVm {
                                         g.drain_bulk()
                                     };
                                     let drained = bulk_assembler.feed(&bytes);
-                                    for m in &drained.messages {
-                                        if m.msg_type == crate::vmm::wire::MSG_TYPE_KERN_ADDRS {
-                                            eprintln!("DIAG: KERN_ADDRS frame received, payload_len={} crc_ok={}", m.payload.len(), m.crc_ok);
-                                        }
-                                    }
                                     // Per-frame typed dispatch.
                                     // Exhaustive `match
                                     // MsgType::from_wire(...)` so a
@@ -1995,18 +2010,12 @@ impl KtstrVm {
                                 _ => {}
                             }
                         }
-                        // Re-check kill/bsp_done — they may have
-                        // flipped via the AtomicBool path before
-                        // the eventfd was drained, or via a path
-                        // that updated the bool but failed to write
-                        // the eventfd (counter overflow under
-                        // EFD_NONBLOCK).
-                        if freeze_coord_kill.load(Ordering::Acquire) {
-                            break 'coord;
-                        }
-                        if freeze_coord_bsp_done.load(Ordering::Acquire) {
-                            break 'coord;
-                        }
+                        // No break on kill/bsp_done here — the
+                        // iteration body must run so the
+                        // late-trigger err_triggered check and
+                        // freeze_and_capture can fire. The while
+                        // condition + inner bsp_done check handle
+                        // loop exit after the body completes.
                     }
                     // Adopt the worker-published accessor pair as
                     // soon as it lands. Both halves of the pair land
@@ -2744,10 +2753,20 @@ impl KtstrVm {
                     let freeze_and_capture =
                         |gate_on_exit_kind: bool|
                             -> Option<(crate::monitor::dump::FailureDumpReport, Instant)> {
-                            tracing::info!(
-                                gate_on_exit_kind,
-                                "freeze-coord: freezing vCPUs for snapshot"
-                            );
+                            let skip_freeze =
+                                freeze_coord_bsp_done.load(Ordering::Acquire);
+                            if skip_freeze {
+                                tracing::info!(
+                                    gate_on_exit_kind,
+                                    "freeze-coord: BSP exited, capturing \
+                                     quiesced guest memory without freeze"
+                                );
+                            } else {
+                                tracing::info!(
+                                    gate_on_exit_kind,
+                                    "freeze-coord: freezing vCPUs for snapshot"
+                                );
+                            }
                             // Capture wall-clock start for the
                             // post-dump timing summary one-liner.
                             // Returned alongside the report so the
@@ -3281,9 +3300,7 @@ impl KtstrVm {
                             let mut parked_count: u64 = 0;
                             let mut all_parked = false;
                             loop {
-                                if freeze_coord_kill.load(Ordering::Acquire)
-                                    || freeze_coord_bsp_done.load(Ordering::Acquire)
-                                {
+                                if freeze_coord_bsp_done.load(Ordering::Acquire) {
                                     break;
                                 }
                                 if parked_count >= expected_parks {
@@ -3500,17 +3517,19 @@ impl KtstrVm {
                                 regs
                             };
                             if !all_parked {
-                                // Rendezvous timed out — at least
-                                // one vCPU never set its parked
-                                // flag, so we cannot safely read
-                                // guest memory. Break out of the
-                                // 'capture block so the unified
-                                // thaw + post-thaw barrier still
-                                // runs.
-                                tracing::debug!(
-                                    "freeze-coord: dump skipped: rendezvous timed out"
-                                );
-                                break 'capture None;
+                                if skip_freeze {
+                                    tracing::info!(
+                                        "freeze-coord: skip_freeze — vCPUs \
+                                         exited, proceeding with dump on \
+                                         quiesced memory"
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "freeze-coord: dump skipped: \
+                                         rendezvous timed out"
+                                    );
+                                    break 'capture None;
+                                }
                             }
                             // Exit-kind gate. The hardware watchpoint
                             // catches every write to
@@ -3953,11 +3972,16 @@ impl KtstrVm {
                     // Finally drain `parked_evt` so cycle N+1's
                     // countdown latch starts at 0.
                     let thaw_and_barrier = || {
+                        // Always unfreeze + thaw even on teardown
+                        // so vCPUs don't stay parked.
                         if let Some(ref blk) = freeze_coord_virtio_blk {
                             blk.lock().resume();
                         }
                         freeze_coord_freeze.store(false, Ordering::Release);
                         let _ = freeze_coord_thaw_evt.write(1);
+                        if freeze_coord_bsp_done.load(Ordering::Acquire) {
+                            return;
+                        }
 
                         let post_thaw_deadline =
                             Instant::now() + FREEZE_RENDEZVOUS_TIMEOUT;
@@ -4632,7 +4656,9 @@ impl KtstrVm {
                         if max_age > early_peak_max_age_jiffies {
                             early_peak_max_age_jiffies = max_age;
                         }
-                        if max_age >= half_threshold_jiffies {
+                        if max_age >= half_threshold_jiffies
+                            && !freeze_coord_bsp_done.load(Ordering::Acquire)
+                        {
                             tracing::info!(
                                 max_age,
                                 half_threshold_jiffies,
@@ -4970,31 +4996,10 @@ impl KtstrVm {
                                 freeze_state = FreezeState::Done;
                             }
                             None if watchpoint_only_trigger_post => {
-                                // Gate-suppressed dump (or rendezvous
-                                // timeout on a watchpoint-only
-                                // trigger). Uses the post-rendezvous
-                                // re-read above — a bss flip during
-                                // the (~30 s) rendezvous window
-                                // diverts to the bss-or-mixed arm
-                                // below so we mark Done instead of
-                                // looping forever on a sticky
-                                // kernel-side latch. Reset
-                                // `watchpoint.hit` so the next
-                                // genuine fire re-triggers cleanly;
-                                // without this reset, the stale
-                                // `hit=true` would re-fire the
-                                // late-trigger every iteration,
-                                // re-running the rendezvous and
-                                // re-suppressing forever.
                                 freeze_coord_watchpoint
                                     .hit
                                     .store(false, Ordering::Release);
-                                tracing::debug!(
-                                    "freeze-coord: watchpoint-only trigger \
-                                     produced no dump (gate suppressed or \
-                                     rendezvous timed out); resetting hit \
-                                     latch and continuing"
-                                );
+                                freeze_state = FreezeState::Done;
                             }
                             None => {
                                 // bss-triggered with rendezvous
@@ -5192,6 +5197,8 @@ impl KtstrVm {
                 // alongside any bytes the device accumulated after
                 // the last coordinator drain, and `parse_tlv_stream`
                 // completes the frame.
+                let coord_exit_t = std::time::Instant::now();
+                eprintln!("CLEANUP: coord loop exited");
                 let residual = bulk_assembler.take_residual();
                 if !residual.is_empty() {
                     freeze_coord_virtio_con.lock().push_back_bulk(&residual);
@@ -5219,7 +5226,9 @@ impl KtstrVm {
                 // happy path the worker has long since published the
                 // OnceLock and exited, so the join is a no-op.
                 if let Some(handle) = accessor_init_handle {
+                    let jt = std::time::Instant::now();
                     let _ = handle.join();
+                    eprintln!("CLEANUP: accessor-init worker joined {:?}", jt.elapsed());
                 }
                 // Extract the prog accessor for collect_verifier_stats
                 // and stash it in the shared slot so run_vm can pass
@@ -5232,6 +5241,7 @@ impl KtstrVm {
                         .map(|(_map, prog)| prog);
                     *slot.lock().unwrap_or_else(|e| e.into_inner()) = extracted;
                 }
+                eprintln!("CLEANUP: coord closure done {:?}", coord_exit_t.elapsed());
             })
             .context("spawn freeze coordinator thread")?;
 
@@ -5362,9 +5372,7 @@ impl KtstrVm {
                             eprintln!(
                                 "watchdog: scheduler attach observed, hard \
                                  deadline reset to {:?} from VM start",
-                                reset_deadline
-                                    .unwrap()
-                                    .saturating_duration_since(run_start),
+                                reset_deadline.unwrap().saturating_duration_since(run_start),
                             );
                         }
                     }
@@ -5671,6 +5679,7 @@ impl KtstrVm {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take(),
+            kern_phys_base: kern_phys_base_for_result.load(Ordering::Acquire),
             // Virtio-console handle threaded into `collect_results`
             // for the post-exit `drain_bulk()` call. Carries any
             // port-1 TLV bytes the guest wrote that the freeze
@@ -6268,8 +6277,7 @@ impl KtstrVm {
                     );
                     let real_phys_base = mem.read_u64(pb_pa, 0);
                     if real_phys_base != 0 || phys_base == 0 {
-                        let ko = phys_base.wrapping_sub(real_phys_base);
-                        ko
+                        phys_base.wrapping_sub(real_phys_base)
                     } else {
                         0
                     }
@@ -6693,6 +6701,7 @@ impl KtstrVm {
     /// `virtio_con` is the shared virtio-console device used to push
     /// the host→guest wake byte after the writes land. Replaces the
     /// legacy SHM signal slot 0 notification.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn start_bpf_map_write(
         &self,
         vm: &kvm::KtstrKvm,
@@ -6701,6 +6710,7 @@ impl KtstrVm {
         tcr_el1: Option<Arc<std::sync::atomic::AtomicU64>>,
         cr3: Arc<std::sync::atomic::AtomicU64>,
         virtio_con: Arc<PiMutex<virtio_console::VirtioConsole>>,
+        kern_phys_base: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Option<JoinHandle<()>>> {
         if self.bpf_map_writes.is_empty() {
             return Ok(None);
@@ -6776,12 +6786,21 @@ impl KtstrVm {
                 let phase1_deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(30);
                 let owned = loop {
+                    let biased = kern_phys_base.load(std::sync::atomic::Ordering::Acquire);
+                    if biased == 0 {
+                        if kill_clone.load(Ordering::Acquire) {
+                            return;
+                        }
+                        poll_eventfd_until_ready_or_timeout(&probes_ready_evt, 200);
+                        continue;
+                    }
+                    let pb_hint = biased.wrapping_sub(1);
                     let tcr_val = tcr_el1
                         .as_ref()
                         .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
                         .unwrap_or(0);
                     let cr3_val = cr3.load(std::sync::atomic::Ordering::Acquire);
-                    match monitor::bpf_map::GuestMemMapAccessorOwned::from_elf(Arc::clone(&mem), &vmlinux_elf, &vmlinux_data, &vmlinux, tcr_val, cr3_val) {
+                    match monitor::bpf_map::GuestMemMapAccessorOwned::from_elf_with_hint(Arc::clone(&mem), &vmlinux_elf, &vmlinux_data, &vmlinux, tcr_val, cr3_val, pb_hint) {
                         Ok(a) => {
                             let _ = probes_ready_evt.write(1);
                             break a;
@@ -7354,10 +7373,12 @@ impl KtstrVm {
                 None => (None, BulkDrainResult::default()),
             };
         eprintln!("CLEANUP: monitor joined");
+        let cleanup_t = std::time::Instant::now();
 
         if let Some(h) = run.bpf_write_handle {
             let _ = h.join();
         }
+        eprintln!("CLEANUP: bpf_write joined {:?}", cleanup_t.elapsed());
 
         // Drain the virtio-console port-1 TX accumulator: the guest
         // wrote bulk TLV-framed messages (STIMULUS, EXIT, SCHED_EXIT,
@@ -7504,17 +7525,27 @@ impl KtstrVm {
         // only exist when a sched_ext scheduler attached (either via
         // a userspace binary or kernel-built enable commands).
         let has_scheduler = self.scheduler_binary.is_some() || !self.sched_enable_cmds.is_empty();
+        let vs_t = std::time::Instant::now();
         let verifier_stats = if has_scheduler {
             if let Some(ref prog) = run.prog_accessor {
                 use crate::monitor::bpf_prog::BpfProgAccessor;
+                eprintln!("CLEANUP: verifier_stats using pre-built accessor");
                 let a = prog.as_accessor();
                 a.struct_ops_progs()
             } else {
-                self.collect_verifier_stats(&run.vm, run.tcr_el1.as_ref(), &run.cr3, run.vmlinux_data.as_ref().map(|d| d.as_slice()))
+                eprintln!("CLEANUP: verifier_stats fallback (full parse)");
+                self.collect_verifier_stats(
+                    &run.vm,
+                    run.tcr_el1.as_ref(),
+                    &run.cr3,
+                    run.vmlinux_data.as_ref().map(|d| d.as_slice()),
+                    run.kern_phys_base,
+                )
             }
         } else {
             Vec::new()
         };
+        eprintln!("CLEANUP: verifier_stats done {:?}", vs_t.elapsed());
 
         // Sample cleanup elapsed AFTER every blocking step that runs on
         // the post-BSP-exit critical path so the duration captures the
@@ -7526,7 +7557,7 @@ impl KtstrVm {
         // the result so the `Instant::now()` here is the latest possible
         // read.
         let cleanup_duration = Some(run.cleanup_start.elapsed());
-        eprintln!("CLEANUP: collect_results done");
+        eprintln!("CLEANUP: collect_results done {:?}", cleanup_t.elapsed());
 
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
@@ -7558,6 +7589,7 @@ impl KtstrVm {
         tcr_el1: Option<&Arc<std::sync::atomic::AtomicU64>>,
         cr3: &Arc<std::sync::atomic::AtomicU64>,
         cached_vmlinux_data: Option<&[u8]>,
+        kern_phys_base_biased: u64,
     ) -> Vec<monitor::bpf_prog::ProgVerifierStats> {
         let vmlinux = match find_vmlinux(&self.kernel) {
             Some(v) => v,
@@ -7621,7 +7653,18 @@ impl KtstrVm {
             Ok(e) => e,
             Err(_) => return Vec::new(),
         };
-        let kernel = match monitor::guest::GuestKernel::from_elf(Arc::new(mem), &elf, tcr_val, cr3_val) {
+        let pb_hint = if kern_phys_base_biased != 0 {
+            kern_phys_base_biased.wrapping_sub(1)
+        } else {
+            0
+        };
+        let kernel = match monitor::guest::GuestKernel::from_elf_with_hint(
+            Arc::new(mem),
+            &elf,
+            tcr_val,
+            cr3_val,
+            pb_hint,
+        ) {
             Ok(k) => k,
             Err(_) => return Vec::new(),
         };

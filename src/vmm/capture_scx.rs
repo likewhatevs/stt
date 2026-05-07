@@ -240,7 +240,7 @@ mod tests {
         // scanner uses — any drift between the two would surface
         // here as different per-CPU PAs.
         let expected_pas =
-            crate::monitor::symbols::compute_rq_pas(runqueues_off, &per_cpu, page_offset, 0);
+            crate::monitor::symbols::compute_rq_pas(runqueues_off, &per_cpu, page_offset, 0, 0);
         assert_eq!(owned.rq_pas, expected_pas);
         // Every rq_kva is the recovered KVA for the same CPU's PA.
         for (cpu, expected_pa) in expected_pas.iter().enumerate() {
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(owned.rq_kvas.len(), 2);
         assert_eq!(owned.rq_pas.len(), 2);
         let expected_pas =
-            crate::monitor::symbols::compute_rq_pas(runqueues_off, &per_cpu, page_offset, 0);
+            crate::monitor::symbols::compute_rq_pas(runqueues_off, &per_cpu, page_offset, 0, 0);
         assert_eq!(owned.rq_pas, expected_pas);
     }
 

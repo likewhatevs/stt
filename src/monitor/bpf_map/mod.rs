@@ -439,10 +439,7 @@ pub(crate) fn find_all_bpf_maps(ctx: &AccessorCtx<'_>, map_idr_kva: u64) -> Vec<
     if xa_head == 0 {
         return Vec::new();
     }
-    // idr_next is the next ID the kernel will allocate. All live entries
-    // have IDs in 0..idr_next, so scanning beyond it only hits empty or
-    // wrapped slots.
-    let idr_next = ctx.mem.read_u32(idr_pa, offsets.idr_next);
+    let idr_next = ctx.mem.read_u32(idr_pa, offsets.idr_next).min(65536);
 
     let mut maps = Vec::new();
 
@@ -585,7 +582,7 @@ pub(crate) fn find_bpf_map(
     if xa_head == 0 {
         return None;
     }
-    let idr_next = ctx.mem.read_u32(idr_pa, offsets.idr_next);
+    let idr_next = ctx.mem.read_u32(idr_pa, offsets.idr_next).min(65536);
 
     for id in 0..idr_next {
         let Some(entry) = xa_load(
@@ -1671,7 +1668,37 @@ impl GuestMemMapAccessorOwned {
         tcr_el1: u64,
         cr3_pa: u64,
     ) -> anyhow::Result<Self> {
-        let kernel = super::guest::GuestKernel::from_elf(mem, elf, tcr_el1, cr3_pa)?;
+        Self::from_elf_inner(mem, elf, data, vmlinux, tcr_el1, cr3_pa, 0)
+    }
+
+    pub fn from_elf_with_hint(
+        mem: std::sync::Arc<GuestMem>,
+        elf: &goblin::elf::Elf<'_>,
+        data: &[u8],
+        vmlinux: &std::path::Path,
+        tcr_el1: u64,
+        cr3_pa: u64,
+        phys_base_hint: u64,
+    ) -> anyhow::Result<Self> {
+        Self::from_elf_inner(mem, elf, data, vmlinux, tcr_el1, cr3_pa, phys_base_hint)
+    }
+
+    fn from_elf_inner(
+        mem: std::sync::Arc<GuestMem>,
+        elf: &goblin::elf::Elf<'_>,
+        data: &[u8],
+        vmlinux: &std::path::Path,
+        tcr_el1: u64,
+        cr3_pa: u64,
+        phys_base_hint: u64,
+    ) -> anyhow::Result<Self> {
+        let kernel = super::guest::GuestKernel::from_elf_with_hint(
+            mem,
+            elf,
+            tcr_el1,
+            cr3_pa,
+            phys_base_hint,
+        )?;
         let offsets = BpfMapOffsets::from_elf(elf, data, vmlinux)?;
         let map_idr_kva = kernel
             .symbol_kva("map_idr")

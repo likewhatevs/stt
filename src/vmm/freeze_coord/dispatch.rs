@@ -186,9 +186,7 @@ pub(super) fn dispatch_bulk_message(
             // Payload carries phys_base + 1 (biased to avoid
             // the 0 sentinel). Subtract 1 to recover.
             if msg.crc_ok && msg.payload.len() >= 8 {
-                let biased = u64::from_le_bytes(
-                    msg.payload[..8].try_into().unwrap_or([0; 8]),
-                );
+                let biased = u64::from_le_bytes(msg.payload[..8].try_into().unwrap_or([0; 8]));
                 if biased != 0 {
                     sinks
                         .kern_phys_base

@@ -189,6 +189,21 @@ impl GuestKernel {
         tcr_el1: u64,
         cr3_pa: u64,
     ) -> Result<Self> {
+        Self::from_elf_with_hint(mem, elf, tcr_el1, cr3_pa, 0)
+    }
+
+    /// Like [`Self::from_elf`] but accepts a `phys_base_hint`. When
+    /// non-zero, skips the page-table walk for `phys_base` and uses
+    /// the hint directly. The guest-reported `phys_base` (from
+    /// `/proc/iomem`) includes `kaslr_offset`, which is what
+    /// `text_kva_to_pa_with_base` needs for link-time KVAs.
+    pub fn from_elf_with_hint(
+        mem: Arc<GuestMem>,
+        elf: &goblin::elf::Elf<'_>,
+        tcr_el1: u64,
+        cr3_pa: u64,
+        phys_base_hint: u64,
+    ) -> Result<Self> {
         // Filter on `st_shndx == SHN_UNDEF` (== 0 per ELF spec)
         // rather than `st_value == 0`. SHN_UNDEF marks linker
         // placeholders and imports — those have no defining section
@@ -251,8 +266,11 @@ impl GuestKernel {
         // aarch64, walk fails on a still-booting guest) defaults to
         // `0`, which is the non-KASLR / aarch64 value and produces
         // the historical translation behaviour.
-        let phys_base =
-            resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1).unwrap_or(0);
+        let phys_base = if phys_base_hint != 0 {
+            phys_base_hint
+        } else {
+            resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1).unwrap_or(0)
+        };
 
         // Re-resolve l5 with the live `phys_base` so a future
         // toolchain that sets the L5 flag after `phys_base`

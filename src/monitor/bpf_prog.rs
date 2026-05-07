@@ -5,8 +5,6 @@
 //! No guest cooperation is needed — all reads go through the guest
 //! physical memory mapping.
 
-use anyhow::Context;
-
 use super::btf_offsets::BpfProgOffsets;
 use super::idr::{translate_any_kva, xa_load};
 use super::reader::{GuestMem, WalkContext};
@@ -50,6 +48,10 @@ pub(crate) fn find_struct_ops_progs(
         return Vec::new();
     }
     let idr_next = mem.read_u32(idr_pa, offsets.idr_next);
+    // Cap the scan to 64K entries. A real kernel never has
+    // millions of BPF programs; a larger idr_next means the
+    // PA is wrong or the IDR is corrupt.
+    let idr_next = idr_next.min(65536);
 
     let mut progs = Vec::new();
 
@@ -520,35 +522,13 @@ pub struct GuestMemProgAccessorOwned {
 }
 
 impl GuestMemProgAccessorOwned {
-    /// One-shot constructor: builds a [`super::guest::GuestKernel`]
-    /// from `vmlinux`, parses BTF to resolve the BPF-program-related
-    /// struct offsets, and resolves the `prog_idr` symbol KVA. The
-    /// resulting handle owns both the `GuestKernel` and the
-    /// `BpfProgOffsets`, with `prog_idr_kva` cached so
-    /// [`Self::as_accessor`] is infallible.
-    ///
-    /// Errors when the vmlinux ELF / BTF parse fails, when the
-    /// `GuestKernel` handshake fails (still-booting guest), or
-    /// when `prog_idr` is missing from the symbol table.
-    pub fn new(
-        mem: std::sync::Arc<super::reader::GuestMem>,
+    pub fn finish(
+        kernel: super::guest::GuestKernel,
+        elf: &goblin::elf::Elf<'_>,
+        data: &[u8],
         vmlinux: &std::path::Path,
-        tcr_el1: u64,
-        cr3_pa: u64,
     ) -> anyhow::Result<Self> {
-        // Read vmlinux once and parse the ELF once. Both
-        // `GuestKernel::from_elf` and `BpfProgOffsets::from_elf`
-        // borrow from the same `data`/`elf` pair, eliminating the
-        // redundant `std::fs::read` + `goblin::elf::Elf::parse` that
-        // an inline `GuestKernel::new` + `BpfProgOffsets::from_vmlinux`
-        // pair would incur on every scan tick (the freeze coordinator
-        // calls this from `try_init_owned_prog_accessor` until the
-        // accessor lands).
-        let data = std::fs::read(vmlinux)
-            .with_context(|| format!("read vmlinux: {}", vmlinux.display()))?;
-        let elf = goblin::elf::Elf::parse(&data).context("parse vmlinux ELF")?;
-        let kernel = super::guest::GuestKernel::from_elf(mem, &elf, tcr_el1, cr3_pa)?;
-        let offsets = BpfProgOffsets::from_elf(&elf, &data, vmlinux)?;
+        let offsets = BpfProgOffsets::from_elf(elf, data, vmlinux)?;
         let prog_idr_kva = kernel
             .symbol_kva("prog_idr")
             .ok_or_else(|| anyhow::anyhow!("prog_idr symbol not found in vmlinux"))?;

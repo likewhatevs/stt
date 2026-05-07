@@ -671,8 +671,8 @@ mod tests {
             duration: Duration::from_secs(30),
             ..KtstrTestEntry::DEFAULT
         };
-        // base = max(60, 30, 1) = 60s, plus 45s headroom = 105s.
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(105));
+        // base = max(60, 30, 1) = 60s + 0 headroom = 60s.
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(60));
     }
 
     /// Duration dominates when it's larger than the watchdog.
@@ -684,8 +684,8 @@ mod tests {
             duration: Duration::from_secs(120),
             ..KtstrTestEntry::DEFAULT
         };
-        // base = max(5, 120, 1) = 120s, plus 45s headroom = 165s.
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(165));
+        // base = max(5, 120, 1) = 120s + 0 headroom = 120s.
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(120));
     }
 
     /// Both watchdog and duration well under 1s → 1s floor + headroom.
@@ -699,8 +699,8 @@ mod tests {
             duration: Duration::from_millis(50),
             ..KtstrTestEntry::DEFAULT
         };
-        // base = max(10ms, 50ms, 1s) = 1s, plus 45s headroom = 46s.
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(46));
+        // base = max(10ms, 50ms, 1s) = 1s + 0 headroom = 1s.
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(1));
     }
 
     #[test]

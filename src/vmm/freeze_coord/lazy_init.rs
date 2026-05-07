@@ -66,43 +66,49 @@ use crate::monitor;
 /// cached bytes is microseconds, the original `std::fs::read` was
 /// 14-28 s on cold disk cache). `vmlinux` is still passed through for
 /// the BTF sidecar cache lookup inside `BpfMapOffsets::from_elf`.
-pub(super) fn try_init_owned_accessor(
+pub(super) fn try_init_owned_accessor_with_hint(
     mem: Arc<monitor::reader::GuestMem>,
     data: &[u8],
     vmlinux: &std::path::Path,
     tcr_el1: Option<&Arc<AtomicU64>>,
     cr3: &Arc<AtomicU64>,
+    phys_base_hint: u64,
 ) -> anyhow::Result<monitor::bpf_map::GuestMemMapAccessorOwned> {
     let tcr_val = tcr_el1.map(|c| c.load(Ordering::Acquire)).unwrap_or(0);
     let cr3_val = cr3.load(Ordering::Acquire);
-    let elf = goblin::elf::Elf::parse(data)
-        .map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
-    monitor::bpf_map::GuestMemMapAccessorOwned::from_elf(
-        mem, &elf, data, vmlinux, tcr_val, cr3_val,
+    let elf =
+        goblin::elf::Elf::parse(data).map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
+    monitor::bpf_map::GuestMemMapAccessorOwned::from_elf_with_hint(
+        mem,
+        &elf,
+        data,
+        vmlinux,
+        tcr_val,
+        cr3_val,
+        phys_base_hint,
     )
 }
 
-/// Sibling of [`try_init_owned_accessor`] for the prog-side
-/// accessor. Same boot-race rationale, same Acquire-inside-the-helper
-/// pattern. Constructed independently from the map-side accessor
-/// because the prog-side lookups (`prog_idr`) and offsets
-/// ([`crate::monitor::bpf_prog::BpfProgOffsets`]) are disjoint from
-/// the map side, so a kernel that exposes maps but lacks `prog_idr`
-/// (theoretical) still gets map rendering.
-///
-/// Returns `Err` on construction failure so the caller can warn-once
-/// on permanent failure modes (matching the
-/// [`try_init_owned_accessor`] contract).
-///
-pub(super) fn try_init_owned_prog_accessor(
+pub(super) fn try_init_owned_prog_accessor_with_hint(
     mem: Arc<monitor::reader::GuestMem>,
+    data: &[u8],
     vmlinux: &std::path::Path,
     tcr_el1: Option<&Arc<AtomicU64>>,
     cr3: &Arc<AtomicU64>,
+    phys_base_hint: u64,
 ) -> anyhow::Result<monitor::bpf_prog::GuestMemProgAccessorOwned> {
     let tcr_val = tcr_el1.map(|c| c.load(Ordering::Acquire)).unwrap_or(0);
     let cr3_val = cr3.load(Ordering::Acquire);
-    monitor::bpf_prog::GuestMemProgAccessorOwned::new(mem, vmlinux, tcr_val, cr3_val)
+    let elf =
+        goblin::elf::Elf::parse(data).map_err(|e| anyhow::anyhow!("parse vmlinux ELF: {e}"))?;
+    let kernel = monitor::guest::GuestKernel::from_elf_with_hint(
+        mem,
+        &elf,
+        tcr_val,
+        cr3_val,
+        phys_base_hint,
+    )?;
+    monitor::bpf_prog::GuestMemProgAccessorOwned::finish(kernel, &elf, data, vmlinux)
 }
 
 /// Resolve and cache the per-CPU offset array. Returns `Some(offsets)`

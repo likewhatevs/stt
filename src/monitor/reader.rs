@@ -2486,9 +2486,7 @@ pub(crate) fn monitor_loop(
         // independently of `watchdog_override`: a kernel without
         // a resolvable `scx_sched.watchdog_timeout` BTF field
         // still gets a correct outer kill timer.
-        if !watchdog_reset_signaled
-            && let Some(reset) = cfg.watchdog_reset.as_ref()
-        {
+        if !watchdog_reset_signaled && let Some(reset) = cfg.watchdog_reset.as_ref() {
             let scx_sched_kva = mem.read_u64(reset.scx_root_pa, 0);
             if scx_sched_kva != 0 {
                 // Encode as ns since `run_start` so the watchdog
@@ -2587,7 +2585,13 @@ pub(crate) fn monitor_loop(
                     fresh.first().copied().unwrap_or(0),
                 );
             }
-            rq_pas_buf = super::symbols::compute_rq_pas(refresh.runqueues_kva, &fresh, page_offset, refresh.per_cpu_start, refresh.kaslr_offset);
+            rq_pas_buf = super::symbols::compute_rq_pas(
+                refresh.runqueues_kva,
+                &fresh,
+                page_offset,
+                refresh.per_cpu_start,
+                refresh.kaslr_offset,
+            );
             // `event_pcpu_pas` requires both fresh `__per_cpu_offset[]`
             // AND a non-null `*scx_root` (a scheduler must be
             // attached). Until the scheduler attaches, `scx_sched_kva`
@@ -3653,6 +3657,8 @@ mod tests {
             num_cpus: 2,
             page_offset_base_pa: None,
             event: None,
+            per_cpu_start: 0,
+            kaslr_offset: 0,
         };
 
         let handle = {
@@ -3722,6 +3728,8 @@ mod tests {
             num_cpus: 2,
             page_offset_base_pa: None,
             event: None,
+            per_cpu_start: 0,
+            kaslr_offset: 0,
         };
 
         let handle = {
