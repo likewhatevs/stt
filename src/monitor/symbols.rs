@@ -520,12 +520,15 @@ pub(crate) fn resolve_phys_base(
     // already does this internally for descriptor entries, but the
     // initial CR3 we're handed by KVM SREGS is the raw register
     // value.
-    // Clear PCID bits [11:0] AND PTI user-PGD bit [12]. With
-    // CONFIG_MITIGATION_PAGE_TABLE_ISOLATION, bit 12 selects the
-    // user PGD half (kernel PML4 entries stripped) — walking from
-    // the user PGD for a kernel-half KVA returns None.
-    let cr3_pa_masked = cr3_pa & !0x1FFFu64;
-    let pa = mem.translate_kva(cr3_pa_masked, super::Kva(kva), l5, tcr_el1)?;
+    // Try with bit 12 preserved first (mitigations=off: bit 12 is
+    // a real PA bit). If the walk fails, retry with bit 12 cleared
+    // (mitigations=on / PTI: bit 12 selects user PGD).
+    let cr3_no_pcid = cr3_pa & !0xFFFu64;
+    if let Some(pa) = mem.translate_kva(cr3_no_pcid, super::Kva(kva), l5, tcr_el1) {
+        return Some(mem.read_u64(pa, 0));
+    }
+    let cr3_no_pti = cr3_pa & !0x1FFFu64;
+    let pa = mem.translate_kva(cr3_no_pti, super::Kva(kva), l5, tcr_el1)?;
     Some(mem.read_u64(pa, 0))
 }
 
