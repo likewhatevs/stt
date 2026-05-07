@@ -288,7 +288,9 @@ int main(void) {{
         // Warning before network access so a hang is diagnosable.
         if !busybox_src.join("Makefile").exists() {
             let tarball_url = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
-            println!("cargo:warning=downloading busybox source tarball from {tarball_url} (requires network)");
+            println!(
+                "cargo:warning=downloading busybox source tarball from {tarball_url} (requires network)"
+            );
             let tarball_err = (|| -> Result<(), String> {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
