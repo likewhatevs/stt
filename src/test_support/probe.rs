@@ -360,7 +360,7 @@ pub(crate) fn attempt_auto_repro(
 
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
-    let no_perf_mode = super::runtime::no_perf_mode_active();
+    let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     let mut builder = super::runtime::build_vm_builder_base(
         entry,
         kernel,

@@ -62,6 +62,15 @@ pub(crate) enum KtstrCommand {
         /// Also settable via KTSTR_NO_PERF_MODE env var.
         #[arg(long)]
         no_perf_mode: bool,
+        /// Promote hardware-driven test skips to hard failures.
+        /// `ResourceContention` (no LLC slot / not enough CPUs / KVM
+        /// fd budget) and host-topology-insufficient skips become
+        /// exit 1 instead of silent passes. For CI environments
+        /// where the hardware IS expected to support every test —
+        /// a skip means the CI config is wrong, not that the test
+        /// is inapplicable. Exports `KTSTR_NO_SKIP_MODE=1`.
+        #[arg(long)]
+        no_skip_mode: bool,
         /// Build and run tests with the release profile
         /// (`--cargo-profile release` to nextest).
         ///
@@ -94,6 +103,11 @@ pub(crate) enum KtstrCommand {
         /// Also settable via KTSTR_NO_PERF_MODE env var.
         #[arg(long)]
         no_perf_mode: bool,
+        /// Promote hardware-driven test skips to hard failures.
+        /// See `cargo ktstr test --no-skip-mode` for the full
+        /// contract. Exports `KTSTR_NO_SKIP_MODE=1`.
+        #[arg(long)]
+        no_skip_mode: bool,
         /// Build and collect coverage with the release profile
         /// (`--cargo-profile release` to llvm-cov nextest).
         ///
@@ -132,6 +146,11 @@ pub(crate) enum KtstrCommand {
         /// Also settable via KTSTR_NO_PERF_MODE env var.
         #[arg(long)]
         no_perf_mode: bool,
+        /// Promote hardware-driven test skips to hard failures.
+        /// See `cargo ktstr test --no-skip-mode` for the full
+        /// contract. Exports `KTSTR_NO_SKIP_MODE=1`.
+        #[arg(long)]
+        no_skip_mode: bool,
         /// Arguments passed through to cargo llvm-cov.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

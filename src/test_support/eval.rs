@@ -869,7 +869,7 @@ fn run_ktstr_test_inner_impl(
 
     let (vm_topology, memory_mb) = super::runtime::resolve_vm_topology(entry, topo);
 
-    let no_perf_mode = super::runtime::no_perf_mode_active();
+    let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
 
     // Pre-clear stale failure-dump files before the primary VM
     // boots. A passing rerun after a prior failed invocation must
@@ -2332,6 +2332,13 @@ pub enum ResolveSource {
     /// caller trusts the variable or argument; git-hash provenance
     /// is UNKNOWN to this process.
     EnvVar,
+    /// Resolved via a `$PATH` lookup. Only produced when
+    /// `KTSTR_CARGO_TEST_MODE` is active and a binary by the
+    /// requested name was found on the user's `$PATH` in front of
+    /// the sibling-dir / target-dir cascade. Git-hash provenance
+    /// UNKNOWN — the binary on PATH may be a system-wide install,
+    /// a prior build, or a custom one the user staged for this run.
+    PathLookup,
     /// Resolved via a sibling of [`crate::resolve_current_exe`]
     /// (same directory, or the sibling of a `deps/` directory for
     /// integration tests / nextest). Git-hash provenance UNKNOWN
@@ -2357,6 +2364,36 @@ pub enum ResolveSource {
     NotFound,
 }
 
+/// Walk `$PATH` directories in order looking for an executable
+/// named `name`. Returns the first match that is a regular file
+/// with at least one execute permission bit set. None when `PATH`
+/// is unset, empty, or contains no matching executable.
+///
+/// Mirrors the semantics of `which(1)` and the
+/// `crate::export::search_path_for` helper without pulling in a
+/// new crate dependency. Used by [`resolve_scheduler`] only when
+/// `KTSTR_CARGO_TEST_MODE` is active so the existing nextest /
+/// `cargo ktstr test` discovery cascade stays in front of any
+/// system-wide install on PATH for the production test path.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            continue;
+        }
+        let executable = candidate
+            .metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        if executable {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Resolve a scheduler binary from a `SchedulerSpec`.
 ///
 /// Returns the resolved path (if any) paired with the
@@ -2372,12 +2409,20 @@ pub enum ResolveSource {
 /// - `Path(p)` → `(Some(p), EnvVar)` (explicit caller-named path;
 ///   validated for existence).
 /// - `Discover(name)` → cascade through `KTSTR_SCHEDULER` env
-///   ([`EnvVar`](ResolveSource::EnvVar)), sibling of
+///   ([`EnvVar`](ResolveSource::EnvVar)), `$PATH` lookup when
+///   `KTSTR_CARGO_TEST_MODE` is active
+///   ([`PathLookup`](ResolveSource::PathLookup)), sibling of
 ///   `current_exe` ([`SiblingDir`](ResolveSource::SiblingDir)),
 ///   `target/debug/` ([`TargetDebug`](ResolveSource::TargetDebug)),
 ///   `target/release/` ([`TargetRelease`](ResolveSource::TargetRelease)),
 ///   on-demand build ([`AutoBuilt`](ResolveSource::AutoBuilt)).
-///   Exhausting every branch is a hard error.
+///   Exhausting every branch is a hard error. The PATH lookup is
+///   only enabled in cargo-test mode so the existing nextest /
+///   `cargo ktstr test` discovery cascade remains canonical
+///   (sibling-of-test-binary first) — pulling a system-wide
+///   `scx_layered` ahead of a workspace-built one would corrupt
+///   gauntlet runs whose results must reflect the in-tree
+///   scheduler revision.
 pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, ResolveSource)> {
     match spec {
         SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => {
@@ -2395,6 +2440,20 @@ pub fn resolve_scheduler(spec: &SchedulerSpec) -> Result<(Option<PathBuf>, Resol
                 if path.exists() {
                     return Ok((Some(path), ResolveSource::EnvVar));
                 }
+            }
+
+            // 1b. KTSTR_CARGO_TEST_MODE: try $PATH lookup so a user
+            // who installed scx_layered (or scx-ktstr) on PATH can
+            // run the test without going through the cargo-ktstr
+            // wrapper or having a target/debug/ build of the
+            // scheduler. Only active in cargo-test mode — outside
+            // that mode the sibling-dir / target-dir cascade below
+            // remains authoritative so gauntlet runs land on the
+            // workspace-built scheduler revision.
+            if super::runtime::cargo_test_mode_active()
+                && let Some(found) = find_on_path(name)
+            {
+                return Ok((Some(found), ResolveSource::PathLookup));
             }
 
             // 2. Sibling of current executable (or parent of deps/)
@@ -3083,6 +3142,76 @@ mod tests {
             ResolveSource::EnvVar,
             "KTSTR_SCHEDULER hit must tag the result EnvVar",
         );
+    }
+
+    /// `KTSTR_CARGO_TEST_MODE=1` enables the `$PATH` lookup branch of
+    /// `Discover`. Stage a tempdir containing an executable with the
+    /// requested name, point `PATH` at it, and verify the resolution
+    /// tags the result `ResolveSource::PathLookup`. Pins the
+    /// cargo-test-mode contract: a user can install scx_layered on
+    /// PATH and run their test without driving the cargo-ktstr
+    /// build pipeline.
+    #[test]
+    fn resolve_scheduler_discover_path_lookup_under_cargo_test_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = lock_env();
+        let _no_env = EnvVarGuard::remove("KTSTR_SCHEDULER");
+        let _cargo = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let dir = TempDir::new().expect("tempdir");
+        let bin_path = dir.path().join("__test_path_scheduler__");
+        std::fs::write(&bin_path, b"#!/bin/sh\nexit 0\n").expect("write stub");
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, perms).expect("chmod 0755");
+        let _path_env = EnvVarGuard::set("PATH", dir.path());
+        let (path, source) =
+            resolve_scheduler(&SchedulerSpec::Discover("__test_path_scheduler__")).unwrap();
+        assert_eq!(path.expect("found on PATH"), bin_path);
+        assert_eq!(
+            source,
+            ResolveSource::PathLookup,
+            "PATH-lookup hit must tag the result PathLookup",
+        );
+    }
+
+    /// Without `KTSTR_CARGO_TEST_MODE`, the `$PATH` lookup branch is
+    /// inert: the cascade falls through to the sibling-dir / target-
+    /// dir / build path even when the requested binary IS on PATH.
+    /// Pins the production-path contract: gauntlet runs land on the
+    /// workspace-built scheduler revision, never a system-wide
+    /// install. The test stages a stub on PATH but expects the
+    /// resolution to NOT pick it up — instead it should bail with
+    /// the "not found" error from the cascade exhaustion (or hit
+    /// some other branch, e.g. `target/debug/`, that does not match
+    /// the staged stub's name).
+    #[test]
+    fn resolve_scheduler_discover_path_lookup_inert_without_cargo_test_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = lock_env();
+        let _no_env = EnvVarGuard::remove("KTSTR_SCHEDULER");
+        let _cargo = EnvVarGuard::remove("KTSTR_CARGO_TEST_MODE");
+        let dir = TempDir::new().expect("tempdir");
+        let bin_path = dir.path().join("__test_inert_path_scheduler__");
+        std::fs::write(&bin_path, b"#!/bin/sh\nexit 0\n").expect("write stub");
+        let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, perms).expect("chmod 0755");
+        let _path_env = EnvVarGuard::set("PATH", dir.path());
+        // Without the cargo-test-mode flag the cascade falls
+        // through to the sibling-dir / target-dir / build branches,
+        // none of which know about `__test_inert_path_scheduler__`,
+        // so the call must error rather than report PathLookup.
+        let result = resolve_scheduler(&SchedulerSpec::Discover("__test_inert_path_scheduler__"));
+        match result {
+            Ok((_, source)) => panic!(
+                "PATH lookup must be inert without KTSTR_CARGO_TEST_MODE; got source {source:?}",
+            ),
+            Err(_) => {
+                // Expected: cascade exhausted because the staged
+                // stub is on PATH but not in any of the production
+                // branches the cascade walks.
+            }
+        }
     }
 
     // -- scheduler_label tests --

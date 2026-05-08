@@ -120,6 +120,7 @@ fn run_cargo_sub(
     label: &str,
     kernel: Vec<String>,
     no_perf_mode: bool,
+    no_skip_mode: bool,
     release: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
@@ -138,6 +139,9 @@ fn run_cargo_sub(
     cmd.args(&args);
     if no_perf_mode {
         cmd.env("KTSTR_NO_PERF_MODE", "1");
+    }
+    if no_skip_mode {
+        cmd.env("KTSTR_NO_SKIP_MODE", "1");
     }
 
     if let Some(pat) = profraw_inject_for(sub_argv, std::env::var_os("LLVM_PROFILE_FILE")) {
@@ -231,15 +235,25 @@ fn cleanup_shm() {
 pub(crate) fn run_test(
     kernel: Vec<String>,
     no_perf_mode: bool,
+    no_skip_mode: bool,
     release: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
-    run_cargo_sub(TEST_SUB_ARGV, "tests", kernel, no_perf_mode, release, args)
+    run_cargo_sub(
+        TEST_SUB_ARGV,
+        "tests",
+        kernel,
+        no_perf_mode,
+        no_skip_mode,
+        release,
+        args,
+    )
 }
 
 pub(crate) fn run_coverage(
     kernel: Vec<String>,
     no_perf_mode: bool,
+    no_skip_mode: bool,
     release: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
@@ -248,6 +262,7 @@ pub(crate) fn run_coverage(
         "coverage",
         kernel,
         no_perf_mode,
+        no_skip_mode,
         release,
         args,
     )
@@ -256,6 +271,7 @@ pub(crate) fn run_coverage(
 pub(crate) fn run_llvm_cov(
     kernel: Vec<String>,
     no_perf_mode: bool,
+    no_skip_mode: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
     // `llvm-cov` is raw passthrough — the user supplies every
@@ -267,6 +283,7 @@ pub(crate) fn run_llvm_cov(
         "llvm-cov",
         kernel,
         no_perf_mode,
+        no_skip_mode,
         false,
         args,
     )

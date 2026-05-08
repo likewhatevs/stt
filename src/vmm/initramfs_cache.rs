@@ -273,6 +273,16 @@ impl AsRef<[u8]> for BaseRef {
 /// 2. POSIX shared-memory segment via O_CREAT|O_EXCL race gate:
 ///    - Winner builds, writes segment, losers block on flock then mmap
 /// 3. Fallback: build without cross-process coordination
+///
+/// `KTSTR_CARGO_TEST_MODE` skips steps 2 and 3's SHM coordination
+/// entirely — the cross-process SHM cache assumes a `cargo ktstr
+/// test` driver that staged the test binaries; under bare
+/// `cargo test` each invocation is independent and the
+/// `LOCK_EX | LOCK_NB` GC sweep / `O_EXCL` race gate would surface
+/// as confusing flock contention messages on contributor
+/// workstations. Per-process HashMap memoisation still applies, so
+/// repeat tests inside the same `cargo test` invocation share the
+/// build cost.
 pub(crate) fn get_or_build_base(
     payload: &Path,
     extras: &[(&str, &Path)],
@@ -280,6 +290,39 @@ pub(crate) fn get_or_build_base(
     busybox: bool,
     key: &BaseKey,
 ) -> Result<BaseRef> {
+    let cargo_test_mode = std::env::var("KTSTR_CARGO_TEST_MODE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+
+    // 1. Process-local cache. Always tried first — this is the only
+    //    layer that survives in cargo-test mode.
+    if let Some(arc) = base_cache().lock().unwrap().get(key).cloned() {
+        tracing::debug!("initramfs base cache hit (process)");
+        return Ok(BaseRef::Owned(arc));
+    }
+
+    if cargo_test_mode {
+        // Inline build, store in process-local cache only. Skip the
+        // /dev/shm sweep and the O_EXCL race gate — the SHM
+        // coordination layer is meant for `cargo ktstr test` /
+        // nextest where N test processes share the same staged
+        // binaries; under bare `cargo test` the sibling-binary
+        // assumption does not hold.
+        let t0 = std::time::Instant::now();
+        let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
+        let arc = Arc::new(data);
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            bytes = arc.len(),
+            "build_initramfs_base (cargo-test inline)",
+        );
+        base_cache()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), arc.clone());
+        return Ok(BaseRef::Owned(arc));
+    }
+
     // Clean stale SHM segments from previous runs. The /dev/shm scan
     // touches every entry once and is keyed off `current` to skip the
     // segment we are about to use; running it on every call wastes
@@ -288,12 +331,6 @@ pub(crate) fn get_or_build_base(
     // and every subsequent call is a free no-op.
     static CLEANUP_ONCE: OnceLock<()> = OnceLock::new();
     CLEANUP_ONCE.get_or_init(|| cleanup_stale_shm(key));
-
-    // 1. Process-local cache
-    if let Some(arc) = base_cache().lock().unwrap().get(key).cloned() {
-        tracing::debug!("initramfs base cache hit (process)");
-        return Ok(BaseRef::Owned(arc));
-    }
 
     // 2. SHM race gate: try O_CREAT|O_EXCL to elect a single builder.
     let seg_name = initramfs::shm_segment_name(key.0);
@@ -749,5 +786,67 @@ mod tests {
         assert_eq!(initramfs::shm_load_base(h2).unwrap().as_ref(), &d2[..]);
         initramfs::shm_unlink_base(h1);
         initramfs::shm_unlink_base(h2);
+    }
+
+    /// `KTSTR_CARGO_TEST_MODE=1` short-circuits `get_or_build_base`
+    /// to the inline-build path: process-local HashMap still
+    /// memoises so a second call with the same key returns the
+    /// SAME `Arc` without re-running the builder, but no SHM
+    /// segment is created or loaded. Pins the bypass contract:
+    /// bare `cargo test` does not share the cross-process SHM
+    /// cache contract that nextest / `cargo ktstr test` peers
+    /// rely on.
+    ///
+    /// The test stages a sentinel value in the process-local cache
+    /// for a synthetic key, then calls `get_or_build_base` twice.
+    /// The first call must hit the cache; the second must observe
+    /// the same `Arc`. A regression that bypassed the HashMap
+    /// (e.g. always re-running the builder) would surface as an
+    /// `Arc::ptr_eq` failure.
+    #[test]
+    fn get_or_build_base_cargo_test_mode_uses_process_local_cache() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _lock = lock_env();
+        let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let exe = crate::resolve_current_exe().unwrap();
+        let key = BaseKey::new(&exe, None, None, None).unwrap();
+
+        // Plant a sentinel in the process-local cache so the
+        // call's first-tier lookup returns it without invoking
+        // the (expensive) inline builder. A real cargo-test-mode
+        // run with no prior cache entry would still work — the
+        // inline build path is exercised — but staging the
+        // sentinel keeps this test fast and removes the kernel /
+        // shared-lib resolution dependency.
+        let sentinel = Arc::new(vec![0xC0u8, 0xDE, 0x01, 0x07, 0x07, 0x01]);
+        base_cache()
+            .lock()
+            .unwrap()
+            .insert(key.clone(), sentinel.clone());
+
+        let result = get_or_build_base(&exe, &[], &[], false, &key)
+            .expect("cargo-test-mode must reuse process-local cache");
+        match result {
+            BaseRef::Owned(arc) => {
+                assert!(
+                    Arc::ptr_eq(&arc, &sentinel),
+                    "cargo-test-mode hit on a planted process-local entry \
+                     must return the SAME Arc — a regression that fell \
+                     through into the inline-build path would produce a \
+                     fresh Arc with the same contents but a different \
+                     identity"
+                );
+            }
+            BaseRef::Mapped(_) => {
+                panic!(
+                    "cargo-test-mode must NEVER mmap an SHM segment — \
+                     bypass contract requires process-local-only memoisation"
+                );
+            }
+        }
+
+        // Clean up so this test does not leak state into siblings
+        // (shared `base_cache()` Mutex outlives the test).
+        base_cache().lock().unwrap().remove(&key);
     }
 }

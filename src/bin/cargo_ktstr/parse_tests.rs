@@ -112,6 +112,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
         KtstrCommand::Test {
             kernel,
             no_perf_mode,
+            no_skip_mode,
             release,
             args,
         } => {
@@ -122,6 +123,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !no_perf_mode,
                 "bare `--` passthrough must not spuriously set --no-perf-mode",
+            );
+            assert!(
+                !no_skip_mode,
+                "bare `--` passthrough must not spuriously set --no-skip-mode",
             );
             assert!(
                 !release,
@@ -132,6 +137,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
         KtstrCommand::Coverage {
             kernel,
             no_perf_mode,
+            no_skip_mode,
             release,
             args,
         } => {
@@ -144,6 +150,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
                 "bare `--` passthrough must not spuriously set --no-perf-mode",
             );
             assert!(
+                !no_skip_mode,
+                "bare `--` passthrough must not spuriously set --no-skip-mode",
+            );
+            assert!(
                 !release,
                 "bare `--` passthrough must not spuriously set --release",
             );
@@ -152,6 +162,7 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
         KtstrCommand::LlvmCov {
             kernel,
             no_perf_mode,
+            no_skip_mode,
             args,
         } => {
             assert!(
@@ -161,6 +172,10 @@ fn assert_passthrough_args(subcommand: &str, passthrough: &[&str]) {
             assert!(
                 !no_perf_mode,
                 "bare `--` passthrough must not spuriously set --no-perf-mode",
+            );
+            assert!(
+                !no_skip_mode,
+                "bare `--` passthrough must not spuriously set --no-skip-mode",
             );
             assert_eq!(args, expected);
         }
@@ -283,6 +298,7 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
     let KtstrCommand::Test {
         kernel,
         no_perf_mode,
+        no_skip_mode,
         release,
         args,
     } = k.command
@@ -291,6 +307,7 @@ fn parse_nextest_alias_with_kernel_and_no_perf_mode() {
     };
     assert_eq!(kernel, vec!["6.14.2".to_string()]);
     assert!(no_perf_mode);
+    assert!(!no_skip_mode);
     assert!(!release, "bare invocation must default --release to false");
     assert!(args.is_empty());
 }
@@ -360,6 +377,7 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
     let KtstrCommand::Coverage {
         kernel,
         no_perf_mode,
+        no_skip_mode,
         release,
         args,
     } = k.command
@@ -368,6 +386,7 @@ fn parse_coverage_with_kernel_and_no_perf_mode() {
     };
     assert_eq!(kernel, vec!["6.14.2".to_string()]);
     assert!(no_perf_mode);
+    assert!(!no_skip_mode);
     assert!(!release, "bare invocation must default --release to false");
     assert_eq!(args, vec!["--workspace"]);
 }
@@ -424,6 +443,7 @@ fn parse_llvm_cov_with_kernel_and_no_perf_mode() {
     let KtstrCommand::LlvmCov {
         kernel,
         no_perf_mode,
+        no_skip_mode,
         args,
     } = k.command
     else {
@@ -431,6 +451,7 @@ fn parse_llvm_cov_with_kernel_and_no_perf_mode() {
     };
     assert_eq!(kernel, vec!["6.14.2".to_string()]);
     assert!(no_perf_mode);
+    assert!(!no_skip_mode);
     assert_eq!(args, vec!["report", "--lcov"]);
 }
 

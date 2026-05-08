@@ -45,6 +45,50 @@ pub(crate) fn no_perf_mode_active() -> bool {
         .unwrap_or(false)
 }
 
+/// Effective no-perf-mode for a given test entry. The env override
+/// `KTSTR_NO_PERF_MODE` and the per-entry [`KtstrTestEntry::no_perf_mode`]
+/// attribute are OR'd: either source forces the no-perf path
+/// (cpuset/LLC locking still applies, but vCPU pinning, hugepages,
+/// NUMA mbind, RT scheduling, and KVM exit suppression are all
+/// skipped). The env override is the operator-level switch; the
+/// per-entry attribute lets a test author opt the test out
+/// permanently — e.g. tests that exercise wild virtual topologies
+/// the host hardware can't possibly satisfy under perf-mode pinning.
+pub(crate) fn no_perf_mode_for_entry(entry: &KtstrTestEntry) -> bool {
+    no_perf_mode_active() || entry.no_perf_mode
+}
+
+/// True when `KTSTR_CARGO_TEST_MODE` is set to a NON-EMPTY value.
+///
+/// Marks a test invocation that runs without the cargo-ktstr wrapper
+/// (typically `KTSTR_KERNEL=... KTSTR_CARGO_TEST_MODE=1 cargo test
+/// -- some_test`). When active, the harness:
+///
+/// 1. Skips the cross-process initramfs SHM cache and builds the
+///    initramfs inline per VM run (no `shm_open`, no `flock`-based
+///    builder election; the process-local HashMap still memoises).
+/// 2. Skips host-topology LLC / per-CPU flock acquisition — tests
+///    run on whatever CPUs the OS schedules them onto. Acceptable
+///    for development iteration; perf-mode tests still use their
+///    measurement contract internally but no peer-coordination
+///    flocks are taken.
+/// 3. Skips gauntlet variant expansion in nextest discovery —
+///    each `#[ktstr_test]` runs once with its declared topology.
+///    No multi-kernel fan-out via `KTSTR_KERNEL_LIST`.
+/// 4. Resolves `SchedulerSpec::Discover(name)` via `$PATH` first
+///    (before the sibling-dir / target-dir / build chain) so a
+///    user can install scx_layered on PATH and run their test
+///    without driving the cargo-ktstr build pipeline.
+///
+/// Empty-string rejection mirrors [`no_perf_mode_active`]: a stray
+/// `KTSTR_CARGO_TEST_MODE=` from CI shell quirks must not silently
+/// flip the harness into degraded coordination mode.
+pub(crate) fn cargo_test_mode_active() -> bool {
+    std::env::var("KTSTR_CARGO_TEST_MODE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Derive initramfs archive path, host path, and guest path from a
 /// scheduler's `config_file`. Returns `None` when no config file is set.
 pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathBuf, String)> {
@@ -680,6 +724,46 @@ mod tests {
             msg.contains("build_vm_builder_base_test_scheduler"),
             "expected the fake scheduler path to appear, got: {msg}",
         );
+    }
+
+    // -- cargo_test_mode_active --
+
+    /// `KTSTR_CARGO_TEST_MODE=1` (any non-empty value) flips the
+    /// flag to true. Pins the activation contract against the
+    /// dispatch sites that gate gauntlet emission, scheduler PATH
+    /// lookup, initramfs-cache SHM bypass, and host-topology flock
+    /// bypass on this exact predicate.
+    #[test]
+    fn cargo_test_mode_active_set_non_empty() {
+        let _lock = lock_env();
+        let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        assert!(cargo_test_mode_active());
+        let _env_word = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "yes");
+        assert!(cargo_test_mode_active());
+    }
+
+    /// Empty-string rejection: `KTSTR_CARGO_TEST_MODE=` does NOT
+    /// flip the flag. Mirrors `no_perf_mode_active`'s behavior so
+    /// CI shells / docker pass-through that set the var without a
+    /// value never accidentally degrade the harness.
+    #[test]
+    fn cargo_test_mode_active_empty_string_rejected() {
+        let _lock = lock_env();
+        let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "");
+        assert!(
+            !cargo_test_mode_active(),
+            "empty-string KTSTR_CARGO_TEST_MODE must NOT activate; \
+             treating it as truthy would silently degrade SHM / \
+             flock coordination on a stray `--env` pass-through"
+        );
+    }
+
+    /// Unset env var → false.
+    #[test]
+    fn cargo_test_mode_active_unset() {
+        let _lock = lock_env();
+        let _env = EnvVarGuard::remove("KTSTR_CARGO_TEST_MODE");
+        assert!(!cargo_test_mode_active());
     }
 
     // -- vm_timeout_from_entry tests --

@@ -96,20 +96,23 @@ fn main() {
         KtstrCommand::Test {
             kernel,
             no_perf_mode,
+            no_skip_mode,
             release,
             args,
-        } => run_cargo::run_test(kernel, no_perf_mode, release, args),
+        } => run_cargo::run_test(kernel, no_perf_mode, no_skip_mode, release, args),
         KtstrCommand::Coverage {
             kernel,
             no_perf_mode,
+            no_skip_mode,
             release,
             args,
-        } => run_cargo::run_coverage(kernel, no_perf_mode, release, args),
+        } => run_cargo::run_coverage(kernel, no_perf_mode, no_skip_mode, release, args),
         KtstrCommand::LlvmCov {
             kernel,
             no_perf_mode,
+            no_skip_mode,
             args,
-        } => run_cargo::run_llvm_cov(kernel, no_perf_mode, args),
+        } => run_cargo::run_llvm_cov(kernel, no_perf_mode, no_skip_mode, args),
         KtstrCommand::Stats { ref command } => stats::run_stats(command),
         KtstrCommand::Kernel { command } => match command {
             KernelCommand::List { json, range } => match range {

@@ -77,6 +77,15 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `auto_repro = bool` (default: `true`)
 ///   - `host_only = bool` (default: `false`) — run the test function
 ///     on the host instead of inside a VM
+///   - `no_perf_mode = bool` (default: `false`) — decouple the
+///     virtual topology from host hardware. The VM is built with
+///     the declared `numa_nodes` / `llcs` / `cores` / `threads`
+///     even on smaller hosts; vCPU pinning, hugepages, NUMA mbind,
+///     RT scheduling, and KVM exit suppression are skipped, and
+///     gauntlet preset filtering relaxes host-topology checks
+///     to the single "host has enough total CPUs" inequality.
+///     Mutually exclusive with `performance_mode = true`. Maps onto
+///     `KtstrTestEntry::no_perf_mode`.
 ///   - `post_vm = PATH` — host-side callback invoked after
 ///     `vm.run()` returns, with access to the full `VmResult`.
 ///     Use for assertions that need host-side state — e.g.
@@ -162,6 +171,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut watchdog_timeout_s_set = false;
     let mut performance_mode: bool = false;
     let mut performance_mode_set = false;
+    let mut no_perf_mode: bool = false;
+    let mut no_perf_mode_set = false;
     let mut duration_s: u64 = 2;
     let mut duration_s_set = false;
     let mut workers_per_cgroup: u32 = 2;
@@ -338,7 +349,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         config_set = true;
                     }
                     "auto_repro" | "not_starved" | "isolation" | "performance_mode"
-                    | "requires_smt" | "expect_err" | "fail_on_stall" | "host_only" => {
+                    | "no_perf_mode" | "requires_smt" | "expect_err" | "fail_on_stall"
+                    | "host_only" => {
                         let lit_bool = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Bool(lb),
@@ -363,6 +375,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "performance_mode" => {
                                 performance_mode = lit_bool.value();
                                 performance_mode_set = true;
+                            }
+                            "no_perf_mode" => {
+                                no_perf_mode = lit_bool.value();
+                                no_perf_mode_set = true;
                             }
                             "requires_smt" => {
                                 requires_smt = lit_bool.value();
@@ -696,7 +712,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only, cleanup_budget_ms, post_vm, config, num_snapshots"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only, cleanup_budget_ms, post_vm, config, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
@@ -1151,6 +1167,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    let no_perf_mode_field = if no_perf_mode_set {
+        quote! { no_perf_mode: #no_perf_mode, }
+    } else {
+        quote! {}
+    };
     let duration_field = if duration_s_set {
         quote! { duration: ::std::time::Duration::from_secs(#duration_s), }
     } else {
@@ -1262,6 +1283,20 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // satisfied "expected failure", hiding the
                     // contention from stats tooling and producing a
                     // false-positive pass for the wrong reason.
+                    //
+                    // KTSTR_NO_SKIP_MODE inverts the policy: CI runs
+                    // that demand every test execute against the
+                    // available hardware promote contention to a
+                    // hard failure so a misconfigured host surfaces
+                    // instead of silently passing.
+                    if ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some() {
+                        panic!(
+                            "ktstr: FAIL: resource contention under --no-skip-mode: {e:#}. \
+                             Either provision hardware that satisfies the test's topology \
+                             requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
+                             accept the skip."
+                        );
+                    }
                     eprintln!("ktstr: SKIP: resource contention: {e:#}");
                     return;
                 }
@@ -1290,6 +1325,20 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // sidecar is recorded inside `run_ktstr_test_inner`
                     // at every contention site, so stats tooling still
                     // sees the skip without a panic-driven retry.
+                    //
+                    // KTSTR_NO_SKIP_MODE inverts the policy: CI runs
+                    // that demand every test execute against the
+                    // available hardware promote contention to a
+                    // hard failure so a misconfigured host surfaces
+                    // instead of silently passing.
+                    if ::std::env::var_os("KTSTR_NO_SKIP_MODE").is_some() {
+                        panic!(
+                            "ktstr: FAIL: resource contention under --no-skip-mode: {e:#}. \
+                             Either provision hardware that satisfies the test's topology \
+                             requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
+                             accept the skip."
+                        );
+                    }
                     eprintln!("ktstr: SKIP: resource contention: {e:#}");
                     return;
                 }
@@ -1405,6 +1454,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #watchdog_timeout_field
             #bpf_map_write_field
             #performance_mode_field
+            #no_perf_mode_field
             #duration_field
             #workers_per_cgroup_field
             #num_snapshots_field

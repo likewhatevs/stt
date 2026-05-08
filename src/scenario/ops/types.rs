@@ -1155,6 +1155,16 @@ impl CgroupDef {
     /// `def.nice(n).work(spec)` are equivalent. A WorkSpec that
     /// explicitly sets a non-zero nice keeps its value. The
     /// cgroup-level default lives in [`Self::default_nice`].
+    ///
+    /// A WorkSpec that explicitly sets `.nice(0)` is treated as
+    /// "unset" and inherits this default — there is no way to opt
+    /// out of cgroup-level nice while keeping nice=0 (matches
+    /// [`crate::workload::WorkloadConfig::nice`]'s `0 = skip
+    /// setpriority(2)` sentinel). To preserve a per-WorkSpec
+    /// nice=0 in the presence of a non-zero cgroup default,
+    /// override the default at the cgroup level instead — the
+    /// merge has no "explicitly zero" signal to distinguish from
+    /// "default zero".
     #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
         self.default_nice = Some(n);
@@ -1216,6 +1226,26 @@ impl CgroupDef {
     /// CgroupDef-level field. This builder writes the value into
     /// every WorkSpec directly so `apply_setup` has a single
     /// authoritative source per WorkSpec.
+    ///
+    /// **Not order-independent with [`Self::work`] — by design.**
+    /// Unlike [`Self::nice`] / [`Self::comm`] / [`Self::uid`] /
+    /// [`Self::gid`] / [`Self::numa_node`], which store a
+    /// cgroup-level default and merge into every WorkSpec at
+    /// `merged_works()` call time, `pcomm` mutates `works`
+    /// in-place when called: it stamps every WorkSpec that
+    /// EXISTS at call time and then returns. WorkSpecs added
+    /// via subsequent [`Self::work`] calls are not retroactively
+    /// touched, and a WorkSpec that already carried its own
+    /// `pcomm` is OVERWRITTEN if it was pushed before
+    /// `.pcomm(..)` ran. This is intentional — `pcomm`
+    /// determines the thread-group leader's coalescing key in
+    /// `apply_setup`, so the framework needs the value baked
+    /// onto each WorkSpec by the time `merged_works()` runs.
+    /// Storing it as a default and merging at read time would
+    /// break the coalescing contract for the empty-works case
+    /// (the synthesised `WorkSpec::default()` would have to
+    /// carry the pcomm without distinguishing "default" from
+    /// "explicit override").
     #[must_use = "builder methods consume self; bind the result"]
     pub fn pcomm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
         let name: Cow<'static, str> = name.into();
@@ -2218,5 +2248,225 @@ impl CpusetSpec {
             }
             CpusetSpec::Exact(cpus) => cpus.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod cgroup_def_default_tests {
+    //! Order-independence and override-precedence coverage for the
+    //! cgroup-level defaults that flow through
+    //! [`CgroupDef::merged_works`] (`nice` / `comm` / `uid` / `gid` /
+    //! `numa_node`) plus the per-WorkSpec [`CgroupDef::pcomm`] writer.
+    //!
+    //! The merged-works contract: each cgroup-level default is applied
+    //! to every [`WorkSpec`] in `works` whose own field is unset (or
+    //! the framework's "skip" sentinel for `nice`). Builder ordering
+    //! must not change the outcome — `def.work(spec).nice(n)` and
+    //! `def.nice(n).work(spec)` both produce a merged WorkSpec
+    //! carrying `nice = n`. WorkSpecs that explicitly set a non-default
+    //! value must keep their own. `pcomm` is the lone exception: it
+    //! lives only on `WorkSpec`, so `CgroupDef::pcomm` writes the
+    //! value into every WorkSpec at builder time and overwrites any
+    //! prior per-WorkSpec value, with `def.pcomm(..).work(spec)`
+    //! emitting a default leader and pushing the explicit `spec` after
+    //! (so the `spec`'s own pcomm survives).
+    use super::*;
+    use crate::workload::WorkSpec;
+
+    #[test]
+    fn merged_works_nice_order_independent() {
+        let pre = CgroupDef::named("cg").nice(7).work(WorkSpec::default());
+        let post = CgroupDef::named("cg").work(WorkSpec::default()).nice(7);
+        assert_eq!(pre.merged_works()[0].nice, 7);
+        assert_eq!(post.merged_works()[0].nice, 7);
+    }
+
+    #[test]
+    fn merged_works_comm_order_independent() {
+        let pre = CgroupDef::named("cg").comm("hot").work(WorkSpec::default());
+        let post = CgroupDef::named("cg").work(WorkSpec::default()).comm("hot");
+        assert_eq!(pre.merged_works()[0].comm.as_deref(), Some("hot"));
+        assert_eq!(post.merged_works()[0].comm.as_deref(), Some("hot"));
+    }
+
+    #[test]
+    fn merged_works_uid_order_independent() {
+        let pre = CgroupDef::named("cg").uid(1234).work(WorkSpec::default());
+        let post = CgroupDef::named("cg").work(WorkSpec::default()).uid(1234);
+        assert_eq!(pre.merged_works()[0].uid, Some(1234));
+        assert_eq!(post.merged_works()[0].uid, Some(1234));
+    }
+
+    #[test]
+    fn merged_works_gid_order_independent() {
+        let pre = CgroupDef::named("cg").gid(4321).work(WorkSpec::default());
+        let post = CgroupDef::named("cg").work(WorkSpec::default()).gid(4321);
+        assert_eq!(pre.merged_works()[0].gid, Some(4321));
+        assert_eq!(post.merged_works()[0].gid, Some(4321));
+    }
+
+    #[test]
+    fn merged_works_numa_node_order_independent() {
+        let pre = CgroupDef::named("cg")
+            .numa_node(2)
+            .work(WorkSpec::default());
+        let post = CgroupDef::named("cg")
+            .work(WorkSpec::default())
+            .numa_node(2);
+        assert_eq!(pre.merged_works()[0].numa_node, Some(2));
+        assert_eq!(post.merged_works()[0].numa_node, Some(2));
+    }
+
+    /// Per-WorkSpec values must beat cgroup-level defaults. The merge
+    /// rule is "fill if unset", not "overwrite", so a WorkSpec that
+    /// explicitly carries `nice` / `comm` / `uid` / `gid` /
+    /// `numa_node` keeps its own value regardless of the
+    /// cgroup-level default. Pins the polarity of each merge gate.
+    #[test]
+    fn merged_works_workspec_overrides_default() {
+        let spec = WorkSpec::default()
+            .nice(3)
+            .comm("override")
+            .uid(11)
+            .gid(22)
+            .numa_node(5);
+        let def = CgroupDef::named("cg")
+            .nice(7)
+            .comm("default")
+            .uid(99)
+            .gid(88)
+            .numa_node(0)
+            .work(spec);
+        let merged = def.merged_works();
+        assert_eq!(merged.len(), 1);
+        let w = &merged[0];
+        assert_eq!(w.nice, 3, "WorkSpec nice must beat default_nice");
+        assert_eq!(
+            w.comm.as_deref(),
+            Some("override"),
+            "WorkSpec comm must beat default_comm",
+        );
+        assert_eq!(w.uid, Some(11), "WorkSpec uid must beat default_uid");
+        assert_eq!(w.gid, Some(22), "WorkSpec gid must beat default_gid");
+        assert_eq!(
+            w.numa_node,
+            Some(5),
+            "WorkSpec numa_node must beat default_numa_node",
+        );
+    }
+
+    /// `CgroupDef::pcomm` writes `pcomm` into every WorkSpec in
+    /// `works`. When the builder runs `pcomm(..)` AFTER a `work(spec)`
+    /// where the spec has its own `pcomm`, the pcomm setter
+    /// overwrites the per-WorkSpec value — pcomm is a fan-out
+    /// applied to every existing WorkSpec, not a "merge if unset"
+    /// default. Pins the documented overwrite semantics.
+    #[test]
+    fn pcomm_after_work_overrides() {
+        let spec = WorkSpec::default().pcomm("explicit");
+        let def = CgroupDef::named("cg").work(spec).pcomm("forced");
+        let works = def.merged_works();
+        assert_eq!(works.len(), 1);
+        assert_eq!(
+            works[0].pcomm.as_deref(),
+            Some("forced"),
+            "pcomm() after work() must overwrite the WorkSpec's own pcomm \
+             (the convenience method is a fan-out, not a merge-if-unset \
+             default)",
+        );
+    }
+
+    /// `CgroupDef::pcomm` called BEFORE any `work(spec)` pushes a
+    /// default WorkSpec carrying the pcomm; subsequent `work(spec)`
+    /// calls APPEND new entries to `works`, and those new entries
+    /// keep their own `pcomm` (or `None`) — pcomm only writes to
+    /// WorkSpecs that exist when the builder runs. Pins the
+    /// behaviour so a future change that fan-out-rewrote `pcomm` over
+    /// later-appended WorkSpecs surfaces here as a regression.
+    #[test]
+    fn pcomm_then_work_appends() {
+        let extra = WorkSpec::default().pcomm("appended");
+        let def = CgroupDef::named("cg").pcomm("initial").work(extra);
+        let works = def.merged_works();
+        assert_eq!(works.len(), 2, "pcomm() pushes one default + work() one");
+        // First WorkSpec is the default that pcomm() created — its
+        // pcomm is the one pcomm() set.
+        assert_eq!(
+            works[0].pcomm.as_deref(),
+            Some("initial"),
+            "pcomm() before any work() pushes a default WorkSpec carrying \
+             the pcomm value",
+        );
+        // Second WorkSpec was appended AFTER pcomm() ran, so it keeps
+        // its own pcomm — pcomm() does NOT retroactively touch
+        // later-pushed entries.
+        assert_eq!(
+            works[1].pcomm.as_deref(),
+            Some("appended"),
+            "WorkSpec appended after pcomm() keeps its own pcomm — \
+             pcomm() only writes to WorkSpecs that exist at call time",
+        );
+    }
+
+    /// An empty `works` list yields a single synthesised
+    /// `WorkSpec::default()` with the cgroup-level defaults applied.
+    /// Pins the documented "empty → one default" substitution at
+    /// types.rs:1510-1514, plus the fact that the synthesised
+    /// WorkSpec sees the same merge rules as a hand-pushed default
+    /// — no shortcut path that bypasses the cgroup defaults.
+    #[test]
+    fn merged_works_empty_works_substitutes_default() {
+        let def = CgroupDef::named("cg")
+            .nice(11)
+            .comm("default")
+            .uid(7)
+            .gid(8)
+            .numa_node(1);
+        let works = def.merged_works();
+        assert_eq!(
+            works.len(),
+            1,
+            "empty works must yield exactly one default WorkSpec"
+        );
+        let w = &works[0];
+        assert_eq!(w.nice, 11);
+        assert_eq!(w.comm.as_deref(), Some("default"));
+        assert_eq!(w.uid, Some(7));
+        assert_eq!(w.gid, Some(8));
+        assert_eq!(w.numa_node, Some(1));
+    }
+
+    /// `merged_works` must be pure — calling it twice on the same
+    /// CgroupDef produces identical output and does not mutate the
+    /// cgroup's `works` vec or the cgroup-level defaults. Pins the
+    /// `&self` signature's contract against a future refactor that
+    /// drained `self.works` for performance.
+    #[test]
+    fn merged_works_does_not_mutate_self() {
+        let def = CgroupDef::named("cg")
+            .nice(5)
+            .comm("named")
+            .uid(101)
+            .gid(202)
+            .numa_node(3)
+            .work(WorkSpec::default());
+        let first = def.merged_works();
+        let second = def.merged_works();
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first.len(), 1);
+        let a = &first[0];
+        let b = &second[0];
+        assert_eq!(a.nice, b.nice);
+        assert_eq!(a.comm, b.comm);
+        assert_eq!(a.uid, b.uid);
+        assert_eq!(a.gid, b.gid);
+        assert_eq!(a.numa_node, b.numa_node);
+        // Underlying state untouched.
+        assert_eq!(def.works.len(), 1);
+        assert_eq!(def.default_nice, Some(5));
+        assert_eq!(def.default_comm.as_deref(), Some("named"));
+        assert_eq!(def.default_uid, Some(101));
+        assert_eq!(def.default_gid, Some(202));
+        assert_eq!(def.default_numa_node, Some(3));
     }
 }

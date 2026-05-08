@@ -13,6 +13,21 @@ use anyhow::{Context, Result};
 // (production + `super::*` tests) compiling unchanged.
 use crate::flock::{FlockMode, try_flock};
 
+/// True when `KTSTR_CARGO_TEST_MODE` is set to a non-empty value.
+///
+/// Mirrored from `super::test_support::runtime::cargo_test_mode_active`
+/// (which is `pub(crate)` inside `test_support`) without the
+/// cross-module dependency: this module is on the VM-host side of
+/// the library and shouldn't pull in `test_support` symbols just for
+/// an env-var read. Empty-string rejection matches the test_support
+/// helper so a stray `KTSTR_CARGO_TEST_MODE=` doesn't accidentally
+/// flip the harness into degraded coordination mode.
+fn cargo_test_mode_active() -> bool {
+    std::env::var("KTSTR_CARGO_TEST_MODE")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Resource contention error — LLC slots or CPUs unavailable.
 /// Downcast via `anyhow::Error::downcast_ref::<ResourceContention>()`
 /// to distinguish from fatal errors.
@@ -590,11 +605,23 @@ pub enum LockOutcome {
 /// Single non-blocking attempt. Returns `LockOutcome::Unavailable`
 /// immediately when any resource is busy. Callers rely on nextest
 /// retry backoff for contention resolution.
+///
+/// `KTSTR_CARGO_TEST_MODE` short-circuits the entire flock dance and
+/// returns `Acquired` with an empty fd list — bare `cargo test`
+/// invocations don't share the cross-process LLC reservation
+/// contract that nextest / `cargo ktstr test` peers rely on. Tests
+/// run on whatever CPUs the OS schedules them onto.
 pub fn acquire_resource_locks(
     plan: &PinningPlan,
     llc_indices: &[usize],
     llc_mode: LlcLockMode,
 ) -> Result<LockOutcome> {
+    if cargo_test_mode_active() {
+        return Ok(LockOutcome::Acquired {
+            llc_offset: llc_indices.first().copied().unwrap_or(0),
+            locks: Vec::new(),
+        });
+    }
     match try_acquire_all(plan, llc_indices, llc_mode) {
         Ok(locks) => Ok(LockOutcome::Acquired {
             llc_offset: llc_indices.first().copied().unwrap_or(0),
@@ -1366,6 +1393,57 @@ pub fn acquire_llc_plan(
     test_topo: &crate::topology::TestTopology,
     cpu_cap: Option<CpuCap>,
 ) -> Result<LlcPlan> {
+    if cargo_test_mode_active() {
+        // Bare `cargo test` mode: no peer-coordination contract.
+        // Synthesise a degenerate plan that names every LLC and
+        // every allowed CPU but holds no flocks. The vmm caller
+        // strips `locks` after build (see `KtstrVmBuilder::build`)
+        // and re-acquires via `acquire_resource_locks` at run time
+        // — also short-circuited above. `cpus` is the calling
+        // process's allowed cpuset so the `sched_setaffinity`
+        // sites inside the vmm have a valid mask to apply
+        // (allowed cpuset = whatever the OS schedules us onto).
+        let allowed = host_allowed_cpus();
+        if allowed.is_empty() {
+            return Err(ResourceContention {
+                reason: "could not determine allowed CPU set \
+                         (sched_getaffinity and /proc/self/status both failed)"
+                    .into(),
+            }
+            .into());
+        }
+        let _ = test_topo;
+        let _ = cpu_cap;
+        let allowed_set: std::collections::BTreeSet<usize> = allowed.iter().copied().collect();
+        let locked_llcs: Vec<usize> = topo
+            .llc_groups
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, group)| {
+                if group.cpus.iter().any(|c| allowed_set.contains(c)) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mems: std::collections::BTreeSet<usize> = locked_llcs
+            .iter()
+            .filter_map(|&idx| {
+                topo.llc_groups
+                    .get(idx)
+                    .and_then(|g| g.cpus.first().copied())
+                    .and_then(|c| topo.cpu_to_node.get(&c).copied())
+            })
+            .collect();
+        return Ok(LlcPlan {
+            locked_llcs,
+            cpus: allowed,
+            mems,
+            snapshot: Vec::new(),
+            locks: Vec::new(),
+        });
+    }
     acquire_llc_plan_with_acquire_fn(topo, test_topo, cpu_cap, try_acquire_llc_plan_locks)
 }
 

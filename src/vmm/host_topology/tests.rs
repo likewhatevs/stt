@@ -3187,3 +3187,81 @@ fn acquire_llc_plan_cross_node_spill_mems_union() {
         plan.mems,
     );
 }
+
+// ─── KTSTR_CARGO_TEST_MODE bypass ────────────────────────────
+//
+// Tests at indices 95000-95999 cover the cargo-test-mode flock
+// bypass. Use the `crate::test_support::test_helpers::lock_env`
+// pattern to serialise env mutation across tests; otherwise a
+// concurrent test could observe a transiently-set
+// `KTSTR_CARGO_TEST_MODE` and short-circuit its own assertions.
+
+/// `acquire_resource_locks` returns `Acquired { locks: vec![] }`
+/// in cargo-test mode regardless of the requested `LlcLockMode`
+/// or whether a peer holds the same lockfile. Pins the bypass
+/// contract: bare `cargo test` doesn't share the cross-process
+/// LLC reservation contract that nextest / `cargo ktstr test`
+/// peers rely on.
+#[test]
+fn acquire_resource_locks_cargo_test_mode_bypasses_flock() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _lock = lock_env();
+    let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+    let plan = PinningPlan {
+        assignments: vec![(0, 95100)],
+        service_cpu: None,
+        llc_indices: vec![95100],
+        locks: Vec::new(),
+    };
+    let outcome = acquire_resource_locks(&plan, &[95100usize], LlcLockMode::Exclusive).unwrap();
+    match outcome {
+        LockOutcome::Acquired { llc_offset, locks } => {
+            assert_eq!(llc_offset, 95100);
+            assert!(
+                locks.is_empty(),
+                "cargo-test-mode bypass must NOT take any flocks; \
+                 got {} held fds",
+                locks.len(),
+            );
+        }
+        LockOutcome::Unavailable(reason) => {
+            panic!("expected Acquired in cargo-test mode, got Unavailable: {reason}");
+        }
+    }
+}
+
+/// Empty `KTSTR_CARGO_TEST_MODE` does NOT activate the bypass.
+/// The standard `acquire_resource_locks` path runs and returns an
+/// `Acquired` with the actual fd vector. Mirrors the empty-string
+/// rejection on `cargo_test_mode_active` so a stray `--env`
+/// pass-through can't silently degrade the locking contract.
+#[test]
+fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
+    use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+    let _lock = lock_env();
+    let _env = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "");
+    let plan = PinningPlan {
+        assignments: vec![(0, 95200)],
+        service_cpu: None,
+        llc_indices: vec![95200],
+        locks: Vec::new(),
+    };
+    cleanup_lock("/tmp/ktstr-llc-95200.lock");
+    let outcome = acquire_resource_locks(&plan, &[95200usize], LlcLockMode::Exclusive).unwrap();
+    match outcome {
+        LockOutcome::Acquired { locks, .. } => {
+            assert_eq!(
+                locks.len(),
+                1,
+                "empty-string cargo-test-mode is inert — expected the \
+                 standard `Exclusive` path to take exactly one LLC fd, \
+                 got {}",
+                locks.len(),
+            );
+        }
+        LockOutcome::Unavailable(reason) => {
+            panic!("expected Acquired with empty-string bypass inert, got Unavailable: {reason}");
+        }
+    }
+    cleanup_lock("/tmp/ktstr-llc-95200.lock");
+}

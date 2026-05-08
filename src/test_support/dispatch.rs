@@ -555,19 +555,30 @@ pub fn ktstr_test_early_dispatch() {
         // (cargo test invokes one test binary per crate; the ctor
         // runs exactly once per test binary) so there is no need to
         // gate with a std::sync::Once.
-        let total = KTSTR_TESTS.len();
-        let real = KTSTR_TESTS
-            .iter()
-            .filter(|e| !is_test_sentinel(e.name))
-            .count();
-        if real > 0 {
-            eprintln!(
-                "warning: {real} of {total} ktstr test entries registered in this binary \
-                 will not generate their flag-profile / topology-preset gauntlet variants — \
-                 NEXTEST env var is not set and the standard rustc harness does not expand \
-                 them. Use `cargo nextest run` (or `cargo ktstr test`) to exercise the full \
-                 gauntlet.",
-            );
+        //
+        // `KTSTR_CARGO_TEST_MODE=1` opts out of the warning: the
+        // operator deliberately picked the cargo-test-direct path
+        // (e.g. for a single-test debug iteration without the
+        // nextest harness) and accepts that gauntlet variants
+        // won't run. The warning is still emitted under bare
+        // `cargo test` without the env var set so unaware users
+        // see the coverage gap.
+        if !super::runtime::cargo_test_mode_active() {
+            let total = KTSTR_TESTS.len();
+            let real = KTSTR_TESTS
+                .iter()
+                .filter(|e| !is_test_sentinel(e.name))
+                .count();
+            if real > 0 {
+                eprintln!(
+                    "warning: {real} of {total} ktstr test entries registered in this binary \
+                     will not generate their flag-profile / topology-preset gauntlet variants — \
+                     NEXTEST env var is not set and the standard rustc harness does not expand \
+                     them. Use `cargo nextest run` (or `cargo ktstr test`) to exercise the full \
+                     gauntlet, or set KTSTR_CARGO_TEST_MODE=1 to opt into single-variant \
+                     bare-`cargo test` mode without this warning.",
+                );
+            }
         }
     }
 }
@@ -834,6 +845,7 @@ fn run_ktstr_test_with_topo_and_flags(
 /// failure (exit 1) rather than the skip path (exit 0), turning
 /// every host-resource-exhausted run into a hard test failure.
 fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
+    let no_skip = std::env::var_os("KTSTR_NO_SKIP_MODE").is_some();
     match result {
         Ok(_) if expect_err => {
             eprintln!("expected error but test passed");
@@ -848,12 +860,31 @@ fn result_to_exit_code(result: Result<AssertResult>, expect_err: bool) -> i32 {
                         .map(|rc| rc.reason.clone())
                 })
                 .unwrap_or_else(|| "<unknown>".to_string());
-            crate::report::test_skip(format_args!("resource contention: {reason}"));
-            0
+            if no_skip {
+                eprintln!(
+                    "ktstr: FAIL: resource contention under --no-skip-mode: {reason}. \
+                     Either provision hardware that satisfies the test's topology \
+                     requirement, or drop --no-skip-mode / KTSTR_NO_SKIP_MODE to \
+                     accept the skip."
+                );
+                1
+            } else {
+                crate::report::test_skip(format_args!("resource contention: {reason}"));
+                0
+            }
         }
         Err(e) if is_topology_insufficient(&e) => {
-            crate::report::test_skip(format_args!("host topology insufficient: {e:#}"));
-            0
+            if no_skip {
+                eprintln!(
+                    "ktstr: FAIL: host topology insufficient under --no-skip-mode: {e:#}. \
+                     Either provision a host with the required CPU / LLC count, or drop \
+                     --no-skip-mode / KTSTR_NO_SKIP_MODE to accept the skip."
+                );
+                1
+            } else {
+                crate::report::test_skip(format_args!("host topology insufficient: {e:#}"));
+                0
+            }
         }
         Err(_) if expect_err => 0,
         Err(e) => {
@@ -1032,13 +1063,26 @@ fn for_each_gauntlet_variant<F>(
     let profiles = entry
         .scheduler
         .generate_profiles(entry.required_flags, entry.excluded_flags);
+    let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     for preset in presets {
-        if !entry.constraints.accepts(
-            &preset.topology,
-            host_cpus,
-            host_llcs,
-            host_max_cpus_per_llc,
-        ) {
+        // No-perf-mode tests run KVM-emulated topology — guest sees the
+        // declared NUMA / LLC / per-LLC layout regardless of host
+        // hardware — so the host-side LLC count and per-LLC CPU width
+        // do not constrain preset eligibility. Only the total-CPU
+        // budget survives.
+        let accepted = if no_perf_mode {
+            entry
+                .constraints
+                .accepts_no_perf_mode(&preset.topology, host_cpus)
+        } else {
+            entry.constraints.accepts(
+                &preset.topology,
+                host_cpus,
+                host_llcs,
+                host_max_cpus_per_llc,
+            )
+        };
+        if !accepted {
             continue;
         }
         for profile in &profiles {
@@ -1057,7 +1101,16 @@ fn for_each_gauntlet_variant<F>(
 /// historical `gauntlet/{name}/{preset}/{profile}` shape so existing
 /// CI baselines, test-name filters, and per-test config overrides
 /// keep matching.
+///
+/// `KTSTR_CARGO_TEST_MODE=1` skips gauntlet variant emission and
+/// the multi-kernel suffix path: each test gets exactly one
+/// `ktstr/{name}: test` line. Bare `cargo test` doesn't have
+/// access to the cargo-ktstr resolver that produces
+/// `KTSTR_KERNEL_LIST`, so the multi-kernel branch can't apply
+/// even if it were enabled — pin both behaviors explicitly so
+/// the listing matches what the dispatch path will actually run.
 fn list_tests_all(ignored_only: bool) {
+    let cargo_test_mode = super::runtime::cargo_test_mode_active();
     let presets = crate::vm::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
         .ok()
@@ -1066,7 +1119,7 @@ fn list_tests_all(ignored_only: bool) {
     let (host_cpus, host_llcs, host_max_cpus_per_llc) = host_capacity();
 
     let kernel_list = read_kernel_list();
-    let multi_kernel = kernel_list.len() > 1;
+    let multi_kernel = kernel_list.len() > 1 && !cargo_test_mode;
     // Single-kernel mode (no list, or list has exactly one entry)
     // emits one variant per (test × preset × profile) tuple with no
     // kernel suffix. Multi-kernel mode iterates every kernel as an
@@ -1109,6 +1162,14 @@ fn list_tests_all(ignored_only: bool) {
             continue;
         }
 
+        // KTSTR_CARGO_TEST_MODE: skip gauntlet expansion. The
+        // operator picked the bare-`cargo test` path; emit only
+        // the base name so each `#[ktstr_test]` runs once with its
+        // declared topology.
+        if cargo_test_mode {
+            continue;
+        }
+
         // Gauntlet variants are always ignored — users opt in with
         // --run-ignored. Presets that exceed the host's CPU count or
         // LLC count are filtered from the listing entirely.
@@ -1147,9 +1208,17 @@ fn list_tests_all(ignored_only: bool) {
 /// and prints only the selected subset. Multi-kernel mode adds the
 /// kernel suffix as a feature dimension so the budget selector
 /// picks per-kernel coverage; single-kernel mode is unchanged.
+///
+/// `KTSTR_CARGO_TEST_MODE=1` is treated identically to
+/// `list_tests_all`: the budget pipeline runs only over base test
+/// candidates (no gauntlet-variant candidates, no multi-kernel
+/// fan-out). The greedy selector still applies — a low budget
+/// can still trim the base list — but the candidate set is the
+/// same set that the dispatch path would actually run.
 fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     use crate::budget::{TestCandidate, estimate_duration, extract_features, select};
 
+    let cargo_test_mode = super::runtime::cargo_test_mode_active();
     let presets = crate::vm::gauntlet_presets();
     let has_vmlinux = resolve_test_kernel()
         .ok()
@@ -1159,7 +1228,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     let mut candidates: Vec<TestCandidate> = Vec::new();
 
     let kernel_list = read_kernel_list();
-    let multi_kernel = kernel_list.len() > 1;
+    let multi_kernel = kernel_list.len() > 1 && !cargo_test_mode;
     let kernel_suffixes: Vec<&str> = if multi_kernel {
         kernel_list.iter().map(|k| k.sanitized.as_str()).collect()
     } else {
@@ -1206,6 +1275,15 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
         }
 
         if entry.host_only {
+            continue;
+        }
+
+        if cargo_test_mode {
+            // No gauntlet candidates in cargo-test mode — the
+            // dispatch path will never execute them and including
+            // them in the budget candidate set would shift greedy
+            // selection toward variants that resolve to "no test"
+            // at run time.
             continue;
         }
 
@@ -2591,6 +2669,66 @@ mod tests {
             !line.contains("kernel_6_14_2") && !line.contains("kernel_6_15_0"),
             "host_only candidate must carry NO sanitized kernel suffix — \
              a regression that emitted `/kernel_…` would surface here. line: {line:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // KTSTR_CARGO_TEST_MODE listing behavior
+    // ---------------------------------------------------------------
+    //
+    // `list_tests_all` and `list_tests_budget` skip gauntlet
+    // emission when `KTSTR_CARGO_TEST_MODE` is active. Pins the
+    // dispatch contract: bare `cargo test` runs each test once
+    // with its declared topology, no preset × profile fan-out.
+    // Multi-kernel suffix emission is also suppressed because the
+    // cargo-ktstr resolver that produces `KTSTR_KERNEL_LIST` is
+    // not on the cargo-test path.
+
+    /// Under `KTSTR_CARGO_TEST_MODE=1`, `list_tests_all` emits
+    /// exactly one `ktstr/{name}: test` line per registered entry
+    /// — no `gauntlet/...` lines. Pins the gauntlet-skip branch.
+    #[test]
+    fn list_tests_all_cargo_test_mode_skips_gauntlet() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _cargo = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let _no_kernel_list = EnvVarGuard::remove(crate::KTSTR_KERNEL_LIST_ENV);
+        let _budget_guard = EnvVarGuard::remove("KTSTR_BUDGET_SECS");
+
+        let (_, captured) = capture_stdout(|| list_tests_all(false));
+        let stdout = std::str::from_utf8(&captured).expect("utf-8");
+        let gauntlet_lines: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.starts_with("gauntlet/"))
+            .collect();
+        assert!(
+            gauntlet_lines.is_empty(),
+            "cargo-test-mode must suppress every `gauntlet/...` line; \
+             got {} lines: {gauntlet_lines:?}",
+            gauntlet_lines.len(),
+        );
+    }
+
+    /// Multi-kernel suffix emission is suppressed in
+    /// cargo-test mode even when `KTSTR_KERNEL_LIST` is set —
+    /// the bare `cargo test` path doesn't drive the cargo-ktstr
+    /// resolver, so any `KTSTR_KERNEL_LIST` is a stale leftover
+    /// from a prior session and must not influence listing.
+    #[test]
+    fn list_tests_all_cargo_test_mode_ignores_kernel_list() {
+        use crate::test_support::test_helpers::{EnvVarGuard, lock_env};
+        let _env_lock = lock_env();
+        let _cargo = EnvVarGuard::set("KTSTR_CARGO_TEST_MODE", "1");
+        let _kernel_list = EnvVarGuard::set(crate::KTSTR_KERNEL_LIST_ENV, TWO_KERNEL_LIST);
+        let _budget_guard = EnvVarGuard::remove("KTSTR_BUDGET_SECS");
+
+        let (_, captured) = capture_stdout(|| list_tests_all(false));
+        let stdout = std::str::from_utf8(&captured).expect("utf-8");
+        assert!(
+            !stdout.contains("kernel_6_14_2") && !stdout.contains("kernel_6_15_0"),
+            "cargo-test-mode must suppress multi-kernel suffix emission \
+             even when KTSTR_KERNEL_LIST is set; got stdout containing a \
+             sanitized kernel label:\n{stdout}",
         );
     }
 }

@@ -280,6 +280,34 @@ impl TopologyConstraints {
             && topo.num_llcs() <= host_llcs
             && topo.cores_per_llc * topo.threads_per_core <= host_max_cpus_per_llc
     }
+
+    /// No-perf-mode variant of [`Self::accepts`]. The VM topology is
+    /// emulated via KVM (vCPUs, ACPI SRAT/SLIT, CPUID), not pinned to
+    /// host hardware, so the host's NUMA-node count, LLC count, and
+    /// per-LLC CPU width do not constrain it. Only the total-CPU
+    /// inequality survives — the guest needs `topo.total_cpus()` host
+    /// CPUs to schedule its vCPU threads, regardless of how those
+    /// vCPUs are grouped into virtual LLCs and nodes.
+    ///
+    /// The entry's `min_numa_nodes` / `min_llcs` / `min_cpus` /
+    /// `requires_smt` / `max_*` fields still gate which gauntlet
+    /// presets the test author wants to exercise — those are
+    /// expressing test scope, not host capability — so they keep
+    /// firing here. The host-side checks (`<= host_cpus`,
+    /// `<= host_llcs`, `<= host_max_cpus_per_llc`) collapse to the
+    /// single CPU-budget check.
+    pub fn accepts_no_perf_mode(&self, topo: &Topology, host_cpus: u32) -> bool {
+        topo.num_numa_nodes() >= self.min_numa_nodes
+            && self
+                .max_numa_nodes
+                .is_none_or(|max| topo.num_numa_nodes() <= max)
+            && topo.num_llcs() >= self.min_llcs
+            && self.max_llcs.is_none_or(|max| topo.num_llcs() <= max)
+            && (!self.requires_smt || topo.threads_per_core >= 2)
+            && topo.total_cpus() >= self.min_cpus
+            && self.max_cpus.is_none_or(|max| topo.total_cpus() <= max)
+            && topo.total_cpus() <= host_cpus
+    }
 }
 
 /// Definition of a scheduler for the test framework.
@@ -689,6 +717,32 @@ pub struct KtstrTestEntry {
     /// available. The four host-side optimizations (vCPU pinning,
     /// hugepages, NUMA mbind, RT scheduling) apply.
     pub performance_mode: bool,
+    /// Decouple virtual topology from host hardware. When set:
+    ///
+    /// - The VM's virtual topology (`numa_nodes`, `llcs`, `cores`,
+    ///   `threads`) is built as declared — the guest sees the full
+    ///   requested topology via KVM vCPU layout, ACPI SRAT/SLIT
+    ///   tables, etc.
+    /// - Host-side cpuset/LLC locking still applies (the no-perf
+    ///   `LlcPlan` path), so concurrent perf-mode peers are still
+    ///   serialised against this VM.
+    /// - Host-side performance_mode optimisations are skipped:
+    ///   no vCPU-to-host-core pinning, no 2 MB hugepages, no NUMA
+    ///   mbind, no `SCHED_FIFO` promotion, no `KVM_HINTS_REALTIME`
+    ///   CPUID hint, no `KVM_CAP_X86_DISABLE_EXITS`.
+    /// - Host topology constraints are relaxed during gauntlet
+    ///   preset filtering — the entry's `min_numa_nodes` /
+    ///   `min_llcs` / `requires_smt` / per-LLC CPU limits are not
+    ///   compared against host hardware. The only host check that
+    ///   stays is "total host CPUs >= total vCPUs", so a test
+    ///   declaring `numa_nodes = 3` runs on a 1-NUMA-node host.
+    ///
+    /// Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test —
+    /// either source forces the no-perf path. Mutually exclusive
+    /// with `performance_mode = true`; [`KtstrTestEntry::validate`]
+    /// rejects the combination because "I want pinning" and "I
+    /// explicitly don't want pinning" are contradictory.
+    pub no_perf_mode: bool,
     /// Workload duration.
     pub duration: Duration,
     /// Workers per cgroup.
@@ -906,6 +960,7 @@ impl KtstrTestEntry {
         required_flags: &[],
         excluded_flags: &[],
         performance_mode: false,
+        no_perf_mode: false,
         duration: Duration::from_secs(12),
         workers_per_cgroup: 2,
         expect_err: false,
@@ -994,6 +1049,15 @@ impl KtstrTestEntry {
                  host_only skips the VM boot that owns the virtio-blk \
                  device lifecycle, so the disk would never be attached. \
                  Drop one of host_only or disk.",
+                self.name,
+            );
+        }
+        if self.performance_mode && self.no_perf_mode {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.performance_mode=true with \
+                 no_perf_mode=true — the two flags are contradictory \
+                 (\"I want pinning\" vs. \"I explicitly don't want \
+                 pinning\"). Drop one of them.",
                 self.name,
             );
         }
@@ -1279,6 +1343,7 @@ mod tests {
         assert!(d.required_flags.is_empty());
         assert!(d.excluded_flags.is_empty());
         assert!(!d.performance_mode);
+        assert!(!d.no_perf_mode);
         assert_eq!(d.duration, Duration::from_secs(12));
         assert_eq!(d.workers_per_cgroup, 2);
         assert!(!d.expect_err);

@@ -301,9 +301,12 @@ impl NumaMemoryLayout {
             // ENOMEM when a peer is holding the host's GuestMemoryMmap
             // budget at the time we register this slot. Routing through
             // the classifier turns those into a SKIP banner instead of a
-            // hard test failure; non-transient errnos flow through
-            // unchanged so a real bug never gets misclassified as
-            // contention. The non-transient set per kernel source:
+            // hard test failure (under default policy — `KTSTR_NO_SKIP_MODE`
+            // promotes the classified contention to a FAIL at the dispatch
+            // boundary in `test_support::dispatch::result_to_exit_code`
+            // and the `#[ktstr_test]` macro's terminal arm); non-transient
+            // errnos flow through unchanged so a real bug never gets
+            // misclassified as contention. The non-transient set per kernel source:
             //   - EINVAL: bad alignment, untagged-addr mismatch, or
             //     access_ok failure on userspace_addr; bad slot ID;
             //     bad gpa_start (virt/kvm/kvm_main.c:2025-2038).
