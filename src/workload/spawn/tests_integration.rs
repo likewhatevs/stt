@@ -1183,17 +1183,35 @@ fn assert_worker_report_eq(a: &WorkerReport, b: &WorkerReport) {
     assert_eq!(a.max_gap_ms, b.max_gap_ms, "max_gap_ms");
     assert_eq!(a.max_gap_cpu, b.max_gap_cpu, "max_gap_cpu");
     assert_eq!(a.max_gap_at_ms, b.max_gap_at_ms, "max_gap_at_ms");
-    assert_eq!(a.resume_latencies_ns, b.resume_latencies_ns, "resume_latencies_ns");
-    assert_eq!(a.wake_sample_total, b.wake_sample_total, "wake_sample_total");
-    assert_eq!(a.iteration_costs_ns, b.iteration_costs_ns, "iteration_costs_ns");
+    assert_eq!(
+        a.resume_latencies_ns, b.resume_latencies_ns,
+        "resume_latencies_ns"
+    );
+    assert_eq!(
+        a.wake_sample_total, b.wake_sample_total,
+        "wake_sample_total"
+    );
+    assert_eq!(
+        a.iteration_costs_ns, b.iteration_costs_ns,
+        "iteration_costs_ns"
+    );
     assert_eq!(
         a.iteration_cost_sample_total, b.iteration_cost_sample_total,
         "iteration_cost_sample_total"
     );
     assert_eq!(a.iterations, b.iterations, "iterations");
-    assert_eq!(a.schedstat_run_delay_ns, b.schedstat_run_delay_ns, "schedstat_run_delay_ns");
-    assert_eq!(a.schedstat_run_count, b.schedstat_run_count, "schedstat_run_count");
-    assert_eq!(a.schedstat_cpu_time_ns, b.schedstat_cpu_time_ns, "schedstat_cpu_time_ns");
+    assert_eq!(
+        a.schedstat_run_delay_ns, b.schedstat_run_delay_ns,
+        "schedstat_run_delay_ns"
+    );
+    assert_eq!(
+        a.schedstat_run_count, b.schedstat_run_count,
+        "schedstat_run_count"
+    );
+    assert_eq!(
+        a.schedstat_cpu_time_ns, b.schedstat_cpu_time_ns,
+        "schedstat_cpu_time_ns"
+    );
     assert_eq!(a.completed, b.completed, "completed");
     assert_eq!(a.numa_pages, b.numa_pages, "numa_pages");
     assert_eq!(

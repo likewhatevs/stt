@@ -3036,9 +3036,8 @@ fn run_relay_session(
             // unhealthy. POLLHUP+POLLIN means buffered data is
             // still drainable; we mark unhealthy AFTER reading
             // that data.
-            let socket_hup_seen = socket_rev.is_some_and(|r| {
-                r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR)
-            });
+            let socket_hup_seen = socket_rev
+                .is_some_and(|r| r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR));
             let stop_ready = stop_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
             (port_ready, socket_in, socket_hup_seen, stop_ready)
         };

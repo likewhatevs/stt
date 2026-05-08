@@ -58,9 +58,8 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     // bridge happened to also store under the same drain
     // (e.g. an Op::Snapshot fire from inside the scenario body) so
     // the temporal patterns walk a clean, contiguous timeline.
-    let series =
-        SampleSeries::from_drained(result.snapshot_bridge.drain_ordered_with_stats())
-            .periodic_only();
+    let series = SampleSeries::from_drained(result.snapshot_bridge.drain_ordered_with_stats())
+        .periodic_only();
     anyhow::ensure!(
         !series.is_empty(),
         "post_vm: no periodic samples on the bridge — the freeze \
@@ -80,9 +79,7 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     // wrap, a dropped capture re-using an older value, or a
     // monotonicity bug in the snapshot pipeline.
     series
-        .bpf("nr_dispatched", |snap| {
-            snap.var("nr_dispatched").as_u64()
-        })
+        .bpf("nr_dispatched", |snap| snap.var("nr_dispatched").as_u64())
         .nondecreasing(&mut verdict);
 
     // Stats axis: per-sample ceiling on the same counter exposed
@@ -127,9 +124,7 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
     auto_repro = false,
     post_vm = assert_temporal_patterns,
 )]
-fn temporal_assertions_over_periodic_samples(
-    ctx: &ktstr::scenario::Ctx,
-) -> Result<AssertResult> {
+fn temporal_assertions_over_periodic_samples(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],
