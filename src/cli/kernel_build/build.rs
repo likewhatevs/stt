@@ -1016,16 +1016,12 @@ mod tests {
         let holder = acquire_source_tree_lock(&canonical, "test")
             .expect("first acquire must succeed under isolated cache");
         let canonical2 = canonical.clone();
-        let waiter = std::thread::spawn(move || {
-            acquire_source_tree_lock(&canonical2, "test")
-        });
+        let waiter = std::thread::spawn(move || acquire_source_tree_lock(&canonical2, "test"));
         // Give the waiter thread time to hit the blocking flock,
         // then release the holder so it unblocks.
         std::thread::sleep(std::time::Duration::from_millis(200));
         drop(holder);
-        let result = waiter
-            .join()
-            .expect("waiter thread must not panic");
+        let result = waiter.join().expect("waiter thread must not panic");
         result.expect("second acquire must succeed after holder releases");
     }
 
