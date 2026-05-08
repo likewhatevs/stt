@@ -253,13 +253,9 @@ pub(crate) fn acquire_source_tree_lock(
                  build — waiting for it to finish.\n{holder_text}",
                 canonical.display(),
             );
-            crate::flock::block_flock(&lock_path, crate::flock::FlockMode::Exclusive)
-                .with_context(|| {
-                    format!(
-                        "blocking wait on source-tree flock {}",
-                        lock_path.display()
-                    )
-                })
+            crate::flock::block_flock(&lock_path, crate::flock::FlockMode::Exclusive).with_context(
+                || format!("blocking wait on source-tree flock {}", lock_path.display()),
+            )
         }
     }
 }
