@@ -78,6 +78,27 @@ fn pcomm_spec(workers: usize, pcomm: &'static str) -> WorkSpec {
         .pcomm(pcomm)
 }
 
+/// Enumerate every TID inside a thread group via
+/// `/proc/<leader_pid>/task/`. Each subdirectory name is a TID; the
+/// leader's own TID is included (TID == TGID for the group leader).
+/// Caller must invoke before the leader is reaped — once
+/// `stop_and_collect` runs, the directory disappears.
+fn read_task_tids(leader_pid: libc::pid_t) -> BTreeSet<libc::pid_t> {
+    let mut out = BTreeSet::new();
+    let dir = std::fs::read_dir(format!("/proc/{leader_pid}/task"))
+        .expect("/proc/<leader>/task must be readable while leader is alive");
+    for entry in dir {
+        let entry = entry.expect("task directory entry must read cleanly");
+        let name = entry.file_name();
+        let s = name
+            .to_str()
+            .expect("/proc task entry names are ASCII tids");
+        let tid: libc::pid_t = s.parse().expect("/proc task entry must parse as pid_t");
+        out.insert(tid);
+    }
+    out
+}
+
 /// Basic happy path: a single WorkSpec with `pcomm = "leader"`
 /// and `num_workers = 2` produces 2 reports whose tids share a
 /// single Tgid. `/proc/<Tgid>/comm` equals the configured pcomm
@@ -92,7 +113,25 @@ fn pcomm_container_sets_group_leader_comm() {
     let mut h = WorkloadHandle::spawn_pcomm_cgroup("leader", None, None, &works)
         .expect("pcomm spawn must succeed");
     h.start();
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(200));
+    // Read procfs while workers are alive — stop_and_collect SIGKILLs
+    // and waitpid-reaps the container leader, after which
+    // /proc/<tid>/{comm,status} returns ENOENT.
+    let pids = h.worker_pids();
+    assert_eq!(
+        pids.len(),
+        1,
+        "pcomm spawn registers a single container child (the leader); \
+         got {} entries",
+        pids.len(),
+    );
+    let leader_pid = pids[0];
+    let leader_comm = read_comm(leader_pid);
+    let task_tids = read_task_tids(leader_pid);
+    let mut tgids: BTreeSet<libc::pid_t> = BTreeSet::new();
+    for tid in &task_tids {
+        tgids.insert(read_tgid(*tid));
+    }
     let reports = h.stop_and_collect();
     assert_eq!(
         reports.len(),
@@ -100,21 +139,20 @@ fn pcomm_container_sets_group_leader_comm() {
         "pcomm group must produce exactly 2 reports; got {}",
         reports.len(),
     );
-    let mut tgids: BTreeSet<libc::pid_t> = BTreeSet::new();
-    for r in &reports {
-        tgids.insert(read_tgid(r.tid));
-    }
     assert_eq!(
         tgids.len(),
         1,
         "all pcomm-group threads must share a single Tgid (the leader); \
          observed Tgids: {tgids:?}",
     );
-    let leader_pid = *tgids.iter().next().unwrap();
-    let observed_comm = read_comm(leader_pid);
     assert_eq!(
-        observed_comm, "leader",
-        "/proc/<leader>/comm must equal pcomm; got {observed_comm:?}",
+        *tgids.iter().next().unwrap(),
+        leader_pid,
+        "shared Tgid must equal the container leader pid",
+    );
+    assert_eq!(
+        leader_comm, "leader",
+        "/proc/<leader>/comm must equal pcomm; got {leader_comm:?}",
     );
 }
 
@@ -141,26 +179,40 @@ fn pcomm_per_thread_comm_distinct_from_group_leader() {
     let mut h = WorkloadHandle::spawn_pcomm_cgroup("leader", None, None, &works)
         .expect("pcomm + comm spawn must succeed");
     h.start();
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(200));
+    // Read procfs while workers are alive (stop_and_collect reaps
+    // the leader).
+    let pids = h.worker_pids();
+    assert_eq!(pids.len(), 1);
+    let leader_pid = pids[0];
+    let leader_comm = read_comm(leader_pid);
+    let task_tids = read_task_tids(leader_pid);
+    // Sample per-thread comms for every worker thread (excluding the
+    // leader itself, which holds pcomm). Worker threads override
+    // their own comm via prctl(PR_SET_NAME) in worker_main.
+    let mut worker_comms: Vec<(libc::pid_t, String)> = Vec::new();
+    for tid in &task_tids {
+        if *tid == leader_pid {
+            continue;
+        }
+        worker_comms.push((*tid, read_comm(*tid)));
+    }
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 2);
-    // Leader's comm is the thread-group leader's comm.
-    let leader_pid = read_tgid(reports[0].tid);
     assert_eq!(
-        read_comm(leader_pid),
-        "leader",
+        leader_comm, "leader",
         "/proc/<leader>/comm must equal pcomm",
     );
-    // Each worker thread's own /proc/<tid>/comm is the per-thread
-    // comm, not pcomm. The leader holds pcomm; the threads
-    // override their own comm via prctl in worker_main.
-    for r in &reports {
-        let tcomm = read_comm(r.tid);
+    assert_eq!(
+        worker_comms.len(),
+        2,
+        "expected 2 worker thread tids besides the leader; got {worker_comms:?}",
+    );
+    for (tid, tcomm) in &worker_comms {
         assert_eq!(
             tcomm, "worker",
-            "/proc/<tid>/comm for worker tid={} must equal per-thread \
+            "/proc/<tid>/comm for worker tid={tid} must equal per-thread \
              comm 'worker'; got {tcomm:?}",
-            r.tid,
         );
     }
 }
@@ -180,28 +232,60 @@ fn multiple_pcomm_groups_have_distinct_containers() {
         .expect("group_b pcomm spawn must succeed");
     h_a.start();
     h_b.start();
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(200));
+    // Read procfs for both groups while alive (stop_and_collect
+    // reaps the leaders below).
+    let pids_a = h_a.worker_pids();
+    let pids_b = h_b.worker_pids();
+    assert_eq!(pids_a.len(), 1);
+    assert_eq!(pids_b.len(), 1);
+    let leader_a = pids_a[0];
+    let leader_b = pids_b[0];
+    let comm_a = read_comm(leader_a);
+    let comm_b = read_comm(leader_b);
+    let tids_a = read_task_tids(leader_a);
+    let tids_b = read_task_tids(leader_b);
+    let mut tgids_a: BTreeSet<libc::pid_t> = BTreeSet::new();
+    for tid in &tids_a {
+        tgids_a.insert(read_tgid(*tid));
+    }
+    let mut tgids_b: BTreeSet<libc::pid_t> = BTreeSet::new();
+    for tid in &tids_b {
+        tgids_b.insert(read_tgid(*tid));
+    }
     let reports_a = h_a.stop_and_collect();
     let reports_b = h_b.stop_and_collect();
     assert_eq!(reports_a.len(), 2, "group_a must produce 2 reports");
     assert_eq!(reports_b.len(), 2, "group_b must produce 2 reports");
-    let tgid1 = read_tgid(reports_a[0].tid);
-    let tgid2 = read_tgid(reports_b[0].tid);
     // Leaders must be distinct PIDs.
     assert_ne!(
-        tgid1, tgid2,
-        "the two pcomm groups must have distinct leaders; both observed Tgid={tgid1}",
+        leader_a, leader_b,
+        "the two pcomm groups must have distinct leaders; both observed pid={leader_a}",
     );
     // Each group's threads share their leader's tgid.
-    for r in &reports_a {
-        assert_eq!(read_tgid(r.tid), tgid1);
-    }
-    for r in &reports_b {
-        assert_eq!(read_tgid(r.tid), tgid2);
-    }
+    assert_eq!(
+        tgids_a.len(),
+        1,
+        "group_a tgids must collapse to one; observed {tgids_a:?}",
+    );
+    assert_eq!(
+        *tgids_a.iter().next().unwrap(),
+        leader_a,
+        "group_a shared Tgid must equal leader_a",
+    );
+    assert_eq!(
+        tgids_b.len(),
+        1,
+        "group_b tgids must collapse to one; observed {tgids_b:?}",
+    );
+    assert_eq!(
+        *tgids_b.iter().next().unwrap(),
+        leader_b,
+        "group_b shared Tgid must equal leader_b",
+    );
     // Leader comms are the configured pcomms.
-    assert_eq!(read_comm(tgid1), "group_a");
-    assert_eq!(read_comm(tgid2), "group_b");
+    assert_eq!(comm_a, "group_a");
+    assert_eq!(comm_b, "group_b");
 }
 
 /// `stop_and_collect` returns exactly N reports for a pcomm group
@@ -276,11 +360,14 @@ fn pcomm_kernel_truncates_to_15_bytes() {
     let mut h = WorkloadHandle::spawn_pcomm_cgroup(long_name, None, None, &works)
         .expect("pcomm spawn must succeed");
     h.start();
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(200));
+    // Read procfs while leader is alive.
+    let pids = h.worker_pids();
+    assert_eq!(pids.len(), 1);
+    let leader_pid = pids[0];
+    let observed = read_comm(leader_pid);
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 1);
-    let leader_pid = read_tgid(reports[0].tid);
-    let observed = read_comm(leader_pid);
     assert_eq!(
         observed.len(),
         15,
@@ -386,14 +473,27 @@ fn pcomm_multiple_workspecs_coalesce_into_one_leader() {
     let mut h = WorkloadHandle::spawn_pcomm_cgroup("shared", None, None, &works)
         .expect("multi-WorkSpec pcomm spawn must succeed");
     h.start();
-    std::thread::sleep(Duration::from_millis(150));
+    std::thread::sleep(Duration::from_millis(200));
+    // Capture leader and per-thread tgids while alive.
+    let pids = h.worker_pids();
+    assert_eq!(pids.len(), 1);
+    let leader_pid = pids[0];
+    let task_tids = read_task_tids(leader_pid);
+    let mut tgids: BTreeSet<libc::pid_t> = BTreeSet::new();
+    for tid in &task_tids {
+        tgids.insert(read_tgid(*tid));
+    }
     let reports = h.stop_and_collect();
     assert_eq!(reports.len(), 3, "2 + 1 workers across 2 WorkSpecs");
-    let tgids: BTreeSet<libc::pid_t> = reports.iter().map(|r| read_tgid(r.tid)).collect();
     assert_eq!(
         tgids.len(),
         1,
         "every thread shares the single leader's Tgid; observed {tgids:?}",
+    );
+    assert_eq!(
+        *tgids.iter().next().unwrap(),
+        leader_pid,
+        "shared Tgid must equal the container leader pid",
     );
     let group0 = reports.iter().filter(|r| r.group_idx == 0).count();
     let group1 = reports.iter().filter(|r| r.group_idx == 1).count();

@@ -1830,6 +1830,44 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
             let works_for_pcomm = pcomm_groups
                 .remove(&pcomm)
                 .expect("pcomm key inserted during partition pass");
+            // glibc setresuid/setresgid broadcasts via NPTL signalling
+            // to every thread in the tgid; coalesced WorkSpecs that
+            // disagree on uid/gid would race the leader's credentials
+            // out from under the other group's threads. Reject mixed
+            // values upfront so the misconfiguration surfaces here
+            // rather than as a runtime credential flap.
+            if works_for_pcomm.len() > 1 {
+                let first_uid = works_for_pcomm[0].uid;
+                let first_gid = works_for_pcomm[0].gid;
+                for (i, w) in works_for_pcomm.iter().enumerate().skip(1) {
+                    if w.uid != first_uid {
+                        anyhow::bail!(
+                            "cgroup '{}' pcomm '{}': WorkSpec[0].uid={:?} differs from \
+                             WorkSpec[{}].uid={:?}; pcomm-coalesced WorkSpecs must \
+                             agree on uid (NPTL setresuid is broadcast to every thread \
+                             in the tgid)",
+                            def.name,
+                            pcomm,
+                            first_uid,
+                            i,
+                            w.uid,
+                        );
+                    }
+                    if w.gid != first_gid {
+                        anyhow::bail!(
+                            "cgroup '{}' pcomm '{}': WorkSpec[0].gid={:?} differs from \
+                             WorkSpec[{}].gid={:?}; pcomm-coalesced WorkSpecs must \
+                             agree on gid (NPTL setresgid is broadcast to every thread \
+                             in the tgid)",
+                            def.name,
+                            pcomm,
+                            first_gid,
+                            i,
+                            w.gid,
+                        );
+                    }
+                }
+            }
             // Container-leader credentials. Fall back to the first
             // WorkSpec's uid/gid when no CgroupDef-level default is
             // set: glibc's `setresuid` is broadcast to every thread

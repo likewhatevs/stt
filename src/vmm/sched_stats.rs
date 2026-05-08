@@ -68,6 +68,19 @@ use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 use super::PiMutex;
 use super::virtio_console::VirtioConsole;
 
+/// Synthetic relay-error envelope the drainer injects when the
+/// 2x hard cap on the response accumulator is breached. Without
+/// this, a runaway guest that bursts > 512 KiB without a newline
+/// would silently get its bytes dropped while the host request
+/// hung in `cvar.wait` forever. The drainer instead clears the
+/// buffer, writes this synthetic envelope, and notifies the cvar
+/// so `request_raw` wakes up, parses the envelope, and surfaces
+/// [`SchedStatsError::NoScheduler`] with a `cap-overflow` reason.
+/// The trailing `\n` matches scx_stats's line-delimited wire
+/// format so the existing newline-detection path consumes it
+/// without special-casing.
+const CAP_OVERFLOW_ERROR_REPLY: &[u8] = b"{\"ktstr_relay_error\":\"response cap overflow\"}\n";
+
 /// Maximum bytes accepted in a single host→guest stats request.
 /// scx_stats requests are JSON command lines (`{"req":"stats"}\n`
 /// and similar); 256 KiB is far above any legitimate request size.
@@ -480,8 +493,32 @@ impl SchedStatsClient {
         // Push the request bytes onto port 2 RX. Append the
         // trailing newline scx_stats expects. Bound the device
         // mutex critical section to the queue_input_port2 call.
+        //
+        // B15 fix: drop any host→guest bytes that are still
+        // sitting in `port2_pending_rx` from a prior request that
+        // was abandoned mid-push (e.g. a freeze rendezvous landed
+        // before the guest read those bytes). Without this clear,
+        // the new request would be concatenated onto the dead
+        // tail of the previous one and the guest relay would
+        // forward torn JSON to the scheduler. Account for the
+        // discard via `discarded_bytes` so a stuck-stats
+        // post-mortem can see it.
         {
             let mut g = self.shared.virtio_con.lock();
+            let stale_in = g.clear_port2_pending_rx();
+            if stale_in > 0 {
+                let total = self
+                    .shared
+                    .discarded_bytes
+                    .fetch_add(stale_in as u64, Ordering::Relaxed)
+                    .saturating_add(stale_in as u64);
+                tracing::debug!(
+                    stale_pending_rx = stale_in,
+                    total_discarded = total,
+                    "scx_stats request_raw: clearing stale port2_pending_rx \
+                     (prior request abandoned mid-push)"
+                );
+            }
             // Two pushes are equivalent to one combined push from
             // the device's perspective — the bytes land in the
             // pending-RX deque in order.
@@ -752,11 +789,31 @@ fn drainer_loop(
             match ev.data() {
                 TOKEN_KILL => {
                     let _ = kill_drainer.read();
-                    // Notify the response cvar so any blocked
-                    // `request_raw` wakes and rechecks the cancel
-                    // flag (which may also be set if shutdown is
-                    // in progress) before returning.
-                    let (_, cvar) = &*response_buf;
+                    // B5 fix: acquire the response_buf lock BEFORE
+                    // notifying the cvar. Without the lock the
+                    // notify_all can fire after the request thread
+                    // has dropped the lock-guard but BEFORE it has
+                    // entered cvar.wait — that wake is then lost
+                    // and the request hangs until the next
+                    // legitimate notify (which on the kill path
+                    // will never come). Holding the lock across
+                    // notify_all forces the drainer to interleave
+                    // with the request's check-and-park sequence:
+                    // if the request has already entered cvar.wait,
+                    // notify_all wakes it; if the request is still
+                    // inside the response-buf check, the drainer
+                    // blocks on the lock until the request enters
+                    // cvar.wait, then notifies. Either way the
+                    // wake is delivered.
+                    //
+                    // `lock()` returns LockResult; both Ok and Err
+                    // (poisoned) variants contain a MutexGuard
+                    // that unlocks on Drop, so binding the
+                    // LockResult to `_guard` is sufficient — we
+                    // don't read the guarded payload, only need
+                    // exclusive ownership for the notify.
+                    let (lock, cvar) = &*response_buf;
+                    let _guard = lock.lock();
                     cvar.notify_all();
                     return;
                 }
@@ -767,7 +824,10 @@ fn drainer_loop(
                     if let Some(c) = cancel_evt.as_ref() {
                         let _ = c.read();
                     }
-                    let (_, cvar) = &*response_buf;
+                    // Lock-then-notify, same B5 TOCTOU rationale
+                    // as the TOKEN_KILL arm above.
+                    let (lock, cvar) = &*response_buf;
+                    let _guard = lock.lock();
                     cvar.notify_all();
                     return;
                 }
@@ -791,15 +851,23 @@ fn drainer_loop(
                             // Hard 2x cap to prevent unbounded growth
                             // even when a request is mid-flight (a
                             // hostile guest could send bytes faster
-                            // than the request can complete).
+                            // than the request can complete). B4
+                            // fix: inject a synthetic error envelope
+                            // so request_raw wakes from cvar.wait,
+                            // observes a complete `\n`-terminated
+                            // line, and surfaces NoScheduler — the
+                            // prior code dropped bytes silently and
+                            // the request blocked forever.
                             let new_total = guard.len().saturating_add(bytes.len());
                             if new_total > MAX_RESPONSE_BYTES.saturating_mul(2) {
                                 tracing::warn!(
                                     current = guard.len(),
                                     incoming = bytes.len(),
                                     cap = MAX_RESPONSE_BYTES * 2,
-                                    "stats drainer: hard cap reached; dropping bytes"
+                                    "stats drainer: hard cap reached; injecting cap-overflow error envelope"
                                 );
+                                guard.clear();
+                                guard.extend_from_slice(CAP_OVERFLOW_ERROR_REPLY);
                                 cvar.notify_all();
                                 continue;
                             }

@@ -2585,7 +2585,7 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
     // when stop_evt fires (signal_stop flipped the flag and woke
     // every blocked syscall).
     while !stop.load(Ordering::Acquire) {
-        match wait_for_stats_socket(&stop, &stop_evt) {
+        match wait_for_stats_socket(&mut port, &stop, &stop_evt) {
             Some(socket) => {
                 run_relay_session(&mut port, socket, &stop, &stop_evt);
                 // Session ended (socket EOF/error or stop).
@@ -2612,6 +2612,7 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
 /// finished binding before we created the watch) the connect
 /// succeeds and we return without ever reading from inotify.
 fn wait_for_stats_socket(
+    port: &mut std::fs::File,
     stop: &Arc<AtomicBool>,
     stop_evt: &Arc<vmm_sys_util::eventfd::EventFd>,
 ) -> Option<std::os::unix::net::UnixStream> {
@@ -2626,16 +2627,27 @@ fn wait_for_stats_socket(
     // idempotent.
     let _ = fs::create_dir_all(SCHED_STATS_SOCKET_DIR);
 
-    let inotify = match Inotify::init(InitFlags::IN_CLOEXEC) {
+    let inotify = match Inotify::init(InitFlags::IN_CLOEXEC | InitFlags::IN_NONBLOCK) {
         Ok(i) => i,
         Err(e) => {
             tracing::warn!(error = %e, "stats relay: inotify_init failed");
             return None;
         }
     };
+    // B2 fix: include IN_ATTRIB so a chmod-on-listen (some
+    // schedulers tighten perms after listen()) wakes us; include
+    // IN_OPEN so any client that successfully connects (including
+    // ourselves on a retry) re-fires the watch even if the
+    // initial CREATE-then-connect race already lost. The broader
+    // mask catches more edges than IN_CREATE alone, so a connect
+    // that fails with ECONNREFUSED post-CREATE has additional
+    // events to wake on rather than wedging.
     if let Err(e) = inotify.add_watch(
         SCHED_STATS_SOCKET_DIR,
-        AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO,
+        AddWatchFlags::IN_CREATE
+            | AddWatchFlags::IN_MOVED_TO
+            | AddWatchFlags::IN_ATTRIB
+            | AddWatchFlags::IN_OPEN,
     ) {
         tracing::warn!(
             error = %e,
@@ -2655,24 +2667,33 @@ fn wait_for_stats_socket(
         return Some(s);
     }
 
-    // Park on poll(inotify_fd, stop_evt). Each wake re-reads any
-    // queued inotify events; if the `stats` filename appears, try
-    // connect. If stop_evt fires, return None.
+    // Park on poll(inotify_fd, port_fd, stop_evt). Each wake:
+    //   - inotify edge: re-read events; on any event in the
+    //     watched dir, retry connect (the B2 expanded mask plus
+    //     this any-event retry policy guards against the
+    //     IN_CREATE-then-listen() race that left the prior code
+    //     waiting on a CREATE-only edge that never came again).
+    //   - port edge: B3 fix — host pushed a request before the
+    //     scheduler came up. Drain it and reply with the inline
+    //     error envelope so the host's request_raw wakes
+    //     immediately with NoScheduler instead of waiting for the
+    //     scheduler to appear.
+    //   - stop_evt edge: shutdown.
     let target = OsStr::new(SCHED_STATS_SOCKET_NAME);
+    let mut buf = vec![0u8; RELAY_BUFFER_BYTES];
     loop {
         if stop.load(Ordering::Acquire) {
             return None;
         }
         let inotify_fd = inotify.as_fd();
-        // `vmm_sys_util::EventFd` predates `AsFd` and impls only
-        // `AsRawFd`. Lift its raw fd into a `BorrowedFd` for the
-        // duration of this poll call. SAFETY: `stop_evt` is held
-        // by the surrounding `Arc`, so the raw fd is valid for
-        // the whole loop body.
+        let port_fd = port.as_fd();
+        // SAFETY: `stop_evt` is held by the surrounding `Arc`, so
+        // the raw fd is valid for the whole loop body.
         let stop_evt_fd =
             unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stop_evt.as_raw_fd()) };
         let mut fds = [
             PollFd::new(inotify_fd, PollFlags::POLLIN),
+            PollFd::new(port_fd, PollFlags::POLLIN),
             PollFd::new(stop_evt_fd, PollFlags::POLLIN),
         ];
         match poll(&mut fds, PollTimeout::NONE) {
@@ -2683,41 +2704,92 @@ fn wait_for_stats_socket(
                 return None;
             }
         };
-        // Stop-fd ready? Drain and exit. Source-of-truth check
-        // happens at the top of the loop on the next iteration,
-        // but exit unconditionally on this edge — the only writer
-        // is `RelayStopSignal::signal_stop`.
-        if fds[1]
+        let inotify_ready = fds[0]
             .revents()
-            .is_some_and(|r| r.contains(PollFlags::POLLIN))
-        {
+            .is_some_and(|r| r.contains(PollFlags::POLLIN));
+        let port_ready = fds[1]
+            .revents()
+            .is_some_and(|r| r.contains(PollFlags::POLLIN));
+        let stop_ready = fds[2]
+            .revents()
+            .is_some_and(|r| r.contains(PollFlags::POLLIN));
+
+        // Stop-fd ready? Drain and exit. The only writer is
+        // `RelayStopSignal::signal_stop`.
+        if stop_ready {
             let _ = stop_evt.read();
             return None;
         }
-        // inotify fd ready: drain events. Any event with the
-        // socket filename triggers a connect attempt.
-        if fds[0]
-            .revents()
-            .is_some_and(|r| r.contains(PollFlags::POLLIN))
-        {
+
+        // B3: host pushed a request while we're still waiting for
+        // the scheduler. Drain whatever bytes are available and
+        // reply with the inline error envelope so the request
+        // surfaces NoScheduler immediately. A burst that exceeds
+        // RELAY_BUFFER_BYTES gets one error reply per drain; the
+        // host's request_raw will see the first envelope and
+        // return — subsequent envelopes are harmless because
+        // they sit in the response_buf as stale bytes that the
+        // next request clears.
+        if port_ready {
+            match port.read(&mut buf) {
+                Ok(0) => {
+                    tracing::debug!(
+                        "stats relay: port read EOF in inotify wait; exiting"
+                    );
+                    return None;
+                }
+                Ok(n) => {
+                    tracing::debug!(
+                        bytes = n,
+                        "stats relay: host pushed request while waiting for scheduler; \
+                         emitting no-scheduler error envelope"
+                    );
+                    if let Err(e) = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY) {
+                        tracing::warn!(
+                            error = %e,
+                            "stats relay: port write failed in inotify wait; exiting"
+                        );
+                        return None;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "stats relay: port read error in inotify wait; exiting"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        // inotify fd ready: drain events and try connect. B2:
+        // try connect on ANY event in the watched directory, not
+        // just IN_CREATE for our target — the bind-without-listen
+        // window means a CREATE-only check would miss the
+        // listen-edge that follows.
+        if inotify_ready {
             let events = match inotify.read_events() {
                 Ok(e) => e,
                 Err(nix::errno::Errno::EINTR) => continue,
+                Err(nix::errno::Errno::EAGAIN) => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "stats relay: inotify read_events failed");
                     return None;
                 }
             };
-            let saw_target = events.iter().any(|ev| ev.name.as_deref() == Some(target));
-            if !saw_target {
+            // If any event names our target — or if any event
+            // names anything (the dir's only legitimate occupant
+            // is our socket plus possible peer scheduler files) —
+            // attempt connect. The connect itself is the
+            // synchronisation primitive: ECONNREFUSED means we'll
+            // wait for the next inotify edge.
+            let saw_target_or_any = events
+                .iter()
+                .any(|ev| ev.name.as_deref() == Some(target) || ev.name.is_some());
+            if !saw_target_or_any {
                 continue;
             }
-            // Try connect. The socket file exists (we just saw
-            // its CREATE); connect can still fail transiently if
-            // the scheduler hasn't called listen() yet, in which
-            // case loop back into poll — the next event (which
-            // will be IN_OPEN once the scheduler accepts) brings
-            // us back here.
             match std::os::unix::net::UnixStream::connect(SCHED_STATS_SOCKET) {
                 Ok(s) => {
                     tracing::debug!("stats relay: connected to scheduler socket via inotify edge");
@@ -2726,11 +2798,58 @@ fn wait_for_stats_socket(
                 Err(e) => {
                     tracing::debug!(
                         error = %e,
-                        "stats relay: socket appeared but connect failed; \
-                         continuing to poll inotify"
+                        "stats relay: socket appeared but connect failed (likely \
+                         bind-without-listen race); will retry on next inotify edge"
                     );
                 }
             }
+        }
+    }
+}
+
+/// On socket loss, drain whatever request bytes the host has
+/// already pushed onto port 2 and answer each readable batch with
+/// the inline error envelope. Without this, B12: a request that
+/// the host wrote AFTER we forwarded the prior request to the
+/// (now-dead) socket would otherwise be carried over into the
+/// next relay session, where it would be forwarded to a fresh
+/// scheduler — meaning the host's old request gets answered by
+/// the new scheduler's stats, not by an error.
+///
+/// Uses non-blocking poll-with-zero-timeout via PollTimeout::ZERO
+/// to drain only what's already queued, then returns. Each drained
+/// batch gets one error envelope; the host's request_raw observes
+/// the first envelope and surfaces NoScheduler — the rest sit as
+/// stale bytes in response_buf that the next request clears.
+fn drain_port_emit_errors(port: &mut std::fs::File) {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::io::ErrorKind;
+    use std::os::unix::io::AsFd;
+
+    let mut buf = vec![0u8; RELAY_BUFFER_BYTES];
+    loop {
+        let port_ready = {
+            let port_fd = port.as_fd();
+            let mut fds = [PollFd::new(port_fd, PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::ZERO) {
+                Ok(_) => fds[0]
+                    .revents()
+                    .is_some_and(|r| r.contains(PollFlags::POLLIN)),
+                Err(_) => false,
+            }
+        };
+        if !port_ready {
+            break;
+        }
+        match port.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                if port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY).is_err() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
         }
     }
 }
@@ -2828,9 +2947,18 @@ fn run_relay_session(
             if let Err(e) = socket.write_all(&buf[..n]) {
                 tracing::debug!(
                     error = %e,
-                    "stats relay: socket write failed; emitting error envelope and reconnecting"
+                    "stats relay: socket write failed; emitting error envelopes and reconnecting"
                 );
+                // B12: the host may have additional queued
+                // requests on the port that we haven't read yet —
+                // the failed write_all means we're abandoning the
+                // socket without forwarding them. Answer the
+                // request that triggered this write_all PLUS any
+                // already-queued follow-up requests with error
+                // envelopes so they don't survive into the next
+                // session and get forwarded to a fresh scheduler.
                 let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+                drain_port_emit_errors(port);
                 return;
             }
         }
@@ -2841,9 +2969,10 @@ fn run_relay_session(
             let m = match socket.read(&mut buf) {
                 Ok(0) => {
                     tracing::debug!(
-                        "stats relay: socket EOF; emitting error envelope and reconnecting"
+                        "stats relay: socket EOF; emitting error envelopes and reconnecting"
                     );
                     let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+                    drain_port_emit_errors(port);
                     return;
                 }
                 Ok(m) => m,
@@ -2851,9 +2980,10 @@ fn run_relay_session(
                 Err(e) => {
                     tracing::debug!(
                         error = %e,
-                        "stats relay: socket read error; emitting error envelope and reconnecting"
+                        "stats relay: socket read error; emitting error envelopes and reconnecting"
                     );
                     let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+                    drain_port_emit_errors(port);
                     return;
                 }
             };
@@ -2868,6 +2998,7 @@ fn run_relay_session(
         if socket_hup {
             tracing::debug!("stats relay: socket POLLHUP/POLLERR without data; reconnecting");
             let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+            drain_port_emit_errors(port);
             return;
         }
     }

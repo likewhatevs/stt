@@ -1450,6 +1450,15 @@ impl GroupParams {
     /// [`WorkloadConfig::clone_mode`]; [`WorkSpec`] has no
     /// `clone_mode` field of its own.
     fn from_composed(spec: &WorkSpec, group_idx: usize) -> Result<Self> {
+        if spec.pcomm.is_some() {
+            anyhow::bail!(
+                "composed[{}].pcomm: pcomm via WorkloadHandle::spawn is not supported; \
+                 use WorkloadHandle::spawn_pcomm_cgroup or CgroupDef (apply_setup) — \
+                 spawn always forks one process per worker and never coalesces into \
+                 a thread-group leader",
+                group_idx - 1,
+            );
+        }
         let num_workers = spec.num_workers.ok_or_else(|| {
             anyhow::anyhow!(
                 "composed[{}].num_workers must be set explicitly at spawn time \
@@ -1786,8 +1795,9 @@ pub(super) struct PcommGroupResources {
 /// fork workers:
 ///
 /// 1. After the start handshake, the leader writes one `b'r'` ready
-///    byte to the report pipe (matching the conventional barrier
-///    protocol).
+///    byte to the report pipe after all threads are spawned, a
+///    stronger guarantee than the conventional fork worker's
+///    pre-loop byte.
 /// 2. After all worker threads have joined, the leader serializes
 ///    `Vec<WorkerReport>` (one entry per worker thread, in
 ///    `(group_idx, within-group order)` traversal order) via
@@ -2519,10 +2529,12 @@ pub(super) fn spawn_pcomm_container(
 
             // Encode and write the report stream as a single
             // `Vec<WorkerReport>` JSON document via `serde_json`.
-            // serde_json matches the existing fork-mode report
-            // convention; the pcomm container is a fork-mode child
-            // and its payload sits on the same per-child pipe used
-            // by every other forked worker. The parent decodes via
+            // serde_json for pcomm Vec<WorkerReport> per task #6
+            // design ruling; fork-mode workers use bincode for
+            // single WorkerReport. The pcomm container is a
+            // fork-mode child and its payload sits on the same
+            // per-child pipe used by every other forked worker.
+            // The parent decodes via
             // `serde_json::from_slice::<Vec<WorkerReport>>`. Encode
             // failures fall through to `_exit(0)` — the parent's
             // sentinel path handles missing / truncated payloads.
@@ -4725,9 +4737,9 @@ impl WorkloadHandle {
             // Per-kind decoding. `Worker` carries a single bincode
             // `WorkerReport` (`bincode::config::standard()`,
             // little-endian, variable int). `PcommContainer` carries
-            // a `serde_json` `Vec<WorkerReport>` — JSON matches the
-            // existing fork-mode report convention since the
-            // pcomm container is itself a fork-mode child. Both
+            // a `serde_json` `Vec<WorkerReport>` — serde_json for
+            // pcomm per task #6 design ruling; fork-mode workers
+            // use bincode for single WorkerReport. Both
             // payloads ride the EOF-terminated pipe with no length
             // prefix; the parent's `read_to_end` provides framing.
             // On a decode failure, emit one sentinel per expected
@@ -4765,7 +4777,7 @@ impl WorkloadHandle {
                         Ok(mut decoded_reports) if decoded_reports.len() == total_workers => {
                             reports.append(&mut decoded_reports);
                         }
-                        Ok(decoded_reports) => {
+                        Ok(mut decoded_reports) => {
                             // Cardinality mismatch — surface the
                             // partial set we did get and pad with
                             // sentinels so the total report count
@@ -4792,6 +4804,15 @@ impl WorkloadHandle {
                                 total_workers,
                                 buf.len(),
                             );
+                            // Surplus reports (decoded > total_workers)
+                            // must not leak into the parent's report
+                            // stream — downstream cardinality assertions
+                            // (per-group filtering, assert_not_starved)
+                            // assume exactly `total_workers` entries.
+                            // Truncate to the layout's total before the
+                            // `got..total_workers` loop runs (which is
+                            // a no-op for the surplus case after this).
+                            decoded_reports.truncate(total_workers);
                             let got = decoded_reports.len();
                             for r in decoded_reports {
                                 reports.push(r);

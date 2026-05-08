@@ -1410,6 +1410,22 @@ impl VirtioConsole {
         self.drain_port2_pending_rx();
     }
 
+    /// Drop any host→guest port-2 request bytes that have not yet
+    /// been consumed by the guest. Called by
+    /// [`super::sched_stats::SchedStatsClient::request_raw`] at the
+    /// start of every fresh request: a freeze rendezvous that
+    /// landed mid-request can leave half a JSON request line in
+    /// `port2_pending_rx`. If the next request just pushed onto the
+    /// deque, the guest relay would read the previous-request tail
+    /// concatenated with the new request, producing torn JSON the
+    /// scheduler can't parse. Returns the number of bytes
+    /// discarded so the caller can log/account for them.
+    pub(crate) fn clear_port2_pending_rx(&mut self) -> usize {
+        let n = self.port2_pending_rx.len();
+        self.port2_pending_rx.clear();
+        n
+    }
+
     /// Drain port-2 pending RX into guest buffers. Mirrors
     /// [`Self::drain_port1_pending_rx`] line for line — only the
     /// queue index, the buffer field, and the log-message labels
