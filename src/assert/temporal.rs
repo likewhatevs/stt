@@ -46,7 +46,7 @@ use super::{AssertDetail, DetailKind, Verdict};
 #[derive(Debug, Clone)]
 #[must_use = "SeriesField records nothing until a temporal pattern is invoked"]
 pub struct SeriesField<T> {
-    label: &'static str,
+    label: String,
     tags: Vec<String>,
     elapsed_ms: Vec<u64>,
     values: Vec<SnapshotResult<T>>,
@@ -56,7 +56,7 @@ impl<T> SeriesField<T> {
     /// Build a new field. Internal — projection helpers in
     /// [`crate::scenario::sample`] call this on the series side.
     pub fn from_parts(
-        label: &'static str,
+        label: impl Into<String>,
         tags: Vec<String>,
         elapsed_ms: Vec<u64>,
         values: Vec<SnapshotResult<T>>,
@@ -64,7 +64,7 @@ impl<T> SeriesField<T> {
         debug_assert_eq!(tags.len(), values.len());
         debug_assert_eq!(elapsed_ms.len(), values.len());
         Self {
-            label,
+            label: label.into(),
             tags,
             elapsed_ms,
             values,
@@ -72,8 +72,8 @@ impl<T> SeriesField<T> {
     }
 
     /// Label for failure-message rendering.
-    pub fn label(&self) -> &'static str {
-        self.label
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Number of samples in the field.
@@ -100,6 +100,22 @@ impl<T> SeriesField<T> {
     /// Iterate over per-sample values (each a [`SnapshotResult<T>`]).
     pub fn values_iter(&self) -> impl Iterator<Item = &SnapshotResult<T>> {
         self.values.iter()
+    }
+
+    /// Iterate over the full per-sample triple — `(tag,
+    /// elapsed_ms, &SnapshotResult<T>)`. Lets a caller consume the
+    /// projected column alongside its sample identity without
+    /// re-threading the source [`SampleSeries`](crate::scenario::sample::SampleSeries).
+    /// Yields entries in the same order as the underlying
+    /// `Vec<SnapshotResult<T>>` storage; tags and elapsed-ms
+    /// vectors are guaranteed equal-length to `values` (see
+    /// [`Self::from_parts`]'s `debug_assert_eq!`).
+    pub fn iter_full(&self) -> impl Iterator<Item = (&str, u64, &SnapshotResult<T>)> {
+        self.tags
+            .iter()
+            .zip(self.elapsed_ms.iter())
+            .zip(self.values.iter())
+            .map(|((tag, elapsed_ms), value)| (tag.as_str(), *elapsed_ms, value))
     }
 
     /// Open a per-sample claim builder for scalar comparators
@@ -145,7 +161,7 @@ where
     /// hide a coverage gap, so the pattern uses `partial_cmp` and
     /// reports the offending sample distinctly.
     pub fn at_least(self, floor: T) -> &'v mut Verdict {
-        let label = self.field.label;
+        let label = self.field.label.as_str();
         for (i, slot) in self.field.values.iter().enumerate() {
             match slot {
                 Ok(v) => match v.partial_cmp(&floor) {
@@ -189,7 +205,7 @@ where
     /// NaN samples (on `T = f64`) report an incomparable failure
     /// for the same reason documented on [`Self::at_least`].
     pub fn at_most(self, ceiling: T) -> &'v mut Verdict {
-        let label = self.field.label;
+        let label = self.field.label.as_str();
         for (i, slot) in self.field.values.iter().enumerate() {
             match slot {
                 Ok(v) => match v.partial_cmp(&ceiling) {
@@ -235,7 +251,7 @@ where
     /// sample against an inverted range. NaN samples report an
     /// incomparable failure (see [`Self::at_least`]).
     pub fn between(self, lo: T, hi: T) -> &'v mut Verdict {
-        let label = self.field.label;
+        let label = self.field.label.as_str();
         if lo > hi {
             push_detail(
                 self.verdict,
@@ -353,9 +369,19 @@ where
         for i in 0..self.values.len() - 1 {
             let left = match &self.values[i] {
                 Ok(v) => v,
-                Err(_) => {
+                Err(e) => {
+                    // Surface the underlying SnapshotError variant
+                    // (PlaceholderSample, MissingStats, FieldNotFound,
+                    // VarNotFound, TypeMismatch, …) in the Note so
+                    // the operator can distinguish "freeze rendezvous
+                    // timed out" from "field name typo" from
+                    // "stats relay had no scheduler" without
+                    // re-running the test under a debugger. The
+                    // Display impl on SnapshotError gives the
+                    // human-readable variant text plus context
+                    // (available keys, requested path).
                     skipped.push(format!(
-                        "{tag}(+{elapsed_ms}ms)",
+                        "{tag}(+{elapsed_ms}ms): {e}",
                         tag = self.tags[i],
                         elapsed_ms = self.elapsed_ms[i],
                     ));
@@ -391,13 +417,15 @@ where
         }
         // The final sample's err state was not visited by the
         // loop's left-arm; check it explicitly so the skip count
-        // is exhaustive.
+        // is exhaustive. Carry the same `: {e}` rendering used
+        // above so the trailing skip entry exposes the error
+        // variant just like every other entry.
         if let Some(last) = self.values.last()
-            && last.is_err()
+            && let Err(e) = last
         {
             let i = self.values.len() - 1;
             skipped.push(format!(
-                "{tag}(+{elapsed_ms}ms)",
+                "{tag}(+{elapsed_ms}ms): {e}",
                 tag = self.tags[i],
                 elapsed_ms = self.elapsed_ms[i],
             ));
@@ -444,16 +472,36 @@ impl SeriesField<f64> {
             return verdict;
         }
         // Per-sample projection errors are treated as GAPS — no
-        // rate is computed across the gap. Log how many gaps were
-        // encountered as a Note so a coverage problem is visible
-        // without flipping the verdict on what is structurally a
-        // missing-data condition, not a rate violation.
-        let mut gap_pairs: usize = 0;
+        // rate is computed across the gap. Log every gap with the
+        // underlying error variant via a Note so a coverage
+        // problem is visible (with WHICH error) without flipping
+        // the verdict on what is structurally a missing-data
+        // condition, not a rate violation. When BOTH endpoints of
+        // a pair errored, both errors are surfaced so the operator
+        // can tell whether the projection has a per-sample
+        // coverage hole on one side or a systemic problem on
+        // both.
+        let mut gaps: Vec<String> = Vec::new();
         for i in 0..self.values.len() - 1 {
             let (left, right) = match (&self.values[i], &self.values[i + 1]) {
                 (Ok(l), Ok(r)) => (*l, *r),
-                _ => {
-                    gap_pairs += 1;
+                (lhs_slot, rhs_slot) => {
+                    let mut endpoints: Vec<String> = Vec::with_capacity(2);
+                    if let Err(e) = lhs_slot {
+                        endpoints.push(format!(
+                            "{tag}(+{elapsed_ms}ms): {e}",
+                            tag = self.tags[i],
+                            elapsed_ms = self.elapsed_ms[i],
+                        ));
+                    }
+                    if let Err(e) = rhs_slot {
+                        endpoints.push(format!(
+                            "{tag}(+{elapsed_ms}ms): {e}",
+                            tag = self.tags[i + 1],
+                            elapsed_ms = self.elapsed_ms[i + 1],
+                        ));
+                    }
+                    gaps.push(endpoints.join(" | "));
                     continue;
                 }
             };
@@ -514,11 +562,13 @@ impl SeriesField<f64> {
                 );
             }
         }
-        if gap_pairs > 0 {
+        if !gaps.is_empty() {
             verdict.note(format!(
-                "{label} (rate_within): {gap_pairs} consecutive-pair gap(s) skipped \
-                 due to projection errors on at least one endpoint",
+                "{label} (rate_within): {n} consecutive-pair gap(s) skipped \
+                 due to projection errors on at least one endpoint: {samples}",
                 label = self.label,
+                n = gaps.len(),
+                samples = gaps.join(", "),
             ));
         }
         verdict
@@ -566,12 +616,17 @@ impl SeriesField<f64> {
                 // Per-sample projection errors are treated as
                 // gaps: a missing post-warmup sample cannot
                 // violate the steady-state band (we have no value
-                // to compare). Surface the skip count via a Note
-                // so a coverage hole is visible without flipping
-                // the verdict on what is structurally missing
-                // data, not a band violation.
-                Err(_) => skipped.push(format!(
-                    "{tag}(+{elapsed_ms}ms)",
+                // to compare). Surface the skip count and the
+                // underlying SnapshotError variant for each
+                // skipped sample via a Note so the operator can
+                // tell PlaceholderSample / MissingStats /
+                // FieldNotFound / TypeMismatch apart instead of
+                // collapsing every gap into "projection error" —
+                // a coverage hole is visible WITH the failure
+                // reason without flipping the verdict on what is
+                // structurally missing data, not a band violation.
+                Err(e) => skipped.push(format!(
+                    "{tag}(+{elapsed_ms}ms): {e}",
                     tag = self.tags[i],
                     elapsed_ms = self.elapsed_ms[i],
                 )),
@@ -661,17 +716,36 @@ impl SeriesField<f64> {
         // verdict should fail on. Distinguishes "did not collect
         // enough samples" (Note here) from "collected enough
         // samples but never converged" (the no-witness Temporal
-        // detail emitted below by the witness loop).
-        let projected_count: usize = self
-            .values
-            .iter()
-            .enumerate()
-            .filter(|(i, slot)| self.elapsed_ms[*i] <= deadline_ms && slot.is_ok())
-            .count();
+        // detail emitted below by the witness loop). The Note
+        // names every errored in-window sample with its underlying
+        // SnapshotError variant so the operator can tell
+        // PlaceholderSample / MissingStats / FieldNotFound apart
+        // when diagnosing a coverage hole — a count alone hides
+        // which kind of failure produced the gap.
+        let mut projected_count: usize = 0;
+        let mut error_samples: Vec<String> = Vec::new();
+        for (i, slot) in self.values.iter().enumerate() {
+            if self.elapsed_ms[i] > deadline_ms {
+                continue;
+            }
+            match slot {
+                Ok(_) => projected_count += 1,
+                Err(e) => error_samples.push(format!(
+                    "{tag}(+{elapsed_ms}ms): {e}",
+                    tag = self.tags[i],
+                    elapsed_ms = self.elapsed_ms[i],
+                )),
+            }
+        }
         if projected_count < 3 {
+            let suffix = if error_samples.is_empty() {
+                String::new()
+            } else {
+                format!("; errored sample(s): {}", error_samples.join(", "))
+            };
             verdict.note(format!(
                 "{label} (converges_to {target} ±{tolerance}, deadline_ms={deadline_ms}): \
-                 insufficient samples for converges_to (need ≥3, have {projected_count})",
+                 insufficient samples for converges_to (need ≥3, have {projected_count}){suffix}",
                 label = self.label,
             ));
             return verdict;
@@ -680,6 +754,15 @@ impl SeriesField<f64> {
         let hi = target + tolerance;
         let mut consecutive: usize = 0;
         let mut witness_idx: Option<usize> = None;
+        // Errored in-window samples that interrupted the
+        // 3-consecutive witness search. Recorded here even when
+        // the projected_count >= 3 pre-check passed so a verdict
+        // failure ("no witness") still names the error variants
+        // that broke each attempted run — the operator can see
+        // whether the missing-witness was caused by genuine
+        // out-of-band values or by a coverage hole resetting the
+        // consecutive counter mid-run.
+        let mut interrupting_errors: Vec<String> = Vec::new();
         for (i, slot) in self.values.iter().enumerate() {
             if self.elapsed_ms[i] > deadline_ms {
                 break;
@@ -696,15 +779,37 @@ impl SeriesField<f64> {
                         consecutive = 0;
                     }
                 }
-                Err(_) => consecutive = 0,
+                Err(e) => {
+                    if consecutive > 0 {
+                        // Only record the error when it actually
+                        // interrupted an in-progress run — a
+                        // string of out-of-band errors before any
+                        // in-band samples is irrelevant to
+                        // witness coverage.
+                        interrupting_errors.push(format!(
+                            "{tag}(+{elapsed_ms}ms): {e}",
+                            tag = self.tags[i],
+                            elapsed_ms = self.elapsed_ms[i],
+                        ));
+                    }
+                    consecutive = 0;
+                }
             }
         }
         if witness_idx.is_none() {
+            let suffix = if interrupting_errors.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; in-progress runs interrupted by errored sample(s): {}",
+                    interrupting_errors.join(", ")
+                )
+            };
             push_detail(
                 verdict,
                 format!(
                     "{label} (converges_to {target} ±{tolerance}, deadline_ms={deadline_ms}): \
-                     no 3-consecutive-in-band witness before deadline ({n} samples evaluated)",
+                     no 3-consecutive-in-band witness before deadline ({n} samples evaluated){suffix}",
                     label = self.label,
                     n = self.values.len(),
                 ),
@@ -755,15 +860,34 @@ impl SeriesField<f64> {
         }
         // Per-sample projection errors on either lhs or rhs are
         // treated as gaps — no ratio is computed across the pair.
-        // Surface skip count as a Note so a coverage hole is
-        // visible without flipping the verdict on what is
-        // structurally missing data.
-        let mut gap_pairs: usize = 0;
+        // Surface every gap with the underlying error variant
+        // (and which side errored: lhs / rhs / both) via a Note
+        // so a coverage hole is visible WITH the failure reason
+        // without flipping the verdict on what is structurally
+        // missing data. The Display impl on SnapshotError gives
+        // the variant text plus context (FieldNotFound's
+        // available keys, TypeMismatch's expected/actual,
+        // PlaceholderSample's reason) so the operator can tell
+        // failure modes apart instead of collapsing every gap
+        // into "projection error on one side".
+        let mut gaps: Vec<String> = Vec::new();
         for (i, (lhs_slot, rhs_slot)) in self.values.iter().zip(other.values.iter()).enumerate() {
             let (lhs, rhs) = match (lhs_slot, rhs_slot) {
                 (Ok(l), Ok(r)) => (*l, *r),
                 _ => {
-                    gap_pairs += 1;
+                    let mut endpoints: Vec<String> = Vec::with_capacity(2);
+                    if let Err(e) = lhs_slot {
+                        endpoints.push(format!("lhs {e}"));
+                    }
+                    if let Err(e) = rhs_slot {
+                        endpoints.push(format!("rhs {e}"));
+                    }
+                    gaps.push(format!(
+                        "{tag}(+{elapsed_ms}ms): {endpoints}",
+                        tag = self.tags[i],
+                        elapsed_ms = self.elapsed_ms[i],
+                        endpoints = endpoints.join(" | "),
+                    ));
                     continue;
                 }
             };
@@ -796,11 +920,13 @@ impl SeriesField<f64> {
                 );
             }
         }
-        if gap_pairs > 0 {
+        if !gaps.is_empty() {
             verdict.note(format!(
-                "{label} (ratio_within): {gap_pairs} pair(s) skipped due to projection \
-                 errors on lhs or rhs",
+                "{label} (ratio_within): {n} pair(s) skipped due to projection \
+                 errors on lhs or rhs: {samples}",
                 label = self.label,
+                n = gaps.len(),
+                samples = gaps.join(", "),
             ));
         }
         verdict

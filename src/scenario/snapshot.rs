@@ -228,6 +228,16 @@ pub enum SnapshotError {
     /// argument), giving the operator the cause without re-walking
     /// the report.
     PlaceholderSample { tag: String, reason: String },
+    /// A [`SampleSeries::stats`](crate::scenario::sample::SampleSeries::stats)
+    /// projection ran on a sample whose `stats` field is `None`
+    /// — the stats client was not wired (no `scheduler_binary`)
+    /// or the per-sample stats request failed (relay rejected,
+    /// non-zero envelope errno, scheduler not yet listening).
+    /// Distinguishes a per-sample stats coverage gap from an
+    /// in-stats-JSON path miss (`TypeMismatch` /
+    /// `FieldNotFound`) so the temporal-assertion site can
+    /// branch on the cause without re-walking the source.
+    MissingStats { tag: String },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -341,6 +351,12 @@ impl std::fmt::Display for SnapshotError {
                     f,
                     "sample '{tag}' is a placeholder report (capture pipeline did not land): \
                      {reason}"
+                )
+            }
+            SnapshotError::MissingStats { tag } => {
+                write!(
+                    f,
+                    "sample '{tag}': stats absent (relay error or no scheduler)"
                 )
             }
         }

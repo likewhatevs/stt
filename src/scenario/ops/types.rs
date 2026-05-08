@@ -1156,15 +1156,9 @@ impl CgroupDef {
     /// explicitly sets a non-zero nice keeps its value. The
     /// cgroup-level default lives in [`Self::default_nice`].
     ///
-    /// A WorkSpec that explicitly sets `.nice(0)` is treated as
-    /// "unset" and inherits this default — there is no way to opt
-    /// out of cgroup-level nice while keeping nice=0 (matches
-    /// [`crate::workload::WorkloadConfig::nice`]'s `0 = skip
-    /// setpriority(2)` sentinel). To preserve a per-WorkSpec
-    /// nice=0 in the presence of a non-zero cgroup default,
-    /// override the default at the cgroup level instead — the
-    /// merge has no "explicitly zero" signal to distinguish from
-    /// "default zero".
+    /// Note: a WorkSpec that explicitly sets `.nice(0)` is treated
+    /// as "unset" and inherits this default — there is no way to
+    /// opt out of cgroup-level nice while keeping nice=0.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
         self.default_nice = Some(n);

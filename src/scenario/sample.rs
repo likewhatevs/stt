@@ -202,13 +202,12 @@ impl SampleSeries {
     /// `Err` slots so a temporal-assertion pattern can decide
     /// whether to fail or skip on a missing field.
     ///
-    /// `label` is `&'static str` because it lands in
-    /// [`crate::assert::temporal::SeriesField::label`] and from
-    /// there into failure messages — the same `'static` discipline
-    /// that [`crate::assert::Verdict::claim`] enforces. Producers
-    /// pass `stringify!(field)` (when projecting an auto-derived
-    /// field) or a hand-crafted descriptor literal.
-    pub fn bpf<T, F>(&self, label: &'static str, project: F) -> SeriesField<T>
+    /// `label` is owned (`impl Into<String>`) and lands in
+    /// [`crate::assert::temporal::SeriesField::label`] for failure-
+    /// message rendering. Callers may pass a `&'static str` literal
+    /// or a runtime-built `String` (for auto-discovered struct or
+    /// JSON key names).
+    pub fn bpf<T, F>(&self, label: impl Into<String>, project: F) -> SeriesField<T>
     where
         F: Fn(&Snapshot<'_>) -> SnapshotResult<T>,
     {
@@ -251,7 +250,11 @@ impl SampleSeries {
     /// surface that as a per-sample missing-stats failure rather
     /// than vacuously skipping it, so a coverage gap is never
     /// silent.
-    pub fn stats<T, F>(&self, label: &'static str, project: F) -> SeriesField<T>
+    ///
+    /// `label` is owned (`impl Into<String>`) and matches the
+    /// shape of [`Self::bpf`] — pass a literal or a runtime-built
+    /// `String` for auto-discovered keys.
+    pub fn stats<T, F>(&self, label: impl Into<String>, project: F) -> SeriesField<T>
     where
         F: Fn(StatsValue<'_>) -> SnapshotResult<T>,
     {
@@ -263,10 +266,8 @@ impl SampleSeries {
             elapsed.push(row.elapsed_ms);
             let outcome = match row.stats.as_ref() {
                 Some(v) => project(StatsValue { value: v }),
-                None => Err(crate::scenario::snapshot::SnapshotError::TypeMismatch {
-                    expected: "stats present",
-                    actual: "stats absent (relay error or no scheduler)",
-                    requested: String::new(),
+                None => Err(crate::scenario::snapshot::SnapshotError::MissingStats {
+                    tag: row.tag.clone(),
                 }),
             };
             values.push(outcome);
@@ -362,10 +363,10 @@ impl<'a> BpfMapProjector<'a> {
     /// Project a single named struct field as `u64` (the most
     /// common temporal-assertion shape — counters, byte counts).
     /// The label routed onto the resulting [`SeriesField`] is the
-    /// caller-supplied `'static str`; combined with the map name
-    /// in the diagnostic the failure message reads
+    /// caller-supplied field name; combined with the map name in
+    /// the diagnostic the failure message reads
     /// `"<map>.<entry_index>.<field>"`.
-    pub fn field_u64(&self, field: &'static str) -> SeriesField<u64> {
+    pub fn field_u64(&self, field: &str) -> SeriesField<u64> {
         let map_name = self.map_name.to_string();
         let entry_index = self.entry_index;
         let field_owned = field.to_string();
@@ -379,7 +380,7 @@ impl<'a> BpfMapProjector<'a> {
     }
 
     /// Project a single named struct field as `i64`.
-    pub fn field_i64(&self, field: &'static str) -> SeriesField<i64> {
+    pub fn field_i64(&self, field: &str) -> SeriesField<i64> {
         let map_name = self.map_name.to_string();
         let entry_index = self.entry_index;
         let field_owned = field.to_string();
@@ -393,7 +394,7 @@ impl<'a> BpfMapProjector<'a> {
     }
 
     /// Project a single named struct field as `f64`.
-    pub fn field_f64(&self, field: &'static str) -> SeriesField<f64> {
+    pub fn field_f64(&self, field: &str) -> SeriesField<f64> {
         let map_name = self.map_name.to_string();
         let entry_index = self.entry_index;
         let field_owned = field.to_string();
@@ -433,6 +434,42 @@ impl<'a> BpfMapProjector<'a> {
             _ => Vec::new(),
         }
     }
+
+    /// Project every struct member that resolves as `u64` for at
+    /// least one sample. Iterates [`Self::member_names`], calls
+    /// [`Self::field_u64`] for each, and keeps the entries whose
+    /// resulting [`SeriesField`] has at least one `Ok` value —
+    /// non-numeric members (strings, nested structs, floats) drop
+    /// out because their `as_u64()` cast always errors.
+    pub fn u64_fields(&self) -> Vec<(String, SeriesField<u64>)> {
+        self.member_names()
+            .into_iter()
+            .filter_map(|name| {
+                let field = self.field_u64(&name);
+                // Bind the predicate result and drop the
+                // values_iter borrow before moving `field`. A
+                // chained `.values_iter().any(...).then_some(...)`
+                // keeps the iterator alive across the move and
+                // fails the borrow check.
+                let any_ok = field.values_iter().any(|r| r.is_ok());
+                any_ok.then_some((name, field))
+            })
+            .collect()
+    }
+
+    /// Project every struct member that resolves as `f64` for at
+    /// least one sample. Mirrors [`Self::u64_fields`] using
+    /// [`Self::field_f64`].
+    pub fn f64_fields(&self) -> Vec<(String, SeriesField<f64>)> {
+        self.member_names()
+            .into_iter()
+            .filter_map(|name| {
+                let field = self.field_f64(&name);
+                let any_ok = field.values_iter().any(|r| r.is_ok());
+                any_ok.then_some((name, field))
+            })
+            .collect()
+    }
 }
 
 /// Auto-projector handle returned by [`SampleSeries::stats_path`].
@@ -445,21 +482,21 @@ pub struct StatsPathProjector<'a> {
 
 impl<'a> StatsPathProjector<'a> {
     /// Project a JSON key under the resolved path as `u64`.
-    pub fn field_u64(&self, key: &'static str) -> SeriesField<u64> {
+    pub fn field_u64(&self, key: &str) -> SeriesField<u64> {
         let full_path = join_paths(&self.path, key);
         self.series
             .stats(key, move |sv| sv.path(&full_path).as_u64())
     }
 
     /// Project a JSON key under the resolved path as `i64`.
-    pub fn field_i64(&self, key: &'static str) -> SeriesField<i64> {
+    pub fn field_i64(&self, key: &str) -> SeriesField<i64> {
         let full_path = join_paths(&self.path, key);
         self.series
             .stats(key, move |sv| sv.path(&full_path).as_i64())
     }
 
     /// Project a JSON key under the resolved path as `f64`.
-    pub fn field_f64(&self, key: &'static str) -> SeriesField<f64> {
+    pub fn field_f64(&self, key: &str) -> SeriesField<f64> {
         let full_path = join_paths(&self.path, key);
         self.series
             .stats(key, move |sv| sv.path(&full_path).as_f64())
@@ -503,6 +540,39 @@ impl<'a> StatsPathProjector<'a> {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// Project every object key that resolves as `u64` for at
+    /// least one sample. Iterates [`Self::key_names`], calls
+    /// [`Self::field_u64`] for each, and keeps the entries whose
+    /// resulting [`SeriesField`] has at least one `Ok` value —
+    /// non-numeric leaves (strings, nested objects, floats) drop
+    /// out.
+    pub fn u64_fields(&self) -> Vec<(String, SeriesField<u64>)> {
+        self.key_names()
+            .into_iter()
+            .filter_map(|name| {
+                let field = self.field_u64(&name);
+                // Bind the predicate result and drop the
+                // values_iter borrow before moving `field`.
+                let any_ok = field.values_iter().any(|r| r.is_ok());
+                any_ok.then_some((name, field))
+            })
+            .collect()
+    }
+
+    /// Project every object key that resolves as `f64` for at
+    /// least one sample. Mirrors [`Self::u64_fields`] using
+    /// [`Self::field_f64`].
+    pub fn f64_fields(&self) -> Vec<(String, SeriesField<f64>)> {
+        self.key_names()
+            .into_iter()
+            .filter_map(|name| {
+                let field = self.field_f64(&name);
+                let any_ok = field.values_iter().any(|r| r.is_ok());
+                any_ok.then_some((name, field))
+            })
+            .collect()
     }
 }
 
@@ -662,8 +732,22 @@ mod tests {
         let field: SeriesField<f64> = series.stats("busy", |s| s.path("busy").as_f64());
         let outcomes: Vec<SnapshotResult<f64>> = field.values_iter().cloned().collect();
         assert_eq!(outcomes.len(), 2);
-        assert!(outcomes[0].is_ok());
-        assert!(outcomes[1].is_err());
+        assert_eq!(
+            outcomes[0].as_ref().copied(),
+            Ok(50.0),
+            "sample with stats present must project the `busy` field verbatim"
+        );
+        match &outcomes[1] {
+            Err(crate::scenario::snapshot::SnapshotError::MissingStats { tag }) => {
+                assert_eq!(
+                    tag, "periodic_001",
+                    "MissingStats tag must identify the sample whose stats slot was None"
+                );
+            }
+            other => panic!(
+                "sample with stats=None must surface SnapshotError::MissingStats, got {other:?}"
+            ),
+        }
     }
 
     #[test]

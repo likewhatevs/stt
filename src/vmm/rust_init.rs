@@ -2563,6 +2563,42 @@ fn start_sched_stats_relay() -> RelayStopSignal {
 /// before this function was called) and drives the outer
 /// inotify-wait → connect → poll-relay-session cycle until `stop`
 /// flips.
+/// Maximum consecutive `port.read` Ok(0) returns we tolerate
+/// across the relay loop's inner functions before declaring the
+/// virtio-console port dead and exiting the relay thread.
+///
+/// B14: the stats-port reader can return Ok(0) when the host
+/// hasn't connected its end of `/dev/vport0p2` yet, when the host
+/// closes its console connection, or when the kernel virtio-console
+/// driver hits a transient disconnect. A single Ok(0) is recoverable
+/// (the inner functions exit cleanly, the outer loop re-arms via
+/// inotify and the scheduler/host can re-establish the link).
+/// But a port that's permanently closed produces back-to-back Ok(0)
+/// returns indefinitely — re-arming inotify, getting woken by the
+/// race-free initial probe (which can succeed against a still-bound
+/// socket file even though the port itself is dead), running a
+/// micro-session that immediately exits on Ok(0), and looping. This
+/// busy-loop wastes CPU and produces a log flood. After three
+/// consecutive Ok(0) returns the relay thread exits — the host
+/// loses scheduler-stats relay (no automatic recovery) but the
+/// guest's CPU bill stops.
+const SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF: u32 = 3;
+
+/// Return value of [`run_relay_session`] / [`wait_for_stats_socket`]
+/// signalling why the inner function exited so the outer
+/// [`sched_stats_relay_loop`] can count consecutive port EOFs and
+/// bail when the virtio-console port is persistently dead. See
+/// [`SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF`] for the policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelaySessionExit {
+    /// `port.read` returned Ok(0). Counts toward the consecutive
+    /// EOF budget the outer loop tracks.
+    PortEof,
+    /// Any other clean exit (socket EOF, scheduler error, stop_evt
+    /// fired). Resets the consecutive EOF counter.
+    Other,
+}
+
 fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eventfd::EventFd>) {
     let mut port = match fs::OpenOptions::new()
         .read(true)
@@ -2580,18 +2616,57 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
         }
     };
 
+    // B14: count consecutive `port.read` Ok(0) outcomes from the
+    // inner functions. A single Ok(0) is recoverable; after
+    // `SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF` in a row we
+    // assume the virtio-console port is permanently dead and exit.
+    let mut consecutive_port_eof: u32 = 0;
+
     // Outer loop: wait for socket via inotify, connect, run
     // session, fall back to inotify on socket failure. Stops only
     // when stop_evt fires (signal_stop flipped the flag and woke
     // every blocked syscall).
     while !stop.load(Ordering::Acquire) {
-        match wait_for_stats_socket(&mut port, &stop, &stop_evt) {
-            Some(socket) => {
-                run_relay_session(&mut port, socket, &stop, &stop_evt);
-                // Session ended (socket EOF/error or stop).
-                // Loop and re-wait via inotify if not stopping.
+        let wait_exit = wait_for_stats_socket(&mut port, &stop, &stop_evt);
+        match wait_exit {
+            WaitSocketResult::Connected(socket) => {
+                let exit = run_relay_session(&mut port, socket, &stop, &stop_evt);
+                match exit {
+                    RelaySessionExit::PortEof => {
+                        consecutive_port_eof += 1;
+                    }
+                    RelaySessionExit::Other => {
+                        consecutive_port_eof = 0;
+                    }
+                }
+                if consecutive_port_eof >= SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF {
+                    tracing::warn!(
+                        consecutive_port_eof,
+                        "stats relay: vport0p2 returned Ok(0) on \
+                         {SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF} consecutive \
+                         relay sessions — assuming the port is permanently dead and \
+                         exiting the relay thread to avoid a busy-loop"
+                    );
+                    return;
+                }
             }
-            None => {
+            WaitSocketResult::PortEof => {
+                consecutive_port_eof += 1;
+                if consecutive_port_eof >= SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF {
+                    tracing::warn!(
+                        consecutive_port_eof,
+                        "stats relay: vport0p2 returned Ok(0) on \
+                         {SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF} consecutive \
+                         inotify-wait drains — assuming the port is permanently \
+                         dead and exiting the relay thread to avoid a busy-loop"
+                    );
+                    return;
+                }
+                // Continue the outer loop to re-arm inotify; the
+                // count keeps climbing until it hits the cap or a
+                // non-EOF event resets it.
+            }
+            WaitSocketResult::Stopped => {
                 // wait_for_stats_socket returned None only when
                 // stop flipped or inotify itself errored. Either
                 // way, exit.
@@ -2601,11 +2676,30 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
     }
 }
 
+/// Result of [`wait_for_stats_socket`]: distinguishes a successful
+/// connect from the two clean-exit paths so the outer loop can
+/// classify them correctly. B14: `PortEof` (port read returned
+/// Ok(0)) feeds the consecutive-EOF counter; `Stopped` (stop_evt
+/// fired or inotify errored) terminates the loop unconditionally.
+enum WaitSocketResult {
+    /// Scheduler socket connected; the relay can run a session.
+    Connected(std::os::unix::net::UnixStream),
+    /// `port.read` returned Ok(0) while waiting for the scheduler
+    /// to bind. Counts toward the outer loop's consecutive-EOF
+    /// budget — see
+    /// [`SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF`].
+    PortEof,
+    /// `stop_evt` fired or inotify itself errored — exit
+    /// unconditionally.
+    Stopped,
+}
+
 /// Block (event-driven) until the scheduler's Unix socket exists,
 /// then connect and return the stream. Uses inotify on the parent
 /// directory to receive a `IN_CREATE` event when the scheduler
-/// binds. Returns `None` only when `stop_evt` fires or inotify
-/// itself errors out.
+/// binds. Returns `Stopped` when `stop_evt` fires or inotify
+/// itself errors out, `PortEof` when the host-side port read
+/// reports Ok(0).
 ///
 /// Race-free initial check: after setting up the watch, attempt
 /// to connect once. If the socket already exists (scheduler
@@ -2615,7 +2709,7 @@ fn wait_for_stats_socket(
     port: &mut std::fs::File,
     stop: &Arc<AtomicBool>,
     stop_evt: &Arc<vmm_sys_util::eventfd::EventFd>,
-) -> Option<std::os::unix::net::UnixStream> {
+) -> WaitSocketResult {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
     use std::ffi::OsStr;
@@ -2631,7 +2725,7 @@ fn wait_for_stats_socket(
         Ok(i) => i,
         Err(e) => {
             tracing::warn!(error = %e, "stats relay: inotify_init failed");
-            return None;
+            return WaitSocketResult::Stopped;
         }
     };
     // B2 fix: include IN_ATTRIB so a chmod-on-listen (some
@@ -2654,17 +2748,17 @@ fn wait_for_stats_socket(
             dir = SCHED_STATS_SOCKET_DIR,
             "stats relay: inotify add_watch failed"
         );
-        return None;
+        return WaitSocketResult::Stopped;
     }
 
     // Race-free initial probe: socket may already exist before the
     // watch was added. Try connect; on success skip the loop.
     if stop.load(Ordering::Acquire) {
-        return None;
+        return WaitSocketResult::Stopped;
     }
     if let Ok(s) = std::os::unix::net::UnixStream::connect(SCHED_STATS_SOCKET) {
         tracing::debug!("stats relay: connected to scheduler socket (race-free initial probe)");
-        return Some(s);
+        return WaitSocketResult::Connected(s);
     }
 
     // Park on poll(inotify_fd, port_fd, stop_evt). Each wake:
@@ -2683,7 +2777,7 @@ fn wait_for_stats_socket(
     let mut buf = vec![0u8; RELAY_BUFFER_BYTES];
     loop {
         if stop.load(Ordering::Acquire) {
-            return None;
+            return WaitSocketResult::Stopped;
         }
         let inotify_fd = inotify.as_fd();
         let port_fd = port.as_fd();
@@ -2701,7 +2795,7 @@ fn wait_for_stats_socket(
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => {
                 tracing::warn!(error = %e, "stats relay: poll on inotify failed");
-                return None;
+                return WaitSocketResult::Stopped;
             }
         };
         let inotify_ready = fds[0]
@@ -2718,7 +2812,7 @@ fn wait_for_stats_socket(
         // `RelayStopSignal::signal_stop`.
         if stop_ready {
             let _ = stop_evt.read();
-            return None;
+            return WaitSocketResult::Stopped;
         }
 
         // B3: host pushed a request while we're still waiting for
@@ -2733,8 +2827,16 @@ fn wait_for_stats_socket(
         if port_ready {
             match port.read(&mut buf) {
                 Ok(0) => {
-                    tracing::debug!("stats relay: port read EOF in inotify wait; exiting");
-                    return None;
+                    // B14: this Ok(0) feeds the outer loop's
+                    // consecutive-EOF counter via the PortEof
+                    // return. A single Ok(0) is recoverable
+                    // (the outer re-arms inotify); after the
+                    // configured cap the relay thread exits.
+                    tracing::debug!(
+                        "stats relay: port read EOF in inotify wait; \
+                         returning to outer loop for EOF accounting"
+                    );
+                    return WaitSocketResult::PortEof;
                 }
                 Ok(n) => {
                     tracing::debug!(
@@ -2747,7 +2849,7 @@ fn wait_for_stats_socket(
                             error = %e,
                             "stats relay: port write failed in inotify wait; exiting"
                         );
-                        return None;
+                        return WaitSocketResult::Stopped;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2756,7 +2858,7 @@ fn wait_for_stats_socket(
                         error = %e,
                         "stats relay: port read error in inotify wait; exiting"
                     );
-                    return None;
+                    return WaitSocketResult::Stopped;
                 }
             }
         }
@@ -2773,7 +2875,7 @@ fn wait_for_stats_socket(
                 Err(nix::errno::Errno::EAGAIN) => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "stats relay: inotify read_events failed");
-                    return None;
+                    return WaitSocketResult::Stopped;
                 }
             };
             // If any event names our target — or if any event
@@ -2791,7 +2893,7 @@ fn wait_for_stats_socket(
             match std::os::unix::net::UnixStream::connect(SCHED_STATS_SOCKET) {
                 Ok(s) => {
                     tracing::debug!("stats relay: connected to scheduler socket via inotify edge");
-                    return Some(s);
+                    return WaitSocketResult::Connected(s);
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -2855,12 +2957,16 @@ fn drain_port_emit_errors(port: &mut std::fs::File) {
     }
 }
 
-/// Run a single port-↔-socket relay session. Returns when the
-/// socket reports an error (scheduler restart) or `stop_evt`
-/// fires. Uses poll(2) on (port_fd, socket_fd, stop_evt) so the
-/// thread blocks in the kernel until exactly one of those fds is
-/// readable — no spinning, no timeouts, and `stop_evt` interrupts
-/// any blocked I/O within microseconds.
+/// Run a single port-↔-socket relay session. Returns
+/// [`RelaySessionExit::PortEof`] when `port.read` returned Ok(0)
+/// (the outer loop counts these toward the busy-loop budget — see
+/// [`SCHED_STATS_RELAY_MAX_CONSECUTIVE_PORT_EOF`]) and
+/// [`RelaySessionExit::Other`] for every other clean exit (socket
+/// EOF, scheduler error, stop_evt fired, port write error). Uses
+/// poll(2) on (port_fd, socket_fd, stop_evt) so the thread blocks
+/// in the kernel until exactly one of those fds is readable — no
+/// spinning, no timeouts, and `stop_evt` interrupts any blocked
+/// I/O within microseconds.
 ///
 /// Single-thread serialization: the relay is the only writer and
 /// the only reader of `/dev/vport0p2` inside the guest, so no
@@ -2874,12 +2980,23 @@ fn run_relay_session(
     mut socket: std::os::unix::net::UnixStream,
     stop: &Arc<AtomicBool>,
     stop_evt: &Arc<vmm_sys_util::eventfd::EventFd>,
-) {
+) -> RelaySessionExit {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::io::ErrorKind;
     use std::os::unix::io::AsFd;
 
     let mut buf = vec![0u8; RELAY_BUFFER_BYTES];
+    // B6: track socket health across poll iterations. Set false the
+    // moment POLLHUP/POLLERR is observed on the socket fd; gate
+    // every `socket.write_all` on this flag so we never write into
+    // a HUP'd socket (which fails with EPIPE/SIGPIPE and surfaces
+    // as a noisy error path). When POLLHUP and POLLIN both arrive
+    // in the same poll, drain the buffered POLLIN data first so the
+    // host sees the scheduler's last response before we declare
+    // the session dead — the kernel keeps already-queued data
+    // readable across the half-close, so reading after POLLHUP
+    // is well-defined.
+    let mut socket_healthy = true;
 
     while !stop.load(Ordering::Acquire) {
         // Wait for one of: host pushed bytes (port readable),
@@ -2888,7 +3005,7 @@ fn run_relay_session(
         // scope so the `fds` array (and the immutable borrows on
         // port + socket it holds) drops before we try to read or
         // write either of them.
-        let (port_ready, socket_in, socket_hup, stop_ready) = {
+        let (port_ready, socket_in, socket_hup_seen, stop_ready) = {
             let port_fd = port.as_fd();
             let socket_fd = socket.as_fd();
             // SAFETY: `stop_evt` is held by the surrounding `Arc`,
@@ -2905,7 +3022,7 @@ fn run_relay_session(
                 Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "stats relay: poll failed; exiting session");
-                    return;
+                    return RelaySessionExit::Other;
                 }
             }
             // Snapshot the revents and drop the borrows.
@@ -2914,37 +3031,65 @@ fn run_relay_session(
             let stop_rev = fds[2].revents();
             let port_ready = port_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
             let socket_in = socket_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
-            let socket_hup = socket_rev.is_some_and(|r| {
-                (r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR))
-                    && !r.contains(PollFlags::POLLIN)
+            // B6: any POLLHUP or POLLERR on the socket — with or
+            // without POLLIN — is a permanent transition to
+            // unhealthy. POLLHUP+POLLIN means buffered data is
+            // still drainable; we mark unhealthy AFTER reading
+            // that data.
+            let socket_hup_seen = socket_rev.is_some_and(|r| {
+                r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR)
             });
             let stop_ready = stop_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
-            (port_ready, socket_in, socket_hup, stop_ready)
+            (port_ready, socket_in, socket_hup_seen, stop_ready)
         };
 
         // Stop edge: drain and exit.
         if stop_ready {
             let _ = stop_evt.read();
-            return;
+            return RelaySessionExit::Other;
         }
 
         // Host→guest port readable: read bytes and forward to
         // socket. The socket forward is a blocking write — bounded
         // by the kernel's Unix-socket buffer, not by any user
-        // timeout.
+        // timeout. B6: skip the write_all entirely when the socket
+        // is already known unhealthy (POLLHUP seen on a prior
+        // iteration). Reading the port still drains the host's
+        // queued request bytes so they don't pile up in the kernel
+        // buffer; we answer with the inline error envelope and
+        // exit so the host's pending request_raw wakes with
+        // NoScheduler instead of timing out.
         if port_ready {
             let n = match port.read(&mut buf) {
                 Ok(0) => {
-                    tracing::debug!("stats relay: port read EOF; exiting session");
-                    return;
+                    // B14: this Ok(0) is the busy-loop trigger —
+                    // surface it through the typed return so the
+                    // outer `sched_stats_relay_loop` can count
+                    // consecutive port-EOF exits and bail when the
+                    // budget is exhausted.
+                    tracing::debug!(
+                        "stats relay: port read EOF; returning to outer loop \
+                         for EOF accounting"
+                    );
+                    return RelaySessionExit::PortEof;
                 }
                 Ok(n) => n,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "stats relay: port read error; exiting session");
-                    return;
+                    return RelaySessionExit::Other;
                 }
             };
+            if !socket_healthy {
+                tracing::debug!(
+                    bytes = n,
+                    "stats relay: port→socket forward skipped (socket already \
+                     unhealthy); emitting error envelopes and reconnecting"
+                );
+                let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+                drain_port_emit_errors(port);
+                return RelaySessionExit::Other;
+            }
             if let Err(e) = socket.write_all(&buf[..n]) {
                 tracing::debug!(
                     error = %e,
@@ -2958,14 +3103,21 @@ fn run_relay_session(
                 // already-queued follow-up requests with error
                 // envelopes so they don't survive into the next
                 // session and get forwarded to a fresh scheduler.
+                // No need to mutate `socket_healthy` here — every
+                // arm that reaches a write-failure path returns
+                // immediately and the local goes out of scope.
                 let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
                 drain_port_emit_errors(port);
-                return;
+                return RelaySessionExit::Other;
             }
         }
 
         // Scheduler→host socket readable: read response bytes and
-        // forward to port.
+        // forward to port. B6: read POLLIN data even when POLLHUP
+        // arrived in the same poll — buffered scheduler responses
+        // remain readable across the half-close until the kernel
+        // socket buffer drains. After this read the POLLHUP-only
+        // branch below marks the socket unhealthy.
         if socket_in {
             let m = match socket.read(&mut buf) {
                 Ok(0) => {
@@ -2974,7 +3126,7 @@ fn run_relay_session(
                     );
                     let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
                     drain_port_emit_errors(port);
-                    return;
+                    return RelaySessionExit::Other;
                 }
                 Ok(m) => m,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -2985,24 +3137,39 @@ fn run_relay_session(
                     );
                     let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
                     drain_port_emit_errors(port);
-                    return;
+                    return RelaySessionExit::Other;
                 }
             };
             if let Err(e) = port.write_all(&buf[..m]) {
                 tracing::warn!(error = %e, "stats relay: port write failed; exiting session");
-                return;
+                return RelaySessionExit::Other;
             }
         }
 
-        // Hangup on socket without data: detect explicitly so we
-        // don't spin re-arming poll on a dead fd.
-        if socket_hup {
-            tracing::debug!("stats relay: socket POLLHUP/POLLERR without data; reconnecting");
+        // B6: POLLHUP/POLLERR observed on socket. If POLLIN arrived
+        // in the same revents we already drained the buffered data
+        // above; mark the socket unhealthy now and fall through to
+        // the !socket_healthy reconnect below. If POLLHUP arrived
+        // alone we exit immediately so we don't spin re-arming
+        // poll on a dead fd. The reconnect path is identical for
+        // both: emit the inline error envelope plus drain any
+        // queued port requests.
+        if socket_hup_seen {
+            socket_healthy = false;
+        }
+        if !socket_healthy {
+            tracing::debug!(
+                drained_in = socket_in,
+                "stats relay: socket POLLHUP/POLLERR; reconnecting after draining"
+            );
             let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
             drain_port_emit_errors(port);
-            return;
+            return RelaySessionExit::Other;
         }
     }
+    // Reached only when the outer `stop` flag is observed at the
+    // top of the loop — an ordinary clean shutdown.
+    RelaySessionExit::Other
 }
 
 /// Maximum scheduler-log chunk emitted in a single

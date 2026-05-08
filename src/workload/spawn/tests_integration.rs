@@ -1112,3 +1112,233 @@ fn ipc_variance_spawn_rejects_zero_period_iters() {
         "expected ZeroIpcVarianceParam {{ period_iters }} at spawn; got: {typed:?}",
     );
 }
+
+/// Build a fully populated `WorkerReport` with non-default values
+/// in every field. Anchoring tests on this shape proves the wire
+/// format carries every byte the worker writes — a missing field on
+/// either side would shift the positional bincode decoder onto the
+/// next field's bytes (silent corruption per the doc on
+/// `exit_info` / `affinity_error`).
+fn fully_populated_report() -> WorkerReport {
+    WorkerReport {
+        tid: 12345,
+        work_units: 7_777_777,
+        cpu_time_ns: 3_141_592_653,
+        wall_time_ns: 6_283_185_307,
+        off_cpu_ns: 3_141_592_654,
+        migration_count: 9,
+        cpus_used: [0usize, 3, 5, 7].into_iter().collect(),
+        migrations: vec![
+            Migration {
+                at_ns: 100,
+                from_cpu: 0,
+                to_cpu: 3,
+            },
+            Migration {
+                at_ns: 250,
+                from_cpu: 3,
+                to_cpu: 5,
+            },
+        ],
+        max_gap_ms: 42,
+        max_gap_cpu: 5,
+        max_gap_at_ms: 999,
+        resume_latencies_ns: vec![1_000, 2_000, 3_000, 4_000],
+        wake_sample_total: 4,
+        iteration_costs_ns: vec![10, 20, 30],
+        iteration_cost_sample_total: 3,
+        iterations: 1024,
+        schedstat_run_delay_ns: 555_000,
+        schedstat_run_count: 73,
+        schedstat_cpu_time_ns: 8_000_000_000,
+        completed: true,
+        numa_pages: [(0usize, 100u64), (1usize, 200u64)].into_iter().collect(),
+        vmstat_numa_pages_migrated: 17,
+        exit_info: None,
+        is_messenger: true,
+        group_idx: 4,
+        affinity_error: None,
+    }
+}
+
+/// Compare two `WorkerReport`s field-by-field. `WorkerReport` does
+/// not derive `PartialEq`, so the roundtrip tests must check every
+/// field explicitly. A missing assertion would silently let a
+/// mismatched field through — the same hazard the production
+/// bincode pipe avoids by emitting every field on every call.
+fn assert_worker_report_eq(a: &WorkerReport, b: &WorkerReport) {
+    assert_eq!(a.tid, b.tid, "tid");
+    assert_eq!(a.work_units, b.work_units, "work_units");
+    assert_eq!(a.cpu_time_ns, b.cpu_time_ns, "cpu_time_ns");
+    assert_eq!(a.wall_time_ns, b.wall_time_ns, "wall_time_ns");
+    assert_eq!(a.off_cpu_ns, b.off_cpu_ns, "off_cpu_ns");
+    assert_eq!(a.migration_count, b.migration_count, "migration_count");
+    assert_eq!(a.cpus_used, b.cpus_used, "cpus_used");
+    assert_eq!(a.migrations.len(), b.migrations.len(), "migrations.len");
+    for (i, (am, bm)) in a.migrations.iter().zip(b.migrations.iter()).enumerate() {
+        assert_eq!(am.at_ns, bm.at_ns, "migrations[{i}].at_ns");
+        assert_eq!(am.from_cpu, bm.from_cpu, "migrations[{i}].from_cpu");
+        assert_eq!(am.to_cpu, bm.to_cpu, "migrations[{i}].to_cpu");
+    }
+    assert_eq!(a.max_gap_ms, b.max_gap_ms, "max_gap_ms");
+    assert_eq!(a.max_gap_cpu, b.max_gap_cpu, "max_gap_cpu");
+    assert_eq!(a.max_gap_at_ms, b.max_gap_at_ms, "max_gap_at_ms");
+    assert_eq!(a.resume_latencies_ns, b.resume_latencies_ns, "resume_latencies_ns");
+    assert_eq!(a.wake_sample_total, b.wake_sample_total, "wake_sample_total");
+    assert_eq!(a.iteration_costs_ns, b.iteration_costs_ns, "iteration_costs_ns");
+    assert_eq!(
+        a.iteration_cost_sample_total, b.iteration_cost_sample_total,
+        "iteration_cost_sample_total"
+    );
+    assert_eq!(a.iterations, b.iterations, "iterations");
+    assert_eq!(a.schedstat_run_delay_ns, b.schedstat_run_delay_ns, "schedstat_run_delay_ns");
+    assert_eq!(a.schedstat_run_count, b.schedstat_run_count, "schedstat_run_count");
+    assert_eq!(a.schedstat_cpu_time_ns, b.schedstat_cpu_time_ns, "schedstat_cpu_time_ns");
+    assert_eq!(a.completed, b.completed, "completed");
+    assert_eq!(a.numa_pages, b.numa_pages, "numa_pages");
+    assert_eq!(
+        a.vmstat_numa_pages_migrated, b.vmstat_numa_pages_migrated,
+        "vmstat_numa_pages_migrated"
+    );
+    match (&a.exit_info, &b.exit_info) {
+        (None, None) => {}
+        (Some(WorkerExitInfo::Exited(x)), Some(WorkerExitInfo::Exited(y))) => {
+            assert_eq!(x, y, "exit_info Exited code");
+        }
+        (Some(WorkerExitInfo::Signaled(x)), Some(WorkerExitInfo::Signaled(y))) => {
+            assert_eq!(x, y, "exit_info Signaled signum");
+        }
+        (Some(WorkerExitInfo::TimedOut), Some(WorkerExitInfo::TimedOut)) => {}
+        (Some(WorkerExitInfo::WaitFailed(x)), Some(WorkerExitInfo::WaitFailed(y))) => {
+            assert_eq!(x, y, "exit_info WaitFailed message");
+        }
+        (Some(WorkerExitInfo::Panicked(x)), Some(WorkerExitInfo::Panicked(y))) => {
+            assert_eq!(x, y, "exit_info Panicked message");
+        }
+        (other_a, other_b) => {
+            panic!("exit_info variant mismatch: a={other_a:?} b={other_b:?}");
+        }
+    }
+    assert_eq!(a.is_messenger, b.is_messenger, "is_messenger");
+    assert_eq!(a.group_idx, b.group_idx, "group_idx");
+    assert_eq!(a.affinity_error, b.affinity_error, "affinity_error");
+}
+
+/// Roundtrip a fully populated `WorkerReport` (`exit_info=None`)
+/// through `bincode::serde::encode_to_vec` →
+/// `bincode::serde::decode_from_slice` with
+/// `bincode::config::standard()` — the exact codec the
+/// worker→parent report pipe uses (mod.rs: `encode_to_vec` at the
+/// worker child, `decode_from_slice` at `stop_and_collect`). Every
+/// field is asserted equal post-decode; a missing field on either
+/// side would corrupt subsequent fields silently per the
+/// `exit_info` / `affinity_error` doc warnings.
+#[test]
+fn worker_report_bincode_roundtrip() {
+    let report = fully_populated_report();
+    let bytes =
+        bincode::serde::encode_to_vec(&report, bincode::config::standard()).expect("encode");
+    let (decoded, consumed): (WorkerReport, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
+    assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+    assert_worker_report_eq(&report, &decoded);
+}
+
+/// Roundtrip a sentinel-shaped `WorkerReport`: `exit_info =
+/// Some(Exited(1))` (the catch_unwind panic-arm shape per
+/// stop_and_collect's sentinel doc) and `affinity_error =
+/// Some("EINVAL")` (the EINVAL-from-cpuset shape per the
+/// `affinity_error` doc). Confirms the `Option<…>` tag bytes
+/// round-trip through bincode without losing the inner payload —
+/// the bincode positional encoding emits the tag whether or not
+/// the option is populated, so a sentinel and a live-worker frame
+/// must each decode with their original shape.
+#[test]
+fn worker_report_bincode_sentinel_roundtrip() {
+    let mut report = fully_populated_report();
+    report.exit_info = Some(WorkerExitInfo::Exited(1));
+    report.affinity_error = Some("EINVAL".to_string());
+    let bytes =
+        bincode::serde::encode_to_vec(&report, bincode::config::standard()).expect("encode");
+    let (decoded, consumed): (WorkerReport, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
+    assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+    assert!(
+        matches!(decoded.exit_info, Some(WorkerExitInfo::Exited(1))),
+        "exit_info must roundtrip as Exited(1); got {:?}",
+        decoded.exit_info
+    );
+    assert_eq!(decoded.affinity_error.as_deref(), Some("EINVAL"));
+    assert_worker_report_eq(&report, &decoded);
+}
+
+/// Roundtrip a `Vec<WorkerReport>` — the pcomm-container shape
+/// the leader process writes to the report pipe before exit. The
+/// container holds one report per worker thread; per #6 the
+/// container will move from serde_json to bincode so a single
+/// codec governs both the fork-mode single-report and pcomm-mode
+/// multi-report payloads. This test pins that wire format.
+#[test]
+fn vec_worker_report_bincode_roundtrip() {
+    let mut second = fully_populated_report();
+    second.tid = 67890;
+    second.group_idx = 5;
+    second.is_messenger = false;
+    second.exit_info = Some(WorkerExitInfo::Signaled(9));
+    let reports: Vec<WorkerReport> = vec![fully_populated_report(), second];
+    let bytes =
+        bincode::serde::encode_to_vec(&reports, bincode::config::standard()).expect("encode");
+    let (decoded, consumed): (Vec<WorkerReport>, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
+    assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+    assert_eq!(decoded.len(), reports.len(), "vec length must roundtrip");
+    for (i, (a, b)) in reports.iter().zip(decoded.iter()).enumerate() {
+        assert_worker_report_eq(a, b);
+        assert_eq!(a.tid, b.tid, "report[{i}] tid");
+    }
+}
+
+/// A truncated bincode frame must surface as a decode error, not a
+/// silent partial decode. The parent's pipe-drain code at
+/// `stop_and_collect` relies on this to detect short writes (worker
+/// died mid-flush) and synthesize a sentinel report. If
+/// `decode_from_slice` returned `Ok` on a partial buffer the
+/// parent would publish a half-populated report with garbage in
+/// the trailing fields.
+#[test]
+fn truncated_frame_decodes_to_err() {
+    let report = fully_populated_report();
+    let bytes =
+        bincode::serde::encode_to_vec(&report, bincode::config::standard()).expect("encode");
+    assert!(
+        bytes.len() >= 2,
+        "encoded report must be at least 2 bytes; got {}",
+        bytes.len()
+    );
+    let truncated = &bytes[..bytes.len() / 2];
+    let result: Result<(WorkerReport, usize), _> =
+        bincode::serde::decode_from_slice(truncated, bincode::config::standard());
+    assert!(
+        result.is_err(),
+        "truncated frame must decode to Err; got Ok({:?})",
+        result.ok()
+    );
+}
+
+/// An empty payload must surface as a decode error. The parent's
+/// pipe-drain code observes an empty buffer when the worker dies
+/// before writing anything (post-fork crash, OOM kill, or a
+/// SIGKILL that fired before bincode encoding) and the sentinel
+/// path depends on the empty-slice decode failing — otherwise a
+/// zero-byte buffer would round-trip as a default `WorkerReport`
+/// and mask the real failure.
+#[test]
+fn empty_payload_decodes_to_err() {
+    let result: Result<(WorkerReport, usize), _> =
+        bincode::serde::decode_from_slice(&[], bincode::config::standard());
+    assert!(
+        result.is_err(),
+        "empty payload must decode to Err; got Ok({:?})",
+        result.ok()
+    );
+}

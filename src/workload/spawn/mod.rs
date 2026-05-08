@@ -2707,9 +2707,11 @@ impl WorkloadHandle {
         // Per-group admission. Mirrors `WorkloadHandle::spawn` for
         // shared rules (worker_group_size divisibility,
         // chain-depth-< 2, IdleChurn / IpcVariance zero rejection)
-        // and adds pcomm-specific rejections (ForkExit, CgroupChurn)
-        // since the container's threaded shape introduces shared-
-        // tgid hazards those variants cannot tolerate.
+        // and adds pcomm-specific rejections (ForkExit,
+        // CgroupChurn, PipeIo, CachePipe) since the container's
+        // threaded shape — every worker is a thread of one
+        // forked tgid sharing one fd table — introduces hazards
+        // those variants cannot tolerate.
         for group in &groups {
             if matches!(group.work_type, WorkType::ForkExit) {
                 anyhow::bail!(
@@ -2729,6 +2731,48 @@ impl WorkloadHandle {
                      `cgroup.procs`, which the kernel resolves to the whole \
                      tgid and migrates the entire pcomm container (every \
                      sibling thread). Drop pcomm or pick a different work type.",
+                    group.group_idx,
+                );
+            }
+            // C5: PipeIo / CachePipe pair workers (A=even, B=odd
+            // of each pair) hold opposite halves of a single
+            // (ab, ba) pipe pair — A keeps `ba[0]`/`ab[1]`, B
+            // keeps `ab[0]`/`ba[1]`. Fork-mode workers each
+            // close the inverse halves so EOF propagates when a
+            // peer exits (see [`Self::spawn_group`]'s
+            // close-other-fds block). In a pcomm container every
+            // worker is a thread of one forked tgid sharing a
+            // single fd table — the pre-fork allocation puts
+            // every pipe end into the container's table and
+            // every thread sees the same entries. There is no
+            // per-thread close path that closes one peer's half
+            // without also closing the other peer's: a thread
+            // closing `ab[0]` evicts that fd from the table the
+            // peer thread reads from. Reject at admission time
+            // rather than ship a half-working pair-shape that
+            // races on EOF and corrupts byte ordering.
+            if matches!(group.work_type, WorkType::PipeIo { .. }) {
+                anyhow::bail!(
+                    "WorkSpec::pcomm is incompatible with WorkType::PipeIo \
+                     (works[{}]): PipeIo's pair shape (worker A=even, \
+                     B=odd) holds inverse halves of a single pipe pair, \
+                     which fork-mode dispatch separates by closing each \
+                     peer's inverse fds in its own fd table. The pcomm \
+                     container's threads share one fd table, so closing \
+                     A's inverse halves also closes B's working halves \
+                     — and not closing them leaves every writer alive \
+                     across the container so EOF never propagates. Drop \
+                     pcomm or pick a non-paired work type.",
+                    group.group_idx,
+                );
+            }
+            if matches!(group.work_type, WorkType::CachePipe { .. }) {
+                anyhow::bail!(
+                    "WorkSpec::pcomm is incompatible with WorkType::CachePipe \
+                     (works[{}]): CachePipe shares the same paired-pipe \
+                     shape as PipeIo and inherits the same fd-table \
+                     hazard inside a pcomm container. Drop pcomm or pick \
+                     a non-paired work type.",
                     group.group_idx,
                 );
             }
