@@ -1914,6 +1914,30 @@ impl KtstrVm {
                 // a hostile guest force a spurious capture, mirroring
                 // the SCHED_EXIT promotion gate.
                 let mut snapshot_requests_pending: Vec<SnapshotRequest> = Vec::new();
+                // CAPTURE requests received before `owned_accessor`
+                // adoption are queued here instead of being serviced
+                // immediately. Servicing pre-adoption produces a
+                // partial-dump report (0 maps, vcpu_regs only — see
+                // the `// Partial dump:` branch in
+                // `freeze_and_capture`) which is useless to the test
+                // author who asked for `Op::snapshot("...")`.
+                //
+                // The queue is drained at the accessor-adoption site
+                // by appending its contents back onto
+                // `snapshot_requests_pending`, so the same iteration's
+                // CAPTURE drain dispatches them through the normal
+                // `freeze_and_capture(false)` flow with the accessor
+                // present.
+                //
+                // If the accessor never adopts (worker permanently
+                // failed past its 60 s deadline), the queue is
+                // dropped at coord exit and the guest's blocking
+                // reader on `/dev/vport0p1` times out at the per-Op
+                // 30 s deadline — same observable behaviour as a
+                // late-boot rendezvous timeout. WATCH requests are
+                // NOT deferred: WATCH only needs the symbol cache,
+                // which is independent of `owned_accessor`.
+                let mut capture_requests_deferred: Vec<SnapshotRequest> = Vec::new();
                 // Periodic-capture state. `periodic_boundaries_ns`
                 // is the precomputed list of `Instant` deadlines
                 // (encoded as nanos-since-`run_start`) at which the
@@ -2190,6 +2214,24 @@ impl KtstrVm {
                         owned_accessor = Some(map);
                         if let Some(prog) = prog.as_ref() {
                             owned_prog_accessor = Some(prog);
+                        }
+                        // Drain CAPTURE requests deferred during the
+                        // pre-adoption window. Append onto
+                        // `snapshot_requests_pending` so the existing
+                        // CAPTURE drain (further down this iteration
+                        // body) dispatches them through the normal
+                        // `freeze_and_capture(false)` flow with the
+                        // accessor present — no flow duplication.
+                        if !capture_requests_deferred.is_empty() {
+                            let n = capture_requests_deferred.len();
+                            tracing::info!(
+                                deferred_count = n,
+                                "freeze-coord: draining deferred CAPTURE \
+                                 requests after owned_accessor adoption"
+                            );
+                            snapshot_requests_pending.append(
+                                &mut capture_requests_deferred,
+                            );
                         }
                     }
                     // Resolve the per-CPU offset array once the prog
@@ -4348,6 +4390,38 @@ impl KtstrVm {
                         tag,
                     } in pending
                     {
+                        // Defer CAPTURE before the accessor is ready.
+                        // Servicing now would emit a partial-dump
+                        // report with 0 maps (see `freeze_and_capture`
+                        // closure's else branch). Push onto the
+                        // deferred queue; the accessor-adoption arm
+                        // appends queued entries back into
+                        // `snapshot_requests_pending` so the same
+                        // iteration's drain dispatches them with the
+                        // accessor present. WATCH is NOT deferred
+                        // here: it only needs the cached vmlinux
+                        // symbol table, which is independent of the
+                        // bpf-map accessor. NOTE: do not take the
+                        // in-flight gate before this check — the
+                        // deferral must leave the gate clear so a
+                        // periodic / user-watchpoint capture can
+                        // still run during the boot window.
+                        if kind == crate::vmm::wire::SNAPSHOT_KIND_CAPTURE
+                            && owned_accessor.is_none()
+                        {
+                            tracing::info!(
+                                request_id,
+                                %tag,
+                                "freeze-coord: TLV CAPTURE deferred \
+                                 (owned_accessor not yet adopted)"
+                            );
+                            capture_requests_deferred.push(SnapshotRequest {
+                                request_id,
+                                kind,
+                                tag,
+                            });
+                            continue;
+                        }
                         if freeze_coord_on_demand_in_flight
                             .swap(true, Ordering::AcqRel)
                         {
