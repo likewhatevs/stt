@@ -484,7 +484,7 @@ Run it:
 cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
 ```
 
-## Step 9: Name and prioritize workers
+## Step 10: Name and prioritize workers
 
 Per-cgroup defaults travel through `CgroupDef`'s builder methods so
 schedulers that key on `task->comm` or `task_struct->static_prio`
@@ -522,13 +522,13 @@ indices are computed within the container's thread group, not
 across forked siblings. `SignalStorm` uses `tkill` (per-task signal
 delivery, `PIDTYPE_PID`) rather than `kill` (`PIDTYPE_TGID`), so
 the partner-vs-self addressing is correct uniformly across
-`Fork`, `Thread`, and `Pcomm` clone modes.
+`Fork` and `Thread` clone modes, including inside pcomm-coalesced thread groups.
 
 Per-`WorkSpec` overrides win over cgroup-level defaults — write
 `.work(WorkSpec::default().nice(0).comm("hot_spinner"))` to opt a
 specific worker out of the cgroup-level defaults.
 
-## Step 10: Inline scheduler config
+## Step 11: Inline scheduler config
 
 Schedulers like `scx_layered` and `scx_lavd` accept a JSON config via
 `--config /path/to/file.json`. Declare the arg template + guest path
@@ -566,7 +566,7 @@ host file is packed into the initramfs and `--config` is injected
 into scheduler args automatically; no `config = …` on the test is
 needed in that flavor.
 
-## Step 11: Decouple virtual topology from host hardware
+## Step 12: Decouple virtual topology from host hardware
 
 By default, ktstr pins vCPUs to host cores in a layout that mirrors
 the declared virtual topology. A test declaring `numa_nodes = 3,

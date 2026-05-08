@@ -176,7 +176,7 @@ example.
 |---|---|---|
 | `auto_repro` | `true` | On scheduler crash, boot a second VM with probes attached. Set to `false` for fast iteration. |
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
-| `no_perf_mode` | `false` | Decouple the virtual topology from host hardware: build the VM with the declared `numa_nodes` / `llcs` / `cores` / `threads` even on smaller hosts; skip vCPU pinning, hugepages, NUMA mbind, RT scheduling, and KVM exit suppression; relax gauntlet preset filtering to the single "host has enough total CPUs" check. Mutually exclusive with `performance_mode = true` (validated at compile time). Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test — either source forces the no-perf path. See [Performance Mode](../concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation). |
+| `no_perf_mode` | `false` | Decouple the virtual topology from host hardware: build the VM with the declared `numa_nodes` / `llcs` / `cores` / `threads` even on smaller hosts; skip vCPU pinning, hugepages, NUMA mbind, RT scheduling, and KVM exit suppression; relax gauntlet preset filtering to the single "host has enough total CPUs" check. Mutually exclusive with `performance_mode = true` (validated at runtime by `KtstrTestEntry::validate`). Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test — either source forces the no-perf path. See [Performance Mode](../concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation). |
 | `duration_s` | 12 | Per-scenario duration in seconds |
 | `workers_per_cgroup` | 2 | Workers per cgroup |
 | `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |

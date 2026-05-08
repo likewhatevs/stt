@@ -297,8 +297,8 @@ is the pcomm string, with worker threads inside it. Each worker
 thread additionally sets its own `task->comm` via the per-WorkSpec
 `.comm()`. Models real applications like `chrome` (pcomm) hosting
 `ThreadPoolForeg` (per-thread comm). `PipeIo`/`CachePipe` and
-`SignalStorm` work correctly under all clone modes (Fork, Thread,
-Pcomm). See [Tutorial: Step 9](tutorial.md#step-9-name-and-prioritize-workers).
+`SignalStorm` work correctly under Fork and Thread clone modes,
+including inside pcomm-coalesced thread groups. See [Tutorial: Step 10](tutorial.md#step-10-name-and-prioritize-workers).
 
 </details>
 
