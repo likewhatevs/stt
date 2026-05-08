@@ -947,6 +947,18 @@ pub struct FailureDumpReport {
     /// observing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_counters: Option<ProbeBssCounters>,
+    /// `true` when this report was produced by
+    /// [`Self::placeholder`] — i.e. the capture pipeline could
+    /// not produce real data (typical cause: freeze rendezvous
+    /// timed out). Periodic-sample temporal assertions skip
+    /// placeholder reports rather than treating their empty
+    /// vectors as "no progress" signals; the `*_unavailable`
+    /// fields carry the reason string for human consumers, but
+    /// the boolean flag is the machine-checkable discriminant a
+    /// pattern can branch on without re-deriving placeholder
+    /// status from the absence of every field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_placeholder: bool,
 }
 
 impl Default for FailureDumpReport {
@@ -977,6 +989,7 @@ impl Default for FailureDumpReport {
             vcpu_perf_at_freeze: Vec::new(),
             dump_truncated_at_us: None,
             probe_counters: None,
+            is_placeholder: false,
         }
     }
 }
@@ -1003,6 +1016,7 @@ impl FailureDumpReport {
             per_node_numa_unavailable: Some(reason.clone()),
             task_enrichments_unavailable: Some(reason.clone()),
             scx_walker_unavailable: Some(reason),
+            is_placeholder: true,
             ..Self::default()
         }
     }
@@ -2254,6 +2268,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         vcpu_perf_at_freeze,
         dump_truncated_at_us: None,
         probe_counters,
+        is_placeholder: false,
     };
 
     // Per-map program-BTF cache, keyed by `btf_kva`. Each unique

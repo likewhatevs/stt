@@ -2733,9 +2733,7 @@ fn wait_for_stats_socket(
         if port_ready {
             match port.read(&mut buf) {
                 Ok(0) => {
-                    tracing::debug!(
-                        "stats relay: port read EOF in inotify wait; exiting"
-                    );
+                    tracing::debug!("stats relay: port read EOF in inotify wait; exiting");
                     return None;
                 }
                 Ok(n) => {
@@ -2844,7 +2842,10 @@ fn drain_port_emit_errors(port: &mut std::fs::File) {
         match port.read(&mut buf) {
             Ok(0) => break,
             Ok(_) => {
-                if port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY).is_err() {
+                if port
+                    .write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY)
+                    .is_err()
+                {
                     break;
                 }
             }

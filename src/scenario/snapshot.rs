@@ -214,6 +214,20 @@ pub enum SnapshotError {
     /// Hash entry has no rendered key/value side (BTF type id was
     /// missing at capture time, leaving the hex bytes only).
     NoRendered { map: String, side: &'static str },
+    /// The sample's underlying [`crate::monitor::dump::FailureDumpReport`]
+    /// is a placeholder produced by
+    /// [`crate::monitor::dump::FailureDumpReport::placeholder`] —
+    /// the freeze-rendezvous path could not collect real data
+    /// (typical cause: vCPU rendezvous timed out). Temporal
+    /// patterns in [`crate::assert::temporal`] route this variant
+    /// through their per-sample skip handling so a placeholder
+    /// sample never falsely registers as zero progress against a
+    /// monotonicity / rate / steady / ratio band. The `reason`
+    /// string mirrors `FailureDumpReport::scx_walker_unavailable`
+    /// when present (set by `placeholder()` to the constructor
+    /// argument), giving the operator the cause without re-walking
+    /// the report.
+    PlaceholderSample { tag: String, reason: String },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -320,6 +334,13 @@ impl std::fmt::Display for SnapshotError {
                 write!(
                     f,
                     "map '{map}': {side} has no rendered structure (no BTF type at capture time)"
+                )
+            }
+            SnapshotError::PlaceholderSample { tag, reason } => {
+                write!(
+                    f,
+                    "sample '{tag}' is a placeholder report (capture pipeline did not land): \
+                     {reason}"
                 )
             }
         }
@@ -438,9 +459,27 @@ pub const MAX_STORED_SNAPSHOTS: usize = 64;
 /// Inner storage for [`SnapshotBridge::snapshots`]. Pairs the
 /// HashMap-keyed reports with a [`VecDeque`] tracking insertion
 /// order so the FIFO eviction in [`SnapshotBridge::store`] can pop
-/// the oldest tag in O(1) when the cap is reached.
+/// the oldest tag in O(1) when the cap is reached. The optional
+/// `stats` map carries the scheduler-stats JSON captured at the
+/// same boundary as the snapshot — only periodic captures populate
+/// this; on-demand and watchpoint captures leave the slot empty
+/// because no stats request is issued.
 struct SnapshotStore {
     reports: HashMap<String, FailureDumpReport>,
+    /// scx_stats JSON captured at the same wall-clock as the report
+    /// stored under the same tag in `reports`. Periodic captures
+    /// populate this when a stats client is wired and the request
+    /// succeeds; on-demand / watchpoint paths leave the entry
+    /// absent. Sample::stats reads `stats.get(tag)` — `None` is the
+    /// expected shape for non-periodic tags or when the scheduler
+    /// stats request failed.
+    stats: HashMap<String, serde_json::Value>,
+    /// Elapsed milliseconds since `run_start` at the moment the
+    /// periodic capture fired. Same key set as `reports` for
+    /// periodic tags; absent for non-periodic captures. Read by
+    /// [`SnapshotBridge::drain_ordered_with_stats`] to populate
+    /// `Sample::elapsed_ms` without recomputing.
+    elapsed_ms: HashMap<String, u64>,
     /// Insertion order of currently-resident keys. An overwrite of
     /// an existing key MUST remove the prior entry from this deque
     /// before pushing the fresh occurrence so the `reports.len()`
@@ -452,6 +491,8 @@ impl SnapshotStore {
     fn new() -> Self {
         Self {
             reports: HashMap::new(),
+            stats: HashMap::new(),
+            elapsed_ms: HashMap::new(),
             order: VecDeque::new(),
         }
     }
@@ -636,6 +677,39 @@ impl SnapshotBridge {
     /// of an existing tag also warns and replaces the prior report
     /// in place without disturbing FIFO ordering of other entries.
     pub fn store(&self, name: &str, report: FailureDumpReport) {
+        self.store_internal(name, report, None, None);
+    }
+
+    /// Bundle a [`FailureDumpReport`] with the scx_stats JSON and
+    /// elapsed-millisecond timestamp captured at the same periodic
+    /// boundary. Used by the freeze coordinator's periodic-fire path
+    /// so [`Sample`](crate::scenario::sample::Sample) can pair the
+    /// frozen BPF state with the running-scheduler stats observed
+    /// just before the freeze rendezvous.
+    ///
+    /// Stats / elapsed are stored in parallel HashMaps keyed by the
+    /// same tag as the report. FIFO eviction sweeps all three in
+    /// lock-step; an overwrite refreshes order and replaces every
+    /// parallel value (or clears it when the new write passes
+    /// `None`) so a stale stats / elapsed entry can never accompany
+    /// a freshly stored report.
+    pub fn store_with_stats(
+        &self,
+        name: &str,
+        report: FailureDumpReport,
+        stats: Option<serde_json::Value>,
+        elapsed_ms: Option<u64>,
+    ) {
+        self.store_internal(name, report, stats, elapsed_ms);
+    }
+
+    fn store_internal(
+        &self,
+        name: &str,
+        report: FailureDumpReport,
+        stats: Option<serde_json::Value>,
+        elapsed_ms: Option<u64>,
+    ) {
         let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = store.reports.insert(name.to_string(), report) {
             tracing::warn!(
@@ -652,15 +726,44 @@ impl SnapshotBridge {
                 store.order.remove(pos);
             }
             store.order.push_back(name.to_string());
+            // Refresh / clear parallel stats and elapsed entries so
+            // the post-overwrite `(report, stats, elapsed)` tuple is
+            // self-consistent — a None overwrite must clear the prior
+            // value rather than carrying forward a stale match from
+            // an earlier capture.
+            match stats {
+                Some(v) => {
+                    store.stats.insert(name.to_string(), v);
+                }
+                None => {
+                    store.stats.remove(name);
+                }
+            }
+            match elapsed_ms {
+                Some(v) => {
+                    store.elapsed_ms.insert(name.to_string(), v);
+                }
+                None => {
+                    store.elapsed_ms.remove(name);
+                }
+            }
             return;
         }
         store.order.push_back(name.to_string());
+        if let Some(v) = stats {
+            store.stats.insert(name.to_string(), v);
+        }
+        if let Some(v) = elapsed_ms {
+            store.elapsed_ms.insert(name.to_string(), v);
+        }
         while store.reports.len() > MAX_STORED_SNAPSHOTS {
             let Some(evicted) = store.order.pop_front() else {
                 // Defensive: if order is empty while reports is over
                 // cap something is desynchronised — clear reports to
                 // restore the invariant rather than loop forever.
                 store.reports.clear();
+                store.stats.clear();
+                store.elapsed_ms.clear();
                 break;
             };
             if store.reports.remove(&evicted).is_some() {
@@ -670,6 +773,10 @@ impl SnapshotBridge {
                     "SnapshotBridge::store: cap reached, evicting oldest captured snapshot"
                 );
             }
+            // Sweep the parallel maps in lock-step so a stranded
+            // stats / elapsed entry cannot outlive its report.
+            store.stats.remove(&evicted);
+            store.elapsed_ms.remove(&evicted);
         }
     }
 
@@ -709,10 +816,15 @@ impl SnapshotBridge {
     }
 
     /// Take ownership of the captured snapshots, leaving the bridge
-    /// empty.
+    /// empty. Drops any periodic-capture stats / elapsed metadata
+    /// stored alongside reports — callers that need the stats JSON
+    /// or per-sample timestamp must use
+    /// [`Self::drain_ordered_with_stats`] instead.
     pub fn drain(&self) -> HashMap<String, FailureDumpReport> {
         let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
         store.order.clear();
+        store.stats.clear();
+        store.elapsed_ms.clear();
         std::mem::take(&mut store.reports)
     }
 
@@ -740,6 +852,11 @@ impl SnapshotBridge {
         let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
         let order = std::mem::take(&mut store.order);
         let mut reports = std::mem::take(&mut store.reports);
+        // Stats / elapsed are dropped with the bridge — callers
+        // that need the parallel data must use
+        // `drain_ordered_with_stats` instead.
+        store.stats.clear();
+        store.elapsed_ms.clear();
         let mut out: Vec<(String, FailureDumpReport)> = Vec::with_capacity(order.len());
         for tag in order {
             if let Some(report) = reports.remove(&tag) {
@@ -760,6 +877,69 @@ impl SnapshotBridge {
                  invariant violation; please file)"
             );
             out.push((tag, report));
+        }
+        out
+    }
+
+    /// Take ownership of the captured snapshots in insertion order
+    /// along with the parallel scx_stats JSON and per-sample
+    /// elapsed-ms timestamps (`None` per slot when the tag was
+    /// captured outside the periodic-capture path or when the stats
+    /// request failed). Empties the bridge — every parallel map is
+    /// drained in lock-step so a follow-up call returns an empty
+    /// vec.
+    ///
+    /// The returned tuple shape `(tag, report, stats, elapsed_ms)`
+    /// is the input to
+    /// [`SampleSeries::from_drained`](crate::scenario::sample::SampleSeries::from_drained):
+    /// the bridge owns the raw drainable shape, the higher-level
+    /// `SampleSeries` view consumes it. Insertion order is the
+    /// signal — periodic captures land
+    /// `periodic_000`/`periodic_001`/… in monotonic wall-clock
+    /// order, and the temporal-assertion patterns walk the vec
+    /// expecting that ordering.
+    pub fn drain_ordered_with_stats(
+        &self,
+    ) -> Vec<(
+        String,
+        FailureDumpReport,
+        Option<serde_json::Value>,
+        Option<u64>,
+    )> {
+        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let order = std::mem::take(&mut store.order);
+        let mut reports = std::mem::take(&mut store.reports);
+        let mut stats = std::mem::take(&mut store.stats);
+        let mut elapsed = std::mem::take(&mut store.elapsed_ms);
+        let mut out: Vec<(
+            String,
+            FailureDumpReport,
+            Option<serde_json::Value>,
+            Option<u64>,
+        )> = Vec::with_capacity(order.len());
+        for tag in order {
+            if let Some(report) = reports.remove(&tag) {
+                let s = stats.remove(&tag);
+                let e = elapsed.remove(&tag);
+                out.push((tag, report, s, e));
+            }
+        }
+        // Defensive tail for desynchronised maps (matches
+        // `drain_ordered`'s tail behaviour). Any stats / elapsed
+        // entries that were not paired with a tag in `order` are
+        // dropped because they have no anchoring report — surfacing
+        // them as orphaned tuples would invent a structure no
+        // consumer expects.
+        for (tag, report) in reports {
+            tracing::warn!(
+                tag,
+                "SnapshotBridge::drain_ordered_with_stats: report present in `reports` \
+                 but missing from `order` — surfacing at tail (FIFO \
+                 invariant violation; please file)"
+            );
+            let s = stats.remove(&tag);
+            let e = elapsed.remove(&tag);
+            out.push((tag, report, s, e));
         }
         out
     }
@@ -918,6 +1098,18 @@ impl<'a> Snapshot<'a> {
     /// Number of maps captured in the report.
     pub fn map_count(&self) -> usize {
         self.report.maps.len()
+    }
+
+    /// True when the underlying [`FailureDumpReport`] is a
+    /// placeholder produced by [`FailureDumpReport::placeholder`]
+    /// — i.e. the freeze-rendezvous capture pipeline could not
+    /// produce real data. Periodic-sample temporal patterns use
+    /// this to skip the BPF axis on a placeholder sample (the
+    /// stats axis, when present, may still be valid). Bypassing
+    /// the projection-error path keeps the sample's diagnostic
+    /// distinct from "field missing on a real capture".
+    pub fn is_placeholder(&self) -> bool {
+        self.report.is_placeholder
     }
 }
 
@@ -1425,6 +1617,326 @@ impl<'a> SnapshotField<'a> {
             SnapshotField::Missing(err) => Some(err),
             _ => None,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON dotted-path accessor (mirrors SnapshotField for stats values)
+// ---------------------------------------------------------------------------
+
+/// One value's view at the leaf of a dotted-path walk over a
+/// [`serde_json::Value`]. Returned by [`stats_path`] / [`StatsValue::path`].
+///
+/// Mirrors the [`SnapshotField`] shape so test authors who already
+/// know the BPF-snapshot accessor surface get the same `as_u64` /
+/// `as_i64` / `as_f64` / `as_bool` / `as_str` terminals on the
+/// scx_stats JSON projection. Errors flow through the same
+/// [`SnapshotError`] variants — `FieldNotFound` carries the
+/// available object keys, `NotAStruct` flags a non-object cursor,
+/// `TypeMismatch` reports the actual JSON shape — so failure-path
+/// rendering in temporal assertions is identical regardless of
+/// which side of the
+/// [`Sample`](crate::scenario::sample::Sample) bundle the lookup
+/// originated on.
+#[derive(Debug, Clone)]
+#[must_use = "JsonField is a borrowed view; call as_u64 / as_i64 / etc. to extract"]
+#[non_exhaustive]
+pub enum JsonField<'a> {
+    /// Resolved JSON value at the leaf of the path walk.
+    Value(&'a serde_json::Value),
+    /// Path could not be resolved.
+    Missing(SnapshotError),
+}
+
+impl<'a> JsonField<'a> {
+    /// True when the path resolved.
+    pub fn is_present(&self) -> bool {
+        !matches!(self, JsonField::Missing(_))
+    }
+
+    /// Underlying JSON value if present.
+    pub fn raw(&self) -> Option<&'a serde_json::Value> {
+        match self {
+            JsonField::Value(v) => Some(*v),
+            JsonField::Missing(_) => None,
+        }
+    }
+
+    /// Error reference when the path could not be resolved.
+    pub fn error(&self) -> Option<&SnapshotError> {
+        match self {
+            JsonField::Missing(err) => Some(err),
+            _ => None,
+        }
+    }
+
+    /// Walk further into a sub-field. Composable with the result of
+    /// [`stats_path`] — `stats_path(v, "layers").path("batch.util")`
+    /// is the canonical "drill into a periodic-stats object" shape.
+    pub fn path(&self, path: &str) -> JsonField<'a> {
+        match self {
+            JsonField::Value(v) => walk_json_path(v, path),
+            JsonField::Missing(err) => JsonField::Missing(err.clone()),
+        }
+    }
+
+    /// Read as `u64`. Accepts JSON integers (positive only), JSON
+    /// booleans (true → 1, false → 0), and JSON strings whose
+    /// content parses as a u64 (scx_stats sometimes stringifies
+    /// large counters to avoid 53-bit float collapse). Returns
+    /// [`SnapshotError::TypeMismatch`] otherwise.
+    pub fn as_u64(&self) -> SnapshotResult<u64> {
+        match self {
+            JsonField::Value(v) => json_to_u64(v),
+            JsonField::Missing(err) => Err(err.clone()),
+        }
+    }
+
+    /// Read as `i64`. Accepts JSON integers (any sign), JSON
+    /// booleans (true → 1, false → 0), and JSON strings whose
+    /// content parses as an i64.
+    pub fn as_i64(&self) -> SnapshotResult<i64> {
+        match self {
+            JsonField::Value(v) => json_to_i64(v),
+            JsonField::Missing(err) => Err(err.clone()),
+        }
+    }
+
+    /// Read as `f64`. Accepts JSON numbers (integers and
+    /// floating-point) and JSON strings whose content parses as
+    /// f64.
+    pub fn as_f64(&self) -> SnapshotResult<f64> {
+        match self {
+            JsonField::Value(v) => json_to_f64(v),
+            JsonField::Missing(err) => Err(err.clone()),
+        }
+    }
+
+    /// Read as `bool`. Accepts JSON booleans directly; rejects
+    /// everything else. Distinct from `as_u64() != 0` so the call
+    /// site reads honestly: a `bool` claim wants a JSON `true`/
+    /// `false`, not a stringified `"1"` that happens to parse.
+    pub fn as_bool(&self) -> SnapshotResult<bool> {
+        match self {
+            JsonField::Value(serde_json::Value::Bool(b)) => Ok(*b),
+            JsonField::Value(other) => Err(SnapshotError::TypeMismatch {
+                expected: "bool",
+                actual: describe_json_kind(other),
+                requested: String::new(),
+            }),
+            JsonField::Missing(err) => Err(err.clone()),
+        }
+    }
+
+    /// Read as `&str`. Accepts JSON strings only.
+    pub fn as_str(&self) -> SnapshotResult<&'a str> {
+        match self {
+            JsonField::Value(serde_json::Value::String(s)) => Ok(s.as_str()),
+            JsonField::Value(other) => Err(SnapshotError::TypeMismatch {
+                expected: "str",
+                actual: describe_json_kind(other),
+                requested: String::new(),
+            }),
+            JsonField::Missing(err) => Err(err.clone()),
+        }
+    }
+}
+
+/// Build a [`JsonField`] view rooted at `value` and walk along the
+/// dotted path. An empty path returns the root unchanged so a
+/// caller writing `stats_path(v, "").as_f64()` (e.g. for a
+/// scalar-rooted stats response) hits the typed scalar accessor
+/// directly.
+///
+/// Mirrors [`Snapshot::var`] / [`SnapshotEntry::get`] in error
+/// shape: typos and missing keys surface as
+/// [`SnapshotError::FieldNotFound`] with the available sibling
+/// keys at the failing depth — the same diagnostic experience the
+/// BPF-snapshot side already provides. scx_stats payloads commonly
+/// nest layer / cgroup / cpu maps under top-level keys, so the
+/// dotted form `"layers.batch.util"` is the canonical drill-down
+/// for layered scheduler stats.
+pub fn stats_path<'a>(value: &'a serde_json::Value, path: &str) -> JsonField<'a> {
+    walk_json_path(value, path)
+}
+
+fn walk_json_path<'a>(root: &'a serde_json::Value, path: &str) -> JsonField<'a> {
+    if path.is_empty() {
+        return JsonField::Value(root);
+    }
+    let mut cursor: &serde_json::Value = root;
+    let mut walked = String::new();
+    for component in path.split('.') {
+        if component.is_empty() {
+            return JsonField::Missing(SnapshotError::EmptyPathComponent {
+                requested: path.to_string(),
+            });
+        }
+        match cursor {
+            serde_json::Value::Object(map) => {
+                let Some(next) = map.get(component) else {
+                    let mut available: Vec<String> = map.keys().cloned().collect();
+                    available.sort();
+                    return JsonField::Missing(SnapshotError::FieldNotFound {
+                        requested: path.to_string(),
+                        walked: walked.clone(),
+                        component: component.to_string(),
+                        available,
+                    });
+                };
+                cursor = next;
+            }
+            other => {
+                return JsonField::Missing(SnapshotError::NotAStruct {
+                    requested: path.to_string(),
+                    walked: walked.clone(),
+                    component: component.to_string(),
+                    kind: describe_json_kind(other),
+                });
+            }
+        }
+        if !walked.is_empty() {
+            walked.push('.');
+        }
+        walked.push_str(component);
+    }
+    JsonField::Value(cursor)
+}
+
+fn describe_json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "Null",
+        serde_json::Value::Bool(_) => "Bool",
+        serde_json::Value::Number(_) => "Number",
+        serde_json::Value::String(_) => "String",
+        serde_json::Value::Array(_) => "Array",
+        serde_json::Value::Object(_) => "Object",
+    }
+}
+
+fn json_to_u64(v: &serde_json::Value) -> SnapshotResult<u64> {
+    match v {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Ok(u)
+            } else if let Some(i) = n.as_i64() {
+                if i < 0 {
+                    Err(SnapshotError::TypeMismatch {
+                        expected: "u64",
+                        actual: "Int(negative)",
+                        requested: String::new(),
+                    })
+                } else {
+                    Ok(i as u64)
+                }
+            } else if let Some(f) = n.as_f64() {
+                if !f.is_finite() || f < 0.0 {
+                    Err(SnapshotError::TypeMismatch {
+                        expected: "u64",
+                        actual: "Float(non-coercible)",
+                        requested: String::new(),
+                    })
+                } else if f.fract() != 0.0 {
+                    Err(SnapshotError::TypeMismatch {
+                        expected: "integer",
+                        actual: "non-integer float",
+                        requested: String::new(),
+                    })
+                } else {
+                    Ok(f as u64)
+                }
+            } else {
+                Err(SnapshotError::TypeMismatch {
+                    expected: "u64",
+                    actual: "Number(unrepresentable)",
+                    requested: String::new(),
+                })
+            }
+        }
+        serde_json::Value::Bool(b) => Ok(u64::from(*b)),
+        serde_json::Value::String(s) => s.parse::<u64>().map_err(|_| SnapshotError::TypeMismatch {
+            expected: "u64",
+            actual: "String(non-numeric)",
+            requested: String::new(),
+        }),
+        other => Err(SnapshotError::TypeMismatch {
+            expected: "u64",
+            actual: describe_json_kind(other),
+            requested: String::new(),
+        }),
+    }
+}
+
+fn json_to_i64(v: &serde_json::Value) -> SnapshotResult<i64> {
+    match v {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i)
+            } else if let Some(u) = n.as_u64() {
+                if u > i64::MAX as u64 {
+                    Err(SnapshotError::TypeMismatch {
+                        expected: "i64",
+                        actual: "Uint(>i64::MAX)",
+                        requested: String::new(),
+                    })
+                } else {
+                    Ok(u as i64)
+                }
+            } else if let Some(f) = n.as_f64() {
+                if !f.is_finite() {
+                    Err(SnapshotError::TypeMismatch {
+                        expected: "i64",
+                        actual: "Float(non-finite)",
+                        requested: String::new(),
+                    })
+                } else if f.fract() != 0.0 {
+                    Err(SnapshotError::TypeMismatch {
+                        expected: "integer",
+                        actual: "non-integer float",
+                        requested: String::new(),
+                    })
+                } else {
+                    Ok(f as i64)
+                }
+            } else {
+                Err(SnapshotError::TypeMismatch {
+                    expected: "i64",
+                    actual: "Number(unrepresentable)",
+                    requested: String::new(),
+                })
+            }
+        }
+        serde_json::Value::Bool(b) => Ok(i64::from(*b)),
+        serde_json::Value::String(s) => s.parse::<i64>().map_err(|_| SnapshotError::TypeMismatch {
+            expected: "i64",
+            actual: "String(non-numeric)",
+            requested: String::new(),
+        }),
+        other => Err(SnapshotError::TypeMismatch {
+            expected: "i64",
+            actual: describe_json_kind(other),
+            requested: String::new(),
+        }),
+    }
+}
+
+fn json_to_f64(v: &serde_json::Value) -> SnapshotResult<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64().ok_or(SnapshotError::TypeMismatch {
+            expected: "f64",
+            actual: "Number(unrepresentable)",
+            requested: String::new(),
+        }),
+        serde_json::Value::String(s) => s.parse::<f64>().map_err(|_| SnapshotError::TypeMismatch {
+            expected: "f64",
+            actual: "String(non-numeric)",
+            requested: String::new(),
+        }),
+        other => Err(SnapshotError::TypeMismatch {
+            expected: "f64",
+            actual: describe_json_kind(other),
+            requested: String::new(),
+        }),
     }
 }
 
@@ -2555,5 +3067,164 @@ mod tests {
             a.1.schema, "refreshed",
             "drain_ordered must surface the refreshed report value, not the prior one",
         );
+    }
+
+    /// `store_with_stats` bundles a stats JSON and an elapsed-ms
+    /// timestamp alongside the report. `drain_ordered_with_stats`
+    /// returns the matching `(tag, report, stats, elapsed)` tuple
+    /// per stored entry; non-paired entries (added via plain
+    /// `store`) report `None` for both parallel slots.
+    #[test]
+    fn snapshot_bridge_store_with_stats_round_trips() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        let stats = serde_json::json!({"busy": 75.0});
+        bridge.store_with_stats(
+            "periodic_000",
+            FailureDumpReport::default(),
+            Some(stats.clone()),
+            Some(123),
+        );
+        bridge.store("periodic_001", FailureDumpReport::default());
+        let drained = bridge.drain_ordered_with_stats();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].0, "periodic_000");
+        assert_eq!(drained[0].2, Some(stats));
+        assert_eq!(drained[0].3, Some(123));
+        assert_eq!(drained[1].0, "periodic_001");
+        assert!(drained[1].2.is_none());
+        assert!(drained[1].3.is_none());
+    }
+
+    /// FIFO eviction at `MAX_STORED_SNAPSHOTS` sweeps the parallel
+    /// stats / elapsed maps in lock-step so a stranded entry can
+    /// never outlive its report.
+    #[test]
+    fn snapshot_bridge_store_with_stats_evicts_in_lockstep() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        for i in 0..MAX_STORED_SNAPSHOTS {
+            bridge.store_with_stats(
+                &format!("tag_{i:04}"),
+                FailureDumpReport::default(),
+                Some(serde_json::json!({"i": i})),
+                Some(i as u64),
+            );
+        }
+        let overflow_tag = format!("tag_{MAX_STORED_SNAPSHOTS:04}");
+        bridge.store_with_stats(
+            &overflow_tag,
+            FailureDumpReport::default(),
+            Some(serde_json::json!({"overflow": true})),
+            Some(9_999),
+        );
+        let drained = bridge.drain_ordered_with_stats();
+        // tag_0000 must be evicted.
+        let names: Vec<&str> = drained.iter().map(|(n, _, _, _)| n.as_str()).collect();
+        assert!(!names.contains(&"tag_0000"));
+        // Newest must be present with its parallel data.
+        let last = drained
+            .iter()
+            .find(|(n, _, _, _)| n == &overflow_tag)
+            .expect("overflow tag resident after evict");
+        assert_eq!(last.2, Some(serde_json::json!({"overflow": true})));
+        assert_eq!(last.3, Some(9_999));
+    }
+
+    /// Overwriting a tag with a `None` stats slot clears the prior
+    /// stats — guards against a stale stats / elapsed value
+    /// silently surviving across an overwrite that did not bundle
+    /// fresh values.
+    #[test]
+    fn snapshot_bridge_store_with_stats_overwrite_clears_stale_values() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        bridge.store_with_stats(
+            "periodic_000",
+            FailureDumpReport::default(),
+            Some(serde_json::json!({"first": true})),
+            Some(100),
+        );
+        // Overwrite via plain `store(...)` — should clear the
+        // parallel slots since neither was passed.
+        bridge.store("periodic_000", FailureDumpReport::default());
+        let drained = bridge.drain_ordered_with_stats();
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].2.is_none());
+        assert!(drained[0].3.is_none());
+    }
+
+    // ---------- stats_path JSON accessor ----------
+
+    /// `stats_path` walks a JSON object along a dotted path and
+    /// returns a [`JsonField`] view at the leaf.
+    #[test]
+    fn stats_path_walks_dotted_path() {
+        let v = serde_json::json!({"layers": {"batch": {"util": 75.5}}});
+        let f = stats_path(&v, "layers.batch.util");
+        assert_eq!(f.as_f64().unwrap(), 75.5);
+    }
+
+    /// Empty path returns the root unchanged.
+    #[test]
+    fn stats_path_empty_returns_root() {
+        let v = serde_json::json!(42);
+        let f = stats_path(&v, "");
+        assert_eq!(f.as_u64().unwrap(), 42);
+    }
+
+    /// Missing key surfaces FieldNotFound with the available keys.
+    #[test]
+    fn stats_path_missing_key_lists_alternatives() {
+        let v = serde_json::json!({"busy": 50.0, "antistall": 0});
+        let f = stats_path(&v, "missing");
+        let err = f.error().expect("missing must error");
+        match err {
+            SnapshotError::FieldNotFound {
+                component,
+                available,
+                ..
+            } => {
+                assert_eq!(component, "missing");
+                assert!(available.contains(&"busy".to_string()));
+                assert!(available.contains(&"antistall".to_string()));
+            }
+            other => panic!("expected FieldNotFound, got {other:?}"),
+        }
+    }
+
+    /// Walking through a non-object cursor surfaces NotAStruct.
+    #[test]
+    fn stats_path_through_scalar_errors_not_a_struct() {
+        let v = serde_json::json!({"x": 5});
+        let f = stats_path(&v, "x.y");
+        match f.error().expect("must error") {
+            SnapshotError::NotAStruct { component, .. } => {
+                assert_eq!(component, "y");
+            }
+            other => panic!("expected NotAStruct, got {other:?}"),
+        }
+    }
+
+    /// Empty path component (`a..b`) reports EmptyPathComponent.
+    #[test]
+    fn stats_path_empty_component_errors() {
+        let v = serde_json::json!({"a": {"b": 1}});
+        let f = stats_path(&v, "a..b");
+        match f.error().expect("must error") {
+            SnapshotError::EmptyPathComponent { requested } => {
+                assert_eq!(requested, "a..b");
+            }
+            other => panic!("expected EmptyPathComponent, got {other:?}"),
+        }
+    }
+
+    /// String-encoded numeric coerces via as_u64 (scx_stats
+    /// stringifies large counters to avoid 53-bit float collapse).
+    #[test]
+    fn stats_path_string_to_u64_coerces() {
+        let v = serde_json::json!({"counter": "12345678901234"});
+        let f = stats_path(&v, "counter");
+        assert_eq!(f.as_u64().unwrap(), 12_345_678_901_234);
     }
 }

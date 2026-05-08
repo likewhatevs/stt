@@ -604,8 +604,9 @@ pub mod prelude {
     // `static` of type `Scheduler`, and matching the derive-macro
     // name to its emitted type reads naturally at the call site.
     pub use crate::assert::{
-        Assert, AssertDetail, AssertResult, ClaimBuilder, DetailKind, NoteValue, SchedulerBaseline,
-        SeqClaim, SetClaim, Verdict, assert_baseline, assert_scx_events_clean,
+        Assert, AssertDetail, AssertResult, ClaimBuilder, DetailKind, EachClaim, NoteValue,
+        SchedulerBaseline, SeqClaim, SeriesField, SetClaim, Verdict, assert_baseline,
+        assert_scx_events_clean,
     };
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
@@ -632,9 +633,13 @@ pub mod prelude {
         FailureDumpEntry, FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry,
         FailureDumpReport, SCHEMA_DUAL, SCHEMA_SINGLE,
     };
+    pub use crate::scenario::sample::{
+        BpfMapProjector, Sample, SampleSeries, StatsPathProjector, StatsValue,
+    };
     pub use crate::scenario::snapshot::{
-        BridgeGuard, CaptureCallback, MAX_WATCH_SNAPSHOTS, Snapshot, SnapshotBridge, SnapshotEntry,
-        SnapshotError, SnapshotField, SnapshotMap, SnapshotResult, WatchRegisterCallback,
+        BridgeGuard, CaptureCallback, JsonField, MAX_WATCH_SNAPSHOTS, Snapshot, SnapshotBridge,
+        SnapshotEntry, SnapshotError, SnapshotField, SnapshotMap, SnapshotResult,
+        WatchRegisterCallback, stats_path,
     };
     pub use crate::scenario::{CgroupGroup, Ctx, collect_all, spawn_diverse};
     pub use crate::test_support::{

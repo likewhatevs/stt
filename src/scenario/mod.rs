@@ -32,6 +32,7 @@ pub mod nested;
 pub mod ops;
 pub mod payload_run;
 pub mod performance;
+pub mod sample;
 pub mod scenarios;
 pub mod snapshot;
 pub mod stress;

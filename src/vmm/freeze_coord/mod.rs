@@ -1073,6 +1073,22 @@ impl KtstrVm {
         let freeze_coord_num_nodes = self.topology.num_numa_nodes();
         let freeze_coord_on_demand_in_flight = on_demand_in_flight.clone();
         let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
+        // Stats-client clone for the periodic-capture path. The
+        // periodic-fire branch issues a `stats(&[])` request BEFORE
+        // calling `freeze_and_capture(false)` so the JSON it returns
+        // reflects the running scheduler — once the freeze rendezvous
+        // begins the scheduler's userspace thread is paused and the
+        // request would either time out or wedge until thaw. The
+        // resulting `serde_json::Value` is bundled with the
+        // FailureDumpReport via `SnapshotBridge::store_with_stats` so
+        // a later `Sample` view exposes both axes from the same
+        // boundary. `None` when no scheduler is configured (the
+        // outer `stats_client` builder above returns `None` when
+        // `scheduler_binary.is_none()`); in that case periodic
+        // captures store `None` in the parallel stats slot and the
+        // temporal-stats projection surfaces a per-sample missing-
+        // stats failure that the test author can opt to ignore.
+        let freeze_coord_stats_client = stats_client.clone();
         // Wake-fd handles for the coord epoll loop. `kill_evt` and
         // `bsp_done_evt` are written by every thread that flips the
         // matching AtomicBool (run_vm post-BSP-exit, vCPU shutdown
@@ -4111,6 +4127,7 @@ impl KtstrVm {
                                     ),
                                     dump_truncated_at_us: None,
                                     probe_counters: None,
+                                    is_placeholder: false,
                                 };
                                 tracing::warn!(
                                     owned_accessor = owned_accessor.is_some(),
@@ -4787,6 +4804,84 @@ impl KtstrVm {
                                     %tag,
                                     "freeze-coord: periodic snapshot boundary crossed"
                                 );
+                                // Request scx_stats BEFORE the freeze
+                                // rendezvous so the scheduler's
+                                // userspace thread is still alive to
+                                // service the request. Failure modes
+                                // (no scheduler, relay error, non-
+                                // zero envelope errno) all collapse
+                                // to `None` — the parallel stats
+                                // slot stays absent and the
+                                // temporal-stats projection surfaces
+                                // a per-sample missing-stats failure
+                                // the test author can opt to ignore.
+                                let stats_value: Option<serde_json::Value> =
+                                    if let Some(ref client) = freeze_coord_stats_client {
+                                        match client.stats(&[]) {
+                                            Ok(v) => Some(v),
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    target: "ktstr::failure_dump",
+                                                    %tag,
+                                                    error = %e,
+                                                    "freeze-coord: periodic stats request \
+                                                     failed; bundling None into Sample"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                // Sample timestamp anchor = the moment
+                                // the stats request COMPLETED (or
+                                // failed). Captured AFTER the stats
+                                // client returns so the value
+                                // reflects when the running
+                                // scheduler's stats were observed,
+                                // NOT when we entered the
+                                // periodic-fire branch. Stats and
+                                // BPF freeze can be ~50 ms apart;
+                                // the stats-completion timestamp is
+                                // the authoritative anchor for the
+                                // sample because the JSON content
+                                // was observed at this instant. The
+                                // BPF state captured by the freeze
+                                // that follows is observed up to
+                                // FREEZE_RENDEZVOUS_TIMEOUT later.
+                                //
+                                // Pause-adjusted: subtract cumulative
+                                // ScenarioPause/Resume pause time and
+                                // any in-flight pause currently
+                                // running, mirroring the boundary
+                                // check above. Without this, a
+                                // scenario that pauses (e.g. for a
+                                // multi-second on-demand capture)
+                                // would advance the elapsed_ms
+                                // anchor through the pause window
+                                // and the temporal patterns would
+                                // see false-positive rate drops as
+                                // the workload appears to "skip" a
+                                // window of progress.
+                                let anchor_raw_now_ns =
+                                    u64::try_from(run_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX);
+                                let anchor_cumulative_pause =
+                                    scenario_pause_cumulative_for_coord
+                                        .load(Ordering::Acquire);
+                                let anchor_in_flight_pause_at =
+                                    watchdog_pause_for_coord.load(Ordering::Acquire);
+                                let anchor_in_flight_pause =
+                                    if anchor_in_flight_pause_at > 0 {
+                                        anchor_raw_now_ns
+                                            .saturating_sub(anchor_in_flight_pause_at)
+                                    } else {
+                                        0
+                                    };
+                                let sample_elapsed_ms_anchor = anchor_raw_now_ns
+                                    .saturating_sub(anchor_cumulative_pause)
+                                    .saturating_sub(anchor_in_flight_pause)
+                                    / 1_000_000;
                                 let freeze_start = Instant::now();
                                 let on_demand = freeze_and_capture(false);
                                 thaw_and_barrier();
@@ -4824,9 +4919,16 @@ impl KtstrVm {
                                         vcpu_regs_count,
                                         tasks_enriched,
                                         elapsed_ms,
+                                        stats_present = stats_value.is_some(),
+                                        sample_elapsed_ms = sample_elapsed_ms_anchor,
                                         "freeze-coord: periodic snapshot captured"
                                     );
-                                    freeze_coord_snapshot_bridge.store(&tag, report);
+                                    freeze_coord_snapshot_bridge.store_with_stats(
+                                        &tag,
+                                        report,
+                                        stats_value,
+                                        Some(sample_elapsed_ms_anchor),
+                                    );
                                     // Successful capture resets the
                                     // consecutive-timeout counter so
                                     // a transient rendezvous miss
@@ -4847,8 +4949,29 @@ impl KtstrVm {
                                         crate::monitor::dump::FailureDumpReport::placeholder(
                                             "freeze rendezvous timed out",
                                         );
-                                    freeze_coord_snapshot_bridge
-                                        .store(&tag, placeholder);
+                                    // Even when the freeze fails the
+                                    // pre-freeze stats response (when
+                                    // available) plus the workload-
+                                    // relative timestamp ARE valid —
+                                    // they sample the running
+                                    // scheduler and the wall-clock
+                                    // instant at which we attempted
+                                    // the boundary. Bundle them into
+                                    // the placeholder so a Sample
+                                    // view at least carries the
+                                    // stats axis and timing for this
+                                    // boundary; the BPF axis falls
+                                    // through to the placeholder
+                                    // report and any temporal
+                                    // pattern projecting BPF data
+                                    // surfaces it as the upstream
+                                    // missing-data error variant.
+                                    freeze_coord_snapshot_bridge.store_with_stats(
+                                        &tag,
+                                        placeholder,
+                                        stats_value,
+                                        Some(sample_elapsed_ms_anchor),
+                                    );
                                     periodic_consecutive_timeouts =
                                         periodic_consecutive_timeouts
                                             .saturating_add(1);

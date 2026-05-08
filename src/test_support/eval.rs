@@ -1851,8 +1851,23 @@ fn evaluate_vm_result(
                 String::new()
             };
             let monitor_section = build_monitor_section();
+            // Periodic-sample coverage gauge: fires when the entry
+            // configured `num_snapshots > 0`. Renders the
+            // fired/target ratio; suppressed when the entry did
+            // not request periodic capture so non-periodic tests
+            // produce uncluttered failure output.
+            let periodic_section =
+                crate::test_support::output::format_periodic_samples_section(result);
+            // Temporal-assertion summary: aggregates every
+            // [`DetailKind::Temporal`] detail into a single block
+            // so a test author chasing a violated periodic-sample
+            // pattern sees the offending sample tag(s) at the top
+            // of the section instead of scrolling through scalar
+            // claim failures.
+            let temporal_section =
+                crate::test_support::output::format_temporal_assertions_section(&check_result);
             let msg = format!(
-                "{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}",
+                "{}ktstr_test '{}'{} [topo={}] failed:\n  {}{}{}{}{}{}{}{}{}{}",
                 fingerprint_line,
                 entry.name,
                 sched_label,
@@ -1861,6 +1876,8 @@ fn evaluate_vm_result(
                 stats_section,
                 console_section,
                 timeline_section,
+                periodic_section,
+                temporal_section,
                 sched_log_section,
                 monitor_section,
                 dump_section,

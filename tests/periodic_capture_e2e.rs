@@ -3,7 +3,7 @@
 //!
 //! Boots a real guest VM with `num_snapshots = 3` and a 10 s
 //! workload duration (interior boundaries land at scenario_start
-//! + {3 s, 5 s, 7 s}). The guest just holds the cgroup for the
+//! plus {3 s, 5 s, 7 s}). The guest just holds the cgroup for the
 //! full duration; the freeze coordinator's periodic-capture loop
 //! fires the captures from the host side and stores reports on
 //! the host-side `SnapshotBridge`.

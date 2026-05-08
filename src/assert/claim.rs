@@ -243,6 +243,17 @@ impl Verdict {
         self.result
     }
 
+    /// Mutable handle to the underlying [`AssertResult`]. Used by
+    /// the [`crate::assert::temporal`] patterns to push
+    /// [`DetailKind::Temporal`] details and flip `passed` without
+    /// going through the comparator surface (which is shaped for
+    /// scalar `(name, value)` claims, not per-sample multi-failure
+    /// pile-on). Crate-internal — out-of-tree callers use
+    /// [`Self::merge`] / [`Self::note`] / [`Self::note_value`].
+    pub(crate) fn result_mut(&mut self) -> &mut AssertResult {
+        &mut self.result
+    }
+
     /// Internal: record one claim outcome (pass = no detail, fail =
     /// push detail with `kind` and conjoin `passed`). Shared by every
     /// comparator on every builder type.

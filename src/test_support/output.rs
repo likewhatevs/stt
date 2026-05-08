@@ -291,6 +291,75 @@ pub(crate) fn format_console_diagnostics(
     format!("\n\n--- diagnostics ---\n{}", parts.join("\n"))
 }
 
+/// Format the `--- periodic samples ---` section for failure
+/// output. Reads `VmResult::periodic_target` and
+/// `VmResult::periodic_fired` to surface the cadence-coverage
+/// ratio plus the per-sample tag list — useful when a temporal
+/// assertion failed and the operator needs to see which periodic
+/// boundary samples were actually captured (vs. skipped due to
+/// rendezvous timeout / abandon thresholds).
+///
+/// Returns an empty string when the entry did not configure
+/// periodic capture (`periodic_target == 0`); under those runs
+/// the section is noise. When periodic capture WAS configured but
+/// produced zero captures, the section still renders to surface
+/// the coverage gap.
+pub(crate) fn format_periodic_samples_section(result: &vmm::VmResult) -> String {
+    if result.periodic_target == 0 {
+        return String::new();
+    }
+    let fired = result.periodic_fired;
+    let target = result.periodic_target;
+    let mut lines = vec![format!(
+        "fired {fired}/{target} periodic snapshots ({pct:.0}% coverage)",
+        pct = if target == 0 {
+            0.0
+        } else {
+            100.0 * fired as f64 / target as f64
+        }
+    )];
+    // Snapshot tags / elapsed timestamps live on the bridge until
+    // the test author drains it; without draining (which would
+    // consume the bridge) we can only report coverage. The full
+    // per-sample timeline is the test author's job to render via
+    // the SampleSeries API once they drain — the section here
+    // surfaces the gap, not the values.
+    if fired < target {
+        lines.push(format!(
+            "missing {miss} sample(s) — see freeze-coord traces \
+             for skip / timeout reasons",
+            miss = target.saturating_sub(fired),
+        ));
+    }
+    format!("\n\n--- periodic samples ---\n{}", lines.join("\n"))
+}
+
+/// Format the `--- temporal assertions ---` summary section for
+/// failure output. Walks the [`AssertResult::details`] vector,
+/// filters to entries tagged [`crate::assert::DetailKind::Temporal`],
+/// and renders each as a single line. The section is suppressed
+/// when no temporal-tagged details are present so non-temporal
+/// failure paths do not pick up an empty section header.
+pub(crate) fn format_temporal_assertions_section(result: &crate::assert::AssertResult) -> String {
+    let temporal: Vec<&crate::assert::AssertDetail> = result
+        .details
+        .iter()
+        .filter(|d| d.kind == crate::assert::DetailKind::Temporal)
+        .collect();
+    if temporal.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(temporal.len() + 1);
+    lines.push(format!(
+        "{n} temporal assertion violation(s):",
+        n = temporal.len()
+    ));
+    for detail in temporal {
+        lines.push(format!("  {}", detail.message));
+    }
+    format!("\n\n--- temporal assertions ---\n{}", lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::{assert_result_tlv_entry, build_assert_result};
@@ -898,5 +967,82 @@ mod tests {
             "passing merge must keep verdict passing: {:?}",
             r.details
         );
+    }
+
+    // ---- format_periodic_samples_section ----
+
+    /// Periodic capture not configured: section is empty so a
+    /// non-periodic test's failure output stays uncluttered.
+    #[test]
+    fn format_periodic_samples_section_empty_when_target_zero() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 0;
+        result.periodic_fired = 0;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.is_empty());
+    }
+
+    /// Periodic capture configured and fully covered: section
+    /// renders with the coverage line.
+    #[test]
+    fn format_periodic_samples_section_full_coverage() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 5;
+        result.periodic_fired = 5;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.contains("--- periodic samples ---"));
+        assert!(s.contains("fired 5/5"));
+        assert!(s.contains("100% coverage"));
+        assert!(!s.contains("missing"));
+    }
+
+    /// Periodic capture configured but partially covered: section
+    /// renders the coverage gap line.
+    #[test]
+    fn format_periodic_samples_section_partial_coverage() {
+        let mut result = crate::vmm::VmResult::test_fixture();
+        result.periodic_target = 5;
+        result.periodic_fired = 2;
+        let s = format_periodic_samples_section(&result);
+        assert!(s.contains("--- periodic samples ---"));
+        assert!(s.contains("fired 2/5"));
+        assert!(s.contains("missing 3"));
+    }
+
+    // ---- format_temporal_assertions_section ----
+
+    /// No temporal-tagged details: section is suppressed.
+    #[test]
+    fn format_temporal_assertions_section_empty_without_temporal_details() {
+        let mut r = crate::assert::AssertResult::pass();
+        r.passed = false;
+        r.details
+            .push(AssertDetail::new(DetailKind::Stuck, "tid 7 stuck 2000ms"));
+        let s = format_temporal_assertions_section(&r);
+        assert!(s.is_empty());
+    }
+
+    /// Temporal-tagged details flow into the section verbatim.
+    #[test]
+    fn format_temporal_assertions_section_renders_temporal_details() {
+        let mut r = crate::assert::AssertResult::pass();
+        r.passed = false;
+        r.details.push(AssertDetail::new(
+            DetailKind::Temporal,
+            "counter (nondecreasing): regression at sample periodic_001",
+        ));
+        r.details
+            .push(AssertDetail::new(DetailKind::Stuck, "unrelated failure"));
+        r.details.push(AssertDetail::new(
+            DetailKind::Temporal,
+            "load (steady_within ...): outlier at sample periodic_005",
+        ));
+        let s = format_temporal_assertions_section(&r);
+        assert!(s.contains("--- temporal assertions ---"));
+        assert!(s.contains("2 temporal assertion violation(s)"));
+        assert!(s.contains("counter (nondecreasing)"));
+        assert!(s.contains("load (steady_within"));
+        // Non-temporal details must NOT bleed into the section.
+        assert!(!s.contains("unrelated failure"));
     }
 }

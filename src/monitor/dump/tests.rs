@@ -188,6 +188,7 @@ fn report_serde_roundtrip() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let json = serde_json::to_string(&report).unwrap();
     let parsed: FailureDumpReport = serde_json::from_str(&json).unwrap();
@@ -264,6 +265,7 @@ fn report_display_one_map_with_value() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let out = format!("{report}");
     // Map header line.
@@ -300,6 +302,7 @@ fn report_display_multiple_maps_separated() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let out = format!("{report}");
     // Maps separated by a blank line (\n\n).
@@ -417,6 +420,7 @@ fn report_display_includes_vcpu_regs_section() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let out = format!("{report}");
     // Section header.
@@ -458,6 +462,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let out = format!("{report}");
     // Map block, blank line, vcpu_regs section.
@@ -488,6 +493,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let out = format!("{report}");
     assert_eq!(out, "vcpu_regs:\n  vcpu 0: <unavailable>");
@@ -533,6 +539,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
 
     // (a) Display: vcpu_regs section present, no fallback.
@@ -594,6 +601,7 @@ fn dual_report_serde_roundtrip_with_early() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let late = FailureDumpReport {
         schema: SCHEMA_SINGLE.to_string(),
@@ -615,6 +623,7 @@ fn dual_report_serde_roundtrip_with_early() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let dual = DualFailureDumpReport {
         schema: SCHEMA_DUAL.to_string(),
@@ -962,6 +971,7 @@ fn prog_runtime_stats_serde_roundtrip_with_saturation() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let json = serde_json::to_string(&report).expect("serialize");
     let parsed: FailureDumpReport = serde_json::from_str(&json).expect("deserialize");
@@ -1031,6 +1041,7 @@ fn report_display_renders_prog_runtime_stats() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let out = format!("{report}");
     assert!(
@@ -1079,6 +1090,7 @@ fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        is_placeholder: false,
     };
     let out = format!("{report}");
     assert!(

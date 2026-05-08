@@ -191,6 +191,19 @@ pub enum DetailKind {
     /// `monitor::ScxEventDeltas` and presents them to the
     /// assertion as `(name, count)` pairs.
     SchedulerEvent,
+    /// Temporal assertion failure on a periodic-capture
+    /// [`SampleSeries`](crate::scenario::sample::SampleSeries).
+    /// One of the six built-in patterns
+    /// (`nondecreasing` / `strictly_increasing`, `rate_within`,
+    /// `steady_within`, `converges_to`, `always_true`,
+    /// `ratio_within`) or a per-sample scalar comparator
+    /// invoked via `.each(...)` reported a violation. The
+    /// detail message names the pattern, the offending sample
+    /// tag(s), and the observed-vs-expected values; the
+    /// stdout `--- temporal assertions ---` summary in
+    /// `test_support::output` aggregates the same kind into
+    /// per-assertion pass/fail rows.
+    Temporal,
     /// Skip notification (scenario could not run under this topology/flags).
     Skip,
     /// Informational annotation that does NOT contribute to the
@@ -2126,8 +2139,10 @@ impl Assert {
 }
 
 pub mod claim;
+pub mod temporal;
 
 pub use claim::{ClaimBuilder, SeqClaim, SetClaim, Verdict};
+pub use temporal::{EachClaim, SeriesField};
 
 /// Check that workers only ran on CPUs in `expected`.
 ///

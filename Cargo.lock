@@ -5029,13 +5029,17 @@ name = "scx-ktstr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam",
  "ctrlc",
  "flate2",
  "gix",
  "libbpf-rs",
  "reqwest 0.13.3",
  "scx_cargo",
+ "scx_stats",
+ "scx_stats_derive",
  "scx_utils",
+ "serde",
  "tar",
 ]
 
@@ -5074,6 +5078,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde",
+ "serde_json",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "scx_stats_derive"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd7852948229615bf9db3b4a000dc3517c6e37a0a26b444e1a991938265b858c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "scx_stats",
  "serde_json",
  "syn 2.0.117",
 ]

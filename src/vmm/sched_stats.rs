@@ -1186,7 +1186,9 @@ mod tests {
             req: "stats".to_string(),
             args: std::collections::BTreeMap::new(),
         };
-        req_args.args.insert("target".to_string(), "top".to_string());
+        req_args
+            .args
+            .insert("target".to_string(), "top".to_string());
         let bytes_args = serde_json::to_vec(&req_args).unwrap();
         assert_eq!(
             std::str::from_utf8(&bytes_args).unwrap(),
