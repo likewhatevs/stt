@@ -21,6 +21,66 @@ fail-fast = false
 [profile.ci.junit]
 path = "junit.xml"
 
+# CI overrides — mirrors profile.default.overrides. nextest does not
+# inherit overrides across profiles, so every override that should
+# apply under --profile ci must be duplicated here.
+
+[[profile.ci.overrides]]
+filter = "test(boot_kernel) | test(bench_boot)"
+slow-timeout = { period = "180s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = "test(verifier_)"
+slow-timeout = { period = "180s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = "test(demo_)"
+slow-timeout = { period = "120s", terminate-after = 3 }
+retries = 6
+
+[[profile.ci.overrides]]
+filter = "test(gauntlet/)"
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = "test(compile_fail)"
+slow-timeout = { period = "180s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = "test(cached_releases_with_non_singleton_bypasses_cache)"
+slow-timeout = { period = "240s", terminate-after = 3 }
+retries = 6
+
+[[profile.ci.overrides]]
+filter = "test(eevdf_)"
+slow-timeout = { period = "75s", terminate-after = 3 }
+retries = 6
+
+[[profile.ci.overrides]]
+filter = "test(model_loaded_)"
+slow-timeout = { period = "600s", terminate-after = 3 }
+retries = 6
+
+[[profile.ci.overrides]]
+filter = "test(shell_exec_)"
+test-group = "vm-cli"
+threads-required = 1
+
+[[profile.ci.overrides]]
+filter = "test(sched_perf_)"
+test-group = "vm-perf"
+threads-required = 1
+
+[[profile.ci.overrides]]
+filter = "test(pathology_alu_hot_iterates) | test(alu_hot_vec512)"
+test-group = "alu-vec512"
+threads-required = 1
+
+[[profile.ci.overrides]]
+filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resource_lock_shared_) | test(resource_lock_contention_returns_unavailable) | test(resource_lock_all_or_nothing) | test(resource_lock_service_cpu_contention) | test(resource_lock_empty_llc_indices) | test(resource_lock_release_on_drop) | test(cpu_lock_window_) | test(cpu_lock_acquire_) | test(cpu_lock_llc_shared_protection) | test(cpu_lock_contention_slides_window) | test(cpu_lock_zero_count)"
+test-group = "llc-lock"
+threads-required = 1
+
 [profile.quick]
 # Usage: cargo nextest run --profile quick
 slow-timeout = { period = "10s", terminate-after = 2 }

@@ -6,3 +6,4 @@ doc/guide/book/
 *.swo
 *~
 .envrc
+_site
