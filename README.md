@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml/badge.svg)](https://github.com/likewhatevs/ktstr/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/likewhatevs/ktstr/graph/badge.svg?token=E7GRAO2KZM)](https://codecov.io/gh/likewhatevs/ktstr)
-[![guide](https://img.shields.io/badge/docs-guide-blue)](https://likewhatevs.github.io/ktstr/guide/)
+[![tutorial](https://img.shields.io/badge/docs-tutorial-blue)](https://likewhatevs.github.io/ktstr/guide/tutorial.html)
 [![api](https://img.shields.io/badge/docs-api-blue)](https://likewhatevs.github.io/ktstr/api/ktstr/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/likewhatevs/ktstr/issues)
 
@@ -400,6 +400,9 @@ code paths that only execute under the release profile cannot be
 tested for unwind-safety directly.
 
 ## Documentation
+
+**[Zero to ktstr](https://likewhatevs.github.io/ktstr/guide/tutorial.html)** --
+hands-on tutorial: define a scheduler, write a test, run it.
 
 **[Guide](https://likewhatevs.github.io/ktstr/guide/)** -- getting started, concepts,
 writing tests, recipes, architecture.

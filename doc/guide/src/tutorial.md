@@ -64,22 +64,100 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
 `#[ktstr_test]` attribute registers the function so `cargo ktstr test`
 discovers it and boots a VM with the requested topology.
 
+A test without a `scheduler = ...` attribute runs under the kernel's
+default EEVDF scheduler — useful as a baseline. Step 2 swaps in a
+sched_ext scheduler so the rest of the tutorial exercises that
+scheduler instead.
+
 For the full attribute reference, see
 [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md).
 
-## Step 2: Add workloads
+## Step 2: Define your scheduler
+
+To target a sched_ext scheduler, declare it with `#[derive(Scheduler)]`
+on an enum and reference the generated `_PAYLOAD` const from
+`#[ktstr_test(scheduler = …)]`. The example uses `scx-ktstr`, the
+test-fixture scheduler shipped in this workspace; substitute your own
+binary name to target a different scheduler.
+
+```rust,ignore
+use ktstr::prelude::*;
+
+#[derive(Scheduler)]
+#[scheduler(name = "ktstr_sched", binary = "scx-ktstr")]
+enum KtstrSchedFlag {
+    #[flag(args = ["--slow"])]
+    Slow,
+    #[flag(args = ["--scattershot"])]
+    Scattershot,
+}
+
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1)]
+fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+```
+
+`#[derive(Scheduler)]` takes an enum where each variant is a feature
+flag. The derive emits two consts named after the enum (the
+`Flag`/`Flags` suffix is stripped, the rest is screaming-snake-cased
+— so `KtstrSchedFlag` produces `KTSTR_SCHED`):
+
+- `const KTSTR_SCHED: Scheduler` — the bare scheduler record.
+- `const KTSTR_SCHED_PAYLOAD: Payload` — the `Payload` wrapper. The
+  `scheduler =` slot on `#[ktstr_test]` expects a `Payload`, so pass
+  `KTSTR_SCHED_PAYLOAD`.
+
+The `#[scheduler(...)]` attributes:
+
+- `name` — scheduler name for display and sidecar keys.
+- `binary` — binary name for auto-discovery in
+  `target/{debug,release}/`, the directory containing the test
+  binary, or a `KTSTR_SCHEDULER` override path. When the scheduler
+  is a `[[bin]]` target in the same workspace, `cargo build` already
+  places it where discovery looks. The resolved binary is packed into
+  the VM's initramfs.
+- `topology(numa, llcs, cores, threads)` — optional default VM
+  topology. Tests can override individual dimensions via
+  `#[ktstr_test(llcs = ...)]`. Omitted here; the per-test attributes
+  in Step 4 set every dimension explicitly.
+
+Each enum variant is a feature flag. `#[flag(args = ["--slow"])]`
+means "when this flag is active, append `--slow` to the scheduler's
+command line." (See `scx-ktstr --help` for the full flag list:
+`--slow`, `--scattershot`, `--degrade`, `--stall-after`,
+`--degrade-after`, `--fail-verify`, `--verify-loop`.) An optional
+`requires = [OtherVariant]` clause gates one flag on another so the
+gauntlet (Step 10) only emits combinations where every dependency is
+present. The gauntlet generates the power set of valid flag
+combinations — each combination becomes a test variant.
+
+An enum with zero variants is valid and produces no flag combinations
+beyond the default (no-flags) profile.
+
+For the full attribute surface (`sched_args`, `sysctls`, `kargs`,
+`config_file`, gauntlet constraints), see
+[Scheduler Definitions](writing-tests/scheduler-definitions.md).
+
+When the derive doesn't fit — the most common case being inline JSON
+config supplied per-test — define the `Scheduler` const through the
+manual builder instead. Step 12 below walks through that path with
+`scx_layered`.
+
+## Step 3: Add workloads
 
 A `CgroupDef` declares a cgroup along with the workers that will run
 inside it. The builder methods configure worker count, the work each
 worker performs, scheduling policy, and cpuset assignment.
 
-Add two cgroups -- both running tight CPU spinners for now. Step 4
+Add two cgroups -- both running tight CPU spinners for now. Step 5
 will swap one of them for a phased workload:
 
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(llcs = 1, cores = 2, threads = 1)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("background_spinner")
@@ -95,7 +173,7 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
 Without `.with_cpuset(...)`, a cgroup's workers run on every CPU
 in the test's topology — they share the VM's full CPU set
 with all other cgroups. `.with_cpuset(CpusetSpec::Llc(idx))`
-(introduced in Step 3) restricts a cgroup to one LLC's CPUs, and
+(introduced in Step 4) restricts a cgroup to one LLC's CPUs, and
 the other `CpusetSpec` variants narrow further.
 
 `WorkType::SpinWait` runs a tight CPU spin loop; it is one of many
@@ -111,7 +189,7 @@ concurrently for the test's full duration. Both cgroups are
 cpusets between phases; see [Ops and Steps](concepts/ops.md) for
 the multi-step API.
 
-## Step 3: Set topology
+## Step 4: Set topology
 
 The `#[ktstr_test]` attribute carries the VM's CPU topology.
 Topology dimensions are big-to-little: `numa_nodes` (default 1),
@@ -129,7 +207,7 @@ Bump the topology to two LLCs with two cores each (4 CPUs total) so
 each cgroup can own its own LLC:
 
 ```rust,ignore
-#[ktstr_test(llcs = 2, cores = 2, threads = 1)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 2, cores = 2, threads = 1)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("background_spinner")
@@ -152,7 +230,7 @@ hand-built CPU sets.
 For the full topology surface (NUMA accessors, per-LLC info,
 cpuset generation helpers), see [TestTopology](concepts/topology.md).
 
-## Step 4: Compose phased work inside a cgroup
+## Step 5: Compose phased work inside a cgroup
 
 So far both cgroups run identical CPU spinners. The point of this
 test is to exercise a scheduler against **different lifecycle
@@ -174,7 +252,7 @@ the last phase ends the loop restarts from `first`. Phases:
 use std::time::Duration;
 use ktstr::prelude::*;
 
-#[ktstr_test(llcs = 2, cores = 2, threads = 1)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 2, cores = 2, threads = 1)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         // Persistent CPU pressure on LLC 0 for the whole run.
@@ -210,10 +288,10 @@ phasing happens *within* each `phased_worker` worker's loop, while
 `HoldSpec::FULL`. To express phasing across cgroups (e.g. add
 `phased_worker` only for the second half of the run), use
 `execute_steps` with multiple `Step` entries -- see
-[Ops and Steps](concepts/ops.md). Step 8 below adds an `Op::snapshot`
+[Ops and Steps](concepts/ops.md). Step 9 below adds an `Op::snapshot`
 capture into a step's op list.
 
-## Step 5: Tune execution
+## Step 6: Tune execution
 
 Several `#[ktstr_test]` attributes control how the VM runs the
 scenario. The defaults are tuned for fast iteration; tune up for
@@ -239,13 +317,14 @@ phase iteration repeats many times):
 
 ```rust,ignore
 #[ktstr_test(
+    scheduler = KTSTR_SCHED_PAYLOAD,
     llcs = 2,
     cores = 2,
     threads = 1,
     duration_s = 20,
 )]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
-    // body unchanged from Step 4 -- two cgroups via execute_defs
+    // body unchanged from Step 5 -- two cgroups via execute_defs
 }
 ```
 
@@ -253,7 +332,7 @@ For the full attribute reference (auto-repro, performance mode,
 flag and topology constraints, etc.), see
 [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md).
 
-## Step 6: Add assertions
+## Step 7: Add assertions
 
 Default checks already run with no configuration -- `not_starved` is
 `Some(true)` in `Assert::default_checks()`, which enables:
@@ -281,12 +360,13 @@ use std::time::Duration;
 use ktstr::prelude::*;
 
 #[ktstr_test(
+    scheduler = KTSTR_SCHED_PAYLOAD,
     llcs = 2,
     cores = 2,
     threads = 1,
     duration_s = 20,
     isolation = true,
-    max_spread_pct = 15.0,
+    max_spread_pct = 20.0,
     max_throughput_cv = 0.5,
     min_work_rate = 1.0,
 )]
@@ -311,9 +391,11 @@ What each new attribute gates:
 
 - `isolation = true` -- workers must only run on CPUs in their
   assigned cpuset; any execution on an unexpected CPU fails the test.
-- `max_spread_pct = 15.0` -- per-cgroup fairness, as above (this
-  attribute also overrides the release default if you want a
-  different threshold).
+- `max_spread_pct = 20.0` -- per-cgroup fairness override (the
+  release default is 15.0; this loosens it slightly to absorb noise
+  from the phased worker's yield-driven re-placement). Bare
+  `max_spread_pct = 15.0` would silently match the default and have
+  no observable effect.
 - `max_throughput_cv = 0.5` -- coefficient of variation of
   `work_units / cpu_time` across workers. Catches a scheduler that
   gives some workers disproportionately less effective CPU.
@@ -327,7 +409,7 @@ monitor thresholds, NUMA locality, wake-latency benchmarks). See
 (`default_checks() -> Scheduler.assert -> per-test`) and the
 complete threshold list.
 
-## Step 7: Run it
+## Step 8: Run it
 
 Run the test with `cargo ktstr test`, scoped to this one test name:
 
@@ -365,8 +447,8 @@ A failure prints the violated threshold along with per-cgroup stats:
     FAIL [  12.05s] my_crate::mixed_workloads ktstr/mixed_workloads
 
 --- STDERR ---
-ktstr_test 'mixed_workloads' [topo=1n2l2c1t] failed:
-  unfair cgroup: spread=22% (10-32%) 2 workers on 2 cpus (threshold 15%)
+ktstr_test 'mixed_workloads' [sched=scx-ktstr] [topo=1n2l2c1t] failed:
+  unfair cgroup: spread=22% (10-32%) 2 workers on 2 cpus (threshold 20%)
 
 --- stats ---
 4 workers, 4 cpus, 12 migrations, worst_spread=22.4%, worst_gap=180ms
@@ -394,29 +476,51 @@ stats line emitted by `test_support::eval::evaluate_vm_result`.
 For the full run lifecycle, sidecar layout, and analysis workflow,
 see [Running Tests](running-tests.md).
 
-## Step 8: Capture a snapshot
+## Step 9: Capture a snapshot
 
 Threshold-based assertions tell you something is off; snapshots tell
 you *what* the scheduler's state actually was. `Op::snapshot(name)`
-asks the host to freeze every vCPU long enough to read the BPF map
-state, vCPU registers, and per-CPU counters into a
-`FailureDumpReport` keyed by `name`, then resumes the guest.
+asks the host to freeze every vCPU long enough to read the BPF
+(in-kernel program) map state, vCPU registers, and per-CPU counters
+into a `FailureDumpReport` keyed by `name`, then resumes the guest.
 
-Drop a snapshot into the step's `ops` list, then walk the captured
-report by name with `Snapshot::var(...)`:
+`execute_defs` (used so far) takes a flat list of cgroups and runs
+them concurrently. To inject a snapshot mid-run, switch to
+`execute_steps`, which takes a list of `Step`s — each step has
+`setup` cgroups, an `ops` list (where `Op::snapshot(...)` lives),
+and a `hold` duration:
 
 ```rust,ignore
 use ktstr::prelude::*;
 
-// Inside a Step's ops:
-ops: vec![Op::snapshot("after_workload")],
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 2, cores = 2, threads = 1, duration_s = 20)]
+fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
+    execute_steps(ctx, vec![
+        Step {
+            setup: Setup::Defs(vec![
+                CgroupDef::named("background_spinner")
+                    .workers(2)
+                    .work_type(WorkType::SpinWait)
+                    .with_cpuset(CpusetSpec::Llc(0)),
+                CgroupDef::named("phased_worker")
+                    .workers(2)
+                    .work_type(WorkType::SpinWait)
+                    .with_cpuset(CpusetSpec::Llc(1)),
+            ]),
+            ops: vec![Op::snapshot("after_workload")],
+            hold: HoldSpec::FULL,
+        },
+    ])
+}
 ```
 
 After the scenario completes, the captured report is keyed by name
-on the active `SnapshotBridge`; downstream test code drains it and
-walks scalar variables with the dotted-path accessor — e.g.
-`snap.var("nr_cpus_onln").as_u64()?` reads a scheduler `.bss`
-global as a `u64`.
+on the active `SnapshotBridge` — the host-side store that owns the
+captured `FailureDumpReport` map for the run. Downstream test code
+drains it and walks scalar variables with the dotted-path accessor —
+e.g. `snap.var("nr_cpus_onln").as_u64()?` reads a scheduler global
+(any `.bss`/`.data`/`.rodata` symbol; `Snapshot::var` walks all
+three) as a `u64`.
 
 For the bridge wiring, the full traversal API
 (`Snapshot::map`, `SnapshotEntry::get`, per-CPU narrowing,
@@ -425,7 +529,7 @@ error variants), and the symbol-driven
 that fires whenever the guest writes a kernel symbol, see
 [Snapshots](writing-tests/snapshots.md).
 
-## Step 9: Gauntlet expansion
+## Step 10: Gauntlet expansion
 
 The `#[ktstr_test]` macro doesn't just emit a single test -- it
 also generates a **gauntlet** of variants that run the same body
@@ -444,7 +548,7 @@ on the attribute. See
 [Gauntlet Tests](writing-tests/gauntlet-tests.md) for the full
 filtering and worked examples.
 
-## Step 10: Name and prioritize workers
+## Step 11: Name and prioritize workers
 
 Per-cgroup defaults travel through `CgroupDef`'s builder methods so
 schedulers that key on `task->comm` or `task_struct->static_prio`
@@ -495,7 +599,7 @@ Per-`WorkSpec` overrides win over cgroup-level defaults — write
 `.work(WorkSpec::default().nice(0).comm("hot_spinner"))` to opt a
 specific worker out of the cgroup-level defaults.
 
-## Step 11: Inline scheduler config
+## Step 12: Inline scheduler config
 
 Schedulers like `scx_layered` and `scx_lavd` accept a JSON config via
 `--config /path/to/file.json`. Declare the arg template + guest path
@@ -533,7 +637,7 @@ host file is packed into the initramfs and `--config` is injected
 into scheduler args automatically; no `config = …` on the test is
 needed in that flavor.
 
-## Step 12: Decouple virtual topology from host hardware
+## Step 13: Decouple virtual topology from host hardware
 
 By default, ktstr pins vCPUs to host cores in a layout that mirrors
 the declared virtual topology. A test declaring `numa_nodes = 2,
@@ -563,27 +667,173 @@ In `no_perf_mode`:
   CPUs >= total vCPUs".
 
 `no_perf_mode = true` is mutually exclusive with `performance_mode
-= true` (the macro rejects the combination). Equivalent to setting
-`KTSTR_NO_PERF_MODE=1` per-test — either source forces the
-no-perf path. See
+= true` (`KtstrTestEntry::validate` rejects the combination at
+runtime). Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test —
+either source forces the no-perf path. See
 [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation)
 for the full lifecycle.
 
+## Step 14: Periodic capture and temporal assertions
+
+On-demand `Op::snapshot` (Step 9) captures the scheduler's BPF state
+at a point you choose. **Periodic capture** fires automatically at
+evenly-spaced points across the workload window, producing a
+time-ordered `SampleSeries` (the host-side container of drained
+snapshots, in capture order; `.periodic_only()` filters to
+periodic-tagged samples) for temporal assertions. Periodic capture
+is only useful when paired with a `post_vm` callback that drains
+the bridge and asserts something about the sequence — the two
+attributes belong together.
+
+Enable periodic capture with `num_snapshots = N` and register the
+host-side callback with `post_vm = function_name`. The callback
+drains the bridge and runs assertions over the time-ordered series:
+
+```rust,ignore
+use ktstr::prelude::*;
+
+fn check_dispatch_advances(result: &VmResult) -> Result<()> {
+    let series = SampleSeries::from_drained(
+        result.snapshot_bridge.drain_ordered_with_stats(),
+    )
+    .periodic_only();
+
+    let mut v = Verdict::new();
+
+    let nr_dispatched: SeriesField<u64> = series.bpf(
+        "nr_dispatched",
+        |snap| snap.var("nr_dispatched").as_u64(),
+    );
+    nr_dispatched.nondecreasing(&mut v);
+
+    let r = v.into_result();
+    anyhow::ensure!(r.passed, "temporal assertions failed: {:?}", r.details);
+    Ok(())
+}
+
+#[ktstr_test(
+    scheduler = KTSTR_SCHED_PAYLOAD,
+    llcs = 2,
+    cores = 2,
+    threads = 1,
+    duration_s = 20,
+    num_snapshots = 5,
+    post_vm = check_dispatch_advances,
+)]
+fn dispatch_advances(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("workers").workers(2).work_type(WorkType::SpinWait),
+    ])
+}
+```
+
+`num_snapshots = 5` fires 5 freeze-and-capture boundaries inside the
+10%-90% window of the 20 s workload — at roughly +5 s, +7 s, +10 s,
++13 s, +15 s. Each capture freezes every vCPU, reads BPF map state,
+and resumes. The host watchdog deadline is extended by each freeze
+duration so captures do not eat into the workload budget. The
+captures are stored under `periodic_000`…`periodic_004` on the
+`SnapshotBridge`.
+
+`Verdict` is the assertion accumulator: every pattern call records
+its outcome on the same `Verdict`, and `v.into_result()` consumes it
+into a pass/fail `AssertResult`.
+
+The seven temporal patterns on `SeriesField`:
+
+| Pattern | Type | What it checks |
+|---|---|---|
+| `nondecreasing` | u64/f64 | Every consecutive pair: `v[i] <= v[i+1]` |
+| `strictly_increasing` | u64/f64 | Every consecutive pair: `v[i] < v[i+1]` |
+| `rate_within(lo, hi)` | f64 | Per-pair `delta_value / delta_ms` in `[lo, hi]` |
+| `steady_within(warmup_ms, tol)` | f64 | Post-warmup values within `mean ± tol%` |
+| `converges_to(target, tol, deadline_ms)` | f64 | 3 consecutive samples in `[target ± tol]` before deadline |
+| `ratio_within(other, lo, hi)` | f64 | Per-sample `self / other` in `[lo, hi]` (cross-field) |
+| `always_true` | bool | Every sample is `true` |
+
+Every pattern method takes `&mut Verdict` as its first argument and
+returns it, so calls chain into the same accumulator.
+
+`SeriesField::each` provides per-sample scalar bounds:
+`field.each(&mut v).at_least(1u64)`,
+`field.each(&mut v).between(0.0, 100.0)`.
+
+For boundary timing, spacing rules, and the bridge cap, see
+[Periodic Capture](writing-tests/periodic-capture.md). For the full
+projection API (`bpf`, `stats`, auto-projectors) and failure
+rendering, see
+[Temporal Assertions](writing-tests/temporal-assertions.md).
+
+## Step 15: After the run — test statistics
+
+`cargo ktstr stats` aggregates the sidecar JSON files that each test
+variant writes — useful for tracking gauntlet coverage, BPF verifier
+complexity, and scheduling behavior across commits. This is a
+post-run CLI workflow, not part of the test definition:
+
+```sh
+cargo ktstr stats                    # summary: gauntlet coverage, verifier, KVM stats
+cargo ktstr stats list               # list runs with date, test count, arch
+cargo ktstr stats compare RUN_A RUN_B  # diff two runs
+```
+
+Statistics are collected even on test failure (`if: !cancelled()` in
+CI). For the full subcommand surface, see
+[cargo-ktstr stats](running-tests/cargo-ktstr.md#stats).
+
 ## The complete test
+
+The shape exercised by every step above, in one file. `Slow` and
+`Scattershot` enable scx-ktstr's `--slow` / `--scattershot` modes via
+the gauntlet (Step 10); `watchdog_timeout_s = 10` overrides the
+sched_ext stall threshold (Step 6); `num_snapshots` + `post_vm`
+enable periodic capture and a temporal assertion (Step 14):
 
 ```rust,ignore
 use std::time::Duration;
 use ktstr::prelude::*;
 
+#[derive(Scheduler)]
+#[scheduler(name = "ktstr_sched", binary = "scx-ktstr")]
+enum KtstrSchedFlag {
+    #[flag(args = ["--slow"])]
+    Slow,
+    #[flag(args = ["--scattershot"])]
+    Scattershot,
+}
+
+fn check_dispatch_advances(result: &VmResult) -> Result<()> {
+    let series = SampleSeries::from_drained(
+        result.snapshot_bridge.drain_ordered_with_stats(),
+    )
+    .periodic_only();
+
+    let mut v = Verdict::new();
+
+    let nr_dispatched: SeriesField<u64> = series.bpf(
+        "nr_dispatched",
+        |snap| snap.var("nr_dispatched").as_u64(),
+    );
+    nr_dispatched.nondecreasing(&mut v);
+
+    let r = v.into_result();
+    anyhow::ensure!(r.passed, "temporal assertions failed: {:?}", r.details);
+    Ok(())
+}
+
 #[ktstr_test(
+    scheduler = KTSTR_SCHED_PAYLOAD,
     llcs = 2,
     cores = 2,
     threads = 1,
     duration_s = 20,
+    watchdog_timeout_s = 10,
     isolation = true,
-    max_spread_pct = 15.0,
+    max_spread_pct = 20.0,
     max_throughput_cv = 0.5,
     min_work_rate = 1.0,
+    num_snapshots = 5,
+    post_vm = check_dispatch_advances,
 )]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
@@ -615,20 +865,10 @@ cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
   Rust logic between phases.
 - [Ops and Steps](concepts/ops.md) -- multi-phase scenarios:
   add/remove cgroups, swap cpusets, freeze, resume.
-- [Snapshots](writing-tests/snapshots.md) -- on-demand
-  `Op::snapshot("name")` mid-scenario captures of guest BPF map
-  state plus the typed `Snapshot` accessor for walking BTF-rendered
-  values along dotted paths with structured per-field errors.
 - [Watch Snapshots](writing-tests/watch-snapshots.md) --
   `Op::watch_snapshot("symbol")` registers a hardware data-write
   watchpoint (up to 3 per scenario; slot 0 is reserved for the
   error-class exit_kind trigger).
-- [Periodic Capture](writing-tests/periodic-capture.md) -- cadenced
-  `freeze_and_capture(false)` across the workload window (set
-  `num_snapshots = N`); produces a time-ordered `SampleSeries`.
-- [Temporal Assertions](writing-tests/temporal-assertions.md) --
-  patterns over a `SampleSeries` (`nondecreasing`, `rate_within`,
-  `steady_within`, `converges_to`, `always_true`, `ratio_within`).
 - [MemPolicy](concepts/mem-policy.md) -- NUMA-aware tests that bind
   memory allocations to specific nodes and check page locality.
 - [Performance Mode](concepts/performance-mode.md) -- pinned vCPUs,
