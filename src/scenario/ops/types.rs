@@ -1756,9 +1756,8 @@ impl HoldSpec {
     /// panic downstream.
     ///
     /// Rules:
-    /// - `Fixed(Duration::ZERO)` — the step applies ops and then
-    ///   immediately advances; workers get no run time before the
-    ///   next step. Almost always a typo; reject.
+    /// - `Fixed(Duration::ZERO)` — valid for settle steps and
+    ///   op-only steps that apply changes without holding.
     /// - `Frac(f)` with `!f.is_finite()` (NaN/Inf) — propagates into
     ///   `Duration::from_secs_f64(f)` which panics.
     /// - `Frac(f)` with `f <= 0.0` — zero is vacuous, negative
@@ -1767,12 +1766,7 @@ impl HoldSpec {
     ///   deadline loop without yielding; almost always a typo.
     pub fn validate(&self) -> std::result::Result<(), String> {
         match self {
-            HoldSpec::Fixed(d) if d.is_zero() => {
-                Err("HoldSpec::Fixed(Duration::ZERO) is vacuous — workers \
-                     get no run time before the next step; use at least a \
-                     few ms or drop the step entirely"
-                    .into())
-            }
+            HoldSpec::Fixed(_) => Ok(()),
             HoldSpec::Frac(f) if !f.is_finite() => Err(format!(
                 "HoldSpec::Frac({f}) is not finite (NaN/Inf) — would \
                      panic in Duration::from_secs_f64"

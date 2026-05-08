@@ -3338,12 +3338,10 @@ mod tests {
     }
 
     #[test]
-    fn holdspec_validate_rejects_fixed_zero() {
-        let err = HoldSpec::Fixed(Duration::ZERO).validate().unwrap_err();
-        assert!(
-            err.contains("Fixed") && err.contains("vacuous"),
-            "error must name the variant and reason: {err}"
-        );
+    fn holdspec_validate_accepts_fixed_zero() {
+        HoldSpec::Fixed(Duration::ZERO)
+            .validate()
+            .expect("Duration::ZERO is valid for settle/op-only steps");
     }
 
     #[test]
