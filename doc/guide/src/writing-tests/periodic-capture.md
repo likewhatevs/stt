@@ -56,15 +56,15 @@ pauses for `P` ns delays each remaining boundary by `P` ns.
 
 ## Tag namespace
 
-Each periodic capture is stored on the host's [`SnapshotBridge`] under
+Each periodic capture is stored on the host's `SnapshotBridge` under
 `"periodic_NNN"` — zero-padded 3-digit ordinal index, e.g.
 `periodic_000`, `periodic_001`, `periodic_002`. The width is fixed at
 3 digits because the bridge cap (see below) maxes out at
-[`MAX_STORED_SNAPSHOTS`] (= 64 today), so 3 digits always suffices.
+`MAX_STORED_SNAPSHOTS` (= 64 today), so 3 digits always suffices.
 
 Periodic tags coexist with on-demand `Op::snapshot` tags and
 watchpoint-fire tags on the same bridge. Use
-[`SampleSeries::periodic_only`](temporal-assertions.md#sampleseries) (or
+`SampleSeries::periodic_only`(temporal-assertions.md#sampleseries) (or
 `periodic_ref()` for the borrowed equivalent) to filter to the
 periodic timeline before assertions.
 
@@ -73,7 +73,7 @@ periodic timeline before assertions.
 Each periodic boundary fires the same `freeze_and_capture(false)`
 path that `Op::Snapshot` dispatches:
 
-1. Every vCPU is parked under [`FREEZE_RENDEZVOUS_TIMEOUT`] (30 s
+1. Every vCPU is parked under `FREEZE_RENDEZVOUS_TIMEOUT` (30 s
    hard ceiling).
 2. BPF maps are walked.
 3. The dump is serialised to JSON.
@@ -97,7 +97,7 @@ the configuration.
 
 ### Bridge cap
 
-`num_snapshots` cannot exceed [`MAX_STORED_SNAPSHOTS`] (= 64).
+`num_snapshots` cannot exceed `MAX_STORED_SNAPSHOTS` (= 64).
 Validation rejects higher values rather than silently FIFO-evicting
 the earliest periodic samples. Split into multiple test entries if
 a longer timeline is needed.
@@ -147,7 +147,7 @@ FIFO-evicts past `MAX_STORED_SNAPSHOTS`.
 The temporal-assertion pipeline runs on the **host**, so the drain
 happens after `vm.run()` returns — typically inside a `post_vm`
 callback. Use
-[`SnapshotBridge::drain_ordered_with_stats`](snapshots.md) to take
+`SnapshotBridge::drain_ordered_with_stats`(snapshots.md) to take
 ownership of the captured `(tag, report, stats, elapsed_ms)` tuples
 in insertion order:
 
@@ -192,8 +192,8 @@ periodic timeline ordering — avoid for periodic data.
 
 ## Sample anatomy
 
-Each drained tuple unpacks into a [`Sample<'_>`] view (via
-[`SampleSeries::iter_samples`]):
+Each drained tuple unpacks into a `Sample<'_>` view (via
+`SampleSeries::iter_samples`):
 
 ```rust,ignore
 for sample in series.iter_samples() {
@@ -217,14 +217,14 @@ scheduler's stats were observed; BPF state is observed up to
 (`scheduler_binary` is absent), or the per-sample stats request
 failed (relay rejected, non-zero envelope errno, scheduler not yet
 listening). A `None` slot surfaces through
-[`SampleSeries::stats`](temporal-assertions.md#projecting-from-scx_stats-json) as a
+`SampleSeries::stats`(temporal-assertions.md#projecting-from-scx_stats-json) as a
 `SnapshotError::MissingStats { tag }` per-sample error — distinct
 from in-JSON path misses so the assertion site can branch on the
 cause.
 
-A sample whose underlying [`FailureDumpReport`] is a placeholder
+A sample whose underlying `FailureDumpReport` is a placeholder
 (rendezvous timeout fallback) surfaces through
-[`SampleSeries::bpf`](temporal-assertions.md#projecting-from-bpf-state) as a
+`SampleSeries::bpf`(temporal-assertions.md#projecting-from-bpf-state) as a
 `SnapshotError::PlaceholderSample { tag, reason }` per-sample error
 rather than passing a hollow `Snapshot` to the projection closure.
 
@@ -236,12 +236,12 @@ The standard shape is two-stage:
 2. **Project + assert** — pick a column, choose a temporal pattern.
 
 For monotonic counters (BPF `.bss` advancement, scx_stats counter
-fields), [`nondecreasing`](temporal-assertions.md#nondecreasing--strictly_increasing)
+fields), `nondecreasing`(temporal-assertions.md#nondecreasing--strictly_increasing)
 is the canonical choice. For utilisation-style metrics that should
 hold steady once warmup ends,
-[`steady_within`](temporal-assertions.md#steady_withinwarmup_ms-tolerance-f64-only)
+`steady_within`(temporal-assertions.md#steady_withinwarmup_ms-tolerance-f64-only)
 captures the invariant. For "system stabilizes near `target`",
-[`converges_to`](temporal-assertions.md#converges_totarget-tolerance-deadline_ms-f64-only)
+`converges_to`(temporal-assertions.md#converges_totarget-tolerance-deadline_ms-f64-only)
 witnesses the convergence.
 
 For the full pattern surface, projection helpers, and failure

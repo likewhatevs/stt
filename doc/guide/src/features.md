@@ -329,7 +329,7 @@ builds the VM with the declared `numa_nodes` / `llcs` / `cores` /
 mbind, RT scheduling, and KVM exit suppression are skipped, and
 gauntlet preset filtering relaxes host-topology checks to the
 single "host has enough total CPUs" inequality. Mutually exclusive
-with `performance_mode = true` (validated at compile time). See
+with `performance_mode = true` (validated at runtime by `KtstrTestEntry::validate`). See
 [Tutorial: Step 12](tutorial.md#step-12-decouple-virtual-topology-from-host-hardware)
 and [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation).
 

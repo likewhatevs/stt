@@ -7,15 +7,15 @@ warmup ends? Does a load average converge before a deadline?
 
 The shape is two-stage:
 
-1. Build a [`SampleSeries`](#sampleseries) from the bridge's drained
+1. Build a `SampleSeries`(#sampleseries) from the bridge's drained
    periodic captures.
-2. **Project** a [`SeriesField<T>`](#seriesfield) — one column of
+2. **Project** a `SeriesField<T>`(#seriesfield) — one column of
    `T`-typed values across every sample — and feed it through a
    temporal pattern (`nondecreasing`, `rate_within`, `steady_within`,
    `converges_to`, `always_true`, `ratio_within`).
 
-Each pattern records [`DetailKind::Temporal`](#failure-rendering)
-details on the [`Verdict`] when a sample violates the invariant, and
+Each pattern records `DetailKind::Temporal`(#failure-rendering)
+details on the `Verdict` when a sample violates the invariant, and
 records `Note`s when projection errors leave a coverage gap.
 
 For how to enable periodic capture and drain the bridge, see
@@ -24,10 +24,10 @@ projection + assertion surface only.
 
 ## SampleSeries
 
-[`SampleSeries`] is the ordered sequence of `(tag, report, stats,
+`SampleSeries` is the ordered sequence of `(tag, report, stats,
 elapsed_ms)` tuples drained from the bridge after the VM exits. Build
 it from
-[`SnapshotBridge::drain_ordered_with_stats`](snapshots.md#wiring-the-bridge):
+`SnapshotBridge::drain_ordered_with_stats`(snapshots.md#wiring-the-bridge):
 
 ```rust,ignore
 use ktstr::prelude::*;
@@ -45,7 +45,7 @@ needs both views from the same series.
 `SampleSeries` exposes:
 
 - `len()`, `is_empty()` — sample count.
-- `iter_samples()` — borrowed [`Sample<'_>`] views (each carrying
+- `iter_samples()` — borrowed `Sample<'_>` views (each carrying
   `tag`, `elapsed_ms`, `Snapshot<'_>`, `Option<&Value>` stats).
 - `bpf(label, |snap| …)` / `stats(label, |sv| …)` — manual closure
   projection along the BPF or stats axis.
@@ -54,8 +54,8 @@ needs both views from the same series.
 
 ## SeriesField
 
-A [`SeriesField<T>`] is one per-sample column extracted from a
-`SampleSeries`. Each slot is a [`SnapshotResult<T>`] so a missing
+A `SeriesField<T>` is one per-sample column extracted from a
+`SampleSeries`. Each slot is a `SnapshotResult<T>` so a missing
 field, type mismatch, or placeholder report on any individual sample
 does NOT abort the whole projection — it surfaces at the temporal-
 assertion site as a per-sample error the pattern decides how to
@@ -67,8 +67,8 @@ without the caller re-threading the source series.
 
 ### Projecting from BPF state
 
-The [`SampleSeries::bpf`] closure receives each sample's
-[`Snapshot<'_>`]:
+The `SampleSeries::bpf` closure receives each sample's
+`Snapshot<'_>`:
 
 ```rust,ignore
 let nr_dispatched: SeriesField<u64> = series.bpf(
@@ -82,8 +82,8 @@ its `SnapshotResult<T>` return value lands directly in the field.
 
 ### Projecting from scx_stats JSON
 
-The [`SampleSeries::stats`] closure receives each sample's
-[`StatsValue<'_>`] — a thin wrapper around the per-sample stats JSON
+The `SampleSeries::stats` closure receives each sample's
+`StatsValue<'_>` — a thin wrapper around the per-sample stats JSON
 exposing `path("…").as_u64()` / `as_f64()` etc.:
 
 ```rust,ignore
@@ -128,13 +128,13 @@ non-numeric / type-mismatched fields silently. Useful for blanket
 
 **Top-level scalar fields only** for the typed `field_*` helpers.
 Nested struct members (e.g. `"ctx.weight"`) and per-CPU maps need
-the manual closure path through [`SampleSeries::bpf`].
+the manual closure path through `SampleSeries::bpf`.
 
 ## The six temporal patterns
 
 Every pattern takes `&mut Verdict` and returns the same `&mut
 Verdict` so chains of assertions stack onto one accumulator. Each
-pattern is a method on [`SeriesField`]:
+pattern is a method on `SeriesField`:
 
 ### `nondecreasing` / `strictly_increasing`
 
@@ -252,7 +252,7 @@ listing each gap and which side errored.
 ## Per-sample scalar checks: `each`
 
 The temporal patterns are aggregate. For per-sample scalar bounds
-(`>=`, `<=`, `lo..=hi`) bypass the patterns via [`SeriesField::each`]:
+(`>=`, `<=`, `lo..=hi`) bypass the patterns via `SeriesField::each`:
 
 ```rust,ignore
 nr_dispatched.each(&mut v).at_least(1u64);
@@ -300,7 +300,7 @@ nr_dispatched (nondecreasing): skipped 1 sample(s) with projection errors: \
 
 The temporal-assertion pipeline draining the bridge runs on the
 **host**, not inside the guest. `#[ktstr_test(post_vm = …)]` registers
-a host-side callback that receives the [`VmResult`] after `vm.run()`
+a host-side callback that receives the `VmResult` after `vm.run()`
 returns; the callback drains the bridge and walks the resulting
 series:
 
@@ -344,6 +344,6 @@ fn dispatch_counter_advances(ctx: &Ctx) -> Result<AssertResult> {
 
 For the periodic-capture wiring, `num_snapshots` semantics, and the
 bridge-drain contract, see [Periodic Capture](periodic-capture.md).
-For the underlying [`Snapshot`] / [`SnapshotMap`] / [`SnapshotEntry`]
+For the underlying `Snapshot` / `SnapshotMap` / `SnapshotEntry`
 accessors the projection closures call into, see
 [Snapshots](snapshots.md).
