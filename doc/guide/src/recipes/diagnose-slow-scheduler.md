@@ -117,7 +117,7 @@ wait:
 
 If every taskstats column reads zero, the snapshot likely hit a
 gating problem rather than a real "no delay" reading. Inspect
-[`CtprofSnapshot::taskstats_summary`] (the structured
+`CtprofSnapshot::taskstats_summary` (the structured
 per-snapshot tally written into the snapshot itself):
 
 - `eperm_count > 0` — the capturing process lacked

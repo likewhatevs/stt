@@ -246,7 +246,7 @@ Per-family kconfig gates and runtime toggles:
 Any failed gate or missing cap collapses the affected fields
 to zero. ktstr's capture pipeline emits an info-level tracing
 line per snapshot summarizing taskstats outcomes AND attaches
-the structured tally to [`CtprofSnapshot::taskstats_summary`]
+the structured tally to `CtprofSnapshot::taskstats_summary`
 (`ok_count` / `eperm_count` / `esrch_count` /
 `other_err_count`), so an operator can distinguish "kernel
 doesn't expose this" from "every tid raced exit" from
@@ -364,7 +364,7 @@ sub-table and nothing else. `--sections primary` alone keeps
 every primary row; `--metrics run_time_ns` alone keeps the
 single row across every section that displays it.
 
-Each metric carries exactly one [`Section`] tag in its
+Each metric carries exactly one `Section` tag in its
 registry entry — the 34 taskstats-sourced primary rows and
 the 9 taskstats-derived rows tag `Section::TaskstatsDelay`
 rather than `Section::Primary` / `Section::Derived`. They
@@ -380,12 +380,12 @@ under the same outer headers.
 ### Aggregation rules
 
 Each metric declares its own aggregation rule
-([`CTPROF_METRICS`] in `src/ctprof_compare.rs`). The
+(`CTPROF_METRICS` in `src/ctprof_compare.rs`). The
 `AggRule` enum is **typed**: each variant binds an accessor of a
-specific [`metric_types`] newtype (`MonotonicCount`,
+specific `metric_types` newtype (`MonotonicCount`,
 `MonotonicNs`, `PeakNs`, `Bytes`, etc.) so a registry entry that
 pairs a peak field with a sum reduction (e.g. `t.wait_max`
-([`PeakNs`]) bound to a `Sum*` rule) fails to compile rather
+(`PeakNs`) bound to a `Sum*` rule) fails to compile rather
 than producing a meaningless `1×1s ⊕ 1000×1ms` aggregate. The
 14 variants split into five families: Sum reductions, Max
 reductions, Range reductions, Mode reductions, and the
@@ -474,7 +474,7 @@ the `count/total` fraction.
 
 Heterogeneous groups render as `"N-M cpus (mixed)"`. Unlike the
 other rules, `Affinity` does not route through a
-[`metric_types`] trait — its reduction produces a structured
+`metric_types` trait — its reduction produces a structured
 summary, not a homogeneous newtype.
 
 [`metric_types`]: https://likewhatevs.github.io/ktstr/api/ktstr/metric_types/index.html
@@ -517,7 +517,7 @@ computable" from "computed as zero".
 | `avg_compact_delay_ns` | `compact_delay_total_ns / compact_delay_count` | `compact_delay_total_ns`, `compact_delay_count` | ns | Average memory-compaction wait per event. |
 | `avg_wpcopy_delay_ns` | `wpcopy_delay_total_ns / wpcopy_delay_count` | `wpcopy_delay_total_ns`, `wpcopy_delay_count` | ns | Average write-protect-copy (CoW) fault wait per event. |
 | `avg_irq_delay_ns` | `irq_delay_total_ns / irq_delay_count` | `irq_delay_total_ns`, `irq_delay_count` | ns | Average IRQ-handler window per event. |
-| `total_offcpu_delay_ns` | `cpu + blkio + freepages + compact + wpcopy + irq + max(swapin, thrashing)` | every `*_delay_total_ns` | ns | Sum of every meaningful off-CPU delay-accounting bucket. The swapin/thrashing pair is OR'd with `.max()` rather than summed because the two share syscall-layer events (every thrashing event is also a swapin from the syscall perspective); summing both would double-count thrashing-induced swapins. When `CONFIG_TASK_DELAY_ACCT` is off, the runtime toggle is off, or the kernel predates a bucket's introduction (e.g. `wpcopy_*` lands in v13, `irq_*` in v14), the missing buckets read zero from the truncated taskstats payload — the rollup degrades to the sum of the populated buckets rather than returning `-`. The structured taskstats outcome lives on [`CtprofSnapshot::taskstats_summary`] for the operator to disambiguate "no data" from "zero data." |
+| `total_offcpu_delay_ns` | `cpu + blkio + freepages + compact + wpcopy + irq + max(swapin, thrashing)` | every `*_delay_total_ns` | ns | Sum of every meaningful off-CPU delay-accounting bucket. The swapin/thrashing pair is OR'd with `.max()` rather than summed because the two share syscall-layer events (every thrashing event is also a swapin from the syscall perspective); summing both would double-count thrashing-induced swapins. When `CONFIG_TASK_DELAY_ACCT` is off, the runtime toggle is off, or the kernel predates a bucket's introduction (e.g. `wpcopy_*` lands in v13, `irq_*` in v14), the missing buckets read zero from the truncated taskstats payload — the rollup degrades to the sum of the populated buckets rather than returning `-`. The structured taskstats outcome lives on `CtprofSnapshot::taskstats_summary` for the operator to disambiguate "no data" from "zero data." |
 
 The `is_ratio` column on the registry is load-bearing for the
 renderer: ratio rows skip the `%` column entirely (the absolute
@@ -529,7 +529,7 @@ ladders as their unit family — `Ns` for nanosecond derivations,
 
 The 9 taskstats-derived entries (the 8 `avg_*_delay_ns`
 averages plus `total_offcpu_delay_ns`) tag
-[`Section::TaskstatsDelay`] rather than [`Section::Derived`] so
+`Section::TaskstatsDelay` rather than `Section::Derived` so
 `--sections taskstats-delay` renders the full taskstats view —
 the 34 raw rows AND the 9 derivations that depend on them —
 without dragging in unrelated derivations.
@@ -558,7 +558,7 @@ affinity) fall to the bottom.
 schema is `#[non_exhaustive]` so field additions do not break
 existing snapshots:
 
-```
+```text
 CtprofSnapshot
 ├── captured_at_unix_ns: u64
 ├── host: Option<HostContext>
@@ -603,7 +603,7 @@ group reduction.
 
 ### 1. Add a `ThreadState` field with the right newtype
 
-Pick the [`metric_types`] newtype that matches the kernel-source
+Pick the `metric_types` newtype that matches the kernel-source
 semantic of the field — the per-newtype docs name the kernel
 call sites that update each category. The shape determines what
 aggregation rules are legal in step 3:

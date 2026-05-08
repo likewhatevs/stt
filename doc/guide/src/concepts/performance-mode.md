@@ -94,7 +94,7 @@ Without them, guest memory uses regular pages. A warning is printed.
 either `CAP_SYS_NICE` (root) or an `RLIMIT_RTPRIO` >= the requested
 priority. Set an rtprio limit for non-root use:
 
-```
+```text
 # /etc/security/limits.conf
 username  -  rtprio  99
 ```

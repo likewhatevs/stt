@@ -557,6 +557,7 @@ pub(crate) fn kernel_build(
     extra_kconfig: Option<PathBuf>,
     skip_sha256: bool,
 ) -> Result<(), String> {
+    ktstr::cli::check_tools(&["make"]).map_err(|e| format!("{e:#}"))?;
     // Read the extra-kconfig fragment ONCE up front so a range
     // expansion doesn't re-read the same file per version (and so a
     // bad path surfaces before any download / build work fires).

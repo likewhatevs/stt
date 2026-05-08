@@ -1,3 +1,6 @@
+# All commands live in the justfile so they are runnable locally via
+# `just <recipe>`.  The YAML handles only checkout, toolchain, cache, and
+# tool installation; every `run:` step calls a justfile recipe.
 name: CI
 
 on:
@@ -21,15 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
-      - run: cargo fmt -- --check
-      # `--all-targets` is required for this to catch cfg(test) flips on
-      # pub items: a `pub fn` in a `pub mod` gated by `#[cfg(test)]`
-      # compiles under `cargo check --lib` but breaks the `ktstr` /
-      # `cargo-ktstr` / `ktstr-jemalloc-*` bin targets that import it.
-      # Any change that tightens cfg(test) visibility on a public symbol
-      # MUST verify against `--all-targets` before merge.
-      - run: cargo check --workspace --all-targets
-      - run: cargo clippy --workspace --all-targets
+        with:
+          tools: just
+      - run: just lint
 
   test-x64:
     runs-on: [self-hosted, X64]
@@ -49,18 +46,13 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
-      - name: Install ktstr
-        run: cargo install --path . --locked
-      - name: Build test kernel
-        run: cargo ktstr kernel build ${{ matrix.kernel-version }}
-      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration -j $(( $(nproc) * 5 ))
-      - name: sccache stats
-        if: ${{ !cancelled() }}
-        run: sccache --show-stats
-      - name: Test statistics
-        if: ${{ !cancelled() }}
-        run: cargo ktstr stats
+          tool: just,cargo-nextest
+      - run: just kernel-build ${{ matrix.kernel-version }}
+      - run: just test ${{ matrix.kernel-version }}
+      - if: ${{ !cancelled() }}
+        run: just sccache-stats
+      - if: ${{ !cancelled() }}
+        run: just stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
@@ -87,18 +79,13 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest
-      - name: Install ktstr
-        run: cargo install --path . --locked
-      - name: Build test kernel
-        run: cargo ktstr kernel build ${{ matrix.kernel-version }}
-      - run: cargo ktstr test --kernel ${{ matrix.kernel-version }} -- --profile ci --features integration -j $(( $(nproc) * 5 ))
-      - name: sccache stats
-        if: ${{ !cancelled() }}
-        run: sccache --show-stats
-      - name: Test statistics
-        if: ${{ !cancelled() }}
-        run: cargo ktstr stats
+          tool: just,cargo-nextest
+      - run: just kernel-build ${{ matrix.kernel-version }}
+      - run: just test ${{ matrix.kernel-version }}
+      - if: ${{ !cancelled() }}
+        run: just sccache-stats
+      - if: ${{ !cancelled() }}
+        run: just stats
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
         uses: codecov/codecov-action@v6
@@ -121,15 +108,11 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov,cargo-nextest
-      - name: Install ktstr
-        run: cargo install --path . --locked
-      - name: Build test kernel
-        run: cargo ktstr kernel build
-      - run: cargo ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
-      - name: sccache stats
-        if: ${{ !cancelled() }}
-        run: sccache --show-stats
+          tool: just,cargo-llvm-cov,cargo-nextest
+      - run: just kernel-build
+      - run: just coverage
+      - if: ${{ !cancelled() }}
+        run: just sccache-stats
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:
@@ -151,15 +134,11 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov,cargo-nextest
-      - name: Install ktstr
-        run: cargo install --path . --locked
-      - name: Build test kernel
-        run: cargo ktstr kernel build
-      - run: cargo ktstr coverage -- --profile ci --lcov --output-path lcov.info --features integration --exclude-from-report scx-ktstr
-      - name: sccache stats
-        if: ${{ !cancelled() }}
-        run: sccache --show-stats
+          tool: just,cargo-llvm-cov,cargo-nextest
+      - run: just kernel-build
+      - run: just coverage
+      - if: ${{ !cancelled() }}
+        run: just sccache-stats
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v6
         with:

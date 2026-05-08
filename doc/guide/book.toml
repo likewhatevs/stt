@@ -6,3 +6,7 @@ src = "src"
 
 [output.html]
 git-repository-url = "https://github.com/likewhatevs/ktstr"
+
+[output.linkcheck2]
+follow-web-links = false
+warning-policy = "error"

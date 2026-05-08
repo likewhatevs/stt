@@ -37,7 +37,7 @@ const RELAXED: Scheduler = Scheduler::new("relaxed")
 These overrides sit between `Assert::default_checks()` and per-test
 overrides in the merge chain.
 
-## Per-test overrides via #[ktstr_test]
+## Per-test overrides via #\[ktstr_test\]
 
 ```rust,ignore
 #[ktstr_test(

@@ -96,7 +96,7 @@ Without `.with_cpuset(...)`, a cgroup's workers run on every CPU
 in the test's topology — they share the VM's full CPU set
 with all other cgroups. `.with_cpuset(CpusetSpec::Llc(idx))`
 (introduced in Step 3) restricts a cgroup to one LLC's CPUs, and
-the other [`CpusetSpec`] variants narrow further.
+the other `CpusetSpec` variants narrow further.
 
 `WorkType::SpinWait` runs a tight CPU spin loop; it is one of many
 work primitives -- see [WorkType](concepts/work-types.md) for the
@@ -355,13 +355,13 @@ the verifier output is preserved).
 declared topology, runs the test as the guest's init, and reports
 the result. A passing run looks like:
 
-```
+```text
     PASS [  11.34s] my_crate::mixed_workloads ktstr/mixed_workloads
 ```
 
 A failure prints the violated threshold along with per-cgroup stats:
 
-```
+```text
     FAIL [  12.05s] my_crate::mixed_workloads ktstr/mixed_workloads
 
 --- STDERR ---
@@ -376,20 +376,20 @@ ktstr_test 'mixed_workloads' [topo=1n2l2c1t] failed:
 
 The detail line `unfair cgroup: spread=N% (min-max%) N workers on
 N cpus (threshold N%)` is the exact format produced by
-[`assert::assert_not_starved`]. Other detail-line shapes the
+`assert::assert_not_starved`. Other detail-line shapes the
 same producer emits:
 
 - `tid {N} starved (0 work units)` — when a worker made no
   progress.
 - `tid {N} stuck {N}ms on cpu{N} at +{N}ms (threshold {N}ms)` —
   when a worker's longest off-CPU gap crossed
-  [`Assert::max_gap_ms`]. Example:
+  `Assert::max_gap_ms`. Example:
   `tid 7 stuck 1500ms on cpu3 at +4200ms (threshold 2000ms)`.
 
 The reporting layer does NOT include the cgroup name — `cg{i}`
 is the positional index in the stats roll-up (`cg0`, `cg1`, ...)
 matching the `cg{i}: workers=... cpus=... spread=...` per-cgroup
-stats line emitted by [`test_support::eval::evaluate_vm_result`].
+stats line emitted by `test_support::eval::evaluate_vm_result`.
 
 For the full run lifecycle, sidecar layout, and analysis workflow,
 see [Running Tests](running-tests.md).

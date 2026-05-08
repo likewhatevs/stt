@@ -867,7 +867,7 @@ mod tests {
     ///   - `nr_dispatched`: Uint — projects Ok as u64.
     ///   - `stall`: Uint — projects Ok as u64.
     ///   - `balance`: Float — projects Err as u64 (TypeMismatch),
-    ///                        Ok as f64.
+    ///     Ok as f64.
     ///   - `flag_str`: Bytes — projects Err as both u64 and f64.
     fn mixed_shape_report(disp: u64, balance: f64) -> FailureDumpReport {
         let bss_value = RenderedValue::Struct {
@@ -1067,8 +1067,8 @@ mod tests {
     ///   - `busy`: Number — projects Ok as u64 and f64.
     ///   - `count`: Number — projects Ok as u64 and f64.
     ///   - `ratio`: Number(float) — projects Ok as f64;
-    ///             u64 errors when the float has a non-zero
-    ///             fraction (see `json_to_u64`).
+    ///     u64 errors when the float has a non-zero
+    ///     fraction (see `json_to_u64`).
     ///   - `name`: String("nope") — never coerces to numeric.
     fn mixed_stats(busy: u64, count: u64) -> serde_json::Value {
         serde_json::json!({

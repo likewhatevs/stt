@@ -239,6 +239,8 @@ pub(crate) fn run_test(
     release: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
+    ktstr::cli::check_tools(&["cargo-nextest"]).map_err(|e| format!("{e:#}"))?;
     run_cargo_sub(
         TEST_SUB_ARGV,
         "tests",
@@ -257,6 +259,8 @@ pub(crate) fn run_coverage(
     release: bool,
     args: Vec<String>,
 ) -> Result<(), String> {
+    ktstr::cli::check_kvm().map_err(|e| format!("{e:#}"))?;
+    ktstr::cli::check_tools(&["cargo-nextest", "cargo-llvm-cov"]).map_err(|e| format!("{e:#}"))?;
     run_cargo_sub(
         COVERAGE_SUB_ARGV,
         "coverage",

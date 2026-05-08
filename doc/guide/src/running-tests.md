@@ -55,7 +55,7 @@ Duration estimates account for VM boot overhead based on vCPU count.
 
 A summary is printed to stderr during `--list`:
 
-```
+```text
 ktstr budget: 42/1200 tests, 295/300s used, 38/38 configurations covered
 ```
 

@@ -17,7 +17,7 @@ pair -- there is no separate "baselines" cache.
 
 ## Layout
 
-```
+```text
 target/
 └── ktstr/
     ├── 6.14-abc1234/        # one run: kernel 6.14, project commit abc1234 (clean)

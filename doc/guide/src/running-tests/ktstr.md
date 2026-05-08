@@ -232,7 +232,7 @@ ktstr completions fish
 | Arg / Flag | Default | Description |
 |------|---------|-------------|
 | `SHELL` | required | Shell to generate completions for (`bash`, `zsh`, `fish`, `elvish`, `powershell`). |
-| `--binary NAME` | `ktstr` | Binary name to register the completion under. Override when invoking ktstr through a symlink with a different name (the shell looks up completions by argv[0]). |
+| `--binary NAME` | `ktstr` | Binary name to register the completion under. Override when invoking ktstr through a symlink with a different name (the shell looks up completions by argv\[0]). |
 
 The same subcommand is available as `cargo ktstr completions`
 with identical flag semantics (`--binary` accepted on both;

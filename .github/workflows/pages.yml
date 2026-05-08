@@ -28,20 +28,9 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
         with:
-          tools: mdbook
-
-      - run: mdbook build doc/guide
-      - run: cargo doc --workspace --no-deps
-
-      - name: Assemble site
-        run: |
-          mkdir -p _site/guide _site/api
-          cp -r doc/guide/book/* _site/guide/
-          cp -r target/doc/* _site/api/
-          cat > _site/index.html <<'HTML'
-          <!DOCTYPE html>
-          <meta http-equiv="refresh" content="0; url=guide/">
-          HTML
+          tools: just,mdbook
+      - run: cargo install mdbook-linkcheck2 --locked
+      - run: just site
 
       - uses: actions/upload-pages-artifact@v5
         with:

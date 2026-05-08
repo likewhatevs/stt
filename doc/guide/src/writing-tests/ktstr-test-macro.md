@@ -1,4 +1,4 @@
-# The #[ktstr_test] Macro
+# The #\[ktstr_test\] Macro
 
 `#[ktstr_test]` registers a function as an integration test that runs
 inside a VM.

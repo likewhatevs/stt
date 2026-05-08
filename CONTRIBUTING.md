@@ -4,6 +4,12 @@ Notes for contributors modifying the workspace or its build
 configuration. Day-to-day test authoring does not need any of
 this.
 
+## Dev workflow
+
+Install [just](https://github.com/casey/just) (`cargo install just`).
+All dev and CI commands are defined in the `justfile` — run
+`just --list` to see available recipes. CI uses the same recipes.
+
 ## liblzma build configuration
 
 ktstr depends on the `xz2` crate with the `static` feature,

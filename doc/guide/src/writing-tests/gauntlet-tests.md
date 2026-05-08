@@ -66,7 +66,7 @@ never appears.
 
 The total number of gauntlet variants for a test is:
 
-```
+```text
 valid_presets × valid_profiles × resolved_kernels
 ```
 

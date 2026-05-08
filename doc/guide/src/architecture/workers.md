@@ -90,7 +90,7 @@ wall-clock cost: a reservoir-sampled vector capped at
 `MAX_WAKE_SAMPLES` entries, paired with `iteration_cost_sample_total`
 for the total observation count when the cap is exceeded.
 `group_idx` is `0` for the primary group and `1..=N` for composed
-[`WorkSpec`] entries in declaration order (mirrors
+`WorkSpec` entries in declaration order (mirrors
 `WorkloadConfig::composed`). `affinity_error` is `Some(reason)`
 when the worker's `sched_setaffinity` / `mbind` setup failed; the
 worker still runs and produces a report but the field documents

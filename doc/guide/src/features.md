@@ -83,7 +83,7 @@ dependency constraints. Each flag combination becomes a test variant
 — the framework generates the power set of valid configurations so
 you test combinations you'd never write by hand.
 
-```rust
+```rust,ignore
 #[derive(Scheduler)]
 #[scheduler(name = "mitosis", binary = "scx_mitosis",
             topology(1, 2, 4, 1),

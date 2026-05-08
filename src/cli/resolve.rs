@@ -42,6 +42,29 @@ pub fn check_kvm() -> Result<()> {
     Ok(())
 }
 
+/// Pre-flight check: verify that all required external tools are
+/// present in `$PATH` before starting work.  Collects every missing
+/// tool into a single error so the user sees the full list at once.
+pub fn check_tools(required: &[&str]) -> Result<()> {
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|name| resolve_in_path(std::path::Path::new(name)).is_none())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let list = missing
+        .iter()
+        .map(|t| format!("  - {t}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!(
+        "missing required tool(s):\n{list}\n\n\
+         Install them and ensure they are on $PATH before retrying."
+    );
+}
+
 /// Resolve the rayon pool width for `cargo ktstr`'s
 /// `resolve_kernel_set` per-spec fan-out.
 ///

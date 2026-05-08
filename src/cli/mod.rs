@@ -34,7 +34,7 @@ pub use parse::{DISK_HELP, parse_disk_arg, parse_disk_size_mib, parse_topology_s
 
 pub use resolve::{
     KernelDirCacheHit, KernelDirOutcome, KernelResolvePolicy, auto_download_kernel, cache_lookup,
-    check_kvm, download_and_cache_version, expand_kernel_range, resolve_cached_kernel,
+    check_kvm, check_tools, download_and_cache_version, expand_kernel_range, resolve_cached_kernel,
     resolve_git_kernel, resolve_include_files, resolve_kernel_dir, resolve_kernel_dir_to_entry,
     resolve_kernel_image, resolve_kernel_parallelism,
 };

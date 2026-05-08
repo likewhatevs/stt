@@ -491,12 +491,12 @@ Default mem_policy, no mpol_flags, nice/comm/uid/gid/numa_node = None,
 clone_mode = Fork, composed = empty.
 
 `AffinityIntent` is the type-unified affinity expression used at the
-top level and inside [`WorkSpec`] entries — `Inherit`, `Exact(...)`,
+top level and inside `WorkSpec` entries — `Inherit`, `Exact(...)`,
 and `RandomSubset(...)` are accepted at `WorkloadHandle::spawn`;
 topology-aware variants (`SingleCpu`, `LlcAligned`, `CrossCgroup`,
 `SmtSiblingPair`) require scenario context and are rejected at the
 spawn gate with an actionable diagnostic. `composed` carries
-secondary [`WorkSpec`] groups that spawn alongside the primary; each
+secondary `WorkSpec` groups that spawn alongside the primary; each
 composed entry can override `work_type`, `num_workers`,
 `sched_policy`, `affinity`, etc., and reports back via
 `WorkerReport::group_idx` (0 for the primary, 1..=N for composed

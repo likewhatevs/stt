@@ -105,6 +105,8 @@ it does not build or run on other platforms.
 
 - Linux host with `/dev/kvm`
 - Rust >= 1.94.1 (stable, pinned via `rust-toolchain.toml`)
+- [cargo-nextest](https://nexte.st/) -- `cargo ktstr test` delegates
+  to nextest internally.
 - clang (BPF skeleton compilation)
 - pkg-config, make, gcc
 - autotools (autoconf, autopoint, flex, bison, gawk) -- vendored
@@ -115,11 +117,6 @@ it does not build or run on other platforms.
 
 **Optional:**
 
-- [cargo-nextest](https://nexte.st/) -- nextest runs each test as a
-  separate process, letting a `#[ctor]` hook intercept its
-  `--list`/`--exact` protocol to expand `#[ktstr_test]` entries across
-  topology presets and flag profiles. `cargo test` uses an in-process
-  harness where the hook falls through, so only the base topology runs.
 - Test kernel: Linux 6.12+ with sched_ext for scheduler tests;
   `cargo ktstr kernel build` fetches and caches one. See
   [Supported kernels](https://likewhatevs.github.io/ktstr/guide/features.html#supported-kernels).
@@ -320,16 +317,7 @@ ktstr_test 'two_cgroups' [topo=1n1l2c1t] failed:
   cg1: workers=2 cpus=2 spread=12.3% gap=890ms migrations=4 iter=14870
 ```
 
-### Dev workflow
-
-These commands require `cargo install --locked ktstr` (see [Installation](#installation)).
-The frictionless loop is to build a cached kernel once and then run
-tests against the cache:
-
-```sh
-cargo ktstr kernel build                                   # latest stable into XDG cache
-cargo nextest run                                          # tests find the cached kernel
-```
+### cargo-ktstr subcommands
 
 `cargo ktstr` wraps the full workflow and has subcommands beyond
 `test`:

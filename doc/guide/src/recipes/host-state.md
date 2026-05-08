@@ -100,7 +100,7 @@ part of the compare output (there is no opt-in flag — the
 host-delta section appears whenever the two sides disagree on
 a host field):
 
-```
+```text
 host delta ('A' → 'B'):
   kernel_release: 6.14.2 → 6.15.0
   thp_enabled: always [madvise] never → always madvise [never]

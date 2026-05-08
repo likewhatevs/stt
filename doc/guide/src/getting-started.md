@@ -35,13 +35,14 @@ sudo dnf install clang pkgconf make gcc autoconf gettext-devel flex bison gawk
 ## Install tools
 
 ```sh
-cargo install cargo-nextest           # required for the recommended workflow (gauntlet expansion)
+cargo install cargo-nextest           # required
 cargo install --locked ktstr --bin ktstr --bin cargo-ktstr   # both user-facing binaries (optional)
 ```
 
-`cargo-nextest` is required for the recommended `cargo ktstr test`
-workflow and for gauntlet expansion; `cargo test` works for base
-topology only. `cargo install --locked ktstr --bin ktstr --bin cargo-ktstr`
+`cargo-nextest` is required. `cargo ktstr test` delegates to nextest
+internally; without it, `cargo ktstr test` will fail.
+
+`cargo install --locked ktstr --bin ktstr --bin cargo-ktstr`
 installs the two user-facing binaries (`ktstr` host-side CLI and
 `cargo-ktstr` dev workflow plugin); the `--bin` flags scope the
 install away from the two test-fixture binaries
@@ -280,13 +281,13 @@ is unavailable.
 
 Passing tests:
 
-```
+```text
     PASS [  11.34s] my_crate::my_sched_tests ktstr/my_test
 ```
 
 A failing test prints assertion details:
 
-```
+```text
     FAIL [  12.05s] my_crate::my_sched_tests ktstr/my_test
 
 --- STDERR ---
