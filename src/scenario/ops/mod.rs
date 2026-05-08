@@ -75,7 +75,7 @@ use crate::scenario::backdrop;
 use crate::scenario::{CgroupGroup, Ctx, process_alive};
 use crate::vmm::guest_comms;
 use crate::vmm::wire::StimulusPayload;
-use crate::workload::{MemPolicy, WorkSpec, WorkloadConfig, WorkloadHandle};
+use crate::workload::{MemPolicy, WorkloadConfig, WorkloadHandle};
 
 /// Latched once `Op::Snapshot` / `Op::WatchSnapshot` observes a
 /// [`crate::vmm::wire::SnapshotRequestResult::TransportError`].
@@ -1554,7 +1554,6 @@ fn validate_mempolicy_cpuset(
 /// either state) bails — a `CgroupDef` must not silently shadow a
 /// cgroup that another state slot has already created.
 fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef]) -> Result<()> {
-    let default_work = [WorkSpec::default()];
     for def in defs {
         if state.cgroup_name_is_tracked(&def.name) {
             anyhow::bail!(
@@ -1675,12 +1674,22 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
             }
             ctx.cgroups.set_pids_max(&def.name, pids.max)?;
         }
-        let effective_works: &[WorkSpec] = if def.works.is_empty() {
-            &default_work
-        } else {
-            &def.works
-        };
-        for work in effective_works {
+        // Materialize the per-WorkSpec values with cgroup-level
+        // defaults merged in. `merged_works` substitutes a single
+        // `WorkSpec::default()` when `def.works` is empty (matching
+        // the historical default-substitution rule pinned by
+        // `apply_setup_substitutes_default_workspec_when_works_empty`)
+        // and merges `default_nice` / `default_comm` / `default_uid`
+        // / `default_gid` / `default_numa_node` into each WorkSpec
+        // whose own field is unset, regardless of the order builder
+        // methods were called in. This is what makes
+        // `def.nice(5).work(spec)` and `def.work(spec).nice(5)`
+        // equivalent. `pcomm` lives ONLY on `WorkSpec`; the
+        // `CgroupDef::pcomm` builder writes it into every WorkSpec
+        // directly, so the per-WorkSpec value below is the
+        // authoritative source for the pcomm dispatch.
+        let effective_works = def.merged_works();
+        for work in &effective_works {
             if let Err(reason) = work.mem_policy.validate() {
                 anyhow::bail!("cgroup '{}': {}", def.name, reason);
             }
@@ -1689,7 +1698,7 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
         // `state` across the mutable spawn calls below.
         let cgroup_cpuset: Option<BTreeSet<usize>> = state.lookup_cpuset(&def.name).cloned();
         if let Some(ref resolved) = cgroup_cpuset {
-            for work in effective_works {
+            for work in &effective_works {
                 validate_mempolicy_cpuset(
                     &work.mem_policy,
                     work.mpol_flags,
@@ -1699,7 +1708,37 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 )?;
             }
         }
-        for work in effective_works {
+        // Per-WorkSpec pcomm dispatch. A WorkSpec with `pcomm =
+        // Some(value)` joins a thread-group leader keyed on
+        // `value`: every WorkSpec sharing the same `pcomm` value
+        // coalesces into ONE forked leader per group, and every
+        // thread inside the leader observes
+        // `task->group_leader->comm == pcomm`. WorkSpecs with
+        // `pcomm = None` (or an empty pcomm string, which is
+        // treated as `None`) spawn via the conventional fork path
+        // — one process per worker.
+        //
+        // Coalescing key: the pcomm string itself. Different pcomm
+        // values inside the same CgroupDef produce different
+        // leaders (more flexible than rejecting heterogeneity, and
+        // matches the "model real workloads like `chrome` next to
+        // `java` in one cgroup" use case).
+        //
+        // pcomm > 15 bytes triggers a one-shot warning so operators
+        // see the kernel-side truncation that
+        // `__set_task_comm`/`prctl(PR_SET_NAME)` performs at
+        // `TASK_COMM_LEN - 1`. The warning fires at apply-setup
+        // before any spawn, so a misconfigured pcomm is visible
+        // before any work runs.
+        //
+        // Resolve every WorkSpec's `num_workers` / `work_type` /
+        // `affinity` once up front; the same triple is used by
+        // both dispatch paths and the resolution context (ctx,
+        // cgroup_cpuset) is identical for every WorkSpec inside
+        // this CgroupDef.
+        let mut resolved_works: Vec<crate::workload::WorkSpec> =
+            Vec::with_capacity(effective_works.len());
+        for work in &effective_works {
             let n = crate::scenario::resolve_num_workers(work, ctx.workers_per_cgroup, &def.name)?;
             let effective_work_type = crate::workload::resolve_work_type(
                 &work.work_type,
@@ -1712,18 +1751,109 @@ fn apply_setup(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, defs: &[CgroupDef])
                 cgroup_cpuset.as_ref(),
                 ctx.topo,
             )?;
+            resolved_works.push(crate::workload::WorkSpec {
+                work_type: effective_work_type,
+                sched_policy: work.sched_policy,
+                num_workers: Some(n),
+                affinity,
+                mem_policy: work.mem_policy.clone(),
+                mpol_flags: work.mpol_flags,
+                nice: work.nice,
+                comm: work.comm.clone(),
+                pcomm: work.pcomm.clone(),
+                uid: work.uid,
+                gid: work.gid,
+                numa_node: work.numa_node,
+            });
+        }
+
+        // Partition by pcomm value. `pcomm_groups` is keyed on the
+        // pcomm string; insertion order tracked via a parallel
+        // `pcomm_order` vec so the spawn order is stable
+        // (BTreeMap iteration would reorder by string sort).
+        let mut pcomm_groups: std::collections::HashMap<String, Vec<crate::workload::WorkSpec>> =
+            std::collections::HashMap::new();
+        let mut pcomm_order: Vec<String> = Vec::new();
+        let mut non_pcomm_works: Vec<crate::workload::WorkSpec> = Vec::new();
+        for work in resolved_works {
+            match &work.pcomm {
+                Some(value) if !value.is_empty() => {
+                    let key = value.to_string();
+                    if !pcomm_groups.contains_key(&key) {
+                        pcomm_order.push(key.clone());
+                    }
+                    pcomm_groups.entry(key).or_default().push(work);
+                }
+                _ => non_pcomm_works.push(work),
+            }
+        }
+
+        // Spawn non-pcomm WorkSpecs via the conventional fork path
+        // (one WorkloadHandle per WorkSpec, one move_tasks call
+        // per spawn).
+        for work in non_pcomm_works {
+            let n = work.num_workers.expect("num_workers resolved above");
             let wl = WorkloadConfig {
                 num_workers: n,
-                affinity,
-                work_type: effective_work_type,
+                affinity: work.affinity.clone(),
+                work_type: work.work_type.clone(),
                 sched_policy: work.sched_policy,
                 mem_policy: work.mem_policy.clone(),
                 mpol_flags: work.mpol_flags,
-                nice: 0,
+                nice: work.nice,
+                // scenario-engine spawns are always Fork; pcomm is the only thread-mode path.
                 clone_mode: Default::default(),
+                comm: work.comm.clone(),
+                uid: work.uid,
+                gid: work.gid,
+                numa_node: work.numa_node,
                 composed: Vec::new(),
             };
             let mut h = WorkloadHandle::spawn(&wl)?;
+            ctx.cgroups.move_tasks(&def.name, &h.worker_pids())?;
+            h.start();
+            state.target_handles().push((def.name.to_string(), h));
+        }
+
+        // Spawn one thread-group leader per unique pcomm value.
+        // Each leader hosts every WorkSpec that shares its pcomm.
+        for pcomm in pcomm_order {
+            if pcomm.len() > 15 {
+                tracing::warn!(
+                    cgroup = %def.name,
+                    pcomm = %pcomm,
+                    len = pcomm.len(),
+                    "WorkSpec::pcomm exceeds TASK_COMM_LEN-1 (15 bytes); kernel \
+                     `__set_task_comm` will truncate to the leading 15 bytes",
+                );
+            }
+            let works_for_pcomm = pcomm_groups
+                .remove(&pcomm)
+                .expect("pcomm key inserted during partition pass");
+            // Container-leader credentials. Fall back to the first
+            // WorkSpec's uid/gid when no CgroupDef-level default is
+            // set: glibc's `setresuid` is broadcast to every thread
+            // in the tgid via NPTL signalling, so a worker thread's
+            // setresuid would eventually drop the leader's
+            // credentials anyway. Pre-applying it on the leader
+            // closes the root-uid window between fork and the first
+            // worker's setresuid call. When the WorkSpec also has
+            // `uid = None` the container stays at the parent's
+            // credentials (root in the test harness, the harness's
+            // euid otherwise) — the WorkSpec's lack-of-uid means
+            // "inherit the parent" anyway.
+            let container_uid = def
+                .default_uid
+                .or_else(|| works_for_pcomm.first().and_then(|w| w.uid));
+            let container_gid = def
+                .default_gid
+                .or_else(|| works_for_pcomm.first().and_then(|w| w.gid));
+            let mut h = WorkloadHandle::spawn_pcomm_cgroup(
+                &pcomm,
+                container_uid,
+                container_gid,
+                &works_for_pcomm,
+            )?;
             ctx.cgroups.move_tasks(&def.name, &h.worker_pids())?;
             h.start();
             state.target_handles().push((def.name.to_string(), h));
@@ -1916,8 +2046,13 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     sched_policy: work.sched_policy,
                     mem_policy: work.mem_policy.clone(),
                     mpol_flags: work.mpol_flags,
-                    nice: 0,
+                    nice: work.nice,
+                    // scenario-engine spawns are always Fork; pcomm is the only thread-mode path.
                     clone_mode: Default::default(),
+                    comm: work.comm.clone(),
+                    uid: work.uid,
+                    gid: work.gid,
+                    numa_node: work.numa_node,
                     composed: Vec::new(),
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
@@ -2053,8 +2188,13 @@ fn apply_ops(ctx: &Ctx, state: &mut ScenarioState<'_, '_>, ops: &[Op]) -> Result
                     sched_policy: work.sched_policy,
                     mem_policy: work.mem_policy.clone(),
                     mpol_flags: work.mpol_flags,
-                    nice: 0,
+                    nice: work.nice,
+                    // scenario-engine spawns are always Fork; pcomm is the only thread-mode path.
                     clone_mode: Default::default(),
+                    comm: work.comm.clone(),
+                    uid: work.uid,
+                    gid: work.gid,
+                    numa_node: work.numa_node,
                     composed: Vec::new(),
                 };
                 let mut h = WorkloadHandle::spawn(&wl)?;
@@ -2652,7 +2792,7 @@ mod tests {
     use std::ops::RangeInclusive;
 
     use super::*;
-    use crate::workload::{AffinityIntent, WorkType};
+    use crate::workload::{AffinityIntent, WorkSpec, WorkType};
     use strum::IntoEnumIterator;
 
     /// Exhaustiveness guard for [`OpKind::bit_index`]. A new [`Op`]
@@ -5720,6 +5860,10 @@ mod tests {
             mpol_flags: w.mpol_flags,
             nice: 0,
             clone_mode: Default::default(),
+            comm: None,
+            uid: None,
+            gid: None,
+            numa_node: None,
             composed: Vec::new(),
         };
         let h = WorkloadHandle::spawn(&wl).expect("spawn worker");
@@ -5781,6 +5925,10 @@ mod tests {
             mpol_flags: w.mpol_flags,
             nice: 0,
             clone_mode: Default::default(),
+            comm: None,
+            uid: None,
+            gid: None,
+            numa_node: None,
             composed: Vec::new(),
         };
         let h = WorkloadHandle::spawn(&wl).expect("spawn");
@@ -7462,6 +7610,304 @@ mod tests {
             "default-WorkSpec substitution must spawn workers and migrate them into the \
              cgroup; without it the empty `works` would leave the cgroup taskless. \
              Got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    // -- pcomm coalescing tests -----------------------------------------
+    //
+    // [`CgroupDef::pcomm`] propagates `pcomm` to every WorkSpec in the
+    // group AND records it on the CgroupDef itself. At apply_setup time,
+    // pcomm-bearing WorkSpecs trigger the fork-then-thread spawn path
+    // in [`WorkloadHandle::spawn`]: ONE container child is forked, its
+    // comm is set to `pcomm`, then N thread workers are spawned inside.
+    //
+    // Verification at this layer:
+    // - `move_tasks` receives a single PID per pcomm group (the
+    //   container), not one PID per thread.
+    // - `/proc/<container>/comm` carries `pcomm`, kernel-truncated at
+    //   15 bytes (TASK_COMM_LEN-1 from include/linux/sched.h:325 — the
+    //   write site is __set_task_comm in fs/exec.c:1075 which calls
+    //   `min(strlen, sizeof(tsk->comm) - 1)`).
+    // - Mixed pcomm/non-pcomm CgroupDefs in the same setup keep their
+    //   move_tasks shapes distinct: pcomm group → 1 PID, non-pcomm
+    //   group → N PIDs (one per worker fork).
+    // - pcomm + num_workers=0 (decided no-op): no container fork.
+
+    /// Read the `Tgid:` line from `/proc/<tid>/status`. Returns the
+    /// pid_t of the thread group leader. Panics on read or parse
+    /// failure — the live thread should always be observable; either
+    /// failure indicates a wider problem (worker died early, /proc
+    /// unmounted) outside this test's scope.
+    fn read_status_tgid(tid: libc::pid_t) -> libc::pid_t {
+        let status = std::fs::read_to_string(format!("/proc/{tid}/status"))
+            .expect("/proc/<tid>/status must be readable for live thread");
+        let line = status
+            .lines()
+            .find(|l| l.starts_with("Tgid:"))
+            .expect("/proc/<tid>/status must include Tgid line");
+        line.trim_start_matches("Tgid:")
+            .trim()
+            .parse()
+            .expect("Tgid must be a parseable pid_t")
+    }
+
+    /// Read `/proc/<pid>/comm`. The kernel emits the comm bytes
+    /// followed by a single newline (see `comm_show` in
+    /// `fs/proc/base.c:1750`). The trailing newline is stripped.
+    fn read_proc_comm(pid: libc::pid_t) -> String {
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("/proc/<pid>/comm must be readable for live task");
+        raw.trim_end_matches('\n').to_string()
+    }
+
+    /// `CgroupDef::named(...).pcomm("X").workers(2)` propagates
+    /// pcomm into the group's single (default) WorkSpec, and the
+    /// resulting spawn forks ONE container process — observable
+    /// here as a single PID delivered to `move_tasks`. Without
+    /// fork-then-thread coalescing, `move_tasks` would receive
+    /// 2 distinct fork-mode worker PIDs.
+    #[test]
+    fn apply_setup_pcomm_via_cgroup_def_forks_one_container() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_pcomm").pcomm("leader").workers(2)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("pcomm apply_setup must succeed");
+        let calls = mock.calls();
+        // pcomm coalescing: exactly ONE PID is moved into the
+        // cgroup (the container), not 2 (one per worker fork).
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::MoveTasks(name, 1) if name == "cg_pcomm"
+            )),
+            "pcomm group must move exactly 1 PID (the container) into the cgroup; \
+             got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// pcomm + per-thread comm coexist. The container holds `pcomm`
+    /// as its comm; each worker thread sets its own comm via the
+    /// post-spawn `prctl(PR_SET_NAME)`. Observable through
+    /// `/proc/<leader>/comm == pcomm` while each per-thread file
+    /// at `/proc/<leader>/task/<tid>/comm` carries the per-thread
+    /// `comm` (except the leader-thread's own task entry, whose
+    /// comm tracks `pcomm` since the leader called the
+    /// container-wide prctl).
+    ///
+    /// `worker_pids()` for a pcomm group returns ONLY the leader
+    /// pid (the parent has no per-thread tids exported across the
+    /// process boundary). To verify per-thread comm we enumerate
+    /// `/proc/<leader>/task/` directly: every directory entry is
+    /// a kernel TID inside the container's tgid, and its `comm`
+    /// file is the kernel-side authoritative per-thread comm.
+    #[test]
+    fn apply_setup_pcomm_with_per_thread_comm() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![
+            CgroupDef::named("cg_named")
+                .pcomm("leader")
+                .comm("worker")
+                .workers(2),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).expect("pcomm + comm apply_setup must succeed");
+        // Take handles so the workers are observable before drop.
+        let mut handles = std::mem::take(&mut state.handles);
+        assert_eq!(handles.len(), 1, "one CgroupDef → one handle");
+        let (_name, handle) = handles
+            .pop()
+            .expect("apply_setup must have pushed a handle for cg_named");
+        let pids = handle.worker_pids();
+        assert_eq!(
+            pids.len(),
+            1,
+            "pcomm handle must report exactly 1 pid (the leader); got {}",
+            pids.len(),
+        );
+        // For pcomm groups, worker_pids()[0] IS the leader pid
+        // directly (the parent never observes the per-thread tids).
+        let leader_pid = pids[0];
+        // Container's leader-thread comm is the pcomm value.
+        assert_eq!(
+            read_proc_comm(leader_pid),
+            "leader",
+            "/proc/<leader>/comm must equal pcomm",
+        );
+        // Wait briefly for thread workers to install their
+        // per-thread comm via prctl in worker_main. 100 ms is
+        // generous against scheduler jitter on contended hosts;
+        // test sleep approved per the team-lead's pragmatic-test
+        // ruling.
+        std::thread::sleep(Duration::from_millis(100));
+        // Enumerate /proc/<leader>/task/ — every directory entry
+        // is a TID inside the container's tgid. Read each TID's
+        // comm. The leader-thread's own task entry tracks the
+        // container-wide prctl (== "leader"); every other TID is
+        // a worker thread that ran worker_main's prctl == "worker".
+        let task_dir = format!("/proc/{leader_pid}/task");
+        let entries: Vec<libc::pid_t> = std::fs::read_dir(&task_dir)
+            .expect("/proc/<leader>/task must be readable for live container")
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|n| n.parse().ok()))
+            .collect();
+        assert!(
+            entries.len() >= 3,
+            "leader pid {leader_pid} must have leader + 2 worker threads in /proc/<leader>/task; \
+             observed {} entries: {entries:?}",
+            entries.len(),
+        );
+        let mut leader_seen = false;
+        let mut worker_seen = 0usize;
+        for tid in entries {
+            let tcomm = read_proc_comm(tid);
+            if tid == leader_pid {
+                assert_eq!(
+                    tcomm, "leader",
+                    "/proc/<leader>/task/<leader>/comm must equal pcomm; got {tcomm:?}",
+                );
+                leader_seen = true;
+            } else {
+                assert_eq!(
+                    tcomm, "worker",
+                    "/proc/<leader>/task/{tid}/comm must equal per-thread comm 'worker'; \
+                     got {tcomm:?}",
+                );
+                worker_seen += 1;
+            }
+        }
+        assert!(
+            leader_seen,
+            "leader's own task entry must appear in /proc/<leader>/task",
+        );
+        assert_eq!(
+            worker_seen, 2,
+            "must observe exactly 2 worker threads with per-thread comm 'worker'; \
+             saw {worker_seen}",
+        );
+        // Drop the handle (reaps container + threads) and clean up
+        // the rest of state.
+        drop(handle);
+        cleanup_state(&mut state);
+    }
+
+    /// Mixed cgroup behavior: one CgroupDef has `pcomm`, another
+    /// does not. The pcomm group spawns via fork-then-thread
+    /// (1 PID into its cgroup), the non-pcomm group spawns via
+    /// normal fork mode (N PIDs into its cgroup). Pin both shapes
+    /// so the implementer cannot regress either path.
+    #[test]
+    fn apply_setup_mixed_pcomm_and_non_pcomm_groups() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![
+            // Group 1: pcomm — fork-then-thread, one container PID.
+            CgroupDef::named("cg_pcomm").pcomm("threaded").workers(2),
+            // Group 2: no pcomm — normal fork mode, two PIDs.
+            CgroupDef::named("cg_fork").workers(2),
+        ];
+        apply_setup_test(&ctx, &mut state, &defs).expect("mixed apply_setup must succeed");
+        let calls = mock.calls();
+        // pcomm group: 1 PID move.
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::MoveTasks(name, 1) if name == "cg_pcomm"
+            )),
+            "cg_pcomm must move 1 PID (container only) into its cgroup; \
+             got: {calls:?}",
+        );
+        // Non-pcomm group: 2 PID move.
+        assert!(
+            calls.iter().any(|c| matches!(
+                c,
+                CgroupCall::MoveTasks(name, 2) if name == "cg_fork"
+            )),
+            "cg_fork must move 2 PIDs (one per fork worker) into its cgroup; \
+             got: {calls:?}",
+        );
+        cleanup_state(&mut state);
+    }
+
+    /// `pcomm` longer than 15 bytes is silently truncated by the
+    /// kernel: `__set_task_comm` (fs/exec.c:1075) writes
+    /// `min(strlen(buf), sizeof(tsk->comm) - 1)` bytes, with
+    /// `TASK_COMM_LEN = 16` (include/linux/sched.h:325) so the
+    /// write cap is exactly 15 bytes. Pin the boundary so a future
+    /// caller passing a >15-byte pcomm sees the documented
+    /// truncation, not an error.
+    #[test]
+    fn apply_setup_pcomm_kernel_truncation_at_15_bytes() {
+        let long_name = "this_is_a_very_long_name";
+        assert!(
+            long_name.len() > 15,
+            "test fixture must exceed TASK_COMM_LEN-1=15",
+        );
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_trunc").pcomm(long_name).workers(1)];
+        apply_setup_test(&ctx, &mut state, &defs).expect("long-pcomm apply_setup must succeed");
+        let mut handles = std::mem::take(&mut state.handles);
+        let (_, handle) = handles.pop().expect("one handle");
+        let pids = handle.worker_pids();
+        let container_pid = read_status_tgid(pids[0]);
+        let observed = read_proc_comm(container_pid);
+        assert_eq!(
+            observed.len(),
+            15,
+            "kernel must truncate pcomm to TASK_COMM_LEN-1=15 bytes; \
+             observed length {} for {observed:?}",
+            observed.len(),
+        );
+        assert_eq!(
+            observed,
+            &long_name[..15],
+            "truncated comm must be the leading 15 bytes of pcomm input",
+        );
+        drop(handle);
+        cleanup_state(&mut state);
+    }
+
+    /// `CgroupDef::pcomm("x").workers(0)` is a degenerate input —
+    /// the team-lead-confirmed contract is silent no-op: no
+    /// container is forked, no PIDs move into the cgroup. Pin
+    /// this so a regression that forks an empty container
+    /// (which would idle forever waiting for SIGUSR1) surfaces
+    /// here as a `MoveTasks` count > 0 on the cg_zero entry.
+    ///
+    /// `apply_setup` may still emit `move_tasks(cg_zero, 0)` —
+    /// that's fine; the assertion checks that no positive count
+    /// appears, equivalent to "no container or workers were
+    /// migrated."
+    #[test]
+    fn apply_setup_pcomm_with_zero_workers_skips_container() {
+        let mock = MockCgroupOps::new();
+        let topo = mock_topo();
+        let ctx = mock_ctx(&mock, &topo);
+        let mut state = StepState::empty(&ctx);
+        let defs = vec![CgroupDef::named("cg_zero").pcomm("empty").workers(0)];
+        apply_setup_test(&ctx, &mut state, &defs)
+            .expect("pcomm + 0 workers apply_setup must succeed (no-op contract)");
+        let calls = mock.calls();
+        let bad_move = calls.iter().any(|c| {
+            matches!(
+                c,
+                CgroupCall::MoveTasks(name, count) if name == "cg_zero" && *count > 0
+            )
+        });
+        assert!(
+            !bad_move,
+            "pcomm + workers(0) must NOT move any PIDs into cg_zero \
+             (no container forked); got: {calls:?}",
         );
         cleanup_state(&mut state);
     }

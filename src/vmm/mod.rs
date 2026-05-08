@@ -72,6 +72,7 @@ pub(crate) mod net_config;
 pub(crate) mod numa_mem;
 pub(crate) mod result;
 pub(crate) mod rust_init;
+pub(crate) mod sched_stats;
 pub(crate) mod setup;
 pub(crate) mod vcpu;
 pub(crate) mod virtio_blk;
@@ -129,6 +130,8 @@ pub use builder::KtstrVmBuilder;
 #[allow(unused_imports)]
 pub use result::KVM_INTERESTING_STATS;
 pub use result::{KvmStatsTotals, VmResult};
+#[allow(unused_imports)]
+pub use sched_stats::{SchedStatsClient, SchedStatsError, StatsRequest, StatsResponse};
 
 pub(crate) use contention::{
     create_vm_with_retry, host_resource_snapshot, map_transient_to_contention,
@@ -393,6 +396,19 @@ pub struct KtstrVm {
     /// [`KtstrVmBuilder::workload_duration`].
     #[allow(dead_code)]
     pub(crate) workload_duration: Option<Duration>,
+    /// Periodic snapshot count: when non-zero, the freeze
+    /// coordinator divides the 10%–90% slice of
+    /// [`Self::workload_duration`] into `num_snapshots`
+    /// equally-spaced boundaries (anchored at the first
+    /// `MSG_TYPE_SCENARIO_START` the coordinator observes) and
+    /// fires a host-side `freeze_and_capture(false)` at each one,
+    /// tagged `"periodic_NNN"` and stored on the host's
+    /// [`crate::scenario::snapshot::SnapshotBridge`]. `0` (the
+    /// default) disables the periodic-capture loop entirely.
+    /// Plumbed through [`KtstrVmBuilder::num_snapshots`]; the
+    /// test-entry plumbing comes from
+    /// [`crate::test_support::entry::KtstrTestEntry::num_snapshots`].
+    pub(crate) num_snapshots: u32,
 }
 
 struct RunLocks {

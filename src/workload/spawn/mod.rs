@@ -345,8 +345,8 @@ pub struct WorkerReport {
     /// outer work loop observed STOP and exited cleanly, or a
     /// custom-closure payload returned from its `run` function. A
     /// sentinel report synthesised by
-    /// [`WorkloadHandle::stop_and_collect`]'s JSON-parse fallback
-    /// (see `exit_info` below) carries `false`. Lets downstream
+    /// [`WorkloadHandle::stop_and_collect`]'s decode-failure
+    /// fallback (see `exit_info` below) carries `false`. Lets downstream
     /// consumers distinguish "worker ran to completion and
     /// observed zero iterations" (`completed: true, iterations: 0`
     /// — legitimate for pathologically short test windows) from
@@ -356,22 +356,22 @@ pub struct WorkerReport {
     pub completed: bool,
     /// Per-NUMA-node page counts from `/proc/self/numa_maps` after workload.
     /// Keyed by node ID. Empty when numa_maps is unavailable.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub numa_pages: BTreeMap<usize, u64>,
     /// Delta of `/proc/vmstat` `numa_pages_migrated` over the work loop.
     pub vmstat_numa_pages_migrated: u64,
     /// Diagnostic attached only to sentinel reports — populated when
     /// `stop_and_collect` synthesized the entry because no (or
-    /// unparseable) JSON came back on the report pipe. `None` on every
-    /// real worker-produced report. Lets operators distinguish the
-    /// four failure shapes that all collapse to "empty pipe + no
-    /// report":
+    /// unparseable) bincode payload came back on the report pipe.
+    /// `None` on every real worker-produced report. Lets operators
+    /// distinguish the four failure shapes that all collapse to
+    /// "empty pipe + no report":
     ///
     /// - [`WorkerExitInfo::Exited`] with a non-zero code: worker
-    ///   reached `_exit(code)` without writing JSON — typically the
-    ///   `catch_unwind` Err arm in the worker-child closure (panic
-    ///   under `panic = "unwind"`) or the 30s poll-start timeout's
-    ///   early `_exit(1)`.
+    ///   reached `_exit(code)` without writing the report —
+    ///   typically the `catch_unwind` Err arm in the worker-child
+    ///   closure (panic under `panic = "unwind"`) or the 30s
+    ///   poll-start timeout's early `_exit(1)`.
     /// - [`WorkerExitInfo::Signaled`]: worker was killed — SIGABRT
     ///   under `panic = "abort"`, SIGKILL from the still-alive
     ///   escalation in `stop_and_collect`, or an external signal
@@ -384,13 +384,11 @@ pub struct WorkerReport {
     ///   was reaped by an external signal handler, a double-reap
     ///   regression, or the pid was recycled.
     ///
-    /// `skip_serializing_if = "Option::is_none"` keeps live-worker
-    /// reports compact: only sentinel reports carry the field over
-    /// the pipe. There is no cross-version compatibility concern
-    /// here — `WorkerReport` is pipe-transited child→parent within
-    /// a single `ktstr` process, never read back from a persisted
-    /// sidecar.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// No `skip_serializing_if`: bincode is a positional, schemaless
+    /// format — every Serialize call must emit every field in the
+    /// same order or the decoder reads the next field's bytes off
+    /// the wire (silent data corruption). The Option<…> tag itself
+    /// (one byte) is the only overhead on the live-worker path.
     pub exit_info: Option<WorkerExitInfo>,
     /// `true` when this worker served as the messenger for a
     /// wake-fanout work type ([`WorkType::FutexFanOut`] or
@@ -402,7 +400,7 @@ pub struct WorkerReport {
     /// Populated from the `is_messenger` flag on the
     /// `futex: Option<(*mut u32, bool)>` parameter threaded into
     /// `worker_main`. A sentinel report synthesized by the
-    /// JSON-parse fallback in
+    /// decode-failure fallback in
     /// [`WorkloadHandle::stop_and_collect`] carries `false` via
     /// [`Default`], matching its `completed: false` shape.
     ///
@@ -427,10 +425,10 @@ pub struct WorkerReport {
     /// primary), so per-group filtering in test assertions can
     /// cleanly partition the vector.
     ///
-    /// Sentinel reports (synthesized on missing JSON / panic /
-    /// timeout) carry the `group_idx` of the worker whose pid the
-    /// sentinel replaces, so a "this composed group failed"
-    /// assertion still works on an outright crash.
+    /// Sentinel reports (synthesized on missing or undecodable
+    /// payload / panic / timeout) carry the `group_idx` of the
+    /// worker whose pid the sentinel replaces, so a "this composed
+    /// group failed" assertion still works on an outright crash.
     ///
     /// `#[serde(default)]` so reports persisted before `group_idx`
     /// existed (or written by a worker on a non-composed config)
@@ -458,16 +456,20 @@ pub struct WorkerReport {
     /// its default `None` — a worker that died before
     /// `worker_main` ran has no affinity-error observation.
     ///
-    /// `#[serde(skip_serializing_if = "Option::is_none")]` keeps
-    /// the common success path's pipe payload compact; only
-    /// failed-affinity workers emit the field over the wire.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// No `skip_serializing_if`: bincode is positional and
+    /// schemaless, so every Serialize call must emit every field
+    /// in the same order — skipping a field shifts the decoder
+    /// onto the next field's bytes (silent corruption). The
+    /// Option<…> tag (one byte) is the only overhead on the
+    /// success path.
+    #[serde(default)]
     pub affinity_error: Option<String>,
 }
 
 /// Reason a sentinel [`WorkerReport`] was synthesized — attached to
 /// the report's `exit_info` field so operators can triage a missing
-/// JSON payload without cross-referencing parent-side logs.
+/// or undecodable bincode payload without cross-referencing
+/// parent-side logs.
 ///
 /// Invariant: every variant carries the `waitpid`-derived status for
 /// the worker PID as of the end of `stop_and_collect`. Ordered from
@@ -479,7 +481,7 @@ pub enum WorkerExitInfo {
     /// worker-child closure and `_exit(1)` fired, or the 30s
     /// parent-ready poll timed out. Zero means the worker ran to
     /// completion but failed to write / serialize the report — a
-    /// serde_json or pipe-write failure that didn't panic.
+    /// bincode encode or pipe-write failure that didn't panic.
     Exited(i32),
     /// `WIFSIGNALED=true` with the given signal number. Under
     /// `panic = "abort"` a worker panic raises SIGABRT (signal 6);
@@ -746,6 +748,76 @@ impl Drop for ThreadWorker {
     }
 }
 
+/// Per-fork-child report-decoding shape and bookkeeping recorded
+/// alongside each entry in [`SpawnGuard::children`] and
+/// [`WorkloadHandle::children`].
+///
+/// Two variants:
+///
+/// - [`ForkedChildKind::Worker`]: the conventional fork-mode worker
+///   (one process per worker, single bincode `WorkerReport`).
+///   Carries the worker's `group_idx` so a sentinel report on a
+///   missing payload can be tagged correctly.
+/// - [`ForkedChildKind::PcommContainer`]: a single thread-group
+///   leader that owns `num_workers` worker threads across one or
+///   more logical groups. The leader sets its own `comm` to `pcomm`
+///   via `prctl(PR_SET_NAME)` before spawning the threads, so every
+///   worker thread's `task->group_leader->comm` is `pcomm` (the
+///   kernel truncates to `TASK_COMM_LEN - 1 = 15` bytes inside
+///   `__set_task_comm`). Reports are a single `serde_json`
+///   `Vec<WorkerReport>` (one entry per worker thread; per-thread
+///   `group_idx` lives inside each `WorkerReport`).
+///
+/// Note the per-variant wire-format split: `Worker` uses bincode and
+/// `PcommContainer` uses serde_json. The encodings are dispatched by
+/// `ForkedChildKind` at decode time on the parent.
+#[derive(Clone, Debug)]
+pub(super) enum ForkedChildKind {
+    /// Conventional fork-mode worker (one process per worker).
+    /// Report wire format: bare `b'r'` ready byte followed by a
+    /// `bincode::serde::encode_to_vec(&WorkerReport, …)` document.
+    Worker { group_idx: usize },
+    /// pcomm thread-group leader hosting worker threads across one
+    /// or more logical groups. `groups` records the per-group
+    /// `(group_idx, num_workers)` layout in the order threads were
+    /// spawned: groups[0] contributes the first
+    /// `groups[0].1` worker reports, groups[1] the next
+    /// `groups[1].1`, and so on. Total expected reports =
+    /// `groups.iter().map(|(_, n)| n).sum()`. The layout drives
+    /// sentinel distribution: when the JSON payload is missing or
+    /// short, the parent emits sentinels tagged with the right
+    /// per-group `group_idx` so per-group filters partition
+    /// correctly.
+    ///
+    /// Report wire format: bare `b'r'` ready byte followed by a
+    /// `serde_json::to_vec(&Vec<WorkerReport>)` document, one entry
+    /// per worker thread (in `(group_idx, within-group index)`
+    /// traversal order matching the `groups` layout).
+    PcommContainer { groups: Vec<(usize, usize)> },
+}
+
+/// Bookkeeping for a single forked-child process owned by the spawn
+/// pipeline. Replaces the prior `(pid, report_fd, start_fd)` tuple so
+/// per-child decoding metadata ([`ForkedChildKind`]) lives alongside
+/// the pipe fds and pid.
+#[derive(Clone, Debug)]
+pub(super) struct ForkedChild {
+    /// Forked child's pid (== tgid for both `Worker` and
+    /// `PcommContainer`: the worker is its own thread-group leader,
+    /// the container is the thread-group leader of its inner threads).
+    pub pid: libc::pid_t,
+    /// Parent-side read end of the report pipe. The child writes one
+    /// `b'r'` ready byte followed by either a bincode-encoded single
+    /// `WorkerReport` (Worker) or a `serde_json` `Vec<WorkerReport>`
+    /// (PcommContainer) per the [`ForkedChildKind`] tag.
+    pub report_fd: std::os::unix::io::RawFd,
+    /// Parent-side write end of the start pipe. Closed by [`Self::start`]
+    /// after writing the start byte; set to `-1` thereafter.
+    pub start_fd: std::os::unix::io::RawFd,
+    /// Per-child decoding shape. See [`ForkedChildKind`].
+    pub kind: ForkedChildKind,
+}
+
 /// Handle to spawned worker tasks. Workers block until
 /// [`start()`](Self::start) is called.
 ///
@@ -767,13 +839,13 @@ impl Drop for ThreadWorker {
 ///   parent's cgroup.
 #[must_use = "dropping a WorkloadHandle immediately tears down all worker tasks"]
 pub struct WorkloadHandle {
-    /// Fork-mode workers. Each entry is `(pid, report_fd, start_fd)`.
-    /// Empty when `clone_mode` is not [`CloneMode::Fork`].
-    children: Vec<(
-        libc::pid_t,
-        std::os::unix::io::RawFd,
-        std::os::unix::io::RawFd,
-    )>,
+    /// Forked-child processes owned by this handle. Each entry is a
+    /// [`ForkedChild`] carrying pid, parent-side pipe fds, and a
+    /// [`ForkedChildKind`] tag that drives report decoding (single
+    /// bincode `WorkerReport` for `Worker`; `serde_json`
+    /// `Vec<WorkerReport>` for `PcommContainer`). Empty when every
+    /// group used [`CloneMode::Thread`] without `pcomm`.
+    children: Vec<ForkedChild>,
     /// Thread-mode workers. Empty when `clone_mode` is not
     /// [`CloneMode::Thread`].
     threads: Vec<ThreadWorker>,
@@ -919,9 +991,10 @@ pub(super) struct SpawnGuard {
     /// Typed matches the handle field; see `WorkloadHandle::iter_counters`.
     iter_counters: *mut AtomicU64,
     iter_counter_bytes: usize,
-    /// Already-forked children with their parent-side pipe fds
-    /// (transferred to handle on success).
-    children: Vec<(libc::pid_t, i32, i32)>,
+    /// Already-forked children (either conventional workers or
+    /// pcomm containers) with their parent-side pipe fds and
+    /// per-child decoding shape (transferred to handle on success).
+    children: Vec<ForkedChild>,
     /// Already-spawned thread workers (transferred on success).
     /// Cleanup on early-exit flips each `stop` and joins each
     /// thread, since threads share the parent's address space and
@@ -989,14 +1062,14 @@ impl Drop for SpawnGuard {
         // (we discard the status in the cleanup path), close returns
         // `Result<()>` (we swallow EBADF for fds an earlier arm may
         // have already closed).
-        for &(pid, _, _) in &self.children {
-            let npid = nix::unistd::Pid::from_raw(pid);
+        for child in &self.children {
+            let npid = nix::unistd::Pid::from_raw(child.pid);
             let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
             let _ = nix::sys::wait::waitpid(npid, None);
         }
         // Close each child's parent-side report/start fds.
-        for &(_, rfd, wfd) in &self.children {
-            for fd in [rfd, wfd] {
+        for child in &self.children {
+            for fd in [child.report_fd, child.start_fd] {
                 if fd >= 0 {
                     let _ = nix::unistd::close(fd);
                 }
@@ -1341,10 +1414,11 @@ impl GroupParams {
             mem_policy: config.mem_policy.clone(),
             mpol_flags: config.mpol_flags,
             nice: config.nice,
-            comm: None,
-            uid: None,
-            gid: None,
-            numa_node: None,
+            comm: config.comm.clone(),
+            uid: config.uid,
+            gid: config.gid,
+            numa_node: config.numa_node,
+            pcomm: None,
         };
         Ok(Self::from_work_spec(
             &spec,
@@ -1389,6 +1463,90 @@ impl GroupParams {
         let affinity = Self::resolve_spawn_affinity(&spec.affinity, &site)?;
         Ok(Self::from_work_spec(spec, group_idx, affinity, num_workers))
     }
+}
+
+/// Shared per-group admission rules common to every spawn entry
+/// point. Validates only the rules that are dispatch-agnostic —
+/// `worker_group_size` divisibility, `chain_pipe_depth >= 2`,
+/// `IdleChurn` zero-duration rejections, `IpcVariance` zero-knob
+/// rejections. Dispatch-specific compatibility checks (CloneMode
+/// vs WorkType, pcomm vs WorkType) stay at each entry point's
+/// admission block since their reasoning differs per dispatch.
+///
+/// Called from [`WorkloadHandle::spawn`] (per-group inside
+/// `groups`) and [`WorkloadHandle::spawn_pcomm_cgroup`] (per-group
+/// inside its own `groups`). Centralises the rules so a future
+/// addition (e.g. a new `WorkType` zero-rejection) lives in one
+/// place.
+pub(super) fn validate_workload_admission(group: &GroupParams) -> Result<()> {
+    if let Some(group_size) = group.work_type.worker_group_size()
+        && (group.num_workers == 0 || !group.num_workers.is_multiple_of(group_size))
+    {
+        return Err(WorkTypeValidationError::NonDivisibleWorkerCount {
+            name: group.work_type.name().to_string(),
+            group_idx: group.group_idx,
+            group_size,
+            num_workers: group.num_workers,
+        }
+        .into());
+    }
+    if let Some(depth) = group.work_type.chain_pipe_depth()
+        && depth < 2
+    {
+        return Err(WorkTypeValidationError::InsufficientWakeChainDepth {
+            depth,
+            group_idx: group.group_idx,
+        }
+        .into());
+    }
+    if let WorkType::IdleChurn {
+        burst_duration,
+        sleep_duration,
+        ..
+    } = group.work_type
+    {
+        if burst_duration.is_zero() {
+            return Err(WorkTypeValidationError::ZeroBurstDuration {
+                group_idx: group.group_idx,
+            }
+            .into());
+        }
+        if sleep_duration.is_zero() {
+            return Err(WorkTypeValidationError::ZeroSleepDuration {
+                group_idx: group.group_idx,
+            }
+            .into());
+        }
+    }
+    if let WorkType::IpcVariance {
+        hot_iters,
+        cold_iters,
+        period_iters,
+    } = group.work_type
+    {
+        if hot_iters == 0 {
+            return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                field: "hot_iters",
+                group_idx: group.group_idx,
+            }
+            .into());
+        }
+        if cold_iters == 0 {
+            return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                field: "cold_iters",
+                group_idx: group.group_idx,
+            }
+            .into());
+        }
+        if period_iters == 0 {
+            return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
+                field: "period_iters",
+                group_idx: group.group_idx,
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Spawn a single thread-mode worker via [`std::thread::Builder`].
@@ -1557,6 +1715,894 @@ pub(super) fn spawn_thread_worker(
     Ok(())
 }
 
+/// Per-group resource indices into the [`SpawnGuard`]'s flat
+/// vectors used by [`spawn_pcomm_container`] to compute per-thread
+/// pipe / chain / futex / iter-slot addresses inside the forked
+/// container. Built by [`WorkloadHandle::spawn_pcomm_cgroup`] in
+/// lockstep with the per-group resource allocation pass so the
+/// container's threads can address their own group's resources from
+/// the inherited shared regions.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PcommGroupResources {
+    /// Offset into the iter_counters MAP_SHARED region for this
+    /// group's first worker. Subsequent workers occupy
+    /// `iter_offset + i` for `i in 0..num_workers`.
+    pub iter_offset: usize,
+    /// Index of this group's first pipe pair in `guard.pipe_pairs`
+    /// (only meaningful when `needs_pipes` is true).
+    pub pipe_pair_base: usize,
+    /// Index of this group's first chain pipe in `guard.chain_pipes`
+    /// (only meaningful when `chain_depth` is `Some(_)`).
+    pub chain_pipes_base: usize,
+    /// Index of this group's first futex region in `guard.futex_ptrs`
+    /// (only meaningful when `needs_futex` is true).
+    pub futex_ptrs_base: usize,
+    /// True when the group's `WorkType` requires inter-worker pipe
+    /// pairs (PipeIo / CachePipe).
+    pub needs_pipes: bool,
+    /// `Some(depth)` when the group's `WorkType` requires a chain
+    /// pipe ring (WakeChain { wake: Pipe }); `None` otherwise.
+    pub chain_depth: Option<usize>,
+    /// True when the group's `WorkType` requires a MAP_SHARED futex
+    /// region (FutexPingPong / FutexFanOut / FanOutCompute /
+    /// MutexContention / etc.).
+    pub needs_futex: bool,
+    /// Worker-group-size for per-worker `pos` computation inside
+    /// the futex region (e.g. 2 for FutexPingPong, the messenger /
+    /// receiver split for FutexFanOut). Defaulted to 2 when the
+    /// `WorkType` does not declare a group_size.
+    pub futex_group_size: usize,
+}
+
+/// Fork one thread-group leader hosting every worker thread for the
+/// supplied groups: fork the leader, set its `comm` to `pcomm` via
+/// `prctl(PR_SET_NAME)` (the kernel truncates to `TASK_COMM_LEN - 1
+/// = 15` bytes inside `__set_task_comm`), then spawn
+/// `groups[k].num_workers` worker threads per group inside it. Every
+/// worker thread shares the leader's tgid, so
+/// `task->group_leader->comm == pcomm` for every worker. Models real
+/// workloads like `chrome` (pcomm) hosting `ThreadPoolForeg` and
+/// `GPU Process` (per-thread comm via [`WorkSpec::comm`]) or `java`
+/// (pcomm) hosting `GC Thread` and `C2 CompilerThre`.
+///
+/// `groups` carries per-group [`GroupParams`] and `resources` carries
+/// the parallel [`PcommGroupResources`] pre-built by
+/// [`WorkloadHandle::spawn_pcomm_cgroup`] from the surrounding
+/// per-group resource-allocation pass; the two slices have identical
+/// length and `resources[k]` describes the indices owned by
+/// `groups[k]`.
+///
+/// `container_uid` / `container_gid` are applied via `setresuid` /
+/// `setresgid` once on the leader before spawning threads — the
+/// leader takes the configured process credentials, and each worker
+/// thread additionally re-applies its own merged credentials inside
+/// `worker_main` at thread creation time (idempotent when the merge
+/// produced the same value, which is the common case for a
+/// CgroupDef-level default flowing through `merged_works`).
+///
+/// # Wire format
+///
+/// The parent collects via the same report pipe used by conventional
+/// fork workers:
+///
+/// 1. After the start handshake, the leader writes one `b'r'` ready
+///    byte to the report pipe (matching the conventional barrier
+///    protocol).
+/// 2. After all worker threads have joined, the leader serializes
+///    `Vec<WorkerReport>` (one entry per worker thread, in
+///    `(group_idx, within-group order)` traversal order) via
+///    `serde_json::to_vec` and writes the bytes to the report pipe
+///    before `_exit(0)`. The parent decodes via
+///    `serde_json::from_slice::<Vec<WorkerReport>>`. The report pipe
+///    is sized at 8 MiB; parent `read_to_end` drains concurrently
+///    with the leader's `write_all` so payloads exceeding the pipe
+///    size still drain correctly.
+///
+/// On a decode-failure or short payload, the parent emits one
+/// sentinel report per expected worker so per-group filtering and
+/// `assert_not_starved` see the correct cardinality.
+///
+/// # Lifecycle
+///
+/// - `PR_SET_PDEATHSIG(SIGKILL)`: when the parent dies, the kernel
+///   sends SIGKILL to the LEADER thread (the calling task at fork
+///   time). SIGKILL on any thread is fatal-to-tgid: the kernel
+///   routes it through `complete_signal` → `do_group_exit` →
+///   `zap_other_threads`, which sets `SIGNAL_GROUP_EXIT` on every
+///   sibling thread and walks the thread list signalling each. So
+///   the cascade to worker threads happens via
+///   `zap_other_threads`, NOT via per-task PDEATHSIG inheritance
+///   (PDEATHSIG itself is per-task and is cleared on clone). Net:
+///   parent death → leader's SIGKILL → all worker threads die,
+///   so the container cannot outlive the harness.
+/// - `setpgid(0, 0)`: the leader becomes its own process group
+///   leader so the parent's stop/kill `killpg` reaches any
+///   descendants the workers spawn.
+/// - SIGUSR1 handler installed pre-thread-spawn: any
+///   `kill(leader_pid, SIGUSR1)` from the parent flips the leader's
+///   STOP, which every worker thread observes via
+///   `stop_requested(&STOP)` on its next loop check.
+/// - `prctl(PR_SET_NAME, pcomm)`: sets the leader's `task->comm`,
+///   which becomes `task->group_leader->comm` for every spawned
+///   thread (kernel truncates to 15 bytes).
+/// - `setresuid(container_uid, ...)` / `setresgid(container_gid,
+///   ...)` (if specified) apply once before the start-byte poll.
+/// - Threads spawn AFTER the start byte arrives, so `start()`'s
+///   serial start-byte writes still gate work entry (the parent
+///   moves the leader to its cgroup before sending start).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_pcomm_container(
+    guard: &mut SpawnGuard,
+    pcomm: &str,
+    container_uid: Option<u32>,
+    container_gid: Option<u32>,
+    groups: &[GroupParams],
+    resources: &[PcommGroupResources],
+) -> Result<()> {
+    debug_assert_eq!(
+        groups.len(),
+        resources.len(),
+        "spawn_pcomm_container: groups / resources must have the same length",
+    );
+
+    // Allocate the container's report and start pipes. Parent holds
+    // report_fds[0] (read end) and start_fds[1] (write end); the
+    // container holds the inverse ends post-fork. O_CLOEXEC matches
+    // the defense-in-depth posture used by every other pipe in the
+    // spawn pipeline — defends against future exec paths that could
+    // otherwise leak the fd into a helper.
+    let mut report_fds = [0i32; 2];
+    if unsafe { libc::pipe2(report_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        anyhow::bail!(
+            "pcomm container (pcomm={pcomm:?}): report pipe2 failed: {}",
+            std::io::Error::last_os_error(),
+        );
+    }
+    // Grow the report pipe to 8 MiB so the container's `write_all` of
+    // the JSON-encoded `Vec<WorkerReport>` issues without blocking
+    // for moderate worker counts. For larger payloads the parent's
+    // `read_to_end` drains concurrently with the container's
+    // `write_all`, so a pipe overflow degrades to extra wakeups
+    // rather than truncation. Best-effort failure (older kernel /
+    // EPERM) leaves the default size in place — large payloads
+    // still drain via the concurrent flow but with more wake cycles.
+    const REPORT_PIPE_SIZE: libc::c_int = 8 * 1024 * 1024;
+    let prev_size = unsafe { libc::fcntl(report_fds[1], libc::F_SETPIPE_SZ, REPORT_PIPE_SIZE) };
+    if prev_size < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            pcomm,
+            requested_size = REPORT_PIPE_SIZE,
+            %err,
+            "F_SETPIPE_SZ on pcomm container report pipe failed; falling back \
+             to default pipe capacity",
+        );
+    }
+    let mut start_fds = [0i32; 2];
+    if unsafe { libc::pipe2(start_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        unsafe {
+            libc::close(report_fds[0]);
+            libc::close(report_fds[1]);
+        }
+        anyhow::bail!(
+            "pcomm container (pcomm={pcomm:?}): start pipe2 failed: {}",
+            std::io::Error::last_os_error(),
+        );
+    }
+
+    // Block SIGUSR1 across fork so the container inherits a blocked
+    // mask; the post-fork install + restore pattern matches the
+    // conventional fork worker (see `spawn_group`'s fork dispatch
+    // for the full rationale).
+    let mut old_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut block_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let psm_block_rc = unsafe {
+        libc::sigemptyset(&mut block_mask);
+        libc::sigaddset(&mut block_mask, libc::SIGUSR1);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block_mask, &mut old_mask)
+    };
+    if psm_block_rc != 0 {
+        tracing::warn!(
+            rc = psm_block_rc,
+            pcomm,
+            "pthread_sigmask(SIG_BLOCK, SIGUSR1) failed pre-fork for pcomm container; \
+             container inherits unblocked SIGUSR1 and may terminate on default \
+             action before installing handler",
+        );
+    }
+
+    // Sum of all groups' workers — matches `WorkerReport` cardinality
+    // the parent expects.
+    let total_workers: usize = groups.iter().map(|g| g.num_workers).sum();
+
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => {
+            let psm_restore_rc = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut())
+            };
+            if psm_restore_rc != 0 {
+                tracing::warn!(
+                    rc = psm_restore_rc,
+                    "pthread_sigmask(SIG_SETMASK) failed restoring mask after pcomm \
+                     container fork failure; SIGUSR1 may remain blocked in this thread",
+                );
+            }
+            unsafe {
+                libc::close(report_fds[0]);
+                libc::close(report_fds[1]);
+                libc::close(start_fds[0]);
+                libc::close(start_fds[1]);
+            }
+            anyhow::bail!(
+                "pcomm container (pcomm={pcomm:?}): fork failed: {}",
+                std::io::Error::last_os_error(),
+            );
+        }
+        0 => {
+            // Container child. Mirror the conventional fork worker's
+            // post-fork init: PDEATHSIG, getppid orphan check,
+            // setpgid, SIGUSR1 handler install + mask restore. This
+            // is the exact same defensive sequence; the only
+            // structural difference is what happens AFTER the
+            // start-byte handshake (thread spawn instead of inline
+            // worker_main).
+            unsafe {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            }
+            if std::env::var_os("KTSTR_GUEST_INIT").is_none() && unsafe { libc::getppid() } == 1 {
+                unsafe {
+                    libc::_exit(0);
+                }
+            }
+            unsafe {
+                libc::setpgid(0, 0);
+            }
+            STOP.store(false, Ordering::Relaxed);
+            let sig_prev = unsafe {
+                libc::signal(
+                    libc::SIGUSR1,
+                    sigusr1_handler as *const () as libc::sighandler_t,
+                )
+            };
+            if sig_prev == libc::SIG_ERR {
+                let errno = std::io::Error::last_os_error();
+                eprintln!(
+                    "ktstr: signal(SIGUSR1) install failed in pcomm container: {errno}; \
+                     graceful stop unavailable, killpg escalation will reap"
+                );
+            }
+            let psm_unblock_rc = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut())
+            };
+            if psm_unblock_rc != 0 {
+                eprintln!(
+                    "ktstr: pthread_sigmask(SIG_SETMASK) unblock failed in pcomm \
+                     container: rc={psm_unblock_rc}; SIGUSR1 stays blocked, killpg \
+                     escalation will reap"
+                );
+            }
+            // Close the parent's ends. Keep report_fds[1] (the
+            // container's write end) and start_fds[0] (the
+            // container's read end).
+            unsafe {
+                libc::close(report_fds[0]);
+                libc::close(start_fds[1]);
+            }
+
+            // Inherited-fd sweep. The container forked from the
+            // harness inherits every fd in the parent's table —
+            // including pipe fds from OTHER live `WorkloadHandle`s
+            // and any harness-only fds (tracing subscribers etc.).
+            // Close everything not in the keep-set:
+            //   - 0 / 1 / 2 (stdio).
+            //   - `report_fds[1]` (this container's write end).
+            //   - `start_fds[0]` (this container's read end).
+            //   - This spawn's `pipe_pairs` (per-pair inter-worker
+            //     fds) and `chain_pipes` (per-chain ring fds) —
+            //     worker threads will use them once they start.
+            //
+            // MAP_SHARED regions (futex / iter_counters) are mmap
+            // memory inherited via CLONE_VM, not fd entries; nothing
+            // to keep on that axis. The sweep walks
+            // `/proc/self/fd` once and uses raw `libc::close` on
+            // each non-kept fd; failure to close (EBADF) is benign
+            // — the entry is gone by the time we get to it. Heap
+            // allocation here is acceptable post-fork (PhD-approved
+            // pattern; the conventional fork worker also heap-
+            // allocates in `worker_main`).
+            let mut keep_fds: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+            keep_fds.insert(0);
+            keep_fds.insert(1);
+            keep_fds.insert(2);
+            keep_fds.insert(report_fds[1]);
+            keep_fds.insert(start_fds[0]);
+            for (ab, ba) in &guard.pipe_pairs {
+                keep_fds.insert(ab[0]);
+                keep_fds.insert(ab[1]);
+                keep_fds.insert(ba[0]);
+                keep_fds.insert(ba[1]);
+            }
+            for chain in &guard.chain_pipes {
+                for pipe in chain {
+                    keep_fds.insert(pipe[0]);
+                    keep_fds.insert(pipe[1]);
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
+                let mut to_close: Vec<i32> = Vec::new();
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str()
+                        && let Ok(fd) = name.parse::<i32>()
+                        && !keep_fds.contains(&fd)
+                    {
+                        to_close.push(fd);
+                    }
+                }
+                for fd in to_close {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+            } else {
+                eprintln!(
+                    "ktstr: pcomm container (pcomm={pcomm:?}): /proc/self/fd \
+                     read_dir failed; inherited-fd sweep skipped",
+                );
+            }
+
+            // prctl(PR_SET_NAME, pcomm). The kernel truncates to 15
+            // bytes (TASK_COMM_LEN - 1) inside `__set_task_comm`
+            // and accepts any byte string up to that limit including
+            // the empty string. Setting it on the container's tgid
+            // leader makes `task->group_leader->comm == pcomm` for
+            // every spawned thread (kernel/sys.c::prctl_set_name).
+            // CString construction can only fail on an interior
+            // NUL byte; the WorkSpec::pcomm builder rejects those at
+            // declaration time, so the unwrap path is unreachable
+            // for any value that arrives here. `unwrap_or_default`
+            // is a defensive fall-through to an empty CString —
+            // the kernel accepts it; the leader's comm is set to
+            // the empty string and the failure is surfaced to
+            // stderr.
+            let c_pcomm = std::ffi::CString::new(pcomm).unwrap_or_default();
+            let prctl_rc = unsafe { libc::prctl(libc::PR_SET_NAME, c_pcomm.as_ptr()) };
+            if prctl_rc != 0 {
+                let errno = std::io::Error::last_os_error();
+                eprintln!(
+                    "ktstr: prctl(PR_SET_NAME, {pcomm:?}) failed on pcomm container: {errno}",
+                );
+            }
+
+            // Apply container-level credentials. Order matters:
+            // setresgid first (while still uid=0 we can change the
+            // primary group), setresuid second (after the uid drop
+            // the process loses CAP_SETGID and a later gid change
+            // would EPERM). Failures are surfaced to stderr but do
+            // not halt the container — the threads inside still
+            // run with the inherited credentials, and worker_main's
+            // own setresuid / setresgid calls (which run after this)
+            // act as a second-line defense for any per-thread merge
+            // that produced a different value than the container
+            // default.
+            if let Some(gid) = container_gid {
+                let rc = unsafe { libc::setresgid(gid, gid, gid) };
+                if rc != 0 {
+                    let errno = std::io::Error::last_os_error();
+                    eprintln!("ktstr: setresgid({gid}) failed on pcomm container: {errno}");
+                }
+            }
+            if let Some(uid) = container_uid {
+                let rc = unsafe { libc::setresuid(uid, uid, uid) };
+                if rc != 0 {
+                    let errno = std::io::Error::last_os_error();
+                    eprintln!("ktstr: setresuid({uid}) failed on pcomm container: {errno}");
+                }
+            }
+
+            // Wait for the parent's start byte (poll with 30s
+            // timeout — same budget as the conventional fork
+            // worker). Match the conventional worker's behaviour:
+            // on `poll <= 0` _exit(1) so the parent's collect path
+            // observes a missing report and emits sentinels.
+            let mut pfd = libc::pollfd {
+                fd: start_fds[0],
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ret = unsafe { libc::poll(&mut pfd, 1, 30_000) };
+            if ret <= 0 {
+                unsafe {
+                    libc::_exit(1);
+                }
+            }
+            let mut buf = [0u8; 1];
+            {
+                let mut f = unsafe { std::fs::File::from_raw_fd(start_fds[0]) };
+                let _ = f.read_exact(&mut buf);
+                drop(f);
+            }
+
+            // Unlike fork workers, the pcomm container spawns threads after
+            // the start byte. A latched STOP from a SIGUSR1 race during mask
+            // restore would produce N zero-work threads. Reset so threads
+            // get a fair start.
+            STOP.store(false, Ordering::Relaxed);
+
+            // Spawn worker threads for every group. Each thread
+            // computes its own affinity / pipe-fd / futex /
+            // iter_slot from its (group_idx, within-group index)
+            // pair, matching the conventional fork loop's per-worker
+            // computation but inside the container's address space
+            // (so threads share the parent-allocated MAP_SHARED
+            // regions and inter-worker pipes inherited via fork).
+            // Each spawned thread gets its own `EventFd` cloned into
+            // the closure. A `WorkerExitSignal` Drop guard inside the
+            // closure writes 1 to that fd as the closure unwinds —
+            // covering both the normal-return and panic paths. The
+            // container's join phase below `epoll_wait`s on every
+            // eventfd, so a thread's exit edge is delivered without
+            // any polling sleep. This mirrors `join_thread_with_timeout`'s
+            // pattern but without a timer fd: the parent's
+            // `stop_and_collect` SIGKILL is the only timeout authority,
+            // per the user's "event-driven only, no sleeps or
+            // timeouts" rule.
+            let mut joins: Vec<(
+                std::thread::JoinHandle<WorkerReport>,
+                std::sync::Arc<vmm_sys_util::eventfd::EventFd>,
+            )> = Vec::with_capacity(total_workers);
+            // Snapshot the guard's resource bookkeeping we need
+            // inside each thread closure. The guard is borrowed
+            // mutably by the surrounding `spawn_pcomm_cgroup` and
+            // dropped on the parent side after the function returns;
+            // after fork the container has its own copy of every
+            // field, and these snapshots are clones owned by the
+            // container's process so the closures can capture them
+            // without aliasing the guard.
+            let pipe_pairs_snapshot: Vec<([i32; 2], [i32; 2])> = guard.pipe_pairs.clone();
+            let chain_pipes_snapshot: Vec<Vec<[i32; 2]>> = guard.chain_pipes.clone();
+            let futex_ptrs_snapshot: Vec<*mut u32> = guard.futex_ptrs.clone();
+            let iter_counters_base = guard.iter_counters;
+
+            for (group, res) in groups.iter().zip(resources.iter()) {
+                let num_workers = group.num_workers;
+                for i in 0..num_workers {
+                    // Per-thread affinity resolution. Random-subset
+                    // affinity samples a fresh subset per thread, so
+                    // each call produces an independent BTreeSet.
+                    // Fixed affinity returns the same BTreeSet for
+                    // every thread.
+                    let affinity = match resolve_affinity(&group.affinity) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            eprintln!(
+                                "ktstr: pcomm container (group {}): resolve_affinity \
+                                 for thread {i}/{num_workers} failed: {e:#}",
+                                group.group_idx,
+                            );
+                            None
+                        }
+                    };
+
+                    let worker_pipe_fds: Option<(i32, i32)> = if res.needs_pipes {
+                        let pair_idx = res.pipe_pair_base + i / 2;
+                        let (ab, ba) = &pipe_pairs_snapshot[pair_idx];
+                        if i % 2 == 0 {
+                            Some((ba[0], ab[1]))
+                        } else {
+                            Some((ab[0], ba[1]))
+                        }
+                    } else if let Some(depth) = res.chain_depth
+                        && depth > 0
+                    {
+                        let chain_idx = res.chain_pipes_base + i / depth;
+                        let stage = i % depth;
+                        let prev_stage = (stage + depth - 1) % depth;
+                        let chain = &chain_pipes_snapshot[chain_idx];
+                        Some((chain[prev_stage][0], chain[stage][1]))
+                    } else {
+                        None
+                    };
+
+                    let worker_futex: Option<(*mut u32, usize)> = if res.needs_futex {
+                        let futex_group_idx = res.futex_ptrs_base + i / res.futex_group_size;
+                        let pos = i % res.futex_group_size;
+                        Some((futex_ptrs_snapshot[futex_group_idx], pos))
+                    } else {
+                        None
+                    };
+
+                    let iter_slot: *mut AtomicU64 = if !iter_counters_base.is_null() {
+                        unsafe { iter_counters_base.add(res.iter_offset + i) }
+                    } else {
+                        std::ptr::null_mut()
+                    };
+
+                    // Round raw pointers through Send-newtypes so
+                    // the closure's auto-Send check passes (same
+                    // wrapper pattern `spawn_thread_worker` uses).
+                    let futex_send = SendFutexPtr::new(worker_futex);
+                    let iter_slot_send = SendIterSlotPtr::new(iter_slot);
+
+                    let work_type = group.work_type.clone();
+                    let sched_policy = group.sched_policy;
+                    let mem_policy = group.mem_policy.clone();
+                    let mpol_flags = group.mpol_flags;
+                    let nice = group.nice;
+                    let comm = group.comm.clone();
+                    let uid = group.uid;
+                    let gid = group.gid;
+                    let numa_node = group.numa_node;
+                    let group_idx = group.group_idx;
+
+                    // Per-thread exit eventfd. Cloned into the
+                    // closure as `Arc<EventFd>`; the closure-local
+                    // `WorkerExitSignal` Drop guard writes 1 to the
+                    // fd on every exit path (normal return AND
+                    // panic). The container's join phase below
+                    // `epoll_wait`s on every eventfd to deliver the
+                    // exit edge without polling. EFD_NONBLOCK keeps
+                    // the Drop-time `write` from blocking — counter
+                    // mode means the writer just bumps the counter
+                    // without losing the edge.
+                    let exit_evt = match vmm_sys_util::eventfd::EventFd::new(libc::EFD_NONBLOCK) {
+                        Ok(efd) => std::sync::Arc::new(efd),
+                        Err(e) => {
+                            // Hard fail: continuing with fewer
+                            // threads silently breaks the
+                            // workload's worker count and the
+                            // parent's report count. _exit(1) so
+                            // the parent's sentinel path observes
+                            // a missing payload and emits one
+                            // sentinel per expected report. Reuses
+                            // the same fail-stop contract as the
+                            // start-byte poll timeout (`ret <=
+                            // 0`).
+                            eprintln!(
+                                "ktstr: pcomm container (group {}): EventFd::new for \
+                                 worker {}/{num_workers} failed: {e}; aborting container",
+                                group.group_idx,
+                                i + 1,
+                            );
+                            unsafe {
+                                libc::_exit(1);
+                            }
+                        }
+                    };
+                    let exit_evt_thread = std::sync::Arc::clone(&exit_evt);
+
+                    let join = std::thread::Builder::new()
+                        .name(format!("ktstr-pcomm-g{group_idx}-{i}"))
+                        .spawn(move || {
+                            // Drop guard: bumps the eventfd as the
+                            // closure unwinds. The write is
+                            // non-blocking (EFD_NONBLOCK) and the
+                            // counter accumulates, so a missed
+                            // read just queues the next read's
+                            // value — no edge loss. Drop runs
+                            // under both normal return and
+                            // unwinding (panic), so the container's
+                            // join phase observes EVERY thread's
+                            // exit, including panicked ones.
+                            struct WorkerExitSignal(std::sync::Arc<vmm_sys_util::eventfd::EventFd>);
+                            impl Drop for WorkerExitSignal {
+                                fn drop(&mut self) {
+                                    let _ = self.0.write(1);
+                                }
+                            }
+                            let _exit_signal = WorkerExitSignal(exit_evt_thread);
+
+                            let futex = futex_send.into_raw();
+                            let slot = iter_slot_send.into_raw();
+                            worker_main(
+                                affinity,
+                                work_type,
+                                sched_policy,
+                                mem_policy,
+                                mpol_flags,
+                                nice,
+                                comm.as_deref(),
+                                uid,
+                                gid,
+                                numa_node,
+                                worker_pipe_fds,
+                                futex,
+                                slot,
+                                &STOP,
+                                group_idx,
+                            )
+                        });
+                    match join {
+                        Ok(j) => joins.push((j, exit_evt)),
+                        Err(e) => {
+                            // Hard fail: see EventFd path above.
+                            // A partially-spawned container leaves
+                            // the parent guessing about which
+                            // reports are real vs missing; an
+                            // _exit(1) collapses to the parent's
+                            // sentinel path with deterministic
+                            // cardinality.
+                            eprintln!(
+                                "ktstr: pcomm container (group {}): thread::spawn for \
+                                 worker {}/{num_workers} failed: {e}; aborting container",
+                                group.group_idx,
+                                i + 1,
+                            );
+                            unsafe {
+                                libc::_exit(1);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Publish the ready byte AFTER every worker thread is
+            // alive. The parent's barrier polls every report fd for
+            // POLLIN with a bounded deadline; the byte's correct
+            // semantic is "the container has spawned every worker
+            // thread and they are now running" — earlier (pre-spawn)
+            // is observable to the parent before threads exist, which
+            // races with `set_affinity(idx)` / `worker_pids()` calls
+            // the harness may issue between the parent's barrier wake
+            // and the work loop. Each thread starts work immediately
+            // upon spawn (no per-thread handshake gate) since the
+            // CONTAINER's start-byte poll above is the workload's
+            // single start gate; once the container observes the
+            // start byte, every thread it spawns is by construction
+            // intended to run. Done as a raw `libc::write` to avoid
+            // taking ownership of `report_fds[1]` (we still need it
+            // for the JSON write below).
+            let ready_byte: u8 = b'r';
+            unsafe {
+                libc::write(
+                    report_fds[1],
+                    &ready_byte as *const u8 as *const libc::c_void,
+                    1,
+                );
+            }
+
+            // Join every thread via `epoll_wait` on per-thread exit
+            // eventfds. Each thread's `WorkerExitSignal` Drop guard
+            // writes 1 to its fd as the closure unwinds (normal
+            // return AND panic), so the container's `epoll_wait`
+            // observes EVERY thread's exit edge without polling.
+            // No timeout: per the user's "event-driven only, no
+            // sleeps or timeouts" rule, the container blocks in
+            // `epoll_wait(-1)` until each fd fires. The parent's
+            // `stop_and_collect` 5s collect deadline + SIGKILL is
+            // the only timeout authority; if a thread hangs (no
+            // Drop guard fires — no realistic path to that under
+            // the closures we spawn), the parent SIGKILLs the
+            // container, the kernel tears down every thread, and
+            // the container exits via the signal.
+            //
+            // Setup-failure fallback: if `Epoll::new` or any
+            // `epoll.ctl(Add)` fails, fall back to blocking
+            // `JoinHandle::join` per thread — that itself is
+            // event-driven from the kernel's perspective (the
+            // syscall blocks on the thread's exit signal, no
+            // userspace polling). The fallback path is rare
+            // (epoll_create1 failure means out of fds or out of
+            // memory, both of which are pre-existing failure modes
+            // the conventional fork worker also has).
+            use std::os::unix::io::AsRawFd;
+            use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+            let mut indexed_joins: Vec<(
+                usize,
+                std::thread::JoinHandle<WorkerReport>,
+                std::sync::Arc<vmm_sys_util::eventfd::EventFd>,
+            )> = joins
+                .into_iter()
+                .enumerate()
+                .map(|(i, (j, evt))| (i, j, evt))
+                .collect();
+            let mut reports: Vec<WorkerReport> = Vec::with_capacity(indexed_joins.len());
+
+            let epoll_setup: Option<Epoll> = match Epoll::new() {
+                Ok(ep) => {
+                    let mut ok = true;
+                    for (idx, _, evt) in &indexed_joins {
+                        if let Err(e) = ep.ctl(
+                            ControlOperation::Add,
+                            evt.as_raw_fd(),
+                            EpollEvent::new(EventSet::IN, *idx as u64),
+                        ) {
+                            eprintln!(
+                                "ktstr: pcomm container (pcomm={pcomm:?}): epoll.ctl(Add) \
+                                 for thread {idx} failed: {e}; falling back to blocking \
+                                 join per thread",
+                            );
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok { Some(ep) } else { None }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "ktstr: pcomm container (pcomm={pcomm:?}): Epoll::new failed: {e}; \
+                         falling back to blocking join per thread",
+                    );
+                    None
+                }
+            };
+
+            if let Some(epoll) = epoll_setup {
+                // Event-driven join loop. `epoll_wait(-1, …)` blocks
+                // until at least one eventfd fires, which only
+                // happens when a thread's `WorkerExitSignal` Drop
+                // guard runs. The wake delivers `events[k].data()`
+                // as the index of the finished thread; we
+                // deregister, locate the entry, and `join()` it
+                // (the `join()` call may briefly wait for the OS
+                // thread to fully exit after the Drop guard, but
+                // that wait is itself event-driven inside the
+                // kernel — no userspace polling).
+                let mut events_buf: Vec<EpollEvent> =
+                    vec![EpollEvent::default(); indexed_joins.len().max(1)];
+                while !indexed_joins.is_empty() {
+                    let n = match epoll.wait(-1, &mut events_buf) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            eprintln!(
+                                "ktstr: pcomm container (pcomm={pcomm:?}): epoll.wait \
+                                 failed: {e}; falling back to blocking join for the \
+                                 remaining {} thread(s)",
+                                indexed_joins.len(),
+                            );
+                            break;
+                        }
+                    };
+                    for ev in &events_buf[..n] {
+                        let target_idx = ev.data() as usize;
+                        let pos = match indexed_joins
+                            .iter()
+                            .position(|(idx, _, _)| *idx == target_idx)
+                        {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        let (idx, j, evt) = indexed_joins.swap_remove(pos);
+                        if let Err(e) = epoll.ctl(
+                            ControlOperation::Delete,
+                            evt.as_raw_fd(),
+                            EpollEvent::default(),
+                        ) {
+                            eprintln!(
+                                "ktstr: pcomm container (pcomm={pcomm:?}): epoll.ctl(Del) \
+                                 for thread {idx} failed: {e}",
+                            );
+                        }
+                        let _ = evt.read();
+                        match j.join() {
+                            Ok(r) => reports.push(r),
+                            Err(payload) => {
+                                let msg = extract_panic_payload(payload);
+                                eprintln!(
+                                    "ktstr: pcomm container (pcomm={pcomm:?}): thread {idx} \
+                                     panicked: {msg}",
+                                );
+                                reports.push(WorkerReport {
+                                    completed: false,
+                                    exit_info: Some(WorkerExitInfo::Panicked(msg)),
+                                    ..WorkerReport::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // Either the epoll path completed (drained
+            // `indexed_joins`) or it bailed mid-flight; either way,
+            // any remaining handles are joined by the kernel-blocking
+            // `JoinHandle::join` below. `join` is event-driven inside
+            // the kernel (futex on the thread's TID); no userspace
+            // polling.
+            for (idx, j, _evt) in indexed_joins {
+                match j.join() {
+                    Ok(r) => reports.push(r),
+                    Err(payload) => {
+                        let msg = extract_panic_payload(payload);
+                        eprintln!(
+                            "ktstr: pcomm container (pcomm={pcomm:?}): thread {idx} \
+                             panicked: {msg}",
+                        );
+                        reports.push(WorkerReport {
+                            completed: false,
+                            exit_info: Some(WorkerExitInfo::Panicked(msg)),
+                            ..WorkerReport::default()
+                        });
+                    }
+                }
+            }
+
+            // Encode and write the report stream as a single
+            // `Vec<WorkerReport>` JSON document via `serde_json`.
+            // serde_json matches the existing fork-mode report
+            // convention; the pcomm container is a fork-mode child
+            // and its payload sits on the same per-child pipe used
+            // by every other forked worker. The parent decodes via
+            // `serde_json::from_slice::<Vec<WorkerReport>>`. Encode
+            // failures fall through to `_exit(0)` — the parent's
+            // sentinel path handles missing / truncated payloads.
+            // tracing is unsafe in a forked child (the parent's
+            // subscriber may hold a lock); use eprintln + raw fd.
+            let bytes = match serde_json::to_vec(&reports) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "ktstr: pcomm container (pcomm={pcomm:?}): serde_json encode \
+                         of {} reports failed: {e}",
+                        reports.len(),
+                    );
+                    Vec::new()
+                }
+            };
+            {
+                let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
+                if let Err(e) = f.write_all(&bytes) {
+                    eprintln!(
+                        "ktstr: pcomm container (pcomm={pcomm:?}): report write_all \
+                         of {} bytes failed: {e}",
+                        bytes.len(),
+                    );
+                }
+                drop(f);
+            }
+            unsafe {
+                libc::_exit(0);
+            }
+        }
+        child_pid => {
+            // Parent. Restore signal mask, close the wrong ends,
+            // record the container in `guard.children` so its
+            // lifecycle (kill on bail / collect on stop) is shared
+            // with conventional workers.
+            let psm_parent_restore_rc = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut())
+            };
+            if psm_parent_restore_rc != 0 {
+                tracing::warn!(
+                    rc = psm_parent_restore_rc,
+                    "pthread_sigmask(SIG_SETMASK) failed restoring mask in parent \
+                     post-pcomm-fork; SIGUSR1 stays blocked in this thread for \
+                     the lifetime of the workload",
+                );
+            }
+            unsafe {
+                libc::close(report_fds[1]);
+                libc::close(start_fds[0]);
+            }
+            // Per-group layout for sentinel distribution. Each
+            // entry is `(group_idx, num_workers)`; total report
+            // count is the sum of `num_workers` across the layout
+            // (== `total_workers` invariant). When the parent
+            // emits sentinels for a missing JSON payload, the
+            // layout drives per-group_idx tagging so per-group
+            // filters partition correctly even on a failure.
+            let group_layout: Vec<(usize, usize)> = groups
+                .iter()
+                .map(|g| (g.group_idx, g.num_workers))
+                .collect();
+            debug_assert_eq!(
+                group_layout.iter().map(|(_, n)| n).sum::<usize>(),
+                total_workers,
+                "spawn_pcomm_container: group_layout total must match total_workers",
+            );
+            guard.children.push(ForkedChild {
+                pid: child_pid,
+                report_fd: report_fds[0],
+                start_fd: start_fds[1],
+                kind: ForkedChildKind::PcommContainer {
+                    groups: group_layout,
+                },
+            });
+            Ok(())
+        }
+    }
+}
+
 /// Internal dispatch shape resolved from
 /// [`WorkloadConfig::clone_mode`] inside [`WorkloadHandle::spawn`].
 pub(super) enum Dispatch {
@@ -1565,6 +2611,303 @@ pub(super) enum Dispatch {
 }
 
 impl WorkloadHandle {
+    /// Fork one thread-group leader hosting every worker in `works`
+    /// as worker threads inside a single forked process. Used by
+    /// `apply_setup` when a `CgroupDef` declares `pcomm` — every
+    /// `WorkSpec` in the same `CgroupDef` is coalesced into one
+    /// thread-group leader whose `task->comm` carries `pcomm` (the
+    /// kernel truncates to `TASK_COMM_LEN - 1 = 15` bytes inside
+    /// `__set_task_comm`). Every spawned thread reads its
+    /// `task->group_leader->comm` as `pcomm` for the leader's
+    /// lifetime.
+    ///
+    /// `works` must already be fully resolved: each entry's
+    /// `num_workers` must be `Some(_)` and `affinity` must be
+    /// non-topology-aware (Inherit / Exact / RandomSubset).
+    /// `apply_setup` runs the standard scenario-engine resolution
+    /// (`resolve_num_workers` + `intent_for_spawn`) before calling
+    /// in.
+    ///
+    /// `container_uid` / `container_gid` apply to the leader's
+    /// process credentials via `setresuid` / `setresgid` once,
+    /// inside the forked leader, before threads spawn. Each worker
+    /// thread additionally re-applies its merged uid/gid inside
+    /// `worker_main` at thread creation time; for the common case
+    /// of a single CgroupDef-level default flowing through
+    /// `merged_works`, the per-thread call is idempotent.
+    ///
+    /// On `works.is_empty()` the function returns a handle with no
+    /// children — no fork, no resource allocation. Same for the
+    /// empty-thread case across ALL groups (every `num_workers ==
+    /// 0`): the leader is skipped because there is no work to host.
+    /// This matches the `pcomm_with_zero_workers_skips_container`
+    /// contract.
+    ///
+    /// Group-level admission rejects WorkType variants that conflict
+    /// with the threaded shape (every worker shares the leader's
+    /// tgid):
+    ///
+    /// - [`WorkType::ForkExit`]: a fork from a thread of a
+    ///   multi-threaded process inherits all locks held by other
+    ///   threads at fork time, which the child cannot release;
+    ///   safe-but-degraded use cases would still need
+    ///   `CloneMode::Fork` for clean lock-free child state.
+    /// - [`WorkType::CgroupChurn`]: writing the worker tid to
+    ///   `cgroup.procs` migrates the entire leader tgid (every
+    ///   sibling thread) — the test loses control of its own
+    ///   cgroup placement.
+    pub fn spawn_pcomm_cgroup(
+        pcomm: &str,
+        container_uid: Option<u32>,
+        container_gid: Option<u32>,
+        works: &[WorkSpec],
+    ) -> Result<Self> {
+        // Empty pcomm input is treated as "no pcomm" by the
+        // apply_setup caller; reject here as a safety belt — every
+        // production caller has already filtered empty strings.
+        if pcomm.is_empty() {
+            anyhow::bail!(
+                "spawn_pcomm_cgroup: pcomm must be a non-empty string; \
+                 the caller (apply_setup) treats `Some(\"\")` as \
+                 `None` and falls through to the conventional fork \
+                 spawn — empty here is a programmer error.",
+            );
+        }
+
+        // Build a `GroupParams` per `WorkSpec` using the same
+        // resolver `WorkloadHandle::spawn` uses for composed
+        // entries. group_idx is the entry's position in `works` (0-
+        // based); the parent has no notion of "primary" inside a
+        // pcomm container — every entry is a peer.
+        let mut groups: Vec<GroupParams> = Vec::with_capacity(works.len());
+        for (i, spec) in works.iter().enumerate() {
+            let num_workers = spec.num_workers.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "spawn_pcomm_cgroup: works[{i}].num_workers must be set explicitly \
+                     (apply_setup runs resolve_num_workers before calling in)",
+                )
+            })?;
+            let site = format!("works[{i}].affinity");
+            let affinity = GroupParams::resolve_spawn_affinity(&spec.affinity, &site)?;
+            groups.push(GroupParams::from_work_spec(spec, i, affinity, num_workers));
+        }
+
+        // Per-group admission. Mirrors `WorkloadHandle::spawn` for
+        // shared rules (worker_group_size divisibility,
+        // chain-depth-< 2, IdleChurn / IpcVariance zero rejection)
+        // and adds pcomm-specific rejections (ForkExit, CgroupChurn)
+        // since the container's threaded shape introduces shared-
+        // tgid hazards those variants cannot tolerate.
+        for group in &groups {
+            if matches!(group.work_type, WorkType::ForkExit) {
+                anyhow::bail!(
+                    "WorkSpec::pcomm is incompatible with WorkType::ForkExit \
+                     (works[{}]): a fork from a thread of a multi-threaded \
+                     container inherits all locks held by sibling threads at \
+                     fork time, producing undefined behaviour for any libc \
+                     primitive in the child. Drop pcomm or pick a different \
+                     work type.",
+                    group.group_idx,
+                );
+            }
+            if matches!(group.work_type, WorkType::CgroupChurn { .. }) {
+                anyhow::bail!(
+                    "WorkSpec::pcomm is incompatible with WorkType::CgroupChurn \
+                     (works[{}]): CgroupChurn writes the worker tid to \
+                     `cgroup.procs`, which the kernel resolves to the whole \
+                     tgid and migrates the entire pcomm container (every \
+                     sibling thread). Drop pcomm or pick a different work type.",
+                    group.group_idx,
+                );
+            }
+            validate_workload_admission(group)?;
+        }
+
+        // No-work shortcut: every group has zero workers (or the
+        // works list itself is empty). Fork would produce a
+        // container that blocks on the start byte forever and
+        // outlives the test handle; skip it. The handle still
+        // has a sensible Drop (empty children/threads/regions).
+        let total_workers: usize = groups.iter().map(|g| g.num_workers).sum();
+        if total_workers == 0 {
+            return Ok(SpawnGuard::new().into_handle());
+        }
+
+        // All failable acquisitions route through `guard`. If any
+        // `?` returns early, the guard's Drop SIGKILLs+reaps any
+        // already-forked container, closes open pipe fds, and
+        // munmaps the shared regions — so no leak on a mid-spawn
+        // error path.
+        let mut guard = SpawnGuard::new();
+
+        // Per-worker iteration counter region (MAP_SHARED). Sized
+        // for ALL groups' workers laid out contiguously; matches
+        // the `WorkloadHandle::spawn` allocation but with a
+        // pcomm-specific diagnostic prefix.
+        let size = total_workers * std::mem::size_of::<AtomicU64>();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            let errno = std::io::Error::last_os_error();
+            let hint = mmap_shared_anon_errno_hint(errno.raw_os_error());
+            anyhow::bail!(
+                "mmap(MAP_SHARED|MAP_ANONYMOUS, {size} bytes) for the \
+                 per-worker iter_counters region failed: {errno}{hint}; \
+                 this region holds one AtomicU64 per worker thread \
+                 ({total_workers} thread(s) inside the pcomm={pcomm:?} \
+                 container) so the parent can snapshot iteration \
+                 counts via `snapshot_iterations()`.",
+            );
+        }
+        guard.iter_counters = ptr as *mut AtomicU64;
+        guard.iter_counter_bytes = size;
+
+        // Per-group resource allocation (pipe pairs, chain pipes,
+        // futex regions). Same shape as `WorkloadHandle::spawn_group`'s
+        // prologue but inlined here so the per-group bookkeeping
+        // (`PcommGroupResources`) is built directly for
+        // `spawn_pcomm_container`. `iter_offset` runs across groups
+        // and tracks each group's first iter_slot.
+        let mut resources: Vec<PcommGroupResources> = Vec::with_capacity(groups.len());
+        let mut iter_offset: usize = 0;
+        for group in &groups {
+            let needs_pipes = matches!(
+                group.work_type,
+                WorkType::PipeIo { .. } | WorkType::CachePipe { .. }
+            );
+            let chain_depth = group.work_type.chain_pipe_depth();
+            let needs_futex = group.work_type.needs_shared_mem();
+            let pipe_pair_base = guard.pipe_pairs.len();
+            let chain_pipes_base = guard.chain_pipes.len();
+            let futex_ptrs_base = guard.futex_ptrs.len();
+            let futex_region_size = futex_region_size_for(&group.work_type);
+            let futex_group_size = group.work_type.worker_group_size().unwrap_or(2);
+
+            if needs_pipes {
+                for _ in 0..group.num_workers / 2 {
+                    let mut ab = [0i32; 2];
+                    if unsafe { libc::pipe2(ab.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                        anyhow::bail!(
+                            "pipe2 (pcomm={pcomm:?}, group {}) failed: {}",
+                            group.group_idx,
+                            std::io::Error::last_os_error(),
+                        );
+                    }
+                    let mut ba = [0i32; 2];
+                    if unsafe { libc::pipe2(ba.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                        unsafe {
+                            libc::close(ab[0]);
+                            libc::close(ab[1]);
+                        }
+                        anyhow::bail!(
+                            "pipe2 (pcomm={pcomm:?}, group {}) failed: {}",
+                            group.group_idx,
+                            std::io::Error::last_os_error(),
+                        );
+                    }
+                    guard.pipe_pairs.push((ab, ba));
+                }
+            }
+
+            if let Some(depth) = chain_depth
+                && depth > 0
+                && group.num_workers >= depth
+            {
+                let chains = group.num_workers / depth;
+                for _ in 0..chains {
+                    let mut chain: Vec<[i32; 2]> = Vec::with_capacity(depth);
+                    let mut alloc_ok = true;
+                    for _ in 0..depth {
+                        let mut p = [0i32; 2];
+                        if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                            alloc_ok = false;
+                            break;
+                        }
+                        chain.push(p);
+                    }
+                    if !alloc_ok {
+                        for p in &chain {
+                            unsafe {
+                                libc::close(p[0]);
+                                libc::close(p[1]);
+                            }
+                        }
+                        anyhow::bail!(
+                            "WakeChain pipe2 (pcomm={pcomm:?}, group {}) failed: {}",
+                            group.group_idx,
+                            std::io::Error::last_os_error(),
+                        );
+                    }
+                    guard.chain_pipes.push(chain);
+                }
+            }
+
+            if needs_futex {
+                for _ in 0..group.num_workers / futex_group_size {
+                    let region = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            futex_region_size,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                            -1,
+                            0,
+                        )
+                    };
+                    if region == libc::MAP_FAILED {
+                        let errno = std::io::Error::last_os_error();
+                        let hint = mmap_shared_anon_errno_hint(errno.raw_os_error());
+                        anyhow::bail!(
+                            "mmap(MAP_SHARED|MAP_ANONYMOUS, {futex_region_size} bytes) \
+                             for a futex shared-memory region (pcomm={pcomm:?}, group {}) \
+                             failed: {errno}{hint}",
+                            group.group_idx,
+                        );
+                    }
+                    unsafe {
+                        std::ptr::write_bytes(region as *mut u8, 0, futex_region_size);
+                    }
+                    guard.futex_ptrs.push(region as *mut u32);
+                    guard.futex_region_sizes.push(futex_region_size);
+                }
+            }
+
+            resources.push(PcommGroupResources {
+                iter_offset,
+                pipe_pair_base,
+                chain_pipes_base,
+                futex_ptrs_base,
+                needs_pipes,
+                chain_depth,
+                needs_futex,
+                futex_group_size,
+            });
+            iter_offset += group.num_workers;
+        }
+
+        // Fork the container and spawn its threads. On success the
+        // container is registered in `guard.children`; on failure the
+        // guard's Drop reaps it.
+        spawn_pcomm_container(
+            &mut guard,
+            pcomm,
+            container_uid,
+            container_gid,
+            &groups,
+            &resources,
+        )?;
+
+        Ok(guard.into_handle())
+    }
+
     /// Spawn worker tasks. Workers block until
     /// [`start()`](Self::start) is called, allowing the caller to
     /// move fork-mode workers into cgroups first. The worker creation
@@ -1687,106 +3030,17 @@ impl WorkloadHandle {
                     group.group_idx,
                 );
             }
-            if let Some(group_size) = group.work_type.worker_group_size()
-                && (group.num_workers == 0 || !group.num_workers.is_multiple_of(group_size))
-            {
-                return Err(WorkTypeValidationError::NonDivisibleWorkerCount {
-                    name: group.work_type.name().to_string(),
-                    group_idx: group.group_idx,
-                    group_size,
-                    num_workers: group.num_workers,
-                }
-                .into());
-            }
-            let group_chain_depth = group.work_type.chain_pipe_depth();
-            // WakeChain `wake: WakeMechanism::Pipe` runs under both
-            // [`CloneMode::Fork`] and [`CloneMode::Thread`].
-            // [`SpawnGuard::into_handle`] transfers `chain_pipes` to
-            // the [`WorkloadHandle`], whose `Drop` closes the pipe
-            // fds AFTER worker shutdown completes — so Thread-mode
-            // workers (which share the parent's fd table) finish
-            // their pipe ops before the close runs. Fork mode is
-            // unaffected: each child holds its own fd-table copy
-            // via `fork()`, and the parent's late close is a no-op
-            // for the child's view (its own copy was closed by the
-            // post-fork close-other-fds block in spawn_group).
-            // WakeChain `wake: WakeMechanism::Pipe` with depth=1 deadlocks at fork:
-            // prev_stage and stage collapse to 0, so the post-fork
-            // close-other-fds block closes BOTH ends of the worker's
-            // own pipe (the `s == prev_stage` arm runs first and
-            // closes `pipe[1]`, leaving the worker without a write
-            // end). A 1-stage "ring chain" also has no meaningful
-            // wake-chain semantics — there is no successor to wake.
-            // Reject at spawn time with an actionable diagnostic.
-            if let Some(depth) = group_chain_depth
-                && depth < 2
-            {
-                return Err(WorkTypeValidationError::InsufficientWakeChainDepth {
-                    depth,
-                    group_idx: group.group_idx,
-                }
-                .into());
-            }
-            // IdleChurn rejects Duration::ZERO for either field:
-            //   - burst_duration = 0 collapses the loop to pure
-            //     nanosleep — the worker accrues no runtime; the
-            //     idle-transition observability is unchanged but the
-            //     workload becomes useless as a scheduler test.
-            //   - sleep_duration = 0 produces no idle period; the
-            //     workload degenerates to SpinWait. Use SpinWait
-            //     directly.
-            if let WorkType::IdleChurn {
-                burst_duration,
-                sleep_duration,
-                ..
-            } = group.work_type
-            {
-                if burst_duration.is_zero() {
-                    return Err(WorkTypeValidationError::ZeroBurstDuration {
-                        group_idx: group.group_idx,
-                    }
-                    .into());
-                }
-                if sleep_duration.is_zero() {
-                    return Err(WorkTypeValidationError::ZeroSleepDuration {
-                        group_idx: group.group_idx,
-                    }
-                    .into());
-                }
-            }
-            // IpcVariance rejects 0 for any of the three knobs:
-            // each zero collapses the hot/cold alternation that
-            // is the variant's only purpose. The check runs at
-            // every group entry so composed scenarios surface
-            // the offending group index in the diagnostic.
-            if let WorkType::IpcVariance {
-                hot_iters,
-                cold_iters,
-                period_iters,
-            } = group.work_type
-            {
-                if hot_iters == 0 {
-                    return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
-                        field: "hot_iters",
-                        group_idx: group.group_idx,
-                    }
-                    .into());
-                }
-                if cold_iters == 0 {
-                    return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
-                        field: "cold_iters",
-                        group_idx: group.group_idx,
-                    }
-                    .into());
-                }
-                if period_iters == 0 {
-                    return Err(WorkTypeValidationError::ZeroIpcVarianceParam {
-                        field: "period_iters",
-                        group_idx: group.group_idx,
-                    }
-                    .into());
-                }
-            }
+            // Dispatch-agnostic admission rules
+            // (worker_group_size divisibility, chain depth >= 2,
+            // IdleChurn / IpcVariance zero-rejections) live in
+            // [`validate_workload_admission`] and are shared with
+            // [`Self::spawn_pcomm_cgroup`]. The
+            // CloneMode-vs-WorkType compat checks above stay
+            // dispatch-specific because their reasoning differs
+            // per dispatch (Thread+ForkExit vs pcomm+ForkExit are
+            // rejected for different reasons; Fork+EpollStorm has
+            // no pcomm equivalent).
+            validate_workload_admission(group)?;
         }
 
         // futex region sizing is per-group, not MAX'd across all
@@ -2168,22 +3422,23 @@ impl WorkloadHandle {
             // smaller fields) finishes `write_all` without blocking
             // for the parent to drain. The default pipe capacity on
             // Linux is 16 pages (64 KiB on 4 KiB pages, 256 KiB on
-            // 16 KiB pages); a JSON-encoded `WorkerReport` with both
-            // reservoirs full is roughly 4–5 MiB. Without this grow,
-            // the worker blocks inside `f.write_all(&json)` (line
-            // ~2562) waiting for the parent's `read_to_end`. The
-            // parent reads workers serially with a shared 5 s
-            // deadline (`stop_and_collect`); if the first worker's
-            // drain consumes the budget, every subsequent worker's
-            // `poll` budget is 0, the parent closes the read fd
-            // without reading, and the child's blocked write returns
-            // EPIPE — the report is lost and the failure surfaces
-            // as a sentinel `WorkerReport`. Sizing the pipe to 8 MiB
-            // lets the child write the full JSON in one
-            // non-blocking burst, exit, and close its write end;
-            // when the parent later polls the read fd, all data is
-            // already buffered in the kernel and `read_to_end`
-            // returns immediately with EOF.
+            // 16 KiB pages); a bincode-encoded `WorkerReport` with
+            // both reservoirs full is at most ~1.8 MiB (u64 varint
+            // is up to 9 bytes per entry, 200_000 entries total).
+            // Without this grow, the worker blocks inside
+            // `f.write_all(&bytes)` waiting for the parent's
+            // `read_to_end`. The parent reads workers serially with
+            // a shared 5 s deadline (`stop_and_collect`); if the
+            // first worker's drain consumes the budget, every
+            // subsequent worker's `poll` budget is 0, the parent
+            // closes the read fd without reading, and the child's
+            // blocked write returns EPIPE — the report is lost and
+            // the failure surfaces as a sentinel `WorkerReport`.
+            // Sizing the pipe to 8 MiB lets the child write the
+            // full payload in one non-blocking burst, exit, and
+            // close its write end; when the parent later polls the
+            // read fd, all data is already buffered in the kernel
+            // and `read_to_end` returns immediately with EOF.
             //
             // F_SETPIPE_SZ rounds the requested size up to the next
             // power of two; unprivileged callers are clamped to
@@ -2635,7 +3890,7 @@ impl WorkloadHandle {
                     //    against (a) additional Drops on this
                     //    frame's stack (e.g. future refactors that
                     //    add more RAII) and (b) alloc/OOM panics
-                    //    during worker_main / serde_json.
+                    //    during worker_main / bincode encode.
                     //
                     //    Caveat: catch_unwind is a no-op under
                     //    `panic = "abort"`, which ktstr's Cargo.toml
@@ -2644,7 +3899,7 @@ impl WorkloadHandle {
                     //    the child immediately (SIGABRT); the
                     //    `catch_unwind` call compiles but never
                     //    returns `Err`, and neither the
-                    //    `f.write_all(&json)` nor the `_exit(1)`
+                    //    `f.write_all(&bytes)` nor the `_exit(1)`
                     //    below runs on the panic path. The parent's
                     //    `stop_and_collect` therefore observes a
                     //    missing WorkerReport and fills in a
@@ -2761,9 +4016,9 @@ impl WorkloadHandle {
                             //
                             // The byte is `b'r'`. The parent's collect path
                             // strips a leading `b'r'` before
-                            // `serde_json::from_slice` so the explicit-start
-                            // call site (which skips the barrier) still
-                            // parses correctly. A zero return or short write
+                            // `bincode::serde::decode_from_slice` so the
+                            // explicit-start call site (which skips the
+                            // barrier) still parses correctly. A zero return or short write
                             // is treated as best-effort: if the kernel
                             // refuses the write (EFAULT cannot occur with a
                             // stack pointer; EBADF cannot occur on a fresh
@@ -2802,9 +4057,11 @@ impl WorkloadHandle {
                                 &STOP,
                                 group.group_idx,
                             );
-                            let json = serde_json::to_vec(&report).unwrap_or_default();
+                            let bytes =
+                                bincode::serde::encode_to_vec(&report, bincode::config::standard())
+                                    .unwrap_or_default();
                             let mut f = unsafe { std::fs::File::from_raw_fd(report_fds[1]) };
-                            if let Err(e) = f.write_all(&json) {
+                            if let Err(e) = f.write_all(&bytes) {
                                 // tracing is unsafe in a post-fork child
                                 // (the global subscriber may be holding a
                                 // lock taken in another thread of the
@@ -2855,9 +4112,14 @@ impl WorkloadHandle {
                     // fits in pid_t directly — store as pid_t so
                     // every downstream libc call avoids the u32→i32
                     // sign-cast wraparound bug.
-                    guard
-                        .children
-                        .push((child_pid, report_fds[0], start_fds[1]));
+                    guard.children.push(ForkedChild {
+                        pid: child_pid,
+                        report_fd: report_fds[0],
+                        start_fd: start_fds[1],
+                        kind: ForkedChildKind::Worker {
+                            group_idx: group.group_idx,
+                        },
+                    });
                 }
             }
         }
@@ -2908,15 +4170,31 @@ impl WorkloadHandle {
     /// have stored its tid and `0` (the `AtomicI32` initial value)
     /// is reported in those slots. Callers that require post-start
     /// tids must call `start()` before `worker_pids()`.
+    ///
+    /// # `pcomm` containers
+    ///
+    /// Groups configured with [`WorkSpec::pcomm`] yield a single
+    /// container process whose tgid leader pid is what the parent
+    /// holds; the per-thread `gettid()` values of the workers running
+    /// inside the container are not exported across the process
+    /// boundary. Each pcomm group contributes ONE entry to the
+    /// returned vector — the container pid — regardless of how many
+    /// thread workers it hosts. This pid is correct for `cgroup.procs`
+    /// migration (the container's whole tgid moves) but is NOT
+    /// suitable as a target for per-thread `sched_setaffinity` —
+    /// see [`Self::set_affinity`] for the matching error path.
+    ///
+    /// Order: forked children (conventional workers + pcomm
+    /// containers, in spawn order) followed by Thread-mode workers
+    /// (in spawn order). A workload that mixes pcomm groups with
+    /// non-pcomm Thread-mode groups produces both populated
+    /// collections; a workload using only one dispatch path produces
+    /// only one populated collection.
     pub fn worker_pids(&self) -> Vec<libc::pid_t> {
-        if !self.children.is_empty() {
-            self.children.iter().map(|(pid, _, _)| *pid).collect()
-        } else {
-            self.threads
-                .iter()
-                .map(|tw| tw.tid.load(Ordering::Acquire))
-                .collect()
-        }
+        let mut out = Vec::with_capacity(self.children.len() + self.threads.len());
+        out.extend(self.children.iter().map(|c| c.pid));
+        out.extend(self.threads.iter().map(|tw| tw.tid.load(Ordering::Acquire)));
+        out
     }
 
     /// Worker pids suitable for `cgroup.procs` migration.
@@ -2963,13 +4241,16 @@ impl WorkloadHandle {
             return;
         }
         self.started = true;
-        // Fork-mode: write a byte to the start pipe.
-        for (_, _, start_fd) in &mut self.children {
+        // Fork-mode: write a byte to each child's start pipe (covers
+        // both conventional workers and pcomm containers — both wait
+        // on the same start-byte handshake before entering their work
+        // path).
+        for child in &mut self.children {
             unsafe {
-                libc::write(*start_fd, b"s".as_ptr() as *const _, 1);
-                libc::close(*start_fd);
+                libc::write(child.start_fd, b"s".as_ptr() as *const _, 1);
+                libc::close(child.start_fd);
             }
-            *start_fd = -1;
+            child.start_fd = -1;
         }
         // Thread-mode: send `()` on each worker's start_tx. The
         // SyncSender(0) rendezvous means each send blocks until the
@@ -2996,14 +4277,42 @@ impl WorkloadHandle {
     /// if the thread has not yet published its tid — call
     /// [`start()`](Self::start) first so the worker reaches its
     /// `gettid()` publish before reading.
+    ///
+    /// Bails for [`ForkedChildKind::PcommContainer`] entries: the
+    /// container's tgid leader pid is the only kernel handle the
+    /// parent holds for that group, but `sched_setaffinity` against
+    /// that pid pins only the leader thread (a placeholder thread
+    /// that never enters the work loop), not the worker threads
+    /// running the workload. The container's worker tids are not
+    /// published across the process boundary. Bake the affinity into
+    /// [`WorkSpec::affinity`] at spawn time instead — `worker_main`
+    /// applies it per-thread inside the container.
+    ///
+    /// Index space: `[0, children.len())` addresses forked children
+    /// (conventional workers and pcomm containers), and
+    /// `[children.len(), children.len() + threads.len())` addresses
+    /// Thread-mode workers, matching the ordering of
+    /// [`Self::worker_pids`].
     pub fn set_affinity(&self, idx: usize, cpus: &BTreeSet<usize>) -> Result<()> {
-        let pid = if !self.children.is_empty() {
-            self.children[idx].0
+        let pid = if idx < self.children.len() {
+            let child = &self.children[idx];
+            if let ForkedChildKind::PcommContainer { groups } = &child.kind {
+                let total: usize = groups.iter().map(|(_, n)| n).sum();
+                anyhow::bail!(
+                    "set_affinity: child {idx} is a pcomm container \
+                     hosting {total} thread workers; per-thread \
+                     tids are not exported across the process boundary. \
+                     Set affinity via WorkSpec::affinity at spawn time \
+                     so worker_main applies it inside the container."
+                );
+            }
+            child.pid
         } else {
-            let tid = self.threads[idx].tid.load(Ordering::Acquire);
+            let thread_idx = idx - self.children.len();
+            let tid = self.threads[thread_idx].tid.load(Ordering::Acquire);
             if tid == 0 {
                 anyhow::bail!(
-                    "set_affinity: thread worker {idx} has not yet \
+                    "set_affinity: thread worker {thread_idx} has not yet \
                      published gettid() (call start() first)"
                 );
             }
@@ -3108,16 +4417,17 @@ impl WorkloadHandle {
     /// # Exit-shape invariance
     ///
     /// Collection discriminates purely on the presence and validity of
-    /// the worker's pipe-delivered JSON — **not** on `waitpid` exit
-    /// status. Under `panic = "unwind"` (dev/test profile) the worker's
+    /// the worker's pipe-delivered bincode payload — **not** on
+    /// `waitpid` exit status. Under `panic = "unwind"` (dev/test
+    /// profile) the worker's
     /// `catch_unwind` arm calls `_exit(1)` so the parent sees
     /// `WIFEXITED=true`, `WEXITSTATUS=1`; under `panic = "abort"`
     /// (release profile) the worker aborts with `SIGABRT` so the parent
     /// sees `WIFEXITED=false`, `WTERMSIG=6`. Either way, a panicking
-    /// worker never finishes `f.write_all(&json)` on the report pipe,
+    /// worker never finishes `f.write_all(&bytes)` on the report pipe,
     /// so `poll` + `read_to_end` hands back an empty (or truncated)
-    /// buffer, `serde_json::from_slice` fails, and the sentinel path
-    /// fires. Partial writes from a panic between successful
+    /// buffer, `bincode::serde::decode_from_slice` fails, and the
+    /// sentinel path fires. Partial writes from a panic between successful
     /// `write_all` and `_exit(0)` are not reachable — the write is the
     /// last non-trivial statement inside the catch_unwind closure.
     /// The `waitpid` call later in this function exists solely for
@@ -3166,13 +4476,13 @@ impl WorkloadHandle {
             let barrier_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             // Pending = (index_into_children, read_fd). We track the
             // index so a `POLLHUP` worker can be removed from
-            // pending without disturbing the collect loop's `for
-            // (pid, read_fd, _) in children` ordering below.
+            // pending without disturbing the collect loop's
+            // ordering below.
             let mut pending: Vec<(usize, i32)> = self
                 .children
                 .iter()
                 .enumerate()
-                .map(|(i, &(_, read_fd, _))| (i, read_fd))
+                .map(|(i, c)| (i, c.report_fd))
                 .collect();
             while !pending.is_empty() {
                 let remaining =
@@ -3247,7 +4557,7 @@ impl WorkloadHandle {
                             // ownership of the fd — the collect
                             // path below still owns it via the
                             // `children` Vec and will read the
-                            // JSON tail on its own deadline.
+                            // bincode tail on its own deadline.
                             let mut byte: u8 = 0;
                             // SAFETY: `&mut byte` is a valid
                             // 1-byte buffer; `fd` is the report
@@ -3306,30 +4616,37 @@ impl WorkloadHandle {
         let children = std::mem::take(&mut self.children);
         let threads = std::mem::take(&mut self.threads);
 
-        // Drain the 'r' ready byte from each worker's report pipe
-        // so the collect poll below waits for the JSON report, not
+        // Drain the 'r' ready byte from each child's report pipe
+        // so the collect poll below waits for the report payload, not
         // the already-present ready byte. The barrier section above
         // consumes it for auto-started workers; explicitly-started
         // workers (was_started=true) skip the barrier.
         if was_started {
-            for &(_, read_fd, _) in &children {
+            for child in &children {
                 let mut byte: u8 = 0;
                 unsafe {
-                    libc::read(read_fd, &mut byte as *mut u8 as *mut libc::c_void, 1);
+                    libc::read(
+                        child.report_fd,
+                        &mut byte as *mut u8 as *mut libc::c_void,
+                        1,
+                    );
                 }
             }
         }
 
         // Signal all fork-mode children to stop via SIGUSR1; the
-        // signal handler flips the global STOP that worker_main's
-        // `stop.load(Relaxed)` checks read.
-        // `pid` is `libc::pid_t`, so it flows to `Pid::from_raw`
-        // without the u32→i32 sign-cast wraparound that produced
-        // `kill(-1, ...)` session-wide reaps when the old u32 pid
-        // exceeded i32::MAX.
-        for &(pid, _, _) in &children {
+        // signal handler flips that child's process-local STOP, which
+        // worker_main's `stop_requested` checks read. For pcomm
+        // containers the SIGUSR1 flips the container's STOP, which
+        // every thread inside the container observes via `&STOP`
+        // passed to `worker_main` — one signal stops the whole
+        // group cleanly. `pid` is `libc::pid_t`, so it flows to
+        // `Pid::from_raw` without the u32→i32 sign-cast wraparound
+        // that produced `kill(-1, ...)` session-wide reaps when the
+        // old u32 pid exceeded i32::MAX.
+        for child in &children {
             let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
+                nix::unistd::Pid::from_raw(child.pid),
                 nix::sys::signal::Signal::SIGUSR1,
             );
         }
@@ -3347,14 +4664,14 @@ impl WorkloadHandle {
         // (e.g. under degrade mode) don't serially exhaust the VM
         // timeout.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        for (pid, read_fd, _) in children {
+        for child in children {
             let mut buf = Vec::new();
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let ms = remaining.as_millis().min(i32::MAX as u128) as i32;
             let mut poll_ready = false;
             if ms > 0 {
                 let mut pfd = libc::pollfd {
-                    fd: read_fd,
+                    fd: child.report_fd,
                     events: libc::POLLIN,
                     revents: 0,
                 };
@@ -3362,18 +4679,18 @@ impl WorkloadHandle {
                 poll_ready = ready > 0;
             }
 
-            let npid = nix::unistd::Pid::from_raw(pid);
+            let npid = nix::unistd::Pid::from_raw(child.pid);
             if !poll_ready {
-                // Deadline expired — worker didn't write a report.
+                // Deadline expired — child didn't write a report.
                 // Kill first so read_to_end doesn't block on the
-                // pipe's write end (the worker may have written
-                // only the 'r' ready byte but no JSON).
+                // pipe's write end (the child may have written
+                // only the 'r' ready byte but no payload).
                 let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
                 let _ = nix::sys::signal::killpg(npid, nix::sys::signal::Signal::SIGKILL);
-                let _ = nix::unistd::close(read_fd);
+                let _ = nix::unistd::close(child.report_fd);
             } else {
-                // Worker responded — read the report, then kill.
-                let mut f = unsafe { std::fs::File::from_raw_fd(read_fd) };
+                // Child responded — read the report, then kill.
+                let mut f = unsafe { std::fs::File::from_raw_fd(child.report_fd) };
                 let _ = f.read_to_end(&mut buf);
                 drop(f);
                 let _ = nix::sys::signal::kill(npid, nix::sys::signal::Signal::SIGKILL);
@@ -3389,37 +4706,143 @@ impl WorkloadHandle {
                     waited
                 };
 
-            // Strip the leading `b'r'` worker-ready byte if the
-            // auto-start barrier above did not consume it. The
-            // worker writes this byte unconditionally on every
-            // success path right after the start handshake; the
-            // barrier polls + reads it when `stop_and_collect`
-            // auto-started workers, but explicit-start callers
-            // (`start()` invoked before `stop_and_collect`) bypass
-            // the barrier and the byte sits in the pipe ahead of
-            // the JSON. Strip exactly 1 byte if present so
-            // `serde_json::from_slice` sees a clean JSON document
-            // either way.
+            // Strip the leading `b'r'` ready byte if the auto-start
+            // barrier above did not consume it. Children write this
+            // byte unconditionally on every success path right after
+            // the start handshake; the barrier polls + reads it when
+            // `stop_and_collect` auto-started children, but
+            // explicit-start callers (`start()` invoked before
+            // `stop_and_collect`) bypass the barrier and the byte
+            // sits in the pipe ahead of the payload. Strip exactly 1
+            // byte if present so the per-kind decoder sees a clean
+            // payload either way.
             let report_slice: &[u8] = if buf.first() == Some(&b'r') {
                 &buf[1..]
             } else {
                 &buf[..]
             };
-            if let Ok(report) = serde_json::from_slice::<WorkerReport>(report_slice) {
-                reports.push(report);
-            } else {
-                let exit_info = classify_wait_outcome(exit_info_source);
-                eprintln!(
-                    "ktstr: worker pid={pid} returned no report ({} bytes read, exit={exit_info:?})",
-                    buf.len()
-                );
-                reports.push(WorkerReport {
-                    // Both `pid` and `WorkerReport.tid` are `pid_t`
-                    // (i32) now — no cast needed.
-                    tid: pid,
-                    exit_info: Some(exit_info),
-                    ..WorkerReport::default()
-                });
+
+            // Per-kind decoding. `Worker` carries a single bincode
+            // `WorkerReport` (`bincode::config::standard()`,
+            // little-endian, variable int). `PcommContainer` carries
+            // a `serde_json` `Vec<WorkerReport>` — JSON matches the
+            // existing fork-mode report convention since the
+            // pcomm container is itself a fork-mode child. Both
+            // payloads ride the EOF-terminated pipe with no length
+            // prefix; the parent's `read_to_end` provides framing.
+            // On a decode failure, emit one sentinel per expected
+            // report so downstream consumers (per-group filtering,
+            // assert_not_starved) see the correct cardinality.
+            match child.kind {
+                ForkedChildKind::Worker { group_idx } => {
+                    let decoded: Result<(WorkerReport, usize), _> =
+                        bincode::serde::decode_from_slice(
+                            report_slice,
+                            bincode::config::standard(),
+                        );
+                    if let Ok((report, _)) = decoded {
+                        reports.push(report);
+                    } else {
+                        let exit_info = classify_wait_outcome(exit_info_source);
+                        eprintln!(
+                            "ktstr: worker pid={} returned no report ({} bytes read, exit={exit_info:?})",
+                            child.pid,
+                            buf.len(),
+                        );
+                        reports.push(WorkerReport {
+                            tid: child.pid,
+                            group_idx,
+                            exit_info: Some(exit_info),
+                            ..WorkerReport::default()
+                        });
+                    }
+                }
+                ForkedChildKind::PcommContainer { groups } => {
+                    let total_workers: usize = groups.iter().map(|(_, n)| n).sum();
+                    let decoded: Result<Vec<WorkerReport>, _> =
+                        serde_json::from_slice(report_slice);
+                    match decoded {
+                        Ok(mut decoded_reports) if decoded_reports.len() == total_workers => {
+                            reports.append(&mut decoded_reports);
+                        }
+                        Ok(decoded_reports) => {
+                            // Cardinality mismatch — surface the
+                            // partial set we did get and pad with
+                            // sentinels so the total report count
+                            // still equals `total_workers`. A short
+                            // payload typically signals the
+                            // thread-group leader died mid-encode
+                            // (panic in `serde_json::to_vec`, OOM
+                            // during Vec growth, or a write_all
+                            // truncated by SIGKILL escalation).
+                            // Sentinels are tagged with the right
+                            // per-group `group_idx` using the
+                            // `groups` layout: groups[0] consumed
+                            // the first groups[0].1 slots,
+                            // groups[1] the next groups[1].1, etc.
+                            // We emit sentinels for the trailing
+                            // missing slots, computing each
+                            // sentinel's group_idx by walking the
+                            // layout from `got` forward.
+                            let exit_info = classify_wait_outcome(exit_info_source);
+                            eprintln!(
+                                "ktstr: pcomm thread-group leader pid={} returned {} of {} reports ({} bytes read, exit={exit_info:?})",
+                                child.pid,
+                                decoded_reports.len(),
+                                total_workers,
+                                buf.len(),
+                            );
+                            let got = decoded_reports.len();
+                            for r in decoded_reports {
+                                reports.push(r);
+                            }
+                            // Compute group_idx for each missing
+                            // slot by walking the layout. `slot` is
+                            // a 0-based global index from `got` to
+                            // `total_workers - 1`; we accumulate
+                            // per-group counts to find which group
+                            // owns each slot.
+                            for slot in got..total_workers {
+                                let mut acc = 0usize;
+                                let mut g_idx = 0usize;
+                                for &(gi, n) in &groups {
+                                    if slot < acc + n {
+                                        g_idx = gi;
+                                        break;
+                                    }
+                                    acc += n;
+                                }
+                                reports.push(WorkerReport {
+                                    tid: child.pid,
+                                    group_idx: g_idx,
+                                    exit_info: Some(exit_info.clone()),
+                                    ..WorkerReport::default()
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            let exit_info = classify_wait_outcome(exit_info_source);
+                            eprintln!(
+                                "ktstr: pcomm thread-group leader pid={} returned no decodable report ({} bytes read, exit={exit_info:?})",
+                                child.pid,
+                                buf.len(),
+                            );
+                            // Total decode failure — emit one
+                            // sentinel per slot, tagging each with
+                            // the correct group_idx.
+                            for &(gi, n) in &groups {
+                                for _ in 0..n {
+                                    reports.push(WorkerReport {
+                                        tid: child.pid,
+                                        group_idx: gi,
+                                        exit_info: Some(exit_info.clone()),
+                                        ..WorkerReport::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -3498,20 +4921,22 @@ impl Drop for WorkloadHandle {
         use nix::sys::wait::waitpid;
         use nix::unistd::{Pid, close};
 
-        // Fork-mode children. `pid` is `libc::pid_t` — stored as i32
-        // so `Pid::from_raw` receives the kernel's native
-        // representation directly, not the sign-cast of a u32 that
-        // could alias negative values (including -1, i.e. every
-        // process in the session).
-        for &(pid, rfd, wfd) in &self.children {
+        // Forked children (conventional workers AND pcomm
+        // containers). `pid` is `libc::pid_t` — stored as i32 so
+        // `Pid::from_raw` receives the kernel's native representation
+        // directly, not the sign-cast of a u32 that could alias
+        // negative values (including -1, i.e. every process in the
+        // session).
+        for child in &self.children {
+            let pid = child.pid;
             let nix_pid = Pid::from_raw(pid);
-            // killpg first: reach descendants the worker may have
+            // killpg first: reach descendants the child may have
             // forked (Custom workloads, ForkExit caught mid-fork).
-            // pgid == worker pid because the worker called
-            // `setpgid(0, 0)` at fork time. ESRCH (group gone / no
-            // members) is expected and not a warning-worthy failure;
-            // swallow it to keep the log clean when the common
-            // no-descendants case drops.
+            // pgid == child pid because every forked child (worker
+            // or pcomm container) calls `setpgid(0, 0)` at fork time.
+            // ESRCH (group gone / no members) is expected and not a
+            // warning-worthy failure; swallow it to keep the log
+            // clean when the common no-descendants case drops.
             if let Err(e) = nix::sys::signal::killpg(nix_pid, Signal::SIGKILL)
                 && e != nix::errno::Errno::ESRCH
             {
@@ -3523,7 +4948,7 @@ impl Drop for WorkloadHandle {
             if let Err(e) = waitpid(nix_pid, None) {
                 tracing::warn!(pid, %e, "waitpid failed in WorkloadHandle::drop");
             }
-            for fd in [rfd, wfd] {
+            for fd in [child.report_fd, child.start_fd] {
                 if fd >= 0
                     && let Err(e) = close(fd)
                 {
@@ -3683,6 +5108,8 @@ mod tests_lifecycle;
 mod tests_mempolicy;
 #[cfg(test)]
 mod tests_misc;
+#[cfg(test)]
+mod tests_pcomm;
 #[cfg(test)]
 mod tests_sched_policy;
 #[cfg(test)]

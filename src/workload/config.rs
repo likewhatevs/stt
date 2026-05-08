@@ -872,6 +872,22 @@ pub struct WorkloadConfig {
     pub nice: i32,
     /// How to create each worker. Defaults to [`CloneMode::Fork`].
     pub clone_mode: CloneMode,
+    /// Worker process name set via `prctl(PR_SET_NAME)` after fork.
+    /// Kernel truncates to 15 bytes (TASK_COMM_LEN - 1). `None`
+    /// inherits the binary name. Mirrors [`WorkSpec::comm`] so the
+    /// primary group exposes the same scheduler-matcher knob composed
+    /// entries already do.
+    pub comm: Option<Cow<'static, str>>,
+    /// Effective UID set via `setresuid(uid, uid, uid)` after fork.
+    /// `None` inherits the parent's euid. Mirrors [`WorkSpec::uid`].
+    pub uid: Option<u32>,
+    /// Effective GID set via `setresgid(gid, gid, gid)` after fork.
+    /// `None` inherits the parent's egid. Mirrors [`WorkSpec::gid`].
+    pub gid: Option<u32>,
+    /// Restrict worker affinity to the CPUs of this NUMA node.
+    /// Applied via `sched_setaffinity` after fork. Mirrors
+    /// [`WorkSpec::numa_node`].
+    pub numa_node: Option<u32>,
     /// Secondary worker groups spawned alongside the primary group
     /// described by the top-level fields. Each entry is a
     /// [`WorkSpec`] with its own `work_type`, `num_workers`,
@@ -971,6 +987,10 @@ impl Default for WorkloadConfig {
             mpol_flags: MpolFlags::NONE,
             nice: 0,
             clone_mode: CloneMode::Fork,
+            comm: None,
+            uid: None,
+            gid: None,
+            numa_node: None,
             composed: Vec::new(),
         }
     }
@@ -1046,6 +1066,35 @@ impl WorkloadConfig {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn clone_mode(mut self, m: CloneMode) -> Self {
         self.clone_mode = m;
+        self
+    }
+
+    /// Set the worker process name via `prctl(PR_SET_NAME)`.
+    /// Kernel truncates to 15 bytes.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn comm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.comm = Some(name.into());
+        self
+    }
+
+    /// Set the worker's effective UID via `setresuid`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn uid(mut self, uid: u32) -> Self {
+        self.uid = Some(uid);
+        self
+    }
+
+    /// Set the worker's effective GID via `setresgid`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn gid(mut self, gid: u32) -> Self {
+        self.gid = Some(gid);
+        self
+    }
+
+    /// Restrict worker affinity to a NUMA node's CPU set.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn numa_node(mut self, node: u32) -> Self {
+        self.numa_node = Some(node);
         self
     }
 
@@ -1132,11 +1181,49 @@ pub struct WorkSpec {
     /// for range, default-zero skip semantics, and `CAP_SYS_NICE`
     /// rules.
     pub nice: i32,
-    /// Worker process name set via `prctl(PR_SET_NAME)` after fork.
-    /// Kernel truncates to 15 bytes (TASK_COMM_LEN - 1). `None`
-    /// inherits the binary name. Useful for scheduler matchers
-    /// that filter on `task->comm` (e.g. layered's `CommPrefix`).
+    /// Per-worker comm set via `prctl(PR_SET_NAME)` at thread
+    /// creation time (the kernel truncates to `TASK_COMM_LEN - 1 =
+    /// 15` bytes inside `__set_task_comm`). `None` inherits the
+    /// binary name. Useful for scheduler matchers that filter on
+    /// `task->comm` (e.g. layered's `CommPrefix`). The comm is
+    /// applied once per worker; it is NOT live-propagated after
+    /// the worker enters its work loop.
     pub comm: Option<Cow<'static, str>>,
+    /// The thread-group leader's comm — what schedulers read as
+    /// `task->group_leader->comm`. When set, `apply_setup` coalesces
+    /// every WorkSpec sharing this `pcomm` value (within one
+    /// CgroupDef) into ONE forked thread-group leader. The leader's
+    /// `task->comm` is set via `prctl(PR_SET_NAME)` (kernel
+    /// truncates to `TASK_COMM_LEN - 1 = 15` bytes inside
+    /// `__set_task_comm`), so every worker thread inside observes
+    /// `task->group_leader->comm == pcomm` for the leader's
+    /// lifetime. WorkSpecs with `pcomm = None` (or empty pcomm
+    /// string, treated as `None`) spawn via the conventional fork
+    /// path — one process per worker.
+    ///
+    /// **Dispatch is `apply_setup`-only.** Direct calls to
+    /// [`crate::workload::WorkloadHandle::spawn`] and
+    /// [`crate::scenario::ops::Op::Spawn`] do NOT honor `pcomm` —
+    /// they always spawn one process per worker (fork mode). To
+    /// drive the pcomm container path without going through
+    /// `CgroupDef`, callers may invoke
+    /// [`crate::workload::WorkloadHandle::spawn_pcomm_cgroup`]
+    /// directly with a `&[WorkSpec]` slice.
+    ///
+    /// This is the AUTHORITATIVE source for the pcomm dispatch:
+    /// `apply_setup` reads it directly from each WorkSpec.
+    /// [`crate::scenario::ops::types::CgroupDef::pcomm`] is a
+    /// convenience method that writes the same value into every
+    /// WorkSpec at builder time; there is no separate cgroup-level
+    /// pcomm field.
+    ///
+    /// Per-thread comm goes through [`Self::comm`] and the worker's
+    /// own `prctl(PR_SET_NAME)` at thread creation time. Models
+    /// real workloads like `chrome` (pcomm) hosting
+    /// `ThreadPoolForeg` and `GPU Process` worker threads
+    /// (per-thread comm), or `java` (pcomm) hosting `GC Thread`
+    /// and `C2 CompilerThre` worker threads.
+    pub pcomm: Option<Cow<'static, str>>,
     /// Effective UID set via `setresuid(uid, uid, uid)` after fork.
     /// `None` inherits the parent's euid. Useful for scheduler
     /// matchers that filter on `task->real_cred->euid` (e.g.
@@ -1163,6 +1250,7 @@ impl Default for WorkSpec {
             mpol_flags: MpolFlags::NONE,
             nice: 0,
             comm: None,
+            pcomm: None,
             uid: None,
             gid: None,
             numa_node: None,
@@ -1249,6 +1337,53 @@ impl WorkSpec {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn numa_node(mut self, node: u32) -> Self {
         self.numa_node = Some(node);
+        self
+    }
+
+    /// Set the thread-group leader's comm. Triggers fork-then-thread
+    /// spawn through `apply_setup` (or via
+    /// [`crate::workload::WorkloadHandle::spawn_pcomm_cgroup`] for
+    /// the direct entry point): one forked leader process whose
+    /// `task->comm` is `name`, threads spawned inside it. Each
+    /// thread additionally sets its own `task->comm` via
+    /// [`Self::comm`] at thread creation time.
+    ///
+    /// # Panics
+    ///
+    /// Panics on programmer-error inputs:
+    /// - Empty string — the empty pcomm has no observable effect
+    ///   (kernel sets task->comm to ""), so it's a no-op disguised
+    ///   as configuration. `apply_setup` treats empty as `None` to
+    ///   keep the dispatch contract unambiguous, but accepting the
+    ///   builder call would silently drop user intent. Reject up
+    ///   front.
+    /// - Interior NUL byte — `prctl(PR_SET_NAME)` takes a C string;
+    ///   any embedded NUL truncates the kernel-side comm at the
+    ///   first NUL silently, producing a comm value the caller
+    ///   didn't ask for. Reject so the operator sees the error
+    ///   immediately instead of debugging a truncated comm.
+    ///
+    /// `name.len() > 15` is NOT a panic — the kernel truncates to
+    /// `TASK_COMM_LEN - 1 = 15` bytes inside `__set_task_comm`, and
+    /// some test fixtures intentionally exercise the truncation
+    /// boundary. `apply_setup` emits a `tracing::warn!` at
+    /// dispatch time so operators see the truncation; the actual
+    /// kernel truncation is silent.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn pcomm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        let name: Cow<'static, str> = name.into();
+        assert!(
+            !name.is_empty(),
+            "WorkSpec::pcomm: empty pcomm string rejected — \
+             use `None` (default) for no pcomm, not an empty value",
+        );
+        assert!(
+            !name.contains('\0'),
+            "WorkSpec::pcomm: pcomm string {name:?} contains an interior NUL byte; \
+             prctl(PR_SET_NAME) treats it as a C string and would truncate \
+             at the NUL — strip it before calling .pcomm()",
+        );
+        self.pcomm = Some(name);
         self
     }
 }
@@ -1455,6 +1590,29 @@ mod tests {
     fn workload_config_default_mempolicy() {
         let wl = WorkloadConfig::default();
         assert!(matches!(wl.mem_policy, MemPolicy::Default));
+    }
+    /// `comm` / `uid` / `gid` / `numa_node` mirror the matcher knobs
+    /// that already live on [`WorkSpec`] — ensure the top-level
+    /// defaults are `None` and the builders set the field.
+    #[test]
+    fn workload_config_default_matcher_fields_are_none() {
+        let wl = WorkloadConfig::default();
+        assert!(wl.comm.is_none());
+        assert!(wl.uid.is_none());
+        assert!(wl.gid.is_none());
+        assert!(wl.numa_node.is_none());
+    }
+    #[test]
+    fn workload_config_matcher_field_builders() {
+        let wl = WorkloadConfig::default()
+            .comm("ktstr-worker")
+            .uid(1001)
+            .gid(1002)
+            .numa_node(0);
+        assert_eq!(wl.comm.as_deref(), Some("ktstr-worker"));
+        assert_eq!(wl.uid, Some(1001));
+        assert_eq!(wl.gid, Some(1002));
+        assert_eq!(wl.numa_node, Some(0));
     }
     /// Full `WorkloadConfig` round-trip with `Default` ensures every
     /// field handles serde correctly together — no field is silently

@@ -125,6 +125,11 @@ pub struct KtstrVmBuilder {
     /// the watchdog uses `timeout` as a single deadline counted from
     /// VM boot.
     workload_duration: Option<Duration>,
+    /// Periodic snapshot count plumbed onto [`super::KtstrVm`]; see
+    /// the runtime field for the full contract. `0` disables the
+    /// periodic-capture loop in the freeze coordinator entirely
+    /// (the default).
+    num_snapshots: u32,
 }
 
 impl Default for KtstrVmBuilder {
@@ -166,6 +171,7 @@ impl Default for KtstrVmBuilder {
             dual_snapshot: false,
             template_staging_image: None,
             workload_duration: None,
+            num_snapshots: 0,
         }
     }
 }
@@ -378,6 +384,24 @@ impl KtstrVmBuilder {
     ///    awareness of the dual-snapshot wrapper.
     pub fn dual_snapshot(mut self, enabled: bool) -> Self {
         self.dual_snapshot = enabled;
+        self
+    }
+
+    /// Number of equally-spaced periodic snapshots to fire inside
+    /// the workload's 10%–90% window. `0` (the default) disables
+    /// periodic capture entirely. The freeze coordinator anchors
+    /// the window at the first `MSG_TYPE_SCENARIO_START` it sees,
+    /// so boot + verifier time do not eat the budget. Each fire
+    /// runs the same `freeze_and_capture(false)` path the
+    /// on-demand `Op::Snapshot` handler uses and stores under
+    /// `"periodic_NNN"` on the host's
+    /// [`crate::scenario::snapshot::SnapshotBridge`]. Bounded above
+    /// by [`crate::scenario::snapshot::MAX_STORED_SNAPSHOTS`] —
+    /// `KtstrTestEntry::validate` rejects higher values so the
+    /// bridge's FIFO eviction never silently drops periodic
+    /// samples.
+    pub fn num_snapshots(mut self, n: u32) -> Self {
+        self.num_snapshots = n;
         self
     }
 
@@ -632,6 +656,23 @@ impl KtstrVmBuilder {
     /// `ResourceContention`, which callers typically treat as a
     /// skip rather than a failure).
     pub fn build(mut self) -> Result<KtstrVm> {
+        // Periodic capture's boundary computation requires
+        // `workload_duration` to slice. Without it the
+        // freeze coordinator's run-loop never even computes
+        // boundaries, so a `num_snapshots > 0` value would
+        // silently never fire. Reject at build() so
+        // misconfiguration surfaces during VM construction
+        // rather than as zero captures on a passing run.
+        if self.num_snapshots > 0 && self.workload_duration.is_none() {
+            anyhow::bail!(
+                "KtstrVmBuilder: num_snapshots = {} requires \
+                 workload_duration to be set (the periodic-capture \
+                 path needs a duration to slice into the 10%-90% \
+                 window). Call .workload_duration(d) or set \
+                 num_snapshots = 0.",
+                self.num_snapshots,
+            );
+        }
         let no_perf_mode = self.no_perf_mode;
         if no_perf_mode {
             self.performance_mode = false;
@@ -826,6 +867,7 @@ impl KtstrVmBuilder {
             dual_snapshot: self.dual_snapshot,
             template_staging_image: self.template_staging_image,
             workload_duration: self.workload_duration,
+            num_snapshots: self.num_snapshots,
         })
     }
 

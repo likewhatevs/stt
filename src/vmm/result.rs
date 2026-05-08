@@ -250,6 +250,33 @@ pub struct VmResult {
     /// Always present after a successful `run_vm`; `None`-equivalent
     /// (empty) when the VM crashed before any snapshot fired.
     pub snapshot_bridge: crate::scenario::snapshot::SnapshotBridge,
+    /// Live scheduler-stats client. `Some(_)` when the run wired the
+    /// virtio-console port-2 stats bridge (the in-tree path always
+    /// does so, but tests that construct a [`VmResult`] manually via
+    /// [`Self::test_fixture`] leave this `None`). Test code that
+    /// asserts on scheduler-reported metrics calls
+    /// [`super::SchedStatsClient::stats`] /
+    /// [`super::SchedStatsClient::stats_meta`] on this handle WHILE
+    /// the guest is alive — calling after VM exit will time out
+    /// because the relay thread has already exited. Cloneable;
+    /// multiple test threads may share the same client.
+    #[allow(dead_code)]
+    pub stats_client: Option<super::SchedStatsClient>,
+    /// Number of periodic snapshot boundaries the freeze
+    /// coordinator actually fired during this run. Includes both
+    /// successful captures and rendezvous-timeout placeholders.
+    /// Tests can assert `result.periodic_fired >= some_lower_bound`
+    /// to guard periodic-capture coverage; mismatches against
+    /// [`Self::periodic_target`] flag missing samples (early VM
+    /// exit, kill-flag stop, abandoned-after-timeouts).
+    pub periodic_fired: u32,
+    /// Configured `num_snapshots` count for the entry that drove
+    /// this run (mirrors the `KtstrTestEntry::num_snapshots` field
+    /// the entry was registered with). `0` when periodic capture
+    /// was disabled. Pairs with [`Self::periodic_fired`] so a
+    /// test can compute coverage without re-reading the entry
+    /// table.
+    pub periodic_target: u32,
 }
 
 impl VmResult {
@@ -292,6 +319,9 @@ impl VmResult {
             virtio_blk_counters: None,
             virtio_net_counters: None,
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
+            stats_client: None,
+            periodic_fired: 0,
+            periodic_target: 0,
         }
     }
 }
@@ -508,6 +538,26 @@ pub(crate) struct VmRunState {
     /// `port1_tx_buf` after the coord exited would reach the
     /// verdict, and a typical run would surface no metrics.
     pub(crate) bulk_messages: Arc<std::sync::Mutex<Vec<crate::vmm::wire::ShmEntry>>>,
+    /// Scheduler-stats client constructed at the top of `run_vm`,
+    /// or `None` when the run has no scheduler attached
+    /// (`scheduler_binary` is `None` on the builder). Forwarded
+    /// to [`VmResult::stats_client`] so test code can issue
+    /// `request_raw` / typed `stats` / `stats_meta` calls through
+    /// the run's lifetime. The drainer thread tears down when the
+    /// last clone of the client drops; `None` here means no
+    /// drainer was spawned at all, so the run pays no
+    /// stats-bridge cost.
+    pub(crate) stats_client: Option<super::SchedStatsClient>,
+    /// Periodic captures actually fired by the freeze coordinator
+    /// during the run (success + timeout-placeholder count).
+    /// Forwarded to [`VmResult::periodic_fired`] from the run-loop's
+    /// `next_periodic_idx` final value.
+    pub(crate) periodic_fired: u32,
+    /// Configured periodic-snapshot target (mirrors
+    /// `KtstrVm::num_snapshots`). Forwarded to
+    /// [`VmResult::periodic_target`] so test code can compute
+    /// coverage as `fired / target`.
+    pub(crate) periodic_target: u32,
 }
 #[cfg(test)]
 mod tests {
@@ -533,6 +583,9 @@ mod tests {
             virtio_blk_counters: None,
             virtio_net_counters: None,
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
+            stats_client: None,
+            periodic_fired: 0,
+            periodic_target: 0,
         };
         assert!(r.success);
         assert_eq!(r.exit_code, 0);
@@ -566,6 +619,9 @@ mod tests {
             virtio_blk_counters: Some(Arc::new(VirtioBlkCounters::default())),
             virtio_net_counters: None,
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
+            stats_client: None,
+            periodic_fired: 0,
+            periodic_target: 0,
         };
         assert!(!r2.success);
         assert_eq!(r2.exit_code, 1);
@@ -610,6 +666,9 @@ mod tests {
             virtio_blk_counters: None,
             virtio_net_counters: None,
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
+            stats_client: None,
+            periodic_fired: 0,
+            periodic_target: 0,
         };
         assert!(r.monitor.is_none());
         // Output and exit_code must still be accessible.
@@ -651,6 +710,9 @@ mod tests {
             virtio_blk_counters: None,
             virtio_net_counters: None,
             snapshot_bridge: empty_snapshot_bridge_for_tests(),
+            stats_client: None,
+            periodic_fired: 0,
+            periodic_target: 0,
         };
         let mon = r.monitor.as_ref().unwrap();
         assert_eq!(mon.summary.total_samples, 5);

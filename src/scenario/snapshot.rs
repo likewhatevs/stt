@@ -716,6 +716,54 @@ impl SnapshotBridge {
         std::mem::take(&mut store.reports)
     }
 
+    /// Take ownership of the captured snapshots in insertion order,
+    /// leaving the bridge empty. The returned `Vec` walks
+    /// [`SnapshotStore::order`] (the FIFO key list maintained by
+    /// [`Self::store`]) so periodic captures — whose ordering IS the
+    /// signal — are returned `periodic_000` first, `periodic_NNN`
+    /// last. [`Self::drain`] returns a `HashMap` and loses ordering;
+    /// use this method when ordering matters.
+    ///
+    /// An overwrite of an existing tag (the `if let Some(existing) =
+    /// store.reports.insert(...)` branch in [`Self::store`]) moves
+    /// the tag to the back of the FIFO — `drain_ordered` therefore
+    /// returns the LATEST capture under each tag exactly once, in
+    /// the order of its most-recent insertion.
+    ///
+    /// FIFO eviction at [`MAX_STORED_SNAPSHOTS`] drops the oldest
+    /// tags from `order` AND `reports` together, so a hot run that
+    /// fired more than the cap returns the most recent
+    /// [`MAX_STORED_SNAPSHOTS`] captures in insertion order; older
+    /// captures are gone and [`Self::store`] already logged the
+    /// eviction.
+    pub fn drain_ordered(&self) -> Vec<(String, FailureDumpReport)> {
+        let mut store = self.snapshots.lock().unwrap_or_else(|e| e.into_inner());
+        let order = std::mem::take(&mut store.order);
+        let mut reports = std::mem::take(&mut store.reports);
+        let mut out: Vec<(String, FailureDumpReport)> = Vec::with_capacity(order.len());
+        for tag in order {
+            if let Some(report) = reports.remove(&tag) {
+                out.push((tag, report));
+            }
+        }
+        // Defensive: if any reports remained outside the order Vec
+        // (an invariant violation that would only fire if a future
+        // refactor of `store()` desynchronised the two), surface
+        // them at the tail rather than dropping silently. Their
+        // relative order is HashMap-iteration-arbitrary but at
+        // least nothing is lost.
+        for (tag, report) in reports {
+            tracing::warn!(
+                tag,
+                "SnapshotBridge::drain_ordered: report present in `reports` \
+                 but missing from `order` — surfacing at tail (FIFO \
+                 invariant violation; please file)"
+            );
+            out.push((tag, report));
+        }
+        out
+    }
+
     /// Install this bridge as the active bridge for the calling
     /// thread. The bridge stays installed for the lifetime of the
     /// returned [`BridgeGuard`]; on drop the prior bridge (or
@@ -2391,5 +2439,121 @@ mod tests {
             }
             _ => panic!("expected TypeMismatch"),
         }
+    }
+
+    /// `SnapshotBridge::drain_ordered` returns every stored
+    /// `(name, report)` pair in INSERTION order — the same order the
+    /// internal [`SnapshotStore::order`] `VecDeque` records. This is
+    /// load-bearing for periodic-capture consumers: the freeze
+    /// coordinator's run-loop publishes `periodic_000`, `periodic_001`,
+    /// ... at monotonically-increasing wall-clock times, and the test
+    /// author needs to walk the captures in the same order to compare
+    /// adjacent timeline samples. `drain()` returns a `HashMap` whose
+    /// iteration order is non-deterministic across runs, so periodic
+    /// consumers MUST go through `drain_ordered` to read the timeline
+    /// in cadence order.
+    ///
+    /// Pin the FIFO contract:
+    ///   * insertion order survives through `store()` calls
+    ///   * the result is keyed by `String` and carries the full
+    ///     `FailureDumpReport` value
+    ///   * `drain_ordered()` empties the bridge (matching `drain()`)
+    ///     so a follow-up `len()` is 0
+    ///   * a tag overwrite refreshes its position to the back, in
+    ///     lock-step with the FIFO eviction invariant
+    #[test]
+    fn snapshot_bridge_drain_ordered_preserves_insertion_order() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        // Insert distinct tags in a non-alphabetical order so an
+        // accidental sort-by-key implementation surfaces as a test
+        // failure instead of silently appearing to work.
+        let inputs: &[&str] = &[
+            "periodic_002",
+            "periodic_000",
+            "periodic_005",
+            "periodic_001",
+            "periodic_003",
+        ];
+        for (i, tag) in inputs.iter().enumerate() {
+            let r = FailureDumpReport {
+                schema: format!("schema_{i}"),
+                ..Default::default()
+            };
+            bridge.store(tag, r);
+        }
+        let drained: Vec<(String, FailureDumpReport)> = bridge.drain_ordered();
+        assert_eq!(
+            drained.len(),
+            inputs.len(),
+            "drain_ordered must yield every stored entry exactly once",
+        );
+        let drained_names: Vec<&str> = drained.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            drained_names, inputs,
+            "drain_ordered must yield insertion order, not sorted or hash order",
+        );
+        for (i, (_, report)) in drained.iter().enumerate() {
+            assert_eq!(
+                report.schema,
+                format!("schema_{i}"),
+                "drained entry {i} must carry the originally-stored report",
+            );
+        }
+        assert_eq!(
+            bridge.len(),
+            0,
+            "drain_ordered must empty the bridge (matching drain())",
+        );
+        // A subsequent drain_ordered on the empty bridge yields an
+        // empty vec — guards against double-drain leaving a stray
+        // entry behind in `order` after `reports` is drained.
+        let second: Vec<(String, FailureDumpReport)> = bridge.drain_ordered();
+        assert!(
+            second.is_empty(),
+            "second drain_ordered on empty bridge must be empty, got len={}",
+            second.len(),
+        );
+    }
+
+    /// Re-storing an existing tag refreshes its position to the
+    /// BACK of the insertion order. This is the same invariant that
+    /// `snapshot_bridge_store_overwrite_refreshes_position` pins for
+    /// the FIFO eviction path; `drain_ordered` must surface the
+    /// refreshed order so downstream consumers see the updated
+    /// cadence position. A regression that overwrote the report but
+    /// left the order entry in place would surface here as the
+    /// refreshed tag still appearing at its original index.
+    #[test]
+    fn snapshot_bridge_drain_ordered_overwrite_refreshes_position() {
+        let cb: CaptureCallback = Arc::new(|_| None);
+        let bridge = SnapshotBridge::new(cb);
+        bridge.store("a", FailureDumpReport::default());
+        bridge.store("b", FailureDumpReport::default());
+        bridge.store("c", FailureDumpReport::default());
+        // Overwrite "a" — its position must move from front to
+        // back.
+        bridge.store(
+            "a",
+            FailureDumpReport {
+                schema: "refreshed".to_string(),
+                ..Default::default()
+            },
+        );
+        let drained = bridge.drain_ordered();
+        let names: Vec<&str> = drained.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["b", "c", "a"],
+            "overwrite of 'a' must move it to the back of the insertion order",
+        );
+        let a = drained
+            .iter()
+            .find(|(n, _)| n == "a")
+            .expect("'a' resident after overwrite");
+        assert_eq!(
+            a.1.schema, "refreshed",
+            "drain_ordered must surface the refreshed report value, not the prior one",
+        );
     }
 }

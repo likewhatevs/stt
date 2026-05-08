@@ -3778,6 +3778,9 @@ mod tests {
                 let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
                 crate::scenario::snapshot::SnapshotBridge::new(cb)
             },
+            stats_client: None,
+            periodic_fired: 0,
+            periodic_target: 0,
         };
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(
@@ -4125,6 +4128,9 @@ mod tests {
                 let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
                 crate::scenario::snapshot::SnapshotBridge::new(cb)
             },
+            stats_client: None,
+            periodic_fired: 0,
+            periodic_target: 0,
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES;
         let msg = format!(
@@ -4219,6 +4225,9 @@ mod tests {
                 let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
                 crate::scenario::snapshot::SnapshotBridge::new(cb)
             },
+            stats_client: None,
+            periodic_fired: 0,
+            periodic_target: 0,
         };
         let assertions = crate::assert::Assert::default_checks();
         let msg = format!(

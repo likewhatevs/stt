@@ -892,6 +892,92 @@ fn macro_defaults_leave_payload_none_workloads_empty(ctx: &Ctx) -> Result<Assert
 }
 
 // ---------------------------------------------------------------------------
+// `config = EXPR` macro attribute paired with scheduler.config_file_def
+// ---------------------------------------------------------------------------
+
+/// Scheduler that declares `config_file_def`, so a paired `#[ktstr_test]`
+/// must supply `config = ...`. The macro emits a const assertion that
+/// checks the pairing at compile time; this fixture proves the happy
+/// path (def + content → registers cleanly with both fields set).
+const CFG_PAIRING_SCHED: ktstr::test_support::Scheduler =
+    ktstr::test_support::Scheduler::new("cfg_pairing_test")
+        .config_file_def("--config {file}", "/include-files/cfg.json");
+const CFG_PAIRING_PAYLOAD: ktstr::test_support::Payload =
+    ktstr::test_support::Payload::from_scheduler(&CFG_PAIRING_SCHED);
+
+/// Inline-literal form: `config = "..."` lands as `Some("...")` in the
+/// emitted entry's `config_content` field, paired with a scheduler that
+/// declares `config_file_def`.
+#[ktstr_test(
+    scheduler = CFG_PAIRING_PAYLOAD,
+    host_only = true,
+    config = "{\"layers\":[]}",
+)]
+fn config_literal_compiles(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// Path form: `config = SOME_CONST` resolves to a `const &'static str`
+/// the entry references directly. Same emission shape as the literal
+/// form, just with named indirection — proves both expression kinds
+/// flow through the parser arm.
+const PATH_CONFIG: &str = "{\"path\":true}";
+
+#[ktstr_test(
+    scheduler = CFG_PAIRING_PAYLOAD,
+    host_only = true,
+    config = PATH_CONFIG,
+)]
+fn config_path_compiles(ctx: &Ctx) -> Result<AssertResult> {
+    let _ = ctx;
+    Ok(AssertResult::pass())
+}
+
+/// `config = "..."` lands on the entry's `config_content` field as
+/// `Some("...")`. Pins the literal-form happy path.
+#[test]
+fn entry_config_literal_propagates() {
+    let entry = ktstr::test_support::find_test("config_literal_compiles")
+        .expect("config_literal_compiles must be registered");
+    assert_eq!(
+        entry.config_content,
+        Some("{\"layers\":[]}"),
+        "config = \"...\" must wire onto KtstrTestEntry.config_content as Some(...)",
+    );
+    assert!(
+        entry.scheduler.config_file_def().is_some(),
+        "fixture scheduler must declare config_file_def",
+    );
+}
+
+/// `config = SOME_CONST` lands on the entry's `config_content` field
+/// as `Some(SOME_CONST)`. Pins the path-form happy path.
+#[test]
+fn entry_config_path_propagates() {
+    let entry = ktstr::test_support::find_test("config_path_compiles")
+        .expect("config_path_compiles must be registered");
+    assert_eq!(
+        entry.config_content,
+        Some(PATH_CONFIG),
+        "config = SOME_CONST must wire onto KtstrTestEntry.config_content as Some(SOME_CONST)",
+    );
+}
+
+/// Default macro invocation (no `config = ...`) leaves the entry's
+/// `config_content` field at `None`. Pins that the new attribute is
+/// strictly opt-in and does not regress existing tests.
+#[test]
+fn entry_config_default_none() {
+    let entry = ktstr::test_support::find_test("default_attrs_compile")
+        .expect("default_attrs_compile must be registered");
+    assert!(
+        entry.config_content.is_none(),
+        "omitted config attribute must leave KtstrTestEntry.config_content = None",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #[derive(Payload)] integration with #[ktstr_test(workloads = [...])]
 // ---------------------------------------------------------------------------
 

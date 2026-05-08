@@ -993,6 +993,30 @@ pub struct CgroupDef {
     /// the kernel default in place (no ceiling). Set via
     /// [`Self::pids_max`].
     pub pids: Option<PidsLimits>,
+    /// Cgroup-level default for [`WorkSpec::nice`]. When `Some(n)`,
+    /// every [`WorkSpec`] in [`Self::works`] whose own `nice` field
+    /// is `0` (the framework's "skip setpriority(2)" sentinel — see
+    /// [`WorkloadConfig::nice`](crate::workload::WorkloadConfig::nice))
+    /// inherits `n` at apply-setup time. Set via [`Self::nice`];
+    /// merged in [`Self::merged_works`].
+    pub default_nice: Option<i32>,
+    /// Cgroup-level default for [`WorkSpec::comm`]. Merged into any
+    /// [`WorkSpec`] whose own `comm` is `None` at apply-setup time.
+    /// Set via [`Self::comm`]; merged in [`Self::merged_works`].
+    pub default_comm: Option<Cow<'static, str>>,
+    /// Cgroup-level default for [`WorkSpec::uid`]. Merged into any
+    /// [`WorkSpec`] whose own `uid` is `None` at apply-setup time.
+    /// Set via [`Self::uid`]; merged in [`Self::merged_works`].
+    pub default_uid: Option<u32>,
+    /// Cgroup-level default for [`WorkSpec::gid`]. Merged into any
+    /// [`WorkSpec`] whose own `gid` is `None` at apply-setup time.
+    /// Set via [`Self::gid`]; merged in [`Self::merged_works`].
+    pub default_gid: Option<u32>,
+    /// Cgroup-level default for [`WorkSpec::numa_node`]. Merged into
+    /// any [`WorkSpec`] whose own `numa_node` is `None` at
+    /// apply-setup time. Set via [`Self::numa_node`]; merged in
+    /// [`Self::merged_works`].
+    pub default_numa_node: Option<u32>,
 }
 
 impl CgroupDef {
@@ -1036,7 +1060,14 @@ impl CgroupDef {
         }
     }
 
-    /// Set the number of workers (convenience for single WorkSpec).
+    /// Set the number of workers on `works[0]` only — auto-inserting
+    /// a default [`WorkSpec`] if `works` is empty. Subsequent
+    /// [`Self::work`] calls add additional `WorkSpec` entries that
+    /// keep their own `num_workers`. There is no cgroup-level
+    /// default for `num_workers` because it is the most
+    /// composition-sensitive knob (different work groups commonly
+    /// want different worker counts); use `WorkSpec::workers(n)`
+    /// per group when more than one is in play.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn workers(mut self, n: usize) -> Self {
         self.ensure_default_work();
@@ -1044,7 +1075,14 @@ impl CgroupDef {
         self
     }
 
-    /// Set the work type (convenience for single WorkSpec).
+    /// Set the work type on `works[0]` only — auto-inserting a
+    /// default [`WorkSpec`] if `works` is empty. Subsequent
+    /// [`Self::work`] calls add additional `WorkSpec` entries that
+    /// keep their own `work_type`. There is no cgroup-level default
+    /// for `work_type`: it identifies what each group does, so a
+    /// shared default would make the per-group entries less
+    /// expressive without removing duplication. Multi-group cgroups
+    /// pick `work_type` per `WorkSpec`.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn work_type(mut self, wt: WorkType) -> Self {
         self.ensure_default_work();
@@ -1052,7 +1090,14 @@ impl CgroupDef {
         self
     }
 
-    /// Set the scheduling policy (convenience for single WorkSpec).
+    /// Set the scheduling policy on `works[0]` only — auto-inserting
+    /// a default [`WorkSpec`] if `works` is empty. Subsequent
+    /// [`Self::work`] calls add additional `WorkSpec` entries that
+    /// keep their own `sched_policy`. There is no cgroup-level
+    /// default for `sched_policy`: scenarios that mix policies
+    /// across groups (e.g. a SCHED_FIFO antagonist beside a
+    /// SCHED_NORMAL victim) need each group's policy distinct, so
+    /// the cgroup-level default would obscure the intent.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn sched_policy(mut self, p: crate::workload::SchedPolicy) -> Self {
         self.ensure_default_work();
@@ -1060,7 +1105,13 @@ impl CgroupDef {
         self
     }
 
-    /// Set the per-worker affinity (convenience for single WorkSpec).
+    /// Set the per-worker affinity on `works[0]` only —
+    /// auto-inserting a default [`WorkSpec`] if `works` is empty.
+    /// Subsequent [`Self::work`] calls add additional `WorkSpec`
+    /// entries that keep their own `affinity`. There is no
+    /// cgroup-level default: affinity intents (Inherit, SingleCpu,
+    /// LlcAligned, etc.) carry per-group resolution semantics that
+    /// don't fan out cleanly to a "merge if unset" rule.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn affinity(mut self, a: crate::workload::AffinityIntent) -> Self {
         self.ensure_default_work();
@@ -1068,7 +1119,14 @@ impl CgroupDef {
         self
     }
 
-    /// Set the NUMA memory placement policy (convenience for single WorkSpec).
+    /// Set the NUMA memory placement policy on `works[0]` only —
+    /// auto-inserting a default [`WorkSpec`] if `works` is empty.
+    /// Subsequent [`Self::work`] calls add additional `WorkSpec`
+    /// entries that keep their own `mem_policy`. There is no
+    /// cgroup-level default: `mem_policy` is validated against the
+    /// resolved cpuset per-group, so a fan-out default could
+    /// produce confusing per-group failures and is left out
+    /// deliberately.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn mem_policy(mut self, p: crate::workload::MemPolicy) -> Self {
         self.ensure_default_work();
@@ -1076,7 +1134,12 @@ impl CgroupDef {
         self
     }
 
-    /// Set the NUMA memory policy mode flags (convenience for single WorkSpec).
+    /// Set the NUMA memory policy mode flags on `works[0]` only —
+    /// auto-inserting a default [`WorkSpec`] if `works` is empty.
+    /// Subsequent [`Self::work`] calls add additional `WorkSpec`
+    /// entries that keep their own `mpol_flags`. There is no
+    /// cgroup-level default for the same per-group-validation
+    /// reasons as [`Self::mem_policy`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn mpol_flags(mut self, f: crate::workload::MpolFlags) -> Self {
         self.ensure_default_work();
@@ -1084,57 +1147,95 @@ impl CgroupDef {
         self
     }
 
-    /// Set the per-worker nice value for all WorkSpec groups in this
-    /// cgroup.
+    /// Set the cgroup-level default per-worker nice value. Merged
+    /// into every [`WorkSpec`] in [`Self::works`] whose own
+    /// [`WorkSpec::nice`] is `0` (the framework's "skip
+    /// setpriority(2)" sentinel) at apply-setup time, regardless of
+    /// declaration order — `def.work(spec).nice(n)` and
+    /// `def.nice(n).work(spec)` are equivalent. A WorkSpec that
+    /// explicitly sets a non-zero nice keeps its value. The
+    /// cgroup-level default lives in [`Self::default_nice`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
-        self.ensure_default_work();
-        for w in &mut self.works {
-            w.nice = n;
-        }
+        self.default_nice = Some(n);
         self
     }
 
-    /// Set the worker process name for all WorkSpec groups in this
-    /// cgroup. Every worker forked from any group calls
-    /// `prctl(PR_SET_NAME)` with this name.
+    /// Set the cgroup-level default worker process name. Merged
+    /// into every [`WorkSpec`] in [`Self::works`] whose own
+    /// [`WorkSpec::comm`] is `None` at apply-setup time, regardless
+    /// of declaration order. Each affected worker calls
+    /// `prctl(PR_SET_NAME)` with this name. The cgroup-level
+    /// default lives in [`Self::default_comm`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn comm(mut self, name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
-        self.ensure_default_work();
-        let name = name.into();
-        for w in &mut self.works {
-            w.comm = Some(name.clone());
-        }
+        self.default_comm = Some(name.into());
         self
     }
 
-    /// Set the worker effective UID for all WorkSpec groups.
+    /// Set the cgroup-level default worker effective UID. Merged
+    /// into every [`WorkSpec`] in [`Self::works`] whose own
+    /// [`WorkSpec::uid`] is `None` at apply-setup time, regardless
+    /// of declaration order. The cgroup-level default lives in
+    /// [`Self::default_uid`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn uid(mut self, uid: u32) -> Self {
-        self.ensure_default_work();
-        for w in &mut self.works {
-            w.uid = Some(uid);
-        }
+        self.default_uid = Some(uid);
         self
     }
 
-    /// Set the worker effective GID for all WorkSpec groups.
+    /// Set the cgroup-level default worker effective GID. Merged
+    /// into every [`WorkSpec`] in [`Self::works`] whose own
+    /// [`WorkSpec::gid`] is `None` at apply-setup time, regardless
+    /// of declaration order. The cgroup-level default lives in
+    /// [`Self::default_gid`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn gid(mut self, gid: u32) -> Self {
-        self.ensure_default_work();
+        self.default_gid = Some(gid);
+        self
+    }
+
+    /// Set the thread-group leader's comm on every WorkSpec in
+    /// this CgroupDef. Each affected WorkSpec gets `pcomm =
+    /// Some(name)`; existing per-WorkSpec `pcomm` values (set
+    /// before this call) are overwritten. Calling on an empty
+    /// `works` list pushes a default WorkSpec carrying the value.
+    ///
+    /// The pcomm string is applied via `prctl(PR_SET_NAME)` on
+    /// the forked thread-group leader (the kernel truncates to
+    /// `TASK_COMM_LEN - 1 = 15` bytes inside `__set_task_comm`).
+    /// Setting this triggers the fork-then-thread spawn path in
+    /// `apply_setup`: WorkSpecs sharing a `pcomm` value coalesce
+    /// into ONE thread-group leader per group; every worker
+    /// thread inside observes `task->group_leader->comm == pcomm`.
+    /// Each worker thread additionally sets its own `task->comm`
+    /// via `.comm()` on the per-WorkSpec [`WorkSpec::comm`] at
+    /// thread creation time.
+    ///
+    /// `pcomm` lives ONLY on [`WorkSpec`] — there is no
+    /// CgroupDef-level field. This builder writes the value into
+    /// every WorkSpec directly so `apply_setup` has a single
+    /// authoritative source per WorkSpec.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn pcomm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        let name: Cow<'static, str> = name.into();
+        if self.works.is_empty() {
+            self.works.push(WorkSpec::default());
+        }
         for w in &mut self.works {
-            w.gid = Some(gid);
+            w.pcomm = Some(name.clone());
         }
         self
     }
 
-    /// Restrict all workers to a NUMA node's CPU set.
+    /// Set the cgroup-level default NUMA-node affinity. Merged into
+    /// every [`WorkSpec`] in [`Self::works`] whose own
+    /// [`WorkSpec::numa_node`] is `None` at apply-setup time,
+    /// regardless of declaration order. The cgroup-level default
+    /// lives in [`Self::default_numa_node`].
     #[must_use = "builder methods consume self; bind the result"]
     pub fn numa_node(mut self, node: u32) -> Self {
-        self.ensure_default_work();
-        for w in &mut self.works {
-            w.numa_node = Some(node);
-        }
+        self.default_numa_node = Some(node);
         self
     }
 
@@ -1372,6 +1473,68 @@ impl CgroupDef {
         pids.max = None;
         self
     }
+
+    /// Materialize [`Self::works`] with cgroup-level defaults
+    /// merged into each entry. Called by `apply_setup` to resolve
+    /// the per-WorkSpec values before spawning workers.
+    ///
+    /// For every [`WorkSpec`] in [`Self::works`] (or a single
+    /// [`WorkSpec::default()`] when `works` is empty, matching
+    /// `apply_setup`'s default-substitution rule), each cgroup-level
+    /// default in [`Self::default_nice`] / [`Self::default_comm`] /
+    /// [`Self::default_uid`] / [`Self::default_gid`] /
+    /// [`Self::default_numa_node`] fills the corresponding
+    /// `WorkSpec` field when that field is "unset" at the WorkSpec
+    /// level.
+    ///
+    /// "Unset" means `None` for every `Option`-typed field
+    /// (`comm`, `uid`, `gid`, `numa_node`). For `nice`, which is
+    /// `i32` with no sentinel, "unset" is `0` — the framework's
+    /// "skip setpriority(2)" sentinel per
+    /// [`WorkloadConfig::nice`](crate::workload::WorkloadConfig::nice).
+    /// A `WorkSpec` that explicitly sets a non-zero nice keeps its
+    /// value; the cgroup-level default applies only when the
+    /// WorkSpec is at the framework default of `0`.
+    ///
+    /// `pcomm` is NOT propagated through `merged_works`. The
+    /// [`Self::pcomm`] convenience method writes `pcomm` directly
+    /// into every WorkSpec at builder time so coalescing in
+    /// `apply_setup` reads the per-WorkSpec value (the
+    /// authoritative source).
+    ///
+    /// Decoupling this merge from the convenience-method call sites
+    /// makes the builder order-independent —
+    /// `def.nice(5).work(spec)` and `def.work(spec).nice(5)`
+    /// produce identical effective `WorkSpec` values.
+    pub fn merged_works(&self) -> Vec<WorkSpec> {
+        let base: Vec<WorkSpec> = if self.works.is_empty() {
+            vec![WorkSpec::default()]
+        } else {
+            self.works.clone()
+        };
+        base.into_iter()
+            .map(|mut w| {
+                if w.nice == 0
+                    && let Some(n) = self.default_nice
+                {
+                    w.nice = n;
+                }
+                if w.comm.is_none() {
+                    w.comm = self.default_comm.clone();
+                }
+                if w.uid.is_none() {
+                    w.uid = self.default_uid;
+                }
+                if w.gid.is_none() {
+                    w.gid = self.default_gid;
+                }
+                if w.numa_node.is_none() {
+                    w.numa_node = self.default_numa_node;
+                }
+                w
+            })
+            .collect()
+    }
 }
 
 /// Constructor for the default [`CpuLimits`] used by the cgroup
@@ -1401,6 +1564,11 @@ impl Default for CgroupDef {
             memory: None,
             io: None,
             pids: None,
+            default_nice: None,
+            default_comm: None,
+            default_uid: None,
+            default_gid: None,
+            default_numa_node: None,
         }
     }
 }

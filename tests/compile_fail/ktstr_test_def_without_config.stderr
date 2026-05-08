@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: scheduler declares `config_file_def` but the test does not supply `config = ...`; provide an inline scheduler config or remove `config_file_def` from the scheduler definition
+  --> tests/compile_fail/ktstr_test_def_without_config.rs:17:1
+   |
+17 | #[ktstr_test(scheduler = SCHED_REQUIRES_CONFIG_PAYLOAD)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `__KTSTR_CONFIG_PAIRING_DEF_WITHOUT_CONFIG` failed here
+   |
+   = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -727,6 +727,22 @@ pub struct KtstrTestEntry {
     /// declared by the scheduler's `config_file_def`. The framework
     /// writes this string to a temp file, packs it into the initramfs,
     /// and passes the scheduler's arg template with `{file}` replaced.
+    ///
+    /// Populated by `#[ktstr_test(config = EXPR)]` (literal or path to
+    /// a `const &'static str`) or by direct entry construction.
+    ///
+    /// Pairing gate: `config_content` and the scheduler's
+    /// `config_file_def` must both be `Some(_)` or both be `None`.
+    /// [`KtstrTestEntry::validate`] enforces this at runtime so direct
+    /// programmatic-entry callers see the misconfiguration before VM
+    /// boot, and the `#[ktstr_test]` macro emits a `const _: () = {
+    /// assert!(...) };` block that catches the same mismatch at
+    /// compile time for attribute-built entries. A `Some` here without
+    /// a scheduler `config_file_def` would be silently dropped at
+    /// dispatch (no `--config` flag derives from it); a `None` here
+    /// against a scheduler that declares `config_file_def` would
+    /// launch the scheduler binary without `--config`. Both are
+    /// rejected.
     pub config_content: Option<&'static str>,
     /// Optional virtio-blk disk attached to the VM at `/dev/vda`.
     /// `None` (the default) boots without a disk; `Some(cfg)` calls
@@ -749,6 +765,83 @@ pub struct KtstrTestEntry {
     /// closure receives `&VmResult` and returns `Result<()>` — an
     /// `Err` fails the test with the returned message.
     pub post_vm: Option<fn(&crate::vmm::VmResult) -> Result<()>>,
+    /// Periodic snapshot count: when non-zero, the freeze
+    /// coordinator divides the 10%–90% slice of the workload
+    /// duration (anchored at the FIRST `MSG_TYPE_SCENARIO_START`
+    /// the coordinator observes) into `num_snapshots + 1` equal
+    /// intervals and fires a host-side `freeze_and_capture(false)`
+    /// at each of the `num_snapshots` interior boundaries —
+    /// e.g. `N = 1` lands a single capture at the workload's
+    /// midpoint (`start + 0.5·d`); `N = 3` lands captures at
+    /// `start + 0.3·d`, `start + 0.5·d`, `start + 0.7·d`. No
+    /// boundary lands at exactly `start + 0.1·d` or
+    /// `start + 0.9·d` — the buffers reserve those edges for
+    /// workload ramp-up / ramp-down. Each boundary is stored
+    /// under `"periodic_NNN"` (zero-padded 3-digit index) on the
+    /// host's [`crate::scenario::snapshot::SnapshotBridge`].
+    /// Anchoring at ScenarioStart means boot + verifier time do
+    /// not eat the budget. Pauses observed via
+    /// `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME` shift
+    /// every un-fired boundary by the cumulative pause duration —
+    /// the boundary clock is workload-time, not wall-clock, so a
+    /// guest that pauses for `P` ns delays each remaining boundary
+    /// by `P` ns. `0` (the default) disables periodic capture
+    /// entirely; the coordinator's run-loop never even computes
+    /// boundary timestamps.
+    ///
+    /// **Capture cost.** Each periodic boundary fires the same
+    /// host-side `freeze_and_capture(false)` path that
+    /// [`crate::scenario::ops::Op::Snapshot`] dispatches: every
+    /// vCPU is parked under `FREEZE_RENDEZVOUS_TIMEOUT` (30 s
+    /// hard ceiling), BPF maps are walked, the dump is serialised
+    /// to JSON, and the report is stored on the
+    /// [`crate::scenario::snapshot::SnapshotBridge`]. On a healthy
+    /// guest with a typical scheduler-state map size the freeze
+    /// is tens of milliseconds (10–100 ms is the steady-state
+    /// observation; cold-cache and large guest-memory walks can
+    /// push higher). The host-side watchdog deadline is extended
+    /// by the freeze duration after each fire, so periodic
+    /// captures do not eat into the workload's wall-clock budget.
+    ///
+    /// **Best-effort delivery.** Up to `N` captures fire; an early
+    /// VM exit (kill flag, BSP done, rendezvous timeout, watchdog
+    /// deadline) can cut the periodic sequence short, and the
+    /// run-loop stops servicing periodic boundaries the moment the
+    /// kill flag fires. Tests should assert `>= some_lower_bound`
+    /// rather than `== num_snapshots`. `Op::Snapshot` captures
+    /// composed by the test author land on the same bridge
+    /// alongside the `periodic_NNN` tags; total bridge occupancy
+    /// is `num_snapshots + user_captures` and the bridge
+    /// FIFO-evicts past
+    /// [`crate::scenario::snapshot::MAX_STORED_SNAPSHOTS`].
+    /// Additionally, the run-loop abandons the remaining sequence
+    /// after 2 consecutive rendezvous timeouts and emits a
+    /// `tracing::warn` naming the consecutive-timeout count.
+    ///
+    /// **Minimum spacing.** Each capture freezes every vCPU for
+    /// tens of milliseconds at minimum (see "Capture cost" above),
+    /// so boundaries scheduled closer than ~100 ms apart would
+    /// fire back-to-back without any workload progress in between.
+    /// `validate()` rejects entries where
+    /// `0.8 · duration / (N + 1) < 100 ms` — choose `N` and
+    /// `duration` so the resulting interval clears that floor.
+    ///
+    /// **Ordering.** Periodic captures are stored in order
+    /// (`periodic_000` first, `periodic_NNN` last). Tests that
+    /// need to walk them in time order should call
+    /// [`crate::scenario::snapshot::SnapshotBridge::drain_ordered`]
+    /// rather than [`crate::scenario::snapshot::SnapshotBridge::drain`]
+    /// — the latter returns a `HashMap` and loses ordering.
+    ///
+    /// `validate()` rejects `num_snapshots >
+    /// crate::scenario::snapshot::MAX_STORED_SNAPSHOTS` (= 64
+    /// today): the bridge enforces FIFO eviction at that cap, so a
+    /// higher count would silently drop the earliest periodic
+    /// samples once `store()` started evicting. Refusing the
+    /// configuration is more honest than half-delivering it. The
+    /// 64 cap also ensures the 3-digit `:03` width on
+    /// `periodic_NNN` is always sufficient.
+    pub num_snapshots: u32,
 }
 
 /// Placeholder function for [`KtstrTestEntry::DEFAULT`].
@@ -822,6 +915,7 @@ impl KtstrTestEntry {
         config_content: None,
         disk: None,
         post_vm: None,
+        num_snapshots: 0,
     };
 
     /// Reject values that would boot a broken VM or leave assertions
@@ -901,6 +995,113 @@ impl KtstrTestEntry {
                  device lifecycle, so the disk would never be attached. \
                  Drop one of host_only or disk.",
                 self.name,
+            );
+        }
+        // Periodic snapshots route through SnapshotBridge::store, which
+        // FIFO-evicts at MAX_STORED_SNAPSHOTS. Allowing num_snapshots
+        // past the cap would silently lose the earliest samples — a
+        // periodic run with N=128 today would only retain
+        // periodic_064..periodic_127 in the bridge.
+        let max = crate::scenario::snapshot::MAX_STORED_SNAPSHOTS as u32;
+        if self.num_snapshots > max {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.num_snapshots={} exceeds \
+                 MAX_STORED_SNAPSHOTS={} — the bridge would FIFO-evict \
+                 the earliest periodic samples. Lower the count or split \
+                 into multiple test entries.",
+                self.name,
+                self.num_snapshots,
+                max,
+            );
+        }
+        if self.num_snapshots > 0 {
+            // host_only skips the VM boot that owns the freeze
+            // coordinator's run-loop. Without that loop there is no
+            // thread to stamp `scenario_start_ns`, no thread to fire
+            // `freeze_and_capture(false)` at each boundary, and no
+            // `SnapshotBridge` plumbed onto a `VmResult` for the
+            // test author to drain post-run. The combination is
+            // unsatisfiable; reject at validate time so a
+            // misconfigured entry surfaces during nextest discovery
+            // rather than as silently-empty bridge results.
+            if self.host_only {
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.host_only=true with \
+                     num_snapshots={} > 0 — host_only skips the VM \
+                     boot that owns the freeze coordinator's \
+                     periodic-capture loop, so no snapshot would \
+                     ever fire. Drop one of host_only or \
+                     num_snapshots.",
+                    self.name,
+                    self.num_snapshots,
+                );
+            }
+            // Refuse interval shorter than the minimum useful capture
+            // cadence. Each boundary fire freezes every vCPU, walks
+            // BPF maps, serialises the dump, and writes to the
+            // bridge — under the FREEZE_RENDEZVOUS_TIMEOUT (30 s)
+            // hard ceiling but commonly tens of milliseconds on a
+            // healthy guest. An interval shorter than ~100 ms would
+            // back-to-back the captures with no actual workload
+            // progress between them, defeating the periodic-sampling
+            // purpose. Compute the interval in nanoseconds in u128
+            // to avoid overflow on long durations: the formula
+            // mirrors the run-loop's
+            // `compute_periodic_boundaries_ns` (10 % pre-buffer,
+            // 80 % usable span, divided into N+1 equal intervals).
+            let usable_span_ns = self
+                .duration
+                .as_nanos()
+                .saturating_sub(2u128.saturating_mul(self.duration.as_nanos() / 10));
+            let interval_ns = usable_span_ns / (self.num_snapshots as u128 + 1);
+            const MIN_INTERVAL_NS: u128 = 100 * 1_000_000; // 100 ms
+            if interval_ns < MIN_INTERVAL_NS {
+                anyhow::bail!(
+                    "KtstrTestEntry '{}'.num_snapshots={} with \
+                     duration={:?} produces a periodic interval of \
+                     {} ns ({} ms) — below the 100 ms minimum the \
+                     freeze-and-capture path can sustain without \
+                     back-to-back firing. Either reduce num_snapshots \
+                     or extend duration so 0.8·duration / (N+1) >= 100 ms.",
+                    self.name,
+                    self.num_snapshots,
+                    self.duration,
+                    interval_ns,
+                    interval_ns / 1_000_000,
+                );
+            }
+        }
+        // Pair `scheduler.config_file_def` with `config_content`. The
+        // `#[ktstr_test]` macro emits a `const _: () = assert!(...)`
+        // block that catches the same mismatch at compile time for
+        // attribute-built entries; this branch covers programmatic
+        // construction (callers building `KtstrTestEntry` values
+        // directly) and surfaces the misconfiguration before VM boot
+        // rather than as a silent missing-`--config` flag.
+        let scheduler_has_def = self.scheduler.config_file_def().is_some();
+        let entry_has_content = self.config_content.is_some();
+        if scheduler_has_def && !entry_has_content {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.scheduler '{}' declares \
+                 `config_file_def` but the entry does not supply \
+                 `config_content`; the scheduler binary expects an \
+                 inline config and would launch without `--config`. \
+                 Set `config = ...` on `#[ktstr_test]` or assign \
+                 `config_content` directly.",
+                self.name,
+                self.scheduler.scheduler_name(),
+            );
+        }
+        if !scheduler_has_def && entry_has_content {
+            anyhow::bail!(
+                "KtstrTestEntry '{}'.config_content is set but the \
+                 scheduler '{}' does not declare `config_file_def`; \
+                 the content would be silently dropped at dispatch. \
+                 Remove `config = ...` or add \
+                 `config_file_def(arg_template, guest_path)` to the \
+                 scheduler.",
+                self.name,
+                self.scheduler.scheduler_name(),
             );
         }
         // Mirror the payload-slot gate for every workload entry. The
@@ -1331,6 +1532,335 @@ mod tests {
         entry
             .validate()
             .expect("host_only=false + disk=Some must validate");
+    }
+
+    /// `validate()` rejects `num_snapshots` greater than the bridge
+    /// cap (`MAX_STORED_SNAPSHOTS == 64`). Without the gate the
+    /// periodic loop would publish all `N` boundary captures but the
+    /// bridge's FIFO eviction at `store()` would silently drop the
+    /// earliest samples — a periodic run with `N == 128` would only
+    /// retain `periodic_064..periodic_127`. Refusing the entry is
+    /// more honest than half-delivering it.
+    #[test]
+    fn validate_rejects_num_snapshots_above_max_stored() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let cap = crate::scenario::snapshot::MAX_STORED_SNAPSHOTS as u32;
+        let entry = KtstrTestEntry {
+            name: "too_many_snapshots",
+            func: good_test_func,
+            num_snapshots: cap + 1,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("num_snapshots > MAX_STORED_SNAPSHOTS must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("num_snapshots") && msg.contains("MAX_STORED_SNAPSHOTS"),
+            "expected num_snapshots/MAX_STORED_SNAPSHOTS diagnostic, got: {msg}",
+        );
+        assert!(
+            msg.contains("too_many_snapshots"),
+            "error must name the offending entry, got: {msg}",
+        );
+    }
+
+    /// `num_snapshots == MAX_STORED_SNAPSHOTS` (the boundary case)
+    /// must validate when `duration` is large enough to keep every
+    /// inter-boundary interval at or above the 100 ms minimum spacing
+    /// (see `validate_rejects_tight_periodic_spacing` below). 64
+    /// captures over a long duration is the documented happy path —
+    /// pinning it here prevents an off-by-one in the cap gate from
+    /// silently rejecting the canonical maximum.
+    #[test]
+    fn validate_accepts_num_snapshots_at_max_stored() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let cap = crate::scenario::snapshot::MAX_STORED_SNAPSHOTS as u32;
+        // 100 s · 0.8 / 65 ≈ 1.23 s per inter-boundary interval —
+        // comfortably above the 100 ms minimum spacing gate.
+        let entry = KtstrTestEntry {
+            name: "max_snapshots_ok",
+            func: good_test_func,
+            num_snapshots: cap,
+            duration: Duration::from_secs(100),
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("num_snapshots == MAX_STORED_SNAPSHOTS at long duration must validate");
+    }
+
+    /// `validate()` rejects `num_snapshots > 0` paired with
+    /// `host_only == true`. Periodic capture freezes guest vCPUs via
+    /// the freeze coordinator's rendezvous; a host-only entry never
+    /// boots a VM, so there are no vCPUs to freeze and the periodic
+    /// boundaries would fire against an empty bridge. Catching the
+    /// combination at validate time surfaces the misconfiguration
+    /// before dispatch instead of after a confusing host-only run
+    /// that silently produced zero captures.
+    #[test]
+    fn validate_rejects_num_snapshots_with_host_only() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "host_only_periodic",
+            func: good_test_func,
+            host_only: true,
+            num_snapshots: 1,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("host_only=true + num_snapshots>0 must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("host_only") && msg.contains("num_snapshots"),
+            "expected host_only/num_snapshots diagnostic, got: {msg}",
+        );
+        assert!(
+            msg.contains("host_only_periodic"),
+            "error must name the offending entry, got: {msg}",
+        );
+    }
+
+    /// `host_only == true` with `num_snapshots == 0` (the default)
+    /// is the legitimate host-side shape and must continue to
+    /// validate. Pins the gate to fire only on the actual conflict
+    /// (host_only=true AND num_snapshots>0) and not on every
+    /// host-only entry — a future tightening that rejected every
+    /// host-only test author would silently break the host-only
+    /// surface.
+    #[test]
+    fn validate_accepts_host_only_with_zero_snapshots() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "host_only_no_periodic",
+            func: good_test_func,
+            host_only: true,
+            num_snapshots: 0,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("host_only=true + num_snapshots=0 must validate");
+    }
+
+    /// `validate()` rejects an entry whose periodic boundaries would
+    /// land closer than 100 ms apart. The freeze coordinator's
+    /// periodic loop divides the 80 % usable span (10 % pre-buffer +
+    /// 10 % post-buffer = 20 % buffer; the remainder is the usable
+    /// span) into `num_snapshots + 1` equal intervals; if any
+    /// interval falls under 100 ms the captures crowd into
+    /// rendezvous serialisation slack and one or more boundaries
+    /// will defer-and-drop. Refusing the entry is more honest than
+    /// emitting a partial timeline.
+    ///
+    /// Bound math: a 1 s duration with `num_snapshots == 8` yields
+    /// `(0.8 · 1e9 ns) / 9 ≈ 88.9 ms` per interval — under the 100 ms
+    /// floor, so the gate must reject. Below the cap (8 < 64) so the
+    /// rejection MUST come from the spacing check, not the
+    /// MAX_STORED_SNAPSHOTS gate.
+    #[test]
+    fn validate_rejects_tight_periodic_spacing() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "tight_periodic_spacing",
+            func: good_test_func,
+            duration: Duration::from_secs(1),
+            num_snapshots: 8,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("tight periodic spacing must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("100"),
+            "error must mention the 100 ms floor, got: {msg}",
+        );
+        assert!(
+            msg.contains("num_snapshots") || msg.contains("periodic"),
+            "error must mention num_snapshots or periodic, got: {msg}",
+        );
+        assert!(
+            msg.contains("tight_periodic_spacing"),
+            "error must name the offending entry, got: {msg}",
+        );
+    }
+
+    /// Periodic spacing gate must NOT fire when boundaries are at
+    /// or above the 100 ms floor. 12 s default duration · 0.8 / 2
+    /// = 4.8 s per interval (`N == 1`) is comfortably above the
+    /// floor. Pins the polarity of the spacing gate so a future
+    /// tightening that rejected every reasonable cadence would
+    /// surface here as a regression instead of silently breaking
+    /// every periodic test.
+    #[test]
+    fn validate_accepts_loose_periodic_spacing() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "loose_periodic_spacing",
+            func: good_test_func,
+            // 12 s default duration · 0.8 / (1 + 1) = 4.8 s per
+            // interval — well above 100 ms.
+            num_snapshots: 1,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry
+            .validate()
+            .expect("loose periodic spacing (4.8 s per boundary) must validate");
+    }
+
+    /// `validate()` rejects an entry whose scheduler declares
+    /// `config_file_def` but provides no `config_content`. The macro
+    /// emits a `const _: () = assert!(...)` for attribute-built
+    /// entries; this branch covers programmatic construction so
+    /// dispatch never runs the scheduler binary without `--config`.
+    #[test]
+    fn validate_rejects_config_file_def_without_content() {
+        static SCHED_WITH_CFG: Scheduler = Scheduler {
+            name: "sched_with_cfg",
+            binary: SchedulerSpec::Discover("sched_with_cfg_bin"),
+            flags: &[],
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: Topology {
+                llcs: 1,
+                cores_per_llc: 2,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: Some(("--config {file}", "/include-files/cfg.json")),
+        };
+        static SCHED_WITH_CFG_PAYLOAD: crate::test_support::Payload =
+            crate::test_support::Payload::from_scheduler(&SCHED_WITH_CFG);
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "missing_config",
+            func: good_test_func,
+            scheduler: &SCHED_WITH_CFG_PAYLOAD,
+            config_content: None,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("config_file_def without config_content must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("config_file_def") && msg.contains("config_content"),
+            "expected config_file_def/config_content bail, got: {msg}"
+        );
+        assert!(
+            msg.contains("missing_config"),
+            "error must name the offending entry, got: {msg}"
+        );
+    }
+
+    /// `validate()` rejects an entry that supplies `config_content`
+    /// while pairing with a scheduler that declares no
+    /// `config_file_def`. Symmetric with the missing-content gate:
+    /// the content would be silently dropped at dispatch.
+    #[test]
+    fn validate_rejects_content_without_config_file_def() {
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        let entry = KtstrTestEntry {
+            name: "stray_config",
+            func: good_test_func,
+            scheduler: &crate::test_support::Payload::KERNEL_DEFAULT,
+            config_content: Some("{}"),
+            ..KtstrTestEntry::DEFAULT
+        };
+        let err = entry
+            .validate()
+            .expect_err("config_content without config_file_def must reject");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("config_content") && msg.contains("config_file_def"),
+            "expected config_content/config_file_def bail, got: {msg}"
+        );
+        assert!(
+            msg.contains("stray_config"),
+            "error must name the offending entry, got: {msg}"
+        );
+    }
+
+    /// `validate()` accepts both legitimate pairings: a scheduler
+    /// with `config_file_def` paired with `config_content`, and a
+    /// scheduler without `config_file_def` paired with no
+    /// `config_content`. Pins the happy paths so a future tightening
+    /// of the pairing gate can't silently break valid entries.
+    #[test]
+    fn validate_accepts_config_pairing() {
+        static SCHED_WITH_CFG: Scheduler = Scheduler {
+            name: "sched_paired",
+            binary: SchedulerSpec::Discover("sched_paired_bin"),
+            flags: &[],
+            sysctls: &[],
+            kargs: &[],
+            assert: crate::assert::Assert::NO_OVERRIDES,
+            cgroup_parent: None,
+            sched_args: &[],
+            topology: Topology {
+                llcs: 1,
+                cores_per_llc: 2,
+                threads_per_core: 1,
+                numa_nodes: 1,
+                nodes: None,
+                distances: None,
+            },
+            constraints: TopologyConstraints::DEFAULT,
+            config_file: None,
+            config_file_def: Some(("f:{file}", "/include-files/p.json")),
+        };
+        static SCHED_PAIRED_PAYLOAD: crate::test_support::Payload =
+            crate::test_support::Payload::from_scheduler(&SCHED_WITH_CFG);
+        fn good_test_func(_: &Ctx) -> Result<AssertResult> {
+            Ok(AssertResult::pass())
+        }
+        // Scheduler with def + content set: accepted.
+        let entry_paired = KtstrTestEntry {
+            name: "paired_present",
+            func: good_test_func,
+            scheduler: &SCHED_PAIRED_PAYLOAD,
+            config_content: Some("{\"layers\":[]}"),
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry_paired
+            .validate()
+            .expect("scheduler with config_file_def + content must validate");
+        // Scheduler without def + content unset: also accepted.
+        let entry_none = KtstrTestEntry {
+            name: "neither_present",
+            func: good_test_func,
+            scheduler: &crate::test_support::Payload::KERNEL_DEFAULT,
+            config_content: None,
+            ..KtstrTestEntry::DEFAULT
+        };
+        entry_none
+            .validate()
+            .expect("no config_file_def + no content must validate");
     }
 
     #[test]

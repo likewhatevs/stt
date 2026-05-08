@@ -321,6 +321,8 @@ pub(crate) fn build_vm_builder_base(
         builder = builder.disk(disk_cfg);
     }
 
+    builder = builder.num_snapshots(entry.num_snapshots);
+
     builder.watchdog_timeout(entry.watchdog_timeout)
 }
 

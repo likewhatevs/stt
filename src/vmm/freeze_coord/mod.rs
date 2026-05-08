@@ -68,7 +68,10 @@ use self::snapshot::{
     VmlinuxSymbolCache, arm_user_watchpoint, decode_snapshot_request, frame_snapshot_reply,
     poll_eventfd_until_ready_or_timeout, snapshot_tagged_path,
 };
-use self::state::{BspExitReason, FREEZE_RENDEZVOUS_TIMEOUT, FreezeState, SnapshotRequest};
+use self::state::{
+    BspExitReason, FREEZE_RENDEZVOUS_TIMEOUT, FreezeState, SnapshotRequest,
+    compute_periodic_boundaries_ns, periodic_tag,
+};
 use self::watchpoint::{WatchpointPublishResult, republish_watchpoint_on_rebind};
 
 /// Three-way result of polling the BPF probe's `.bss` latch via the
@@ -416,6 +419,37 @@ impl KtstrVm {
         // awaits N-of-N parked confirmations, runs the dump (placeholder
         // in this batch), and then clears `freeze` to thaw.
         let freeze = Arc::new(AtomicBool::new(false));
+        // Scheduler-stats client. Constructed only when the run
+        // has a scheduler attached — without a scheduler there is
+        // nothing to query, and spawning a drainer thread plus
+        // plumbing a client onto `VmResult` would force every test
+        // that does `stats_client.unwrap().stats(...)` to wait for
+        // its full timeout before discovering "no scheduler". When
+        // `scheduler_binary` is `None`, the field on
+        // [`VmResult::stats_client`] stays `None` and callers can
+        // branch on `.is_none()` to skip the stats path entirely.
+        let stats_client = if self.scheduler_binary.is_some() {
+            Some(
+                crate::vmm::sched_stats::SchedStatsClient::new(
+                    virtio_con.clone(),
+                    Some(freeze.clone()),
+                    // Run-wide kill flag plumbed as the cancel
+                    // signal: when the BSP / watchdog flips
+                    // `kill`, blocked `request_raw` calls wake and
+                    // return `Cancelled` instead of hanging forever.
+                    // The host watchdog is the only "timeout" in
+                    // the stats path.
+                    Some(kill.clone()),
+                    // Paired wake fd: the drainer's epoll watches
+                    // `kill_evt` so the cancel edge propagates to
+                    // a blocked cvar wait within microseconds.
+                    Some(kill_evt.clone()),
+                )
+                .context("construct scheduler-stats client")?,
+            )
+        } else {
+            None
+        };
         // Hardware data-write watchpoint state shared between the
         // freeze coordinator (publishes the resolved
         // `*scx_root->exit_kind` KVA into `request_kva`) and every
@@ -627,6 +661,52 @@ impl KtstrVm {
             Arc::new(std::sync::atomic::AtomicU64::new(0));
         let watchdog_pause_for_coord = watchdog_pause_ns.clone();
         let workload_duration_for_coord = self.workload_duration;
+        // First-ScenarioStart timestamp (nanos since `run_start`),
+        // biased by `+1` so `0` means "no ScenarioStart frame
+        // observed yet". The dispatch.rs ScenarioStart arm
+        // CAS-stamps this on the first frame so the periodic-
+        // snapshot loop in the coord run-loop can anchor the
+        // 10%–90% workload-duration window at the moment the guest
+        // workload actually starts (not at boot or at `run_start`).
+        // `Arc<AtomicU64>` gives the coord thread shared ownership
+        // with the dispatch sinks; both run in the same thread so
+        // Relaxed ordering suffices, but the AtomicU64 keeps the
+        // type story uniform with `watchdog_reset_for_coord` /
+        // `watchdog_pause_for_coord`.
+        let scenario_start_ns: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let scenario_start_ns_for_coord = scenario_start_ns.clone();
+        // Cumulative wall-clock pause time observed between
+        // matched `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME`
+        // pairs (nanoseconds). Periodic-snapshot boundaries are
+        // anchored to workload time, NOT wall-clock time — when the
+        // guest workload pauses, the host's `run_start.elapsed()`
+        // ticks during the pause but the workload's logical clock
+        // does not. The dispatch.rs `ScenarioResume` arm bumps this
+        // atomic by `pause_duration` so the run-loop can subtract it
+        // from `run_start.elapsed()` to get effective workload-time
+        // for the boundary-crossing check. The matching
+        // `watchdog_pause_ns` atomic continues to track only the
+        // current pause's start (used by the watchdog deadline-
+        // extension path); cumulative pause is a periodic-only
+        // concern.
+        let scenario_pause_cumulative_ns: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let scenario_pause_cumulative_for_coord = scenario_pause_cumulative_ns.clone();
+        // Periodic-snapshot count plumbed through KtstrVm for the
+        // coord run-loop's periodic-capture cadence. `0` (the
+        // default) skips the loop entirely — no boundary
+        // computation, no per-iteration check.
+        let freeze_coord_num_snapshots = self.num_snapshots;
+        // Live periodic-fire count published by the run-loop after
+        // each successful capture / placeholder store. Threaded
+        // out to `VmResult::periodic_fired` so test code can
+        // assert coverage. Written by the coordinator thread,
+        // read by run_vm AFTER the coordinator joins, so Relaxed
+        // ordering paired with the join's happens-before suffices.
+        let periodic_fired_slot: Arc<std::sync::atomic::AtomicU32> =
+            Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let periodic_fired_for_coord = periodic_fired_slot.clone();
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
         let bpf_write_handle = self.start_bpf_map_write(
@@ -790,10 +870,12 @@ impl KtstrVm {
         let freeze_coord_virtio_con = virtio_con.clone();
         // Clone the virtio-console tx_evt so the coord epoll wakes
         // immediately whenever the guest publishes a TX descriptor
-        // chain on either port (port 0 console or port 1 bulk).
-        // The tx_evt is a per-device counter — both ports share it,
-        // but a spurious wake on port-0 traffic is harmless: the
-        // coord just calls `drain_bulk()` and finds an empty buffer.
+        // chain on port 0 or port 1. The tx_evt is shared between
+        // those two ports — a spurious wake on port-0 traffic is
+        // harmless: the coord just calls `drain_bulk()` and finds
+        // an empty buffer. Port 2 TX (scheduler stats) is owned
+        // entirely by [`crate::vmm::sched_stats::SchedStatsClient`]
+        // and never reaches this coordinator's epoll set.
         let freeze_coord_tx_evt = virtio_con
             .lock()
             .tx_evt()
@@ -1725,7 +1807,7 @@ impl KtstrVm {
                 const TOKEN_WATCHPOINT: u64 = 3;
                 const TOKEN_SCANNER: u64 = 4;
                 /// virtio-console tx_evt — wakes whenever the guest
-                /// publishes a TX descriptor chain on EITHER port.
+                /// publishes a TX descriptor chain on port 0 or port 1.
                 /// The coordinator drains port-1 bulk TLV bytes and
                 /// promotes a SCHED_EXIT entry into the run-wide
                 /// `kill` flag, and intercepts
@@ -1737,6 +1819,12 @@ impl KtstrVm {
                 /// Port-0 (console) TX wakes are harmless: the coord
                 /// drain returns an empty buffer and the byte stays
                 /// in the host stdout thread's `drain_output` slot.
+                /// Port 2 TX (scheduler stats) does not reach this
+                /// epoll set — the
+                /// [`crate::vmm::sched_stats::SchedStatsClient`]
+                /// owns its own drainer thread and stats_tx_evt
+                /// epoll, leaving this coordinator unaffected by
+                /// stats traffic.
                 const TOKEN_TX: u64 = 5;
                 let epoll = match Epoll::new() {
                     Ok(e) => e,
@@ -1826,6 +1914,50 @@ impl KtstrVm {
                 // a hostile guest force a spurious capture, mirroring
                 // the SCHED_EXIT promotion gate.
                 let mut snapshot_requests_pending: Vec<SnapshotRequest> = Vec::new();
+                // Periodic-capture state. `periodic_boundaries_ns`
+                // is the precomputed list of `Instant` deadlines
+                // (encoded as nanos-since-`run_start`) at which the
+                // run-loop fires `freeze_and_capture(false)`. Lazily
+                // built on the first iteration AFTER BOTH:
+                //   1. `KtstrVm::num_snapshots > 0` (periodic capture
+                //      is requested), AND
+                //   2. `workload_duration_for_coord` is `Some(d)`
+                //      (the workload has a duration to slice), AND
+                //   3. `scenario_start_ns_for_coord` reads non-zero
+                //      (the first ScenarioStart frame has been
+                //      observed and stamped by the dispatch arm).
+                //
+                // Boundaries divide the 10%–90% workload window into
+                // `N + 1` equal intervals, producing `N` interior
+                // boundaries — `N == 1` lands a single sample at
+                // `start + 0.5 d` (midpoint); `N == 3` lands at
+                // 0.3 d, 0.5 d, 0.7 d. The 10% pre-boundary buffer
+                // and 10% post-boundary buffer give the workload
+                // ramp-up / ramp-down room without periodic samples
+                // landing on transient state.
+                //
+                // `next_periodic_idx` tracks how many boundaries
+                // have already fired. When the gate
+                // (`freeze_coord_on_demand_in_flight`) is held by a
+                // concurrent on-demand or watchpoint capture, the
+                // periodic boundary is deferred (NOT skipped) until
+                // a subsequent iteration finds the gate clear — the
+                // 10% buffer is the slack budget for this wait.
+                let mut periodic_boundaries_ns: Option<Vec<u64>> = None;
+                let mut next_periodic_idx: u32 = 0;
+                // Consecutive parked-vCPU rendezvous failures during
+                // periodic capture. Reset to 0 on every successful
+                // `freeze_and_capture(..)`. After 2 consecutive
+                // timeouts the run-loop abandons the remaining
+                // periodic boundaries and logs once — repeated
+                // 30 s rendezvous waits on a wedged guest would
+                // otherwise eat the entire wall-clock budget without
+                // producing useful captures, and a single abandoned
+                // boundary keeps periodic noise off a guest the
+                // operator already knows is degraded.
+                let mut periodic_consecutive_timeouts: u32 = 0;
+                let mut periodic_abandoned: bool = false;
+                const PERIODIC_TIMEOUT_ABANDON_THRESHOLD: u32 = 2;
                 // First iteration always runs scan-tick work so
                 // boot-race lazy resolution attempts fire
                 // immediately rather than waiting up to 100 ms for
@@ -1992,6 +2124,10 @@ impl KtstrVm {
                                             (watchdog_reset_for_coord.as_ref(), d, run_start)
                                         }),
                                         watchdog_pause_ns: watchdog_pause_for_coord.as_ref(),
+                                        scenario_start_ns: scenario_start_ns_for_coord.as_ref(),
+                                        scenario_pause_cumulative_ns:
+                                            scenario_pause_cumulative_for_coord.as_ref(),
+                                        run_start,
                                     };
                                     for msg in &drained.messages {
                                         if let Some(entry) =
@@ -4083,6 +4219,46 @@ impl KtstrVm {
                         // 0) is benign.
                         let _ = freeze_coord_parked_evt.read();
                     };
+                    // Helper: extend the watchdog deadline by the
+                    // wall-clock duration of a single
+                    // `freeze_and_capture(..)` cycle. Captures eat
+                    // host wall-clock that would otherwise count
+                    // against the workload's `workload_duration`
+                    // budget; without this push, a 5 s test that
+                    // fires a 2 s freeze gets only 3 s of guest
+                    // execution before the watchdog kicks. Reads the
+                    // current encoded reset target (or falls back to
+                    // `workload_duration` counted from now) and
+                    // writes back the sum + freeze_duration so the
+                    // watchdog observes the extended deadline on its
+                    // next tick. The watchdog only consults this
+                    // atomic when `workload_duration` is set; runs
+                    // without a workload budget remain on the
+                    // boot-relative `hard_deadline` and this push is
+                    // a no-op.
+                    //
+                    // Shared with the TLV CAPTURE handler, the
+                    // user-watchpoint dispatcher, and the periodic-
+                    // capture drain so the same arithmetic and
+                    // ordering discipline apply at every fire site.
+                    let extend_watchdog_for_freeze = |freeze_start: Instant| {
+                        if let Some(d) = workload_duration_for_coord {
+                            let freeze_duration = freeze_start.elapsed();
+                            let prior = watchdog_reset_for_coord.load(Ordering::Acquire);
+                            let prior_ns = if prior == 0 {
+                                run_start
+                                    .elapsed()
+                                    .as_nanos()
+                                    .saturating_add(d.as_nanos())
+                            } else {
+                                prior as u128
+                            };
+                            let new_target_ns =
+                                prior_ns.saturating_add(freeze_duration.as_nanos());
+                            let encoded = u64::try_from(new_target_ns).unwrap_or(u64::MAX).max(1);
+                            watchdog_reset_for_coord.store(encoded, Ordering::Release);
+                        }
+                    };
                     // Helper: persist the JSON to the optional file
                     // sink, then log a single info-level summary line
                     // referencing the file path + byte count +
@@ -4207,47 +4383,18 @@ impl KtstrVm {
                                 );
                                 // CAPTURE has no while-frozen work,
                                 // so thaw immediately after the
-                                // dump returns.
+                                // dump returns. Then extend the
+                                // watchdog deadline by the freeze
+                                // duration via the shared closure
+                                // (TLV CAPTURE / user watchpoint /
+                                // periodic-capture all use the same
+                                // arithmetic — see
+                                // `extend_watchdog_for_freeze` for
+                                // the full rationale).
                                 let freeze_start = Instant::now();
                                 let on_demand = freeze_and_capture(false);
                                 thaw_and_barrier();
-                                // Extend the watchdog deadline by the
-                                // freeze duration. Without this, vCPU
-                                // freeze time consumed by the on-demand
-                                // capture eats into the test's wall-
-                                // clock budget — a 5s test that fires a
-                                // 2s freeze gets only 3s of guest
-                                // execution before the watchdog kicks.
-                                // Reads the current encoded reset target
-                                // (or falls back to `workload_duration`
-                                // counted from now) and writes back the
-                                // sum + freeze_duration so the watchdog
-                                // observes the extended deadline on its
-                                // next tick. The watchdog only consults
-                                // this atomic when `workload_duration`
-                                // is set; runs without a workload budget
-                                // remain on the boot-relative
-                                // hard_deadline and this push is a no-op.
-                                if let Some(d) = workload_duration_for_coord {
-                                    let freeze_duration = freeze_start.elapsed();
-                                    let prior = watchdog_reset_for_coord
-                                        .load(Ordering::Acquire);
-                                    let prior_ns = if prior == 0 {
-                                        run_start
-                                            .elapsed()
-                                            .as_nanos()
-                                            .saturating_add(d.as_nanos())
-                                    } else {
-                                        prior as u128
-                                    };
-                                    let new_target_ns = prior_ns
-                                        .saturating_add(freeze_duration.as_nanos());
-                                    let encoded = u64::try_from(new_target_ns)
-                                        .unwrap_or(u64::MAX)
-                                        .max(1);
-                                    watchdog_reset_for_coord
-                                        .store(encoded, Ordering::Release);
-                                }
+                                extend_watchdog_for_freeze(freeze_start);
                                 let mut reply_status =
                                     crate::vmm::wire::SNAPSHOT_STATUS_OK;
                                 let mut reply_reason = String::new();
@@ -4457,6 +4604,230 @@ impl KtstrVm {
                         freeze_coord_on_demand_in_flight
                             .store(false, Ordering::Release);
                     }
+                    // Periodic-capture cadence runs BEFORE the
+                    // user-watchpoint dispatch below so periodic
+                    // boundaries get priority over Op::Snapshot /
+                    // Op::WatchSnapshot fires when both contend for
+                    // the same `freeze_coord_on_demand_in_flight`
+                    // gate. Iteration ordering within the body:
+                    // TLV CAPTURE runs first (request-reply,
+                    // self-throttling); periodic runs second with
+                    // priority over user-watchpoint hits.
+                    // Lazily compute the boundary list once
+                    // `num_snapshots > 0`, the workload duration is
+                    // known, and the first ScenarioStart has been
+                    // stamped — then on every iteration check
+                    // whether `now` has crossed the next un-fired
+                    // boundary, and fire a host-side
+                    // `freeze_and_capture(false)` for each crossed
+                    // boundary. Reuses the same gate
+                    // (`freeze_coord_on_demand_in_flight`) the
+                    // TLV CAPTURE / user-watchpoint paths use —
+                    // when the gate is held the boundary is
+                    // deferred to the next iteration rather than
+                    // skipped, so a burst of on-demand captures
+                    // cannot cause a missed periodic sample. The
+                    // 10% / 10% pre/post buffers in the boundary
+                    // formula are the budget that absorbs this
+                    // deferral lag.
+                    if freeze_coord_num_snapshots > 0 && !periodic_abandoned {
+                        if periodic_boundaries_ns.is_none()
+                            && let Some(workload_d) = workload_duration_for_coord
+                        {
+                            let scenario_anchor =
+                                scenario_start_ns_for_coord.load(Ordering::Relaxed);
+                            if scenario_anchor != 0 {
+                                let boundaries = compute_periodic_boundaries_ns(
+                                    scenario_anchor,
+                                    workload_d,
+                                    freeze_coord_num_snapshots,
+                                );
+                                tracing::info!(
+                                    target: "ktstr::failure_dump",
+                                    num_snapshots = freeze_coord_num_snapshots,
+                                    scenario_anchor_ns = scenario_anchor,
+                                    workload_duration_ns = workload_d.as_nanos() as u64,
+                                    "freeze-coord: periodic snapshot boundaries computed"
+                                );
+                                periodic_boundaries_ns = Some(boundaries);
+                            }
+                        }
+                        if let Some(ref boundaries) = periodic_boundaries_ns {
+                            // Drain every crossed boundary in this
+                            // iteration. `now_ns` is recomputed at
+                            // the top of every inner-loop iteration
+                            // so a mid-drain ScenarioPause /
+                            // ScenarioResume pair (a single periodic
+                            // capture can run for several seconds
+                            // through the parked-vCPU rendezvous)
+                            // shifts un-fired boundaries forward as
+                            // soon as the cumulative pause atomic
+                            // updates.
+                            loop {
+                                if (next_periodic_idx as usize) >= boundaries.len() {
+                                    break;
+                                }
+                                let raw_now_ns =
+                                    u64::try_from(run_start.elapsed().as_nanos())
+                                        .unwrap_or(u64::MAX);
+                                let cumulative_pause = scenario_pause_cumulative_for_coord
+                                    .load(Ordering::Acquire);
+                                let in_flight_pause_at = watchdog_pause_for_coord
+                                    .load(Ordering::Acquire);
+                                let in_flight_pause = if in_flight_pause_at > 0 {
+                                    raw_now_ns.saturating_sub(in_flight_pause_at)
+                                } else {
+                                    0
+                                };
+                                let now_ns = raw_now_ns
+                                    .saturating_sub(cumulative_pause)
+                                    .saturating_sub(in_flight_pause);
+                                if boundaries[next_periodic_idx as usize] > now_ns {
+                                    break;
+                                }
+                                if freeze_coord_kill.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                if freeze_coord_on_demand_in_flight
+                                    .swap(true, Ordering::AcqRel)
+                                {
+                                    // Gate held — defer (do NOT
+                                    // skip): leave next_periodic_idx
+                                    // as-is so the next iteration
+                                    // retries this same boundary
+                                    // once the gate clears.
+                                    tracing::info!(
+                                        target: "ktstr::failure_dump",
+                                        idx = next_periodic_idx,
+                                        tag = %periodic_tag(next_periodic_idx),
+                                        "freeze-coord: periodic snapshot deferred \
+                                         (in-flight gate held by another capture); \
+                                         retrying next iteration"
+                                    );
+                                    break;
+                                }
+                                let tag = periodic_tag(next_periodic_idx);
+                                tracing::info!(
+                                    target: "ktstr::failure_dump",
+                                    idx = next_periodic_idx,
+                                    %tag,
+                                    "freeze-coord: periodic snapshot boundary crossed"
+                                );
+                                let freeze_start = Instant::now();
+                                let on_demand = freeze_and_capture(false);
+                                thaw_and_barrier();
+                                extend_watchdog_for_freeze(freeze_start);
+                                if let Some((report, capture_start)) = on_demand {
+                                    let map_count = report.maps.len();
+                                    let vcpu_regs_count = report.vcpu_regs.len();
+                                    let tasks_enriched = report.task_enrichments.len();
+                                    if let Some(ref base_path) = freeze_coord_dump_path {
+                                        let tagged =
+                                            snapshot_tagged_path(base_path, &tag);
+                                        if let Some(parent) = tagged.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        if let Ok(json) =
+                                            serde_json::to_string(&report)
+                                            && let Err(e) =
+                                                std::fs::write(&tagged, &json)
+                                        {
+                                            tracing::warn!(
+                                                path = %tagged.display(),
+                                                error = %e,
+                                                "freeze-coord: periodic dump file write failed"
+                                            );
+                                        }
+                                    }
+                                    let elapsed_ms =
+                                        capture_start.elapsed().as_millis() as u64;
+                                    tracing::info!(
+                                        target: "ktstr::failure_dump",
+                                        kind = "periodic",
+                                        idx = next_periodic_idx,
+                                        %tag,
+                                        map_count,
+                                        vcpu_regs_count,
+                                        tasks_enriched,
+                                        elapsed_ms,
+                                        "freeze-coord: periodic snapshot captured"
+                                    );
+                                    freeze_coord_snapshot_bridge.store(&tag, report);
+                                    // Successful capture resets the
+                                    // consecutive-timeout counter so
+                                    // a transient rendezvous miss
+                                    // does not arm the abandon
+                                    // threshold for unrelated future
+                                    // boundaries.
+                                    periodic_consecutive_timeouts = 0;
+                                } else {
+                                    tracing::warn!(
+                                        idx = next_periodic_idx,
+                                        %tag,
+                                        "freeze-coord: periodic capture failed \
+                                         (freeze_and_capture returned None — most \
+                                         commonly a parked-vCPU rendezvous \
+                                         timeout); storing placeholder report"
+                                    );
+                                    let placeholder =
+                                        crate::monitor::dump::FailureDumpReport::placeholder(
+                                            "freeze rendezvous timed out",
+                                        );
+                                    freeze_coord_snapshot_bridge
+                                        .store(&tag, placeholder);
+                                    periodic_consecutive_timeouts =
+                                        periodic_consecutive_timeouts
+                                            .saturating_add(1);
+                                }
+                                freeze_coord_on_demand_in_flight
+                                    .store(false, Ordering::Release);
+                                next_periodic_idx =
+                                    next_periodic_idx.saturating_add(1);
+                                // Publish the live fire count so
+                                // run_vm can read it after the
+                                // coordinator joins and forward
+                                // onto VmResult::periodic_fired.
+                                periodic_fired_for_coord.store(
+                                    next_periodic_idx,
+                                    Ordering::Relaxed,
+                                );
+                                // After PERIODIC_TIMEOUT_ABANDON_THRESHOLD
+                                // consecutive rendezvous timeouts the
+                                // remaining boundaries are unlikely
+                                // to produce useful captures — every
+                                // fire costs up to
+                                // FREEZE_RENDEZVOUS_TIMEOUT (30 s)
+                                // of wall-clock waiting on a wedged
+                                // guest. Set the abandon flag and
+                                // break the inner drain; the outer
+                                // periodic guard short-circuits on
+                                // the next iteration.
+                                if periodic_consecutive_timeouts
+                                    >= PERIODIC_TIMEOUT_ABANDON_THRESHOLD
+                                    && !periodic_abandoned
+                                {
+                                    let remaining = boundaries
+                                        .len()
+                                        .saturating_sub(next_periodic_idx as usize);
+                                    tracing::warn!(
+                                        target: "ktstr::failure_dump",
+                                        consecutive_timeouts =
+                                            periodic_consecutive_timeouts,
+                                        threshold =
+                                            PERIODIC_TIMEOUT_ABANDON_THRESHOLD,
+                                        remaining_boundaries = remaining,
+                                        "freeze-coord: periodic capture abandoned \
+                                         after {} consecutive rendezvous timeouts \
+                                         ({} boundaries skipped)",
+                                        periodic_consecutive_timeouts,
+                                        remaining,
+                                    );
+                                    periodic_abandoned = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     // After every TLV-driven snapshot dispatch path
                     // runs, also service any user-watchpoint hits on
                     // slots 1..=3.
@@ -4593,36 +4964,10 @@ impl KtstrVm {
                                  commonly a parked-vCPU rendezvous timeout); \
                                  storing placeholder report"
                             );
-                            let placeholder = crate::monitor::dump::FailureDumpReport {
-                                schema: crate::monitor::dump::SCHEMA_SINGLE
-                                    .to_string(),
-                                maps: Vec::new(),
-                                vcpu_regs: Vec::new(),
-                                sdt_allocations: Vec::new(),
-                                prog_runtime_stats: Vec::new(),
-                                prog_runtime_stats_unavailable: Some(
-                                    "freeze rendezvous timed out".to_string(),
-                                ),
-                                per_cpu_time: Vec::new(),
-                                task_enrichments: Vec::new(),
-                                task_enrichments_unavailable: Some(
-                                    "freeze rendezvous timed out".to_string(),
-                                ),
-                                event_counter_timeline: Vec::new(),
-                                rq_scx_states: Vec::new(),
-                                dsq_states: Vec::new(),
-                                scx_sched_state: None,
-                                scx_walker_unavailable: Some(
-                                    "freeze rendezvous timed out".to_string(),
-                                ),
-                                vcpu_perf_at_freeze: Vec::new(),
-                                per_node_numa: Vec::new(),
-                                per_node_numa_unavailable: Some(
-                                    "freeze rendezvous timed out".to_string(),
-                                ),
-                                dump_truncated_at_us: None,
-                                probe_counters: None,
-                            };
+                            let placeholder =
+                                crate::monitor::dump::FailureDumpReport::placeholder(
+                                    "freeze rendezvous timed out",
+                                );
                             freeze_coord_snapshot_bridge.store(&tag, placeholder);
                         }
                         // Release the slot for future arm requests.
@@ -5170,35 +5515,9 @@ impl KtstrVm {
                          storing placeholder report (no capture possible during \
                          teardown — vCPU rendezvous would race teardown joins)"
                     );
-                    let placeholder = crate::monitor::dump::FailureDumpReport {
-                        schema: crate::monitor::dump::SCHEMA_SINGLE.to_string(),
-                        maps: Vec::new(),
-                        vcpu_regs: Vec::new(),
-                        sdt_allocations: Vec::new(),
-                        prog_runtime_stats: Vec::new(),
-                        prog_runtime_stats_unavailable: Some(
-                            "coord exited before capture".to_string(),
-                        ),
-                        per_cpu_time: Vec::new(),
-                        task_enrichments: Vec::new(),
-                        task_enrichments_unavailable: Some(
-                            "coord exited before capture".to_string(),
-                        ),
-                        event_counter_timeline: Vec::new(),
-                        rq_scx_states: Vec::new(),
-                        dsq_states: Vec::new(),
-                        scx_sched_state: None,
-                        scx_walker_unavailable: Some(
-                            "coord exited before capture".to_string(),
-                        ),
-                        vcpu_perf_at_freeze: Vec::new(),
-                        per_node_numa: Vec::new(),
-                        per_node_numa_unavailable: Some(
-                            "coord exited before capture".to_string(),
-                        ),
-                        dump_truncated_at_us: None,
-                        probe_counters: None,
-                    };
+                    let placeholder = crate::monitor::dump::FailureDumpReport::placeholder(
+                        "coord exited before capture",
+                    );
                     freeze_coord_snapshot_bridge.store(&tag, placeholder);
                 }
                 // Post-drain advisory: vCPU threads (BSP + APs) are
@@ -5258,6 +5577,55 @@ impl KtstrVm {
                 // completes the frame.
                 let coord_exit_t = std::time::Instant::now();
                 eprintln!("CLEANUP: coord loop exited");
+                // Periodic-capture teardown summary. When
+                // `num_snapshots > 0`, log the fired/total ratio so
+                // an operator reading the test's tracing output can
+                // tell at a glance whether the periodic-sampling
+                // path delivered. Three distinct shapes surface:
+                //   * `0/N` with no scenario_start_ns stamp — the
+                //     guest never published a CRC-valid
+                //     `MSG_TYPE_SCENARIO_START`, so boundaries were
+                //     never computed. Most commonly a guest that
+                //     crashed mid-boot or a workload that never
+                //     reached the host-comms phase.
+                //   * `0/N` with scenario_start_ns stamped — the
+                //     boundaries were computed but no boundary was
+                //     reached (very-short run, kill before first
+                //     boundary). The doc on
+                //     `KtstrTestEntry::num_snapshots` warns the
+                //     test author to assert `>= some_lower_bound`
+                //     rather than `== num_snapshots` exactly for
+                //     this case.
+                //   * `K/N` with `K < N` — the run terminated mid-
+                //     sequence. Same best-effort contract; tests
+                //     should assert `>= K` not `== N`.
+                if freeze_coord_num_snapshots > 0 {
+                    let scenario_anchor =
+                        scenario_start_ns_for_coord.load(Ordering::Acquire);
+                    if scenario_anchor == 0 {
+                        tracing::warn!(
+                            target: "ktstr::failure_dump",
+                            num_snapshots = freeze_coord_num_snapshots,
+                            fired = next_periodic_idx,
+                            "freeze-coord: 0/{} periodic snapshots fired — \
+                             scenario_start_ns never stamped (no CRC-valid \
+                             MSG_TYPE_SCENARIO_START observed). The guest most \
+                             likely crashed mid-boot or never reached the \
+                             host-comms phase; periodic sampling has no anchor",
+                            freeze_coord_num_snapshots,
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "ktstr::failure_dump",
+                            num_snapshots = freeze_coord_num_snapshots,
+                            fired = next_periodic_idx,
+                            scenario_anchor_ns = scenario_anchor,
+                            "freeze-coord: {}/{} periodic snapshots fired",
+                            next_periodic_idx,
+                            freeze_coord_num_snapshots,
+                        );
+                    }
+                }
                 let residual = bulk_assembler.take_residual();
                 if !residual.is_empty() {
                     freeze_coord_virtio_con.lock().push_back_bulk(&residual);
@@ -5801,6 +6169,23 @@ impl KtstrVm {
             // extraction so every frame the guest published reaches
             // the verdict.
             bulk_messages: freeze_coord_bulk_messages,
+            // Scheduler-stats client constructed at the top of
+            // `run_vm`. Its drainer thread has been alive since the
+            // guest started forwarding stats responses; the client
+            // is threaded onto `VmResult` for test-code access.
+            stats_client,
+            // Periodic-capture count published by the coordinator
+            // run-loop after every successful fire / placeholder
+            // store. Read AFTER `freeze_coord_handle.join()` ran so
+            // the AtomicU32's value is the final advance count;
+            // `collect_results` forwards onto
+            // `VmResult::periodic_fired`.
+            periodic_fired: periodic_fired_slot.load(Ordering::Relaxed),
+            // Configured periodic-target plumbed onto KtstrVm via
+            // `KtstrVmBuilder::num_snapshots`. Forwarded to
+            // `VmResult::periodic_target` so test code can compute
+            // coverage as `fired / target`.
+            periodic_target: self.num_snapshots,
             // Watchpoint Arc forwarded so `collect_results` can
             // invalidate `kind_host_ptr` and `request_kva` after
             // every vCPU thread joins but before `vm` drops.
@@ -7678,6 +8063,15 @@ impl KtstrVm {
         let cleanup_duration = Some(run.cleanup_start.elapsed());
         eprintln!("CLEANUP: collect_results done {:?}", cleanup_t.elapsed());
 
+        // Forward the scheduler-stats client. `run.stats_client` is
+        // `Some(_)` when the run has a scheduler attached and
+        // `None` otherwise; the field on `VmResult.stats_client`
+        // mirrors this exactly. The drainer thread (when present)
+        // continues to run until the last `Arc<ClientShared>` clone
+        // drops; `Drop` on the field then writes the kill eventfd
+        // and the drainer thread exits.
+        let stats_client = run.stats_client;
+
         Ok(VmResult {
             success: !timed_out && exit_code == 0,
             exit_code,
@@ -7695,6 +8089,9 @@ impl KtstrVm {
             virtio_blk_counters: run.virtio_blk_counters,
             virtio_net_counters: run.virtio_net_counters,
             snapshot_bridge: run.snapshot_bridge,
+            stats_client,
+            periodic_fired: run.periodic_fired,
+            periodic_target: run.periodic_target,
         })
     }
 

@@ -981,6 +981,33 @@ impl Default for FailureDumpReport {
     }
 }
 
+impl FailureDumpReport {
+    /// Build a placeholder report for a capture that could not
+    /// produce real data. Every `*_unavailable` field is set to
+    /// `Some(reason)` so downstream consumers (`stats compare`,
+    /// failure-rendering tooling) can distinguish "capture
+    /// happened, no data" from "capture path failed for reason X".
+    /// All vector / option fields stay at their `Default` empty
+    /// state so the report is structurally a real
+    /// `FailureDumpReport`, not a sentinel that breaks consumer
+    /// type contracts.
+    ///
+    /// Used by the freeze coordinator's user-watchpoint dispatch,
+    /// periodic-capture drain, and final-drain teardown — every
+    /// site that needs to publish a "capture attempted, did not
+    /// land" entry on the snapshot bridge.
+    pub fn placeholder(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            prog_runtime_stats_unavailable: Some(reason.clone()),
+            per_node_numa_unavailable: Some(reason.clone()),
+            task_enrichments_unavailable: Some(reason.clone()),
+            scx_walker_unavailable: Some(reason),
+            ..Self::default()
+        }
+    }
+}
+
 /// Pair of failure-dump snapshots captured at two points in a stall.
 ///
 /// `early` is taken when the host-side runnable_at scanner observes

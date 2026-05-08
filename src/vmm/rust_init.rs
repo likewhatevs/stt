@@ -696,6 +696,21 @@ pub(crate) fn ktstr_guest_init() -> ! {
     redirect_stdio_to_bulk_port();
     let t_stdio = t0.elapsed();
 
+    // Phase 2c: spawn the scheduler-stats relay UNCONDITIONALLY.
+    // Event-driven: the relay uses inotify to wait for the
+    // scheduler's `/var/run/scx/root/stats` socket to appear, and
+    // poll(2) to multiplex between the port fd, the socket fd, and
+    // a stop eventfd. No timeouts, no retry sleeps — the only
+    // wakeups are real I/O events or the stop edge written by
+    // phase-6 cleanup.
+    //
+    // By this point `redirect_stdio_to_bulk_port` has run (line
+    // above) and the bulk port has been opened, which proves the
+    // multiport handshake completed; `/dev/vport0p2` is already
+    // present, so the relay's first port-2 open succeeds without
+    // retry.
+    let stats_relay_stop = start_sched_stats_relay();
+
     tracing::debug!(
         mount_ms = t_mounts.as_millis() as u64,
         stdio_ms = t_stdio.as_millis() as u64,
@@ -959,6 +974,13 @@ pub(crate) fn ktstr_guest_init() -> ! {
     if let Some(ref stop) = vc_poll_stop {
         stop.store(true, Ordering::Release);
     }
+    // Flip the AtomicBool source-of-truth THEN write the stop
+    // eventfd. The relay's poll() loop watches stop_evt as one of
+    // its fds; the eventfd write wakes any blocked poll() within
+    // microseconds. We don't join the relay thread because the
+    // kernel reboot path tears down userspace synchronously and
+    // the relay exits when its blocking I/O returns EBADF/EOF.
+    stats_relay_stop.signal_stop();
     if let Some(ref handle) = sched_exit_stop {
         // Order: store `true` first so the monitor's `Acquire` load
         // at the top of its loop sees the stop flag. Then write the
@@ -2415,6 +2437,438 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
             // Died-arm comment.
             drain_probe_pipeline(probe_drain.as_ref());
             force_reboot();
+        }
+    }
+}
+
+/// Path of the scheduler-stats Unix socket inside the guest. Owned
+/// by the running scx_* scheduler binary (created via
+/// `scx_utils::stats::ScxStatsServer`). Empty when no scheduler is
+/// running.
+const SCHED_STATS_SOCKET: &str = "/var/run/scx/root/stats";
+
+/// Path of the guest-side stats relay's port-2 device node. The
+/// kernel virtio-console driver creates this when the multiport
+/// PORT_NAME control message lands ahead of PORT_OPEN; see
+/// [`crate::vmm::wire::PORT2_NAME`].
+const SCHED_STATS_PORT_DEV: &str = "/dev/vport0p2";
+
+/// Per-iteration scratch buffer size. Matches
+/// [`crate::vmm::sched_stats::MAX_REQUEST_BYTES`] (256 KiB) so a
+/// single legitimate request or response fits in one read. Larger
+/// payloads span multiple loop iterations.
+const RELAY_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Parent directory of the scheduler-stats Unix socket. The relay
+/// creates this directory if it doesn't exist (the scheduler
+/// userspace creates it before bind, but we may race) and watches
+/// it via inotify for the `stats` socket file's `IN_CREATE` event.
+const SCHED_STATS_SOCKET_DIR: &str = "/var/run/scx/root";
+
+/// File name (final component) of the scheduler-stats Unix socket
+/// inside [`SCHED_STATS_SOCKET_DIR`]. Matched against
+/// [`nix::sys::inotify::InotifyEvent::name`] entries to detect
+/// the scheduler's bind without polling.
+const SCHED_STATS_SOCKET_NAME: &str = "stats";
+
+/// Inline JSON error response the relay writes back to the host
+/// when it has not yet connected to (or has lost connection to)
+/// the scheduler's Unix socket. The host's
+/// [`crate::vmm::sched_stats::SchedStatsClient`] parses the
+/// `ktstr_relay_error` field into a typed
+/// [`crate::vmm::sched_stats::SchedStatsError::NoScheduler`]. The
+/// trailing `\n` matches scx_stats's line-delimited wire format.
+const SCHED_STATS_RELAY_NO_SCHEDULER_REPLY: &[u8] =
+    b"{\"ktstr_relay_error\":\"no scheduler available\"}\n";
+
+/// Stop signal for the scheduler-stats relay thread. Carries an
+/// `AtomicBool` source-of-truth flag plus an `EventFd` wake fd so
+/// callers in phase-6 cleanup can interrupt a relay that is parked
+/// in `poll(2)` without waiting for any timeout. The relay
+/// registers the eventfd in its poll set and re-checks the
+/// AtomicBool at every wake.
+pub(crate) struct RelayStopSignal {
+    flag: Arc<AtomicBool>,
+    evt: Arc<vmm_sys_util::eventfd::EventFd>,
+}
+
+impl RelayStopSignal {
+    /// Flip the source-of-truth flag and write the eventfd. The
+    /// flag is set with `Release` before the fd write so a relay
+    /// that wakes on the eventfd edge observes `true` on its
+    /// `Acquire` load. Errors from the eventfd write are silently
+    /// ignored — the AtomicBool is authoritative and a saturated
+    /// counter (or torn fd) just means the relay's next natural
+    /// wake re-checks the flag.
+    fn signal_stop(&self) {
+        self.flag.store(true, Ordering::Release);
+        let _ = self.evt.write(1);
+    }
+}
+
+/// Spawn the scheduler-stats relay thread.
+///
+/// Event-driven design: the relay opens [`SCHED_STATS_PORT_DEV`]
+/// once (no retry — `redirect_stdio_to_bulk_port` already proved
+/// the multiport handshake completed by the time this is called),
+/// then runs an outer loop that:
+///
+/// 1. Waits for the scheduler's Unix socket to appear via inotify
+///    (no sleep loop).
+/// 2. Connects, then poll(2)s on the port fd, the socket fd, and
+///    the stop eventfd. On port→socket data arriving, forwards
+///    the bytes; on socket→host data, forwards back; on socket
+///    EOF/error, writes the inline error envelope to the port and
+///    falls back to inotify wait; on stop, returns.
+///
+/// Returns a [`RelayStopSignal`] the caller flips on teardown.
+/// The thread is detached; the kernel reboot path tears down both
+/// device nodes synchronously, so the relay exits when its
+/// blocking I/O returns EBADF/EOF.
+fn start_sched_stats_relay() -> RelayStopSignal {
+    use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
+    let flag = Arc::new(AtomicBool::new(false));
+    let evt = match EventFd::new(EFD_NONBLOCK) {
+        Ok(e) => Arc::new(e),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "stats relay: eventfd create failed; relay disabled \
+                 (host SchedStatsClient calls will hang on shutdown)"
+            );
+            // Return a flag-only signal; the relay never spawns.
+            return RelayStopSignal {
+                flag,
+                evt: Arc::new(EventFd::new(0).unwrap_or_else(|_| {
+                    // Last-resort: try without EFD_NONBLOCK. If
+                    // even this fails, the host is in a degraded
+                    // state where no relay can run anyway.
+                    panic!("stats relay: cannot create any eventfd")
+                })),
+            };
+        }
+    };
+    let flag_for_thread = flag.clone();
+    let evt_for_thread = evt.clone();
+    let _ = std::thread::Builder::new()
+        .name("ktstr-sched-stats-relay".into())
+        .spawn(move || {
+            sched_stats_relay_loop(flag_for_thread, evt_for_thread);
+        });
+    RelayStopSignal { flag, evt }
+}
+
+/// Inner loop for the stats relay thread. Opens the port-2 device
+/// node once (single open — the multiport handshake completed
+/// before this function was called) and drives the outer
+/// inotify-wait → connect → poll-relay-session cycle until `stop`
+/// flips.
+fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eventfd::EventFd>) {
+    let mut port = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(SCHED_STATS_PORT_DEV)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = SCHED_STATS_PORT_DEV,
+                "stats relay: open vport0p2 failed; relay disabled"
+            );
+            return;
+        }
+    };
+
+    // Outer loop: wait for socket via inotify, connect, run
+    // session, fall back to inotify on socket failure. Stops only
+    // when stop_evt fires (signal_stop flipped the flag and woke
+    // every blocked syscall).
+    while !stop.load(Ordering::Acquire) {
+        match wait_for_stats_socket(&stop, &stop_evt) {
+            Some(socket) => {
+                run_relay_session(&mut port, socket, &stop, &stop_evt);
+                // Session ended (socket EOF/error or stop).
+                // Loop and re-wait via inotify if not stopping.
+            }
+            None => {
+                // wait_for_stats_socket returned None only when
+                // stop flipped or inotify itself errored. Either
+                // way, exit.
+                return;
+            }
+        }
+    }
+}
+
+/// Block (event-driven) until the scheduler's Unix socket exists,
+/// then connect and return the stream. Uses inotify on the parent
+/// directory to receive a `IN_CREATE` event when the scheduler
+/// binds. Returns `None` only when `stop_evt` fires or inotify
+/// itself errors out.
+///
+/// Race-free initial check: after setting up the watch, attempt
+/// to connect once. If the socket already exists (scheduler
+/// finished binding before we created the watch) the connect
+/// succeeds and we return without ever reading from inotify.
+fn wait_for_stats_socket(
+    stop: &Arc<AtomicBool>,
+    stop_evt: &Arc<vmm_sys_util::eventfd::EventFd>,
+) -> Option<std::os::unix::net::UnixStream> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+    use std::ffi::OsStr;
+    use std::os::unix::io::AsFd;
+
+    // Best-effort: ensure the parent directory exists so the
+    // inotify watch can attach. The scheduler creates this
+    // directory before bind, but we may race; pre-creating is
+    // idempotent.
+    let _ = fs::create_dir_all(SCHED_STATS_SOCKET_DIR);
+
+    let inotify = match Inotify::init(InitFlags::IN_CLOEXEC) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(error = %e, "stats relay: inotify_init failed");
+            return None;
+        }
+    };
+    if let Err(e) = inotify.add_watch(
+        SCHED_STATS_SOCKET_DIR,
+        AddWatchFlags::IN_CREATE | AddWatchFlags::IN_MOVED_TO,
+    ) {
+        tracing::warn!(
+            error = %e,
+            dir = SCHED_STATS_SOCKET_DIR,
+            "stats relay: inotify add_watch failed"
+        );
+        return None;
+    }
+
+    // Race-free initial probe: socket may already exist before the
+    // watch was added. Try connect; on success skip the loop.
+    if stop.load(Ordering::Acquire) {
+        return None;
+    }
+    if let Ok(s) = std::os::unix::net::UnixStream::connect(SCHED_STATS_SOCKET) {
+        tracing::debug!("stats relay: connected to scheduler socket (race-free initial probe)");
+        return Some(s);
+    }
+
+    // Park on poll(inotify_fd, stop_evt). Each wake re-reads any
+    // queued inotify events; if the `stats` filename appears, try
+    // connect. If stop_evt fires, return None.
+    let target = OsStr::new(SCHED_STATS_SOCKET_NAME);
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let inotify_fd = inotify.as_fd();
+        // `vmm_sys_util::EventFd` predates `AsFd` and impls only
+        // `AsRawFd`. Lift its raw fd into a `BorrowedFd` for the
+        // duration of this poll call. SAFETY: `stop_evt` is held
+        // by the surrounding `Arc`, so the raw fd is valid for
+        // the whole loop body.
+        let stop_evt_fd =
+            unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stop_evt.as_raw_fd()) };
+        let mut fds = [
+            PollFd::new(inotify_fd, PollFlags::POLLIN),
+            PollFd::new(stop_evt_fd, PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "stats relay: poll on inotify failed");
+                return None;
+            }
+        };
+        // Stop-fd ready? Drain and exit. Source-of-truth check
+        // happens at the top of the loop on the next iteration,
+        // but exit unconditionally on this edge — the only writer
+        // is `RelayStopSignal::signal_stop`.
+        if fds[1]
+            .revents()
+            .is_some_and(|r| r.contains(PollFlags::POLLIN))
+        {
+            let _ = stop_evt.read();
+            return None;
+        }
+        // inotify fd ready: drain events. Any event with the
+        // socket filename triggers a connect attempt.
+        if fds[0]
+            .revents()
+            .is_some_and(|r| r.contains(PollFlags::POLLIN))
+        {
+            let events = match inotify.read_events() {
+                Ok(e) => e,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stats relay: inotify read_events failed");
+                    return None;
+                }
+            };
+            let saw_target = events.iter().any(|ev| ev.name.as_deref() == Some(target));
+            if !saw_target {
+                continue;
+            }
+            // Try connect. The socket file exists (we just saw
+            // its CREATE); connect can still fail transiently if
+            // the scheduler hasn't called listen() yet, in which
+            // case loop back into poll — the next event (which
+            // will be IN_OPEN once the scheduler accepts) brings
+            // us back here.
+            match std::os::unix::net::UnixStream::connect(SCHED_STATS_SOCKET) {
+                Ok(s) => {
+                    tracing::debug!("stats relay: connected to scheduler socket via inotify edge");
+                    return Some(s);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "stats relay: socket appeared but connect failed; \
+                         continuing to poll inotify"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Run a single port-↔-socket relay session. Returns when the
+/// socket reports an error (scheduler restart) or `stop_evt`
+/// fires. Uses poll(2) on (port_fd, socket_fd, stop_evt) so the
+/// thread blocks in the kernel until exactly one of those fds is
+/// readable — no spinning, no timeouts, and `stop_evt` interrupts
+/// any blocked I/O within microseconds.
+///
+/// Single-thread serialization: the relay is the only writer and
+/// the only reader of `/dev/vport0p2` inside the guest, so no
+/// userspace mutex around the port fd is required. scx_stats
+/// requests are strictly request/response on a single socket
+/// connection — no req-id multiplexing — so the natural ordering
+/// of the relay's per-iteration loop (read host → write socket
+/// → read socket → write host) preserves the protocol semantics.
+fn run_relay_session(
+    port: &mut std::fs::File,
+    mut socket: std::os::unix::net::UnixStream,
+    stop: &Arc<AtomicBool>,
+    stop_evt: &Arc<vmm_sys_util::eventfd::EventFd>,
+) {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::io::ErrorKind;
+    use std::os::unix::io::AsFd;
+
+    let mut buf = vec![0u8; RELAY_BUFFER_BYTES];
+
+    while !stop.load(Ordering::Acquire) {
+        // Wait for one of: host pushed bytes (port readable),
+        // scheduler emitted bytes (socket readable), or shutdown
+        // (stop_evt readable). Wrap the poll call in an inner
+        // scope so the `fds` array (and the immutable borrows on
+        // port + socket it holds) drops before we try to read or
+        // write either of them.
+        let (port_ready, socket_in, socket_hup, stop_ready) = {
+            let port_fd = port.as_fd();
+            let socket_fd = socket.as_fd();
+            // SAFETY: `stop_evt` is held by the surrounding `Arc`,
+            // so the raw fd is valid for the whole inner scope.
+            let stop_evt_fd =
+                unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stop_evt.as_raw_fd()) };
+            let mut fds = [
+                PollFd::new(port_fd, PollFlags::POLLIN),
+                PollFd::new(socket_fd, PollFlags::POLLIN),
+                PollFd::new(stop_evt_fd, PollFlags::POLLIN),
+            ];
+            match poll(&mut fds, PollTimeout::NONE) {
+                Ok(_) => {}
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stats relay: poll failed; exiting session");
+                    return;
+                }
+            }
+            // Snapshot the revents and drop the borrows.
+            let port_rev = fds[0].revents();
+            let socket_rev = fds[1].revents();
+            let stop_rev = fds[2].revents();
+            let port_ready = port_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
+            let socket_in = socket_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
+            let socket_hup = socket_rev.is_some_and(|r| {
+                (r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR))
+                    && !r.contains(PollFlags::POLLIN)
+            });
+            let stop_ready = stop_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
+            (port_ready, socket_in, socket_hup, stop_ready)
+        };
+
+        // Stop edge: drain and exit.
+        if stop_ready {
+            let _ = stop_evt.read();
+            return;
+        }
+
+        // Host→guest port readable: read bytes and forward to
+        // socket. The socket forward is a blocking write — bounded
+        // by the kernel's Unix-socket buffer, not by any user
+        // timeout.
+        if port_ready {
+            let n = match port.read(&mut buf) {
+                Ok(0) => {
+                    tracing::debug!("stats relay: port read EOF; exiting session");
+                    return;
+                }
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stats relay: port read error; exiting session");
+                    return;
+                }
+            };
+            if let Err(e) = socket.write_all(&buf[..n]) {
+                tracing::debug!(
+                    error = %e,
+                    "stats relay: socket write failed; emitting error envelope and reconnecting"
+                );
+                let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+                return;
+            }
+        }
+
+        // Scheduler→host socket readable: read response bytes and
+        // forward to port.
+        if socket_in {
+            let m = match socket.read(&mut buf) {
+                Ok(0) => {
+                    tracing::debug!(
+                        "stats relay: socket EOF; emitting error envelope and reconnecting"
+                    );
+                    let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+                    return;
+                }
+                Ok(m) => m,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "stats relay: socket read error; emitting error envelope and reconnecting"
+                    );
+                    let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+                    return;
+                }
+            };
+            if let Err(e) = port.write_all(&buf[..m]) {
+                tracing::warn!(error = %e, "stats relay: port write failed; exiting session");
+                return;
+            }
+        }
+
+        // Hangup on socket without data: detect explicitly so we
+        // don't spin re-arming poll on a dead fd.
+        if socket_hup {
+            tracing::debug!("stats relay: socket POLLHUP/POLLERR without data; reconnecting");
+            let _ = port.write_all(SCHED_STATS_RELAY_NO_SCHEDULER_REPLY);
+            return;
         }
     }
 }

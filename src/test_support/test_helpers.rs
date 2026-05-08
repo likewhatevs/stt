@@ -264,6 +264,9 @@ pub(crate) fn make_vm_result(
             let cb: crate::scenario::snapshot::CaptureCallback = std::sync::Arc::new(|_| None);
             crate::scenario::snapshot::SnapshotBridge::new(cb)
         },
+        stats_client: None,
+        periodic_fired: 0,
+        periodic_target: 0,
     }
 }
 

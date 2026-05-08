@@ -48,6 +48,16 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///   - `cleanup_budget_ms = N` — sub-watchdog cap on host-side VM
 ///     teardown wall time; maps onto `KtstrTestEntry::cleanup_budget`
 ///     as `Duration::from_millis(N)`. Default: `None` (unenforced).
+///   - `num_snapshots = N` — fire `N` periodic
+///     `freeze_and_capture(false)` boundaries inside the workload's
+///     10 %–90 % window, stored on the host
+///     `SnapshotBridge` under `periodic_NNN`. `0` (default)
+///     disables periodic capture entirely. Maps onto
+///     `KtstrTestEntry::num_snapshots`; runtime
+///     `KtstrTestEntry::validate` rejects values past the bridge
+///     cap (`MAX_STORED_SNAPSHOTS`), `host_only = true`, and
+///     duration / `N` settings that would land boundaries closer
+///     than 100 ms apart.
 ///   - `scheduler = PATH` — path to a `const Payload` (typically
 ///     produced by `Payload::from_scheduler(&...)`). Maps onto
 ///     `KtstrTestEntry::scheduler`, which is typed
@@ -75,6 +85,16 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///     must have signature
 ///     `fn(&ktstr::vmm::VmResult) -> anyhow::Result<()>`.
 ///     Default: `None` (no callback).
+///   - `config = EXPR` — inline scheduler config content, written
+///     into the guest at the path declared by the scheduler's
+///     `config_file_def`. `EXPR` is either a string literal or a
+///     path to a `const &'static str` (e.g. `LAYERED_CONFIG`).
+///     Maps onto `KtstrTestEntry::config_content`. Required when
+///     the scheduler declares `config_file_def`; rejected when the
+///     scheduler does not. The pairing is enforced at compile time
+///     via a `const` assertion against `Payload::config_file_def`,
+///     and again at runtime by `KtstrTestEntry::validate` so direct
+///     programmatic-entry construction sees the same gate.
 #[proc_macro_attribute]
 pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -146,6 +166,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut duration_s_set = false;
     let mut workers_per_cgroup: u32 = 2;
     let mut workers_per_cgroup_set = false;
+    let mut num_snapshots: u32 = 0;
+    let mut num_snapshots_set = false;
     let mut bpf_map_write: Option<syn::Path> = None;
     let mut expect_err: bool = false;
     let mut expect_err_set = false;
@@ -153,6 +175,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut host_only_set = false;
     let mut cleanup_budget_ms: Option<u64> = None;
     let mut post_vm: Option<syn::Path> = None;
+    let mut config_expr: Option<proc_macro2::TokenStream> = None;
+    let mut config_set = false;
 
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match attr_parser.parse(attr) {
@@ -276,6 +300,43 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
                         post_vm = Some(p);
                     }
+                    "config" => {
+                        if config_set {
+                            return syn::Error::new_spanned(
+                                path,
+                                "duplicate `config = ...` — each test declares at \
+                                 most one inline scheduler config",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        // Accept either a string literal (`config = "..."`) or a
+                        // path to a `const &'static str` (`config = MY_CONFIG`).
+                        // The field is `Option<&'static str>`, so any other
+                        // expression shape would either not borrow as `'static`
+                        // or fail to coerce — reject early with a targeted error
+                        // instead of letting rustc surface a confusing borrow /
+                        // type-mismatch diagnostic at the spread site.
+                        let tokens = match value {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Str(_),
+                                ..
+                            }) => quote! { #value },
+                            syn::Expr::Path(_) => quote! { #value },
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected string literal or path to a \
+                                     `const &'static str` for `config` (e.g. \
+                                     `config = \"{...}\"` or `config = MY_CONFIG`)",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        config_expr = Some(tokens);
+                        config_set = true;
+                    }
                     "auto_repro" | "not_starved" | "isolation" | "performance_mode"
                     | "requires_smt" | "expect_err" | "fail_on_stall" | "host_only" => {
                         let lit_bool = match value {
@@ -337,7 +398,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     | "max_numa_nodes"
                     | "max_cpus"
                     | "max_p99_wake_latency_ns"
-                    | "cleanup_budget_ms" => {
+                    | "cleanup_budget_ms"
+                    | "num_snapshots" => {
                         let lit_int = match value {
                             syn::Expr::Lit(syn::ExprLit {
                                 lit: syn::Lit::Int(li),
@@ -418,6 +480,12 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .base10_parse::<u32>()
                                     .unwrap_or_else(|e| panic!("{e}"));
                                 workers_per_cgroup_set = true;
+                            }
+                            "num_snapshots" => {
+                                num_snapshots = lit_int
+                                    .base10_parse::<u32>()
+                                    .unwrap_or_else(|e| panic!("{e}"));
+                                num_snapshots_set = true;
                             }
                             "max_local_dsq_depth" => {
                                 max_local_dsq_depth = Some(
@@ -628,7 +696,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only, cleanup_budget_ms, post_vm"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only, cleanup_budget_ms, post_vm, config, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
@@ -1093,6 +1161,11 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     } else {
         quote! {}
     };
+    let num_snapshots_field = if num_snapshots_set {
+        quote! { num_snapshots: #num_snapshots, }
+    } else {
+        quote! {}
+    };
     let expect_err_field = if expect_err_set {
         quote! { expect_err: #expect_err, }
     } else {
@@ -1120,6 +1193,50 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { post_vm: Some(#p), }
     } else {
         quote! {}
+    };
+    // `config = EXPR` lands in `KtstrTestEntry::config_content`, which
+    // is `Option<&'static str>`. Wrap the user-supplied expression in
+    // `Some(...)` at emission so the spread site sees a typed Option.
+    let config_content_field = if let Some(ref tokens) = config_expr {
+        quote! { config_content: ::core::option::Option::Some(#tokens), }
+    } else {
+        quote! {}
+    };
+
+    // Compile-time assert: `config = ...` must be paired with a
+    // scheduler that declares `config_file_def`, and vice versa. The
+    // macro can't read the scheduler const's value (it sees only a
+    // path), but both `Payload::config_file_def` and `Option::is_some`
+    // are `const fn`, so a `const _: () = assert!(...)` block can
+    // verify the pairing at compile time. The `KtstrTestEntry::validate`
+    // method enforces the same gate at runtime so direct programmatic
+    // construction doesn't bypass the macro path.
+    let config_set_lit = config_set;
+    let pairing_assert_const_name = format_ident!(
+        "__KTSTR_CONFIG_PAIRING_{}",
+        orig_name.to_string().to_uppercase()
+    );
+    let pairing_assert = quote! {
+        const #pairing_assert_const_name: () = {
+            let has_def = (#scheduler_tokens).config_file_def().is_some();
+            let has_content: bool = #config_set_lit;
+            if has_def && !has_content {
+                panic!(
+                    "scheduler declares `config_file_def` but the test \
+                     does not supply `config = ...`; provide an inline \
+                     scheduler config or remove `config_file_def` from \
+                     the scheduler definition"
+                );
+            }
+            if !has_def && has_content {
+                panic!(
+                    "test supplies `config = ...` but the scheduler does \
+                     not declare `config_file_def`; remove `config = ...` \
+                     or add `config_file_def(arg_template, guest_path)` \
+                     to the scheduler definition"
+                );
+            }
+        };
     };
 
     let test_body = if expect_err {
@@ -1290,13 +1407,17 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #performance_mode_field
             #duration_field
             #workers_per_cgroup_field
+            #num_snapshots_field
             #expect_err_field
             #host_only_field
             #extra_include_files_field
             #cleanup_budget_field
             #post_vm_field
+            #config_content_field
             ..::ktstr::test_support::KtstrTestEntry::DEFAULT
         };
+
+        #pairing_assert
 
         #[test]
         fn #orig_name() {

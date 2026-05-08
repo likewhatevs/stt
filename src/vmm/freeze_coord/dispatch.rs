@@ -83,6 +83,37 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// ScenarioPause stores current elapsed; ScenarioStart clears
     /// it and extends the deadline by the pause duration.
     pub watchdog_pause_ns: &'a std::sync::atomic::AtomicU64,
+    /// First-`ScenarioStart` timestamp (nanos since `run_start`),
+    /// biased by `+1` so `0` means "not yet observed". The first
+    /// CRC-valid `MSG_TYPE_SCENARIO_START` frame stamps
+    /// `(run_start.elapsed().as_nanos() as u64).max(1)` here via
+    /// a one-shot `compare_exchange(0, ..)`; subsequent ScenarioStart
+    /// frames (the guest may publish multiple if the workload
+    /// re-runs) leave the prior stamp untouched. Consumed by the
+    /// freeze coordinator's periodic-capture loop to anchor the
+    /// 10%–90% workload-duration window for `KtstrTestEntry::num_snapshots`
+    /// boundaries — boot + verifier time before the first
+    /// ScenarioStart does not eat the budget.
+    pub scenario_start_ns: &'a std::sync::atomic::AtomicU64,
+    /// Cumulative wall-clock pause time observed between matched
+    /// `MSG_TYPE_SCENARIO_PAUSE` / `MSG_TYPE_SCENARIO_RESUME` pairs
+    /// (nanoseconds). Bumped on every `ScenarioResume` by
+    /// `(now - paused_at)`. Periodic-capture boundaries in the
+    /// coord run-loop are anchored to workload time, not wall-clock
+    /// time — they subtract this cumulative pause from
+    /// `run_start.elapsed()` so a guest that pauses for `P` ns
+    /// shifts every un-fired boundary by `P` ns, matching the
+    /// guest's logical clock.
+    pub scenario_pause_cumulative_ns: &'a std::sync::atomic::AtomicU64,
+    /// Run-start anchor for elapsed-time computations. Available
+    /// unconditionally (no `Option` wrapper) so the
+    /// `MSG_TYPE_SCENARIO_START` arm can stamp
+    /// [`Self::scenario_start_ns`] regardless of whether the
+    /// caller wired up a watchdog reset budget — periodic capture
+    /// (which consumes the stamp) only requires
+    /// `workload_duration` at the run-loop level, not at the
+    /// dispatch level.
+    pub run_start: std::time::Instant,
 }
 
 /// Classify and dispatch a single [`BulkMessage`] from the port-1
@@ -227,13 +258,35 @@ pub(super) fn dispatch_bulk_message(
             None
         }
         Some(crate::vmm::wire::MsgType::ScenarioStart) => {
-            if msg.crc_ok
-                && let Some((reset_ns, duration, run_start)) = sinks.watchdog_reset.as_ref()
-            {
-                let elapsed = run_start.elapsed();
-                let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
-                let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
-                reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+            if msg.crc_ok {
+                // One-shot stamp of scenario_start_ns at the FIRST
+                // observation, hoisted OUTSIDE the watchdog_reset
+                // gate so it fires even when the caller did not
+                // wire a workload-duration budget. Bias `+1` keeps
+                // 0 as the "unset" sentinel so the periodic-capture
+                // loop can distinguish "no scenario started yet"
+                // from "scenario started exactly at run_start".
+                // `compare_exchange` (rather than `store`) makes
+                // the stamp idempotent — a guest that publishes
+                // ScenarioStart more than once (workload re-runs,
+                // multi-phase tests) leaves the first anchor in
+                // place. Relaxed ordering is enough: the periodic
+                // loop runs in the same coordinator thread, so
+                // happens-before is local; no other thread
+                // observes this slot.
+                let elapsed = sinks.run_start.elapsed();
+                let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1);
+                let _ = sinks.scenario_start_ns.compare_exchange(
+                    0,
+                    elapsed_ns,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if let Some((reset_ns, duration, _)) = sinks.watchdog_reset.as_ref() {
+                    let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
+                    let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
+                    reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                }
             }
             Some(crate::vmm::wire::ShmEntry {
                 msg_type: msg.msg_type,
@@ -273,6 +326,24 @@ pub(super) fn dispatch_bulk_message(
                     let extended = (prior as u128).saturating_add(pause_duration);
                     let encoded = u64::try_from(extended).unwrap_or(u64::MAX).max(1);
                     reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                    // Bump the periodic-capture cumulative pause
+                    // counter by the same `pause_duration`. Periodic
+                    // boundaries are anchored to workload time, so a
+                    // guest that paused for `pause_duration` ns
+                    // shifts every un-fired boundary by that amount
+                    // — the run-loop subtracts this cumulative pause
+                    // from `run_start.elapsed()` to compute effective
+                    // workload-time. Saturating add keeps the bump
+                    // honest under the (essentially-unreachable) case
+                    // where total pause time exceeds u64::MAX ns.
+                    let prior_cumulative = sinks
+                        .scenario_pause_cumulative_ns
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let new_cumulative = (prior_cumulative as u128).saturating_add(pause_duration);
+                    let encoded_cumulative = u64::try_from(new_cumulative).unwrap_or(u64::MAX);
+                    sinks
+                        .scenario_pause_cumulative_ns
+                        .store(encoded_cumulative, std::sync::atomic::Ordering::Release);
                 }
             }
             Some(crate::vmm::wire::ShmEntry {
