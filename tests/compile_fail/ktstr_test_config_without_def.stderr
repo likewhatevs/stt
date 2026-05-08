@@ -3,5 +3,3 @@ error[E0080]: evaluation panicked: test supplies `config = ...` but the schedule
   |
 8 | #[ktstr_test(config = "{}")]
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `__KTSTR_CONFIG_PAIRING_CONFIG_WITHOUT_DEF` failed here
-  |
-  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -376,11 +376,16 @@ pub fn kernel_build_pipeline(
     // the operator's escape hatch with the LLC-flock bypass; that
     // env var already declares "I accept noise from concurrent runs."
     //
-    // `try_flock` is non-blocking — if a concurrent peer holds the
-    // lock, it returns `Ok(None)` and we bail with an actionable error
-    // pointing at `cargo ktstr locks` for diagnosis. A blocking acquire
-    // here would silently stall the operator's terminal with no
-    // indication why; a fail-fast surfaces the contention immediately.
+    // `acquire_source_tree_lock` does a non-blocking `try_flock`
+    // first; on EWOULDBLOCK it surfaces the holder via
+    // `/proc/locks` (so the operator's terminal shows which peer is
+    // holding the lock) and then parks in a blocking `flock(LOCK_EX)`
+    // until the holder releases. The wait is intentional: when the
+    // peer's build finishes, the cache slot is likely populated and
+    // the post-acquire cache check below short-circuits the
+    // redundant rebuild. The pre-wait `eprintln!` inside
+    // `acquire_source_tree_lock` ensures the operator sees what
+    // they're waiting on rather than a silent stall.
     let _source_lock = if is_local_source
         && std::env::var("KTSTR_BYPASS_LLC_LOCKS")
             .ok()
@@ -997,46 +1002,199 @@ mod tests {
     }
 
     /// `acquire_source_tree_lock` on a path whose lockfile is
-    /// already held by a peer in this process returns an error
-    /// citing the source tree path AND the actionable
-    /// `cargo ktstr locks` hint. Pins the EWOULDBLOCK diagnostic
-    /// shape — a regression that swallowed the actionable hint or
-    /// degraded to a blocking acquire would surface here.
+    /// already held by a peer parks in a blocking flock(2) until the
+    /// holder releases, then succeeds. Pins the try-then-wait
+    /// contract: a regression that re-introduced the bail-on-EWOULDBLOCK
+    /// behavior, or any other path that returns without ever calling
+    /// `flock(LOCK_EX)` blocking, would surface here as either the
+    /// `/proc/locks` waiter scan timing out (no `-> FLOCK` line ever
+    /// appears against the lockfile inode) or the worker's elapsed
+    /// time being below the holder-retention window.
     ///
-    /// We simulate "concurrent peer" by holding the first FD in
-    /// the same process: `try_flock` is non-blocking, so a second
-    /// acquire of the same lockfile returns `Ok(None)` and the
-    /// helper bails with the actionable error.
+    /// We simulate "concurrent peer" by holding the first FD on the
+    /// main thread, spawn a worker that issues a second acquire (which
+    /// blocks in `block_flock`), poll `/proc/locks` until the kernel
+    /// records the worker as a waiter against the lockfile inode
+    /// (kernel emits blocked flock waiters as lines containing both
+    /// `->` and the `{major:02x}:{minor:02x}:{inode}` triple — see
+    /// `fs/locks.c::lock_get_status`), retain the holder for a fixed
+    /// window after the waiter appears so the worker's blocking call
+    /// can be measured, drop the holder, then collect the worker's
+    /// `Result` via `recv_timeout` so a real regression that caused
+    /// the worker to hang forever surfaces as a bounded test failure
+    /// rather than an indefinite test-runner stall.
+    ///
+    /// Two assertions guard the blocking semantic together:
+    ///   1. The `/proc/locks` waiter scan: proves the worker entered
+    ///      the kernel's blocked-flock state. A non-blocking
+    ///      regression never enters that state.
+    ///   2. The worker's measured elapsed time `>= HOLD_WINDOW`:
+    ///      proves the worker stayed parked until the holder
+    ///      released. A non-blocking regression that eagerly
+    ///      returned `Err` would record a near-zero elapsed time
+    ///      even if the waiter scan happened to be flaky.
     #[test]
-    fn acquire_source_tree_lock_contention_returns_actionable_error() {
+    fn acquire_source_tree_lock_blocks_on_contention_then_succeeds() {
         use crate::test_support::test_helpers::{isolated_cache_dir, lock_env};
+        // `_env_lock` and `cache` MUST outlive the spawned worker
+        // thread. The worker reads `KTSTR_CACHE_DIR` inside
+        // `acquire_source_tree_lock`'s `CacheDir::new()`; if
+        // `IsolatedCacheDir`'s drop ran while the worker was still
+        // resolving the cache root, the worker would observe a
+        // restored / empty env var and either land outside the
+        // tempdir or fail with a stale-cache-root error. The bindings
+        // below are declared here and dropped at end-of-scope, AFTER
+        // the explicit `worker_result` collection point below.
         let _env_lock = lock_env();
-        let _cache = isolated_cache_dir();
+        let cache = isolated_cache_dir();
         let canonical = std::path::PathBuf::from("/tmp/fake-source-contention");
-        let _holder = acquire_source_tree_lock(&canonical, "test")
+        let holder = acquire_source_tree_lock(&canonical, "test")
             .expect("first acquire must succeed under isolated cache");
-        // Second acquire of the same path — must fail because the
-        // first FD still holds the exclusive flock. Note: flock(2)
-        // semantics mean two acquire attempts in the same process
-        // CAN collide because each acquire opens a fresh fd
-        // (different FDs are distinct from the kernel's POV).
-        let err = acquire_source_tree_lock(&canonical, "test")
-            .expect_err("second acquire must fail while the first holds the lock");
-        let msg = format!("{err:#}");
+
+        // Re-derive the lockfile path so we can needle `/proc/locks`
+        // for waiter lines below. The production code constructs the
+        // same path via `CacheDir::lock_path(format!("source-{hash}"))`
+        // — see [`acquire_source_tree_lock`] above. The lockfile was
+        // materialized by the holder's successful `try_flock` open
+        // (O_CREAT), so by this point the inode exists on disk and
+        // `needle_from_path` can stat it.
+        let path_hash = crate::fetch::canonical_path_hash(&canonical);
+        let lock_path = cache
+            .path()
+            .join(crate::flock::LOCK_DIR_NAME)
+            .join(format!("source-{path_hash}.lock"));
+        let needle = crate::flock::needle_from_path(&lock_path)
+            .expect("needle_from_path must resolve the lockfile inode");
+
+        // Spawn a worker that issues the second acquire. The worker's
+        // non-blocking `try_flock` will see the held lock and fall
+        // through to `block_flock`, which parks the worker thread in
+        // `flock(2)` until the holder's FD closes. `OwnedFd` and
+        // `anyhow::Error` are both `Send`, so the `Result<OwnedFd>`
+        // returns through the channel below. The worker also
+        // captures its own elapsed time around the
+        // `acquire_source_tree_lock` call so the assertion below can
+        // verify the blocking path actually executed for the holder
+        // retention window — a regression that returned non-blockingly
+        // without parking in the kernel would surface as a near-zero
+        // elapsed value even if the `/proc/locks` waiter scan happened
+        // to be flaky.
+        //
+        // `sync_channel(1)`: a single-slot buffered channel lets the
+        // worker `send` and exit even if the main thread already
+        // panicked from an earlier assertion failure (rendezvous
+        // bound-0 would leave the worker parked in `send` forever,
+        // a thread leak on top of an already-failed test). A worker
+        // that hangs forever before reaching `send` leaves the
+        // channel empty and the `recv_timeout` below bails the test
+        // within 5s rather than hanging the test runner indefinitely.
+        let worker_canonical = canonical.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(
+            std::result::Result<std::os::fd::OwnedFd, anyhow::Error>,
+            std::time::Duration,
+        )>(1);
+        let _worker = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = acquire_source_tree_lock(&worker_canonical, "test");
+            let elapsed = started.elapsed();
+            // Send result + elapsed through the rendezvous channel.
+            // If the main thread already abandoned the test (panic)
+            // before the worker reached this point the send fails;
+            // discarding the failure is correct because the test is
+            // already failing for a different reason.
+            let _ = tx.send((result, elapsed));
+        });
+
+        // Poll `/proc/locks` for a waiter line against the lockfile
+        // inode. The kernel emits one `-> FLOCK ... {dev}:{ino}` line
+        // per blocked waiter (`fs/locks.c::lock_get_status` — the
+        // leading `-> ` distinguishes a waiter from a holder); seeing
+        // such a line proves the worker is parked in `flock(2)`.
+        // `parse_flock_pids_for_needle` (the production scanner) does
+        // NOT match `-> FLOCK` lines because it filters on `FLOCK` in
+        // field-2, so the test scans the raw text directly with the
+        // `->` + needle byte-pattern documented in the user-facing
+        // task description.
+        //
+        // 10ms poll interval × 500 iterations = 5s deadline. A
+        // healthy host enters the waiter state within a single
+        // 10ms tick; the 5s ceiling exists only to bail a
+        // pathologically-slow CI runner before the test runner's
+        // own hang detector fires.
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+        const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+        let poll_start = std::time::Instant::now();
+        let mut waiter_observed = false;
+        while poll_start.elapsed() < POLL_DEADLINE {
+            let contents = std::fs::read_to_string("/proc/locks")
+                .expect("/proc/locks must be readable on a Linux host");
+            if contents
+                .lines()
+                .any(|line| line.contains("->") && line.contains(&needle))
+            {
+                waiter_observed = true;
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
         assert!(
-            msg.contains("source tree"),
-            "error must name the source tree: {msg}",
+            waiter_observed,
+            "no `-> FLOCK ... {needle}` waiter line appeared in \
+             /proc/locks within {POLL_DEADLINE:?} — worker did not \
+             enter the kernel's blocked-flock state, which means \
+             `acquire_source_tree_lock` regressed off the blocking path",
         );
+
+        // Hold the lock for `HOLD_WINDOW` AFTER the waiter is
+        // observed so the worker's measured elapsed time provably
+        // exceeds the window. A regression that returned
+        // non-blockingly would still record a sub-window elapsed
+        // time even if a waiter line happened to flicker through
+        // /proc/locks for unrelated reasons; the elapsed-window
+        // assertion catches that. The window is wall-clock from
+        // observation, not from worker entry, so the worker's
+        // measured elapsed includes its own pre-park work plus the
+        // window — `worker_elapsed >= HOLD_WINDOW` is sufficient.
+        const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+        std::thread::sleep(HOLD_WINDOW);
+
+        // Drop the holder. The worker's blocking flock(2) returns,
+        // it acquires the lock, and the worker thread sends its
+        // result through the channel.
+        drop(holder);
+
+        // `recv_timeout` bounds the test's worst-case wall time.
+        // Healthy worker delivers within microseconds of the
+        // holder drop; the 5s ceiling fires only on a true
+        // regression (worker stuck, fd not released, etc.).
+        let (worker_result, worker_elapsed) =
+            rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+                "worker must deliver its acquire result within 5s of \
+                 holder release — a regression that caused the worker \
+                 to hang forever lands here",
+            );
+        let acquired = worker_result.expect("worker acquire must succeed once the holder releases");
+
+        // Elapsed-window assertion: the worker's measured time around
+        // `acquire_source_tree_lock` must be at least the holder
+        // retention window, because the worker was parked in
+        // `flock(2)` for at least that long after `/proc/locks`
+        // observed the waiter line. A revert to non-blocking
+        // EWOULDBLOCK behavior would record a sub-window elapsed
+        // value here and fail this assertion even if the
+        // `/proc/locks` waiter scan happened to flake-pass.
         assert!(
-            msg.contains("cargo ktstr locks"),
-            "error must point at `cargo ktstr locks` for diagnosis: {msg}",
+            worker_elapsed >= HOLD_WINDOW,
+            "worker's acquire returned in {worker_elapsed:?}, less than \
+             the {HOLD_WINDOW:?} holder-retention window — worker did \
+             not actually block on the held flock",
         );
-        // The cli_label must surface in the diagnostic so the
-        // operator sees which binary's invocation surfaced it.
-        assert!(
-            msg.contains("test"),
-            "error must include the cli_label `test`: {msg}",
-        );
+
+        // Drop the worker's FD explicitly so the lockfile flock
+        // releases before the isolated cache dir is torn down.
+        // `_env_lock` and `cache` are bound at function-scope above
+        // and drop at end-of-scope, AFTER this point.
+        drop(acquired);
     }
 
     /// `BuildReservation` field declaration order is load-bearing:

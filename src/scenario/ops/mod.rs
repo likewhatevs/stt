@@ -7670,7 +7670,11 @@ mod tests {
     // - Mixed pcomm/non-pcomm CgroupDefs in the same setup keep their
     //   move_tasks shapes distinct: pcomm group → 1 PID, non-pcomm
     //   group → N PIDs (one per worker fork).
-    // - pcomm + num_workers=0 (decided no-op): no container fork.
+    // - pcomm + num_workers=0 is rejected by `resolve_num_workers`
+    //   like any other cgroup: a 0-worker cgroup emits no
+    //   `WorkerReport`s, so every downstream assertion would
+    //   vacuously pass. The pcomm path receives no exception —
+    //   the rejection happens before pcomm dispatch runs.
 
     /// Read the `Tgid:` line from `/proc/<tid>/status`. Returns the
     /// pid_t of the thread group leader. Panics on read or parse
@@ -7755,6 +7759,9 @@ mod tests {
                 .workers(2),
         ];
         apply_setup_test(&ctx, &mut state, &defs).expect("pcomm + comm apply_setup must succeed");
+        // Wait for the container's post-fork init (prctl for leader
+        // comm) before reading /proc. Same race as truncation test.
+        std::thread::sleep(Duration::from_millis(200));
         // Take handles so the workers are observable before drop.
         let mut handles = std::mem::take(&mut state.handles);
         assert_eq!(handles.len(), 1, "one CgroupDef → one handle");
@@ -7894,6 +7901,11 @@ mod tests {
         let mut state = StepState::empty(&ctx);
         let defs = vec![CgroupDef::named("cg_trunc").pcomm(long_name).workers(1)];
         apply_setup_test(&ctx, &mut state, &defs).expect("long-pcomm apply_setup must succeed");
+        // The fork returns to the parent before the child executes
+        // prctl(PR_SET_NAME). Wait for the child's post-fork init
+        // (PDEATHSIG, setpgid, /proc/self/fd sweep, then prctl) to
+        // complete. Matches tests_pcomm.rs:116 pattern.
+        std::thread::sleep(Duration::from_millis(200));
         let mut handles = std::mem::take(&mut state.handles);
         let (_, handle) = handles.pop().expect("one handle");
         let pids = handle.worker_pids();
@@ -7915,37 +7927,53 @@ mod tests {
         cleanup_state(&mut state);
     }
 
-    /// `CgroupDef::pcomm("x").workers(0)` is a degenerate input —
-    /// the team-lead-confirmed contract is silent no-op: no
-    /// container is forked, no PIDs move into the cgroup. Pin
-    /// this so a regression that forks an empty container
-    /// (which would idle forever waiting for SIGUSR1) surfaces
-    /// here as a `MoveTasks` count > 0 on the cg_zero entry.
+    /// `CgroupDef::pcomm("x").workers(0)` is rejected at
+    /// `apply_setup` like any other 0-worker cgroup. The pcomm
+    /// path receives no exception: `resolve_num_workers` runs
+    /// before pcomm dispatch and rejects `num_workers=0`
+    /// because a worker-less cgroup emits no `WorkerReport`s,
+    /// vacuously passing every downstream assertion. The
+    /// rejection error names the cgroup and the offending
+    /// field so a typo'd worker count surfaces at setup
+    /// rather than as a silent green test.
     ///
-    /// `apply_setup` may still emit `move_tasks(cg_zero, 0)` —
-    /// that's fine; the assertion checks that no positive count
-    /// appears, equivalent to "no container or workers were
-    /// migrated."
+    /// Pin the rejection here so a regression that silently
+    /// no-ops the call (or forks an empty container) surfaces
+    /// as a passing `apply_setup_test` instead of the expected
+    /// `Err`.
     #[test]
-    fn apply_setup_pcomm_with_zero_workers_skips_container() {
+    fn apply_setup_pcomm_with_zero_workers_is_rejected() {
         let mock = MockCgroupOps::new();
         let topo = mock_topo();
         let ctx = mock_ctx(&mock, &topo);
         let mut state = StepState::empty(&ctx);
         let defs = vec![CgroupDef::named("cg_zero").pcomm("empty").workers(0)];
-        apply_setup_test(&ctx, &mut state, &defs)
-            .expect("pcomm + 0 workers apply_setup must succeed (no-op contract)");
+        let err = apply_setup_test(&ctx, &mut state, &defs)
+            .expect_err("pcomm + 0 workers apply_setup must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cg_zero"),
+            "rejection error must name the cgroup: {msg}",
+        );
+        assert!(
+            msg.contains("num_workers=0"),
+            "rejection error must name the offending field: {msg}",
+        );
+        // No spawn ever happened: no PIDs were moved into the
+        // cgroup. The cgroup itself may have been created
+        // (`add_cgroup_no_cpuset` runs before the WorkSpec
+        // resolution loop) — only `MoveTasks` is forbidden.
         let calls = mock.calls();
-        let bad_move = calls.iter().any(|c| {
+        let any_move = calls.iter().any(|c| {
             matches!(
                 c,
-                CgroupCall::MoveTasks(name, count) if name == "cg_zero" && *count > 0
+                CgroupCall::MoveTasks(name, _) if name == "cg_zero"
             )
         });
         assert!(
-            !bad_move,
-            "pcomm + workers(0) must NOT move any PIDs into cg_zero \
-             (no container forked); got: {calls:?}",
+            !any_move,
+            "rejection must short-circuit before any move_tasks call \
+             into cg_zero; got: {calls:?}",
         );
         cleanup_state(&mut state);
     }
