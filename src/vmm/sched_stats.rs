@@ -207,11 +207,18 @@ impl std::fmt::Display for SchedStatsError {
 
 impl std::error::Error for SchedStatsError {}
 
-/// Vendored scx_stats request envelope. Mirrors the shape of
-/// `scx_stats::StatsRequest` in scx_utils — the request line
-/// is a JSON object with a `"req"` verb and optional `"args"`
-/// map. We do not depend on the scx_stats crate to avoid pulling
-/// the entire scx_utils transitive tree for a 2-field struct.
+/// Vendored scx_stats request envelope. Wire shape pinned to
+/// scx_stats v1.1.0 `StatsRequest` (server.rs:103-117 of the
+/// upstream crate): a JSON object with a `"req"` verb and
+/// optional `"args"` map of string-valued keys. We do not depend
+/// on the scx_stats crate to keep the dependency surface minimal
+/// for a 2-field type.
+///
+/// `args` matches upstream byte-for-byte as `BTreeMap<String,
+/// String>` — non-string argument values would deserialize-fail
+/// on the scheduler side (the upstream `BTreeMap<String, String>`
+/// rejects e.g. integers). Keep this in lockstep with upstream
+/// or update both sides together.
 ///
 /// Wire format examples:
 /// * `{"req":"stats"}\n`
@@ -223,16 +230,26 @@ pub struct StatsRequest {
     /// `"stats_meta"`, and scheduler-specific verbs.
     pub req: String,
     /// Optional argument map. Empty by default; scheduler-specific
-    /// verbs may require argument keys.
+    /// verbs may require argument keys. Values are strings on the
+    /// wire — see the type-level note above for the upstream
+    /// constraint.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub args: std::collections::BTreeMap<String, serde_json::Value>,
+    pub args: std::collections::BTreeMap<String, String>,
 }
 
-/// Vendored scx_stats response envelope. The scheduler emits a
-/// JSON object on a single line; the shape is verb-specific. We
-/// model the on-wire envelope as `{"errno": Option<i32>, "args":
-/// Value}` — present-and-non-zero `errno` flags scheduler-side
-/// errors, otherwise `args` carries the verb's payload.
+/// Vendored scx_stats response envelope. Wire shape pinned to
+/// scx_stats v1.1.0 `StatsResponse` (server.rs:119-123 of the
+/// upstream crate). The scheduler emits a JSON object on a
+/// single line; the shape is verb-specific. We model the on-wire
+/// envelope as `{"errno": Option<i32>, "args": Value}` —
+/// present-and-non-zero `errno` flags scheduler-side errors,
+/// otherwise `args` carries the verb's payload.
+///
+/// `args` is intentionally `serde_json::Value` (more permissive
+/// than upstream's `BTreeMap<String, Value>`): every scx_stats
+/// scheduler emits an object today, so [`extract_resp`] checks
+/// `Value::Object` before unwrapping `args["resp"]` and the
+/// permissiveness costs nothing on the inbound path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsResponse {
     /// scx_stats error code. `0` (or absent) signals success.
@@ -610,10 +627,7 @@ impl SchedStatsClient {
             args: std::collections::BTreeMap::new(),
         };
         for (k, v) in args {
-            req.args.insert(
-                (*k).to_string(),
-                serde_json::Value::String((*v).to_string()),
-            );
+            req.args.insert((*k).to_string(), (*v).to_string());
         }
         let resp = self.request(&req)?;
         extract_resp(resp)
@@ -1160,6 +1174,26 @@ mod tests {
         let decoded: StatsRequest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded.req, "stats");
         assert!(decoded.args.is_empty());
+
+        // Args are serialized as plain JSON strings (matches upstream
+        // scx_stats v1.1.0 server.rs:107 `BTreeMap<String, String>`),
+        // not wrapped in any other type. A regression to
+        // `BTreeMap<String, serde_json::Value>` would emit
+        // `{"target":"top"}` either way for string values, so this
+        // also pins decoded round-trip equality and rejects integer
+        // / object values at parse time on the upstream side.
+        let mut req_args = StatsRequest {
+            req: "stats".to_string(),
+            args: std::collections::BTreeMap::new(),
+        };
+        req_args.args.insert("target".to_string(), "top".to_string());
+        let bytes_args = serde_json::to_vec(&req_args).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes_args).unwrap(),
+            r#"{"req":"stats","args":{"target":"top"}}"#,
+        );
+        let decoded_args: StatsRequest = serde_json::from_slice(&bytes_args).unwrap();
+        assert_eq!(decoded_args.args.get("target"), Some(&"top".to_string()));
 
         let resp_wire = br#"{"errno":0,"args":{"resp":{"foo":42}}}"#;
         let resp: StatsResponse = serde_json::from_slice(resp_wire).unwrap();
