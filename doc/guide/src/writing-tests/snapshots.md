@@ -10,7 +10,14 @@ it back via the [`Snapshot`](#reading-the-captured-report) accessor for typed tr
 `Op::snapshot("name")` is the **on-demand** capture trigger. Use it to
 ask "what does the scheduler look like *right now*?" at a precise
 point in the scenario. For automatic capture on a kernel write to a
-specific symbol, see [Watch Snapshots](watch-snapshots.md).
+specific symbol, see [Watch Snapshots](watch-snapshots.md). For
+**cadenced** capture across the workload window without invoking
+`Op::snapshot` from the scenario body, see
+[Periodic Capture](periodic-capture.md) — it produces a time-ordered
+[`SampleSeries`](temporal-assertions.md#sampleseries) that flows into
+the [temporal-assertion](temporal-assertions.md) patterns
+(`nondecreasing`, `rate_within`, `steady_within`, `converges_to`,
+`always_true`, `ratio_within`).
 
 ## Issuing a snapshot
 
@@ -102,10 +109,13 @@ let nr_cpus = snap.var("nr_cpus_onln").as_u64()?;
 ```
 
 `Snapshot::var(name)` walks every `*.bss`, `*.data`, and `*.rodata`
-global-section map for a top-level member named `name` and returns the
-first hit as a [`SnapshotField`](#terminal-accessors). A miss yields
-`SnapshotError::VarNotFound { requested, available }` with the union
-of every section's top-level member names.
+global-section map for a top-level member named `name` and returns
+the unique match as a [`SnapshotField`](#terminal-accessors).
+Multiple matches yield
+`SnapshotError::AmbiguousVar { requested, found_in }` —
+disambiguate via `Snapshot::map(name)`. A miss yields
+`SnapshotError::VarNotFound { requested, available }` with the
+union of every section's top-level member names.
 
 ### Entries inside a map
 
@@ -194,9 +204,9 @@ The dotted-path walker:
 | `as_str()` | `&str` | `Enum` with a resolved variant name |
 | `rendered()` | `Option<&RenderedValue>` | the underlying value when present |
 
-Type mismatches surface as `SnapshotError::TypeMismatch { requested,
-actual, path }` — for example, `as_str()` on a `Uint` reports
-`actual: "Uint"`.
+Type mismatches surface as `SnapshotError::TypeMismatch { expected,
+actual, requested }` — for example, `as_str()` on a `Uint` reports
+`expected: "Enum"`, `actual: "Uint"`.
 
 ## Error handling
 
@@ -206,15 +216,26 @@ needed to fix the call site without re-running the test:
 
 - `MapNotFound { requested, available }` — `Snapshot::map(name)` miss.
 - `VarNotFound { requested, available }` — `Snapshot::var(name)` miss.
-- `FieldNotFound { path, walked, component, available }` — a path
-  component did not match any struct member at that depth. `walked`
-  is the prefix that resolved successfully; `component` is the
-  failing segment.
-- `NotAStruct { path, walked, component, kind }` — a path component
-  reached a non-struct value where a struct was expected (e.g.
-  descending into a `Uint` leaf). `kind` names the actual variant.
-- `TypeMismatch { requested, actual, path }` — terminal accessor
-  called on a rendered shape it cannot decode.
+- `AmbiguousVar { requested, found_in }` — more than one
+  `*.bss`/`*.data`/`*.rodata` map exposes a top-level member with the
+  requested name. `found_in` lists every map (in capture order)
+  where the name was seen; disambiguate via `Snapshot::map(name)` +
+  `.at(0).get(...)` against a specific map.
+- `FieldNotFound { requested, walked, component, available }` — a
+  path component did not match any struct member at that depth.
+  `walked` is the prefix that resolved successfully; `component` is
+  the failing segment; `requested` is the original user-supplied
+  path.
+- `NotAStruct { requested, walked, component, kind }` — a path
+  component reached a non-struct value where a struct was expected
+  (e.g. descending into a `Uint` leaf). `kind` names the actual
+  variant.
+- `TypeMismatch { expected, actual, requested }` — terminal
+  accessor called on a rendered shape it cannot decode. `expected`
+  names the scalar type the accessor requires; `actual` names the
+  rendered variant; `requested` is the user-supplied lookup string
+  (empty when the accessor was invoked on a leaf without a path
+  walk).
 - `IndexOutOfRange { map, index, len }` — `SnapshotMap::at(n)` past
   the entry list end.
 - `PerCpuSlot { map, cpu, len, unmapped }` — out-of-range or unmapped
@@ -222,12 +243,26 @@ needed to fix the call site without re-running the test:
   out-of-range CPU.
 - `NoMatch { map, op }` — predicate-based lookup (`find`, `max_by`)
   found no match. `op` names the operation.
-- `EmptyPathComponent { path }` — a path string contained an empty
-  component (e.g. `"a..b"`).
+- `EmptyPathComponent { requested }` — a path string contained an
+  empty component (e.g. `"a..b"`).
 - `PerCpuNotNarrowed { map }` — `entry.get` called on a per-CPU entry
   without `cpu(N)` first.
 - `NoRendered { map, side }` — entry has no rendered key/value side
   (BTF type id missing at capture time, leaving hex bytes only).
+- `PlaceholderSample { tag, reason }` — a periodic-capture sample's
+  underlying `FailureDumpReport` is a placeholder produced by the
+  freeze-rendezvous timeout fallback. Surfaces when projecting via
+  [`SampleSeries::bpf`](temporal-assertions.md#projecting-from-bpf-state);
+  temporal patterns route the variant through their skip path so a
+  placeholder never falsely registers as zero progress against a
+  monotonicity / rate / steady / ratio band. `reason` carries the
+  rendezvous-timeout cause text.
+- `MissingStats { tag }` — a [`SampleSeries::stats`](temporal-assertions.md#projecting-from-scx_stats-json)
+  projection ran on a sample whose `stats` slot is `None` (stats
+  client not wired or per-sample stats request failed). Distinct
+  from in-JSON path misses (`FieldNotFound` / `TypeMismatch`) so the
+  assertion site can branch on the cause without re-walking the
+  source.
 
 `SnapshotError` implements `std::error::Error` and `Display`, so it
 composes with `?` and `anyhow`. The `Display` impl includes the path

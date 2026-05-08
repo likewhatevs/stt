@@ -41,10 +41,10 @@ overall result fails.
 
 **`spawn_diverse(ctx, cgroup_names)`** -- spawns different
 [work types](../concepts/work-types.md) across cgroups, rotating
-through (SpinWait, Bursty{50ms burst / 100ms sleep}, IoSync, Mixed,
-YieldHeavy). Each cgroup uses `ctx.workers_per_cgroup` workers except
-IoSync cgroups, which always use 2 workers so blocking IO does not
-drown the scenario.
+through (SpinWait, Bursty{50ms burst / 100ms sleep}, IoSyncWrite,
+Mixed, YieldHeavy). Each cgroup uses `ctx.workers_per_cgroup`
+workers except IoSyncWrite cgroups, which always use 2 workers so
+blocking IO does not drown the scenario.
 
 ## The Ctx struct
 

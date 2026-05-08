@@ -60,7 +60,7 @@ fn custom_scenario(ctx: &Ctx) -> Result<AssertResult> {
     // If WorkloadHandle::spawn() fails here, guard drops
     // and both cgroups are removed automatically.
     let mut h = WorkloadHandle::spawn(&config)?;
-    ctx.cgroups.move_tasks("cg_0", &h.worker_pids())?;
+    ctx.cgroups.move_tasks("cg_0", &h.worker_pids_for_cgroup_procs()?)?;
     h.start(); // workers block until start() is called
 
     // ... run workload ...

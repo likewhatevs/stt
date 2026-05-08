@@ -58,6 +58,8 @@ pub struct WorkerReport {
     pub max_gap_at_ms: u64,
     pub resume_latencies_ns: Vec<u64>,
     pub wake_sample_total: u64,
+    pub iteration_costs_ns: Vec<u64>,
+    pub iteration_cost_sample_total: u64,
     pub iterations: u64,
     pub schedstat_run_delay_ns: u64,
     pub schedstat_run_count: u64,
@@ -67,8 +69,32 @@ pub struct WorkerReport {
     pub vmstat_numa_pages_migrated: u64,
     pub exit_info: Option<WorkerExitInfo>,
     pub is_messenger: bool,
+    pub group_idx: usize,
+    pub affinity_error: Option<String>,
+}
+
+pub enum WorkerExitInfo {
+    Exited(i32),
+    Signaled(i32),
+    TimedOut,
+    WaitFailed(String),
+    /// Thread-mode worker panicked. Exclusive to `CloneMode::Thread`;
+    /// fork workers surface panics via `Exited(1)` or
+    /// `Signaled(SIGABRT)` depending on the panic strategy.
+    Panicked(String),
 }
 ```
+
+`iteration_costs_ns` mirrors `resume_latencies_ns` for per-iteration
+wall-clock cost: a reservoir-sampled vector capped at
+`MAX_WAKE_SAMPLES` entries, paired with `iteration_cost_sample_total`
+for the total observation count when the cap is exceeded.
+`group_idx` is `0` for the primary group and `1..=N` for composed
+[`WorkSpec`] entries in declaration order (mirrors
+`WorkloadConfig::composed`). `affinity_error` is `Some(reason)`
+when the worker's `sched_setaffinity` / `mbind` setup failed; the
+worker still runs and produces a report but the field documents
+the divergence from the requested affinity contract.
 
 Three fields worth calling out explicitly:
 
@@ -136,16 +162,18 @@ Three fields worth calling out explicitly:
     already faulted this cycle, so the fault count is a ceiling,
     not a floor) + `spin_iters`=64 = 320 work units
     (`gcd(320, 1024) = 64`).
-  - **Every 64 iterations**: IoSync (16 4-KiB writes per
-    write-then-sleep pair → `gcd(16, 1024) = 16`).
+  - **Every 64 iterations**: IoSyncWrite (16 4-KiB writes per
+    write-then-sleep pair → `gcd(16, 1024) = 16`); IoRandRead and
+    IoConvoy use the same 64-iteration cadence for their per-iteration
+    pread/pwrite mixes.
   - **Every 1024 iterations**: YieldHeavy (1 unit per yield),
     ForkExit (1 unit per fork+wait), FanOutCompute worker
     (`operations`=5 matrix multiplies per wake, one `work_units`
     tick per multiply → `gcd(5, 1024) = 1`).
   - **Phase-inherited**: Sequence inherits whichever phase is
     currently active — Spin / Yield / Io use the same per-unit
-    accounting as the SpinWait / YieldHeavy / IoSync groups above;
-    Sleep contributes no `work_units` and so pauses migration
+    accounting as the SpinWait / YieldHeavy / IoSyncWrite groups
+    above; Sleep contributes no `work_units` and so pauses migration
     checks while it runs.
   - **Not tracked by the framework**: Custom workers do not
     contribute to `work_units` on the framework's behalf —
@@ -172,7 +200,8 @@ blocking step: Bursty (sleep), PipeIo (pipe read), FutexPingPong
 (futex wait), FutexFanOut (futex wait, receivers only), FanOutCompute
 (futex wait, workers only — measured as `CLOCK_MONOTONIC` delta from
 messenger's shared timestamp), CacheYield (yield), CachePipe (pipe
-read), IoSync (sleep), NiceSweep (yield), AffinityChurn (yield),
+read), IoSyncWrite / IoRandRead / IoConvoy (pread / pwrite / fdatasync
+blocking), NiceSweep (yield), AffinityChurn (yield),
 PolicyChurn (yield), MutexContention (futex wait on contended
 acquire), ForkExit (parent's waitpid wait), and Sequence when its
 phases include Sleep, Yield, or Io.

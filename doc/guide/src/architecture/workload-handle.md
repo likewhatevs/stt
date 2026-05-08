@@ -80,8 +80,13 @@ killed with SIGKILL. Consumes the handle.
 // 1. Spawn workers (blocked, waiting for start signal)
 let mut handle = WorkloadHandle::spawn(&config)?;
 
-// 2. Move workers into their target cgroup
-ctx.cgroups.move_tasks("cg_0", &handle.worker_pids())?;
+// 2. Move workers into their target cgroup. `cgroup.procs` is
+//    tgid-scoped, so use `worker_pids_for_cgroup_procs()` — it
+//    bails for Thread-mode workers (whose pids share the harness's
+//    tgid) and points at `cgroup.threads` instead. Plain
+//    `worker_pids()` returns the raw pid set without the
+//    cgroup-procs safety check.
+ctx.cgroups.move_tasks("cg_0", &handle.worker_pids_for_cgroup_procs()?)?;
 
 // 3. Signal workers to start
 handle.start();

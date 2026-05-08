@@ -127,6 +127,7 @@ identical work for no signal.
 |------|---------|-------------|
 | `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Repeatable; a multi-kernel set fans the gauntlet across kernels. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
+| `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures (exit `1` instead of `0`). Default behavior skips so a contended runner does not fail tests that simply could not start; setting this flag opts into "if the test cannot run, the test fails". Exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Build and run tests with the release profile (`--cargo-profile release` to nextest). Release mode applies **stricter assertion thresholds** (`gap_threshold_ms` 2000 vs debug's 3000, `spread_threshold_pct` 15% vs debug's 35%) — tests that barely pass in debug may fail under `--release`. `catch_unwind`-based tests and tests gated on `#[cfg(debug_assertions)]` are skipped. |
 
 ### What it does (path mode only)
@@ -282,6 +283,7 @@ cargo ktstr coverage -- --workspace --lcov --output-path lcov.info # lcov output
 |------|---------|-------------|
 | `--kernel ID` (repeatable) | auto | Same shapes and multi-kernel semantics as `cargo ktstr test --kernel`: each (test × kernel) variant runs as its own nextest subprocess so cargo-llvm-cov merges every variant's profraw automatically. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
+| `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 | `--release` | off | Collect coverage with the release profile (`--cargo-profile release` to llvm-cov nextest). Same stricter-threshold caveats as `test --release` — release mode applies `gap_threshold_ms=2000` / `spread_threshold_pct=15%`, and skips `catch_unwind`-based tests along with `#[cfg(debug_assertions)]`-gated tests. |
 
 Requires `cargo-llvm-cov` and the `llvm-tools-preview` rustup
@@ -384,6 +386,7 @@ cargo ktstr llvm-cov --kernel ../linux report                  # pin kernel + pa
 |------|---------|-------------|
 | `--kernel ID` (repeatable) | auto | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Same multi-kernel semantics as `cargo ktstr test --kernel`. |
 | `--no-perf-mode` | off | Disable all performance mode features (flock, pinning, RT scheduling, hugepages, NUMA mbind, KVM exit suppression). Also settable via `KTSTR_NO_PERF_MODE` env var. |
+| `--no-skip-mode` | off | Convert resource-contention and host-topology-insufficient skips into hard test failures. Same semantics as on `test`; exports `KTSTR_NO_SKIP_MODE=1` for the test binary. |
 
 Note: a bare `cargo ktstr llvm-cov` (no trailing subcommand)
 dispatches to `cargo llvm-cov`, which runs `cargo test` — ktstr

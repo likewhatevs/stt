@@ -120,7 +120,7 @@ pub enum WorkType {
         consume_iters: u64,
         queue_depth_target: u64,
     },
-    SignalStorm {                                       // Paired workers fire kill(partner, SIGUSR1) between CPU bursts.
+    SignalStorm {                                       // Paired workers fire tkill(partner, SIGUSR1) between CPU bursts.
         signals_per_iter: u64,
         work_iters: u64,
     },
@@ -395,6 +395,46 @@ for these variants, or `None` for ungrouped types. `PipeIo` and
 `CachePipe` use pipes; `FutexPingPong`, `FutexFanOut`, `FanOutCompute`,
 and `MutexContention` use shared mmap pages with futex wait/wake.
 
+## Clone-mode and pcomm interactions
+
+`CloneMode` is a per-`WorkloadConfig` enum with two variants —
+`Fork` (the default; each worker is its own thread group, reaped
+via `waitpid`) and `Thread` (workers share the parent's tgid, run
+as `std::thread::spawn` threads, reaped via `JoinHandle`).
+
+`pcomm` is **not** a `CloneMode` variant — it is a `WorkSpec`
+field set via `WorkSpec::pcomm(name)` /
+[`CgroupDef::pcomm(name)`](../tutorial.md#step-10-name-and-prioritize-workers).
+When a `WorkSpec` carries `pcomm = Some(name)`, `apply_setup`
+routes it through the fork-then-thread spawn path: ONE forked
+thread-group leader whose `task->comm` is `name` hosts every
+matching worker as a `pthread`-style thread under that leader.
+Workers sharing a `pcomm` value coalesce into one container; this
+combines the per-process-leader visibility schedulers expect (a
+`chrome` parent, a `java` parent) with the in-process
+`std::thread::spawn` dispatch shape `CloneMode::Thread` already
+uses for the worker bodies themselves.
+
+`PipeIo` and `CachePipe` work correctly inside a pcomm container.
+When workers run as threads inside one forked leader, the per-pair
+pipe-fd indices computed in the global `pipe_pairs` table are
+addressed by each worker's position WITHIN the container's thread
+group, so worker A reads its partner's write end whether the pair
+lives in two forked processes (`Fork` mode) or in two threads of
+one pcomm container.
+
+`SignalStorm` uses `tkill(partner_tid, SIGUSR1)` (per-task
+signal delivery, `PIDTYPE_PID`), NOT `kill` (per-tgid,
+`PIDTYPE_TGID`) and NOT `tgkill(self_tgid, partner_tid, …)`
+(would return `ESRCH` under Fork mode because each forked worker
+is its own tgid leader). `tkill` looks up the target via
+`find_task_by_vpid(pid)` and skips the tgid check, so the signal
+hits the partner thread's per-task pending queue under `Fork` and
+`Thread` modes uniformly — including inside pcomm-coalesced
+thread groups. Sibling threads in a pcomm container do NOT dequeue
+each other's SignalStorm signals because the `PIDTYPE_PID` queue
+is per-task, not per-tgid.
+
 ## Default values
 
 `WorkType::from_name()` uses these defaults:
@@ -429,17 +469,37 @@ the user-provided `name` field.
 
 ```rust,ignore
 pub struct WorkloadConfig {
-    pub num_workers: usize,       // Number of worker processes to fork
-    pub affinity: ResolvedAffinity,   // CPU affinity mode (None, Fixed, Random, SingleCpu)
-    pub work_type: WorkType,      // What each worker does
-    pub sched_policy: SchedPolicy, // Linux scheduling policy
-    pub mem_policy: MemPolicy,    // NUMA memory placement policy
-    pub mpol_flags: MpolFlags,    // Optional mode flags for set_mempolicy(2)
+    pub num_workers: usize,           // Number of worker processes to fork
+    pub affinity: AffinityIntent,     // Per-worker affinity intent (resolved at spawn time)
+    pub work_type: WorkType,          // What each worker does
+    pub sched_policy: SchedPolicy,    // Linux scheduling policy
+    pub mem_policy: MemPolicy,        // NUMA memory placement policy
+    pub mpol_flags: MpolFlags,        // Optional mode flags for set_mempolicy(2)
+    pub nice: Option<i32>,            // Per-worker nice via setpriority(2); None inherits
+    pub clone_mode: CloneMode,        // Fork (default) or Thread dispatch
+    pub comm: Option<Cow<'static, str>>, // task->comm via prctl(PR_SET_NAME); kernel truncates to 15 bytes
+    pub uid: Option<u32>,             // Effective UID via setresuid; None inherits
+    pub gid: Option<u32>,             // Effective GID via setresgid; None inherits
+    pub numa_node: Option<u32>,       // Restrict affinity to one NUMA node's CPU set
+    pub composed: Vec<WorkSpec>,      // Secondary worker groups spawned alongside the primary
 }
 ```
 
-`Default`: 1 worker, no affinity, SpinWait, Normal policy, Default
-mem_policy, no mpol_flags.
+`Default`: 1 worker, AffinityIntent::Inherit, SpinWait, Normal policy,
+Default mem_policy, no mpol_flags, nice/comm/uid/gid/numa_node = None,
+clone_mode = Fork, composed = empty.
+
+`AffinityIntent` is the type-unified affinity expression used at the
+top level and inside [`WorkSpec`] entries — `Inherit`, `Exact(...)`,
+and `RandomSubset(...)` are accepted at `WorkloadHandle::spawn`;
+topology-aware variants (`SingleCpu`, `LlcAligned`, `CrossCgroup`,
+`SmtSiblingPair`) require scenario context and are rejected at the
+spawn gate with an actionable diagnostic. `composed` carries
+secondary [`WorkSpec`] groups that spawn alongside the primary; each
+composed entry can override `work_type`, `num_workers`,
+`sched_policy`, `affinity`, etc., and reports back via
+`WorkerReport::group_idx` (0 for the primary, 1..=N for composed
+entries in declaration order).
 
 See [MemPolicy](mem-policy.md) for the NUMA memory placement API.
 
@@ -452,12 +512,23 @@ pub enum SchedPolicy {
     Normal,
     Batch,
     Idle,
-    Fifo(u32),      // priority 1-99
+    Fifo(u32),       // priority 1-99
     RoundRobin(u32), // priority 1-99
+    Deadline {
+        runtime: Duration,   // budget per period
+        deadline: Duration,  // relative deadline from period start
+        period: Duration,    // period; Duration::ZERO uses `deadline`
+    },
 }
 ```
 
-`Fifo` and `RoundRobin` require `CAP_SYS_NICE`.
+`Fifo`, `RoundRobin`, and `Deadline` require `CAP_SYS_NICE`. The
+sched-deadline gate (`runtime <= deadline <= period`, all non-zero
+unless `period == Duration::ZERO`, which the kernel substitutes
+with `deadline`) is validated user-side in
+`SchedPolicy::deadline()` before `sched_setattr` so a malformed
+`Deadline` fails fast rather than tunneling `EINVAL` through the
+syscall.
 
 ## Overriding work types
 

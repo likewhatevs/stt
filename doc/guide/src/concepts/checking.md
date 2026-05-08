@@ -45,7 +45,8 @@ Neither threshold is set by default; enable via `Assert` setters or
 and iteration throughput. Three thresholds:
 - `max_p99_wake_latency_ns`: p99 of all `resume_latencies_ns` samples
   across workers in a cgroup. Populated only for work types that
-  record wake-to-run latency: `IoSync`, `Bursty`, `PipeIo`,
+  record wake-to-run latency: `IoSyncWrite`, `IoRandRead`, `IoConvoy`,
+  `Bursty`, `PipeIo`,
   `FutexPingPong`, `CacheYield`, `CachePipe`, `FutexFanOut`
   (receivers), `Sequence` (Sleep / Yield / Io phases),
   `ForkExit`, `NiceSweep`, `AffinityChurn`, `PolicyChurn`,
@@ -229,8 +230,11 @@ aggregated statistics from a scenario run.
 ### Fields
 
 - `passed: bool` -- whether all checks passed.
-- `details: Vec<String>` -- human-readable diagnostic messages
-  (failure reasons, warnings, skip reasons).
+- `details: Vec<AssertDetail>` -- structured diagnostic entries; each
+  carries a `kind: DetailKind` (`Other`, `Note`, `Skip`, `Temporal`,
+  …) plus a human-readable `message: String`. Consumers filter by
+  `kind` for routing (failure vs informational note) and read
+  `message` for display.
 - `stats: ScenarioStats` -- aggregated worker telemetry across all
   cgroups (spread, gaps, migrations, wake latency, iterations).
 

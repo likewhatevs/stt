@@ -336,7 +336,8 @@ group size. `WorkType::worker_group_size()` returns the divisor.
   type's group size (2 for pipe/futex pairs, `fan_out + 1` for
   FutexFanOut and FanOutCompute).
 - Use an ungrouped work type (`SpinWait`, `Mixed`, `Bursty`,
-  `IoSync`, `YieldHeavy`) if worker count flexibility is needed.
+  `IoSyncWrite`, `IoRandRead`, `IoConvoy`, `YieldHeavy`) if worker
+  count flexibility is needed.
 
 ## Cache corruption
 

@@ -28,7 +28,7 @@ stay compatible across ktstr version bumps that add new variants:
 | `FreezeCgroup` | Freeze every task in the named cgroup via `cgroup.freeze` (kernel-side asynchronous freeze; not a SIGSTOP). Idempotent for already-frozen cgroups. Pair with `UnfreezeCgroup` to release; teardown auto-unfreezes. See [Snapshots](../writing-tests/snapshots.md) for the observer-cgroup deadlock warning. |
 | `UnfreezeCgroup` | Unfreeze every task in the named cgroup via `cgroup.freeze`. Inverse of `FreezeCgroup`. Idempotent. |
 | `Snapshot` | Capture a host-side diagnostic snapshot under `name` via the freeze coordinator: pauses every vCPU, reads BPF map state, vCPU registers, and per-CPU counters into a `FailureDumpReport`, then resumes. The report is keyed by `name` on the active `SnapshotBridge`. No active bridge is a no-op with `tracing::warn!`. See [Snapshots](../writing-tests/snapshots.md). |
-| `WatchSnapshot` | Capture a snapshot whenever the guest writes to the named kernel symbol; one fire = one capture tagged with the symbol path. Symbol resolution at op execution time uses BTF + kallsyms (`bss.<obj>.<field>` or `kernel.<symbol>[.<field>...]`). Maximum 3 watch ops per scenario (3 hardware watchpoint slots; 1 slot reserved for the error-class exit_kind trigger). See [Watch Snapshots](../writing-tests/watch-snapshots.md). |
+| `WatchSnapshot` | Capture a snapshot whenever the guest writes to the named kernel symbol; one fire = one capture tagged with the symbol path. Symbol resolution at op execution time looks the name up by **verbatim vmlinux ELF symbol-table match** — the requested name must appear in the guest kernel's static symbol table exactly as written (no path expansion, no BTF descent). Maximum 3 watch ops per scenario (3 hardware watchpoint slots; 1 slot reserved for the error-class exit_kind trigger). See [Watch Snapshots](../writing-tests/watch-snapshots.md). |
 
 Op constructors accept string literals directly (no `.into()` needed):
 
@@ -42,7 +42,7 @@ Op::spawn_host(WorkSpec::default().workers(4))
 Op::freeze_cgroup("cg_0")
 Op::unfreeze_cgroup("cg_0")
 Op::snapshot("after_spawn")
-Op::watch_snapshot("bss.scx_ktstr.alloc_count")
+Op::watch_snapshot("jiffies_64")
 ```
 
 `SpawnHost` creates workers in the parent cgroup, not in a managed
@@ -110,18 +110,59 @@ let def = CgroupDef::named("cg_0")
 
 ### Builder methods
 
-- `.with_cpuset(CpusetSpec)` -- set the cpuset.
+- `.with_cpuset(CpusetSpec)` -- set the cpuset (CPU set the cgroup is
+  pinned to).
+- `.with_cpuset_mems(BTreeSet<usize>)` -- explicit `cpuset.mems`
+  override (default derives from the resolved cpuset's NUMA nodes).
 - `.workers(n)` -- set worker count.
 - `.work_type(WorkType)` -- set work type (default: `SpinWait`).
 - `.sched_policy(SchedPolicy)` -- set Linux scheduling policy
   (default: `Normal`). See [WorkSpec Types](work-types.md#scheduling-policies).
 - `.work(WorkSpec)` -- add a work group (multiple calls for concurrent groups).
+- `.workload(&'static Payload)` -- attach a binary workload payload
+  to run alongside the worker group; the framework launches it as a
+  child process inside the cgroup.
 - `.affinity(AffinityIntent)` -- set per-worker affinity (default: `Inherit`).
 - `.mem_policy(MemPolicy)` -- set NUMA memory placement policy
   (default: `Default`). See [MemPolicy](mem-policy.md).
 - `.mpol_flags(MpolFlags)` -- set mode flags for `set_mempolicy(2)`
   (default: `NONE`). See [MemPolicy](mem-policy.md#mpolflags).
+- `.nice(n)` -- cgroup-level default per-worker nice value, merged
+  into every WorkSpec whose own `nice` is unset. See
+  [Tutorial: Step 9](../tutorial.md#step-9-name-and-prioritize-workers).
+- `.comm(name)` -- cgroup-level default per-worker `task->comm` via
+  `prctl(PR_SET_NAME)`. Merged into every WorkSpec whose own `comm`
+  is unset.
+- `.pcomm(name)` -- thread-group-leader `task->comm` for the
+  fork-then-thread spawn path (workers run as threads under one
+  forked leader). Stamps every existing WorkSpec in-place; not
+  order-independent with `.work(...)`.
+- `.uid(uid)` / `.gid(gid)` -- cgroup-level default per-worker
+  effective UID / GID via `setresuid` / `setresgid`. Merged into
+  every WorkSpec whose own `uid` / `gid` is unset.
+- `.numa_node(node)` -- cgroup-level default NUMA-node affinity for
+  every WorkSpec. Merged at apply-setup time.
 - `.swappable(bool)` -- opt into gauntlet work type override.
+
+#### Cgroup controllers
+
+The cgroup-v2 cpu / memory / io / pids controllers are exposed as
+typed setters (default: unconstrained):
+
+- `.cpu_quota_pct(pct)` / `.cpu_quota(quota, period)` /
+  `.cpu_unlimited()` -- write `cpu.max` (`pct` is shorthand: `100`
+  = one full CPU). `cpu_unlimited` resets to the kernel default.
+- `.cpu_weight(weight)` -- write `cpu.weight` (`1..=10000`,
+  default `100`).
+- `.memory_max(bytes)` / `.memory_high(bytes)` /
+  `.memory_low(bytes)` / `.memory_unlimited()` -- write
+  `memory.max` / `memory.high` / `memory.low`. `memory_unlimited`
+  resets `memory.max` to `max`.
+- `.memory_swap_max(bytes)` / `.memory_swap_unlimited()` -- write
+  `memory.swap.max`.
+- `.io_weight(weight)` -- write `io.weight` (`1..=10000`,
+  default `100`).
+- `.pids_max(n)` / `.pids_unlimited()` -- write `pids.max`.
 
 ### MemPolicy-cpuset validation
 

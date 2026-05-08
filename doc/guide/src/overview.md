@@ -20,7 +20,7 @@ fn my_test(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 ```sh
-cargo nextest run --workspace
+cargo ktstr test --kernel ../linux
 ```
 
 Without a `scheduler` attribute, tests run under EEVDF. See

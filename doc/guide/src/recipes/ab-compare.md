@@ -61,12 +61,12 @@ mkdir -p ~/opensource/scx-runs/ktstr
 
 # Baseline.
 cd ~/opensource/scx-main
-cargo nextest run --workspace
+cargo ktstr test --kernel ../linux
 mv target/ktstr/* ~/opensource/scx-runs/ktstr/
 
 # Experimental.
 cd ~/opensource/scx
-cargo nextest run --workspace
+cargo ktstr test --kernel ../linux
 mv target/ktstr/* ~/opensource/scx-runs/ktstr/
 ```
 

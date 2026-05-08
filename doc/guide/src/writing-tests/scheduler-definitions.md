@@ -18,8 +18,23 @@ pub struct Scheduler {
     pub topology: Topology,
     pub constraints: TopologyConstraints,
     pub config_file: Option<&'static str>,
+    pub config_file_def: Option<(&'static str, &'static str)>,
 }
 ```
+
+`config_file` packs a host-side file into the initramfs at
+`/include-files/{filename}` and prepends `--config
+/include-files/{filename}` to scheduler args automatically.
+
+`config_file_def` declares an arg-template + guest-path pair for
+schedulers that take inline JSON content via the test attribute
+`#[ktstr_test(config = …)]`: the framework writes the test's
+`config_content` to the declared guest path and substitutes
+`{file}` in the arg template before launching the scheduler. The
+two fields are alternatives — `config_file` is the host-file path,
+`config_file_def` is the inline-content path. See
+[The #\[ktstr_test\] Macro](ktstr-test-macro.md#inline-scheduler-config)
+for the inline pairing gate.
 
 `sysctls` takes `Sysctl` values. Construct them with
 `Sysctl::new("key", "value")` in `const` context. Use the
@@ -352,11 +367,19 @@ not as a license to hand-roll literals. Each is populated by
 - `default_args: &'static [&'static str]` — CLI args prepended to
   every invocation. Per-test `ctx.payload(...).args(...)` appends
   after these.
-- `default_checks: &'static [Check]` — static assertions applied to
-  the payload's output/exit. Merged with per-test `.checks(...)`.
+- `default_checks: &'static [MetricCheck]` — static assertions
+  applied to the payload's output/exit (`min` / `max` / `range` /
+  `exists` / `exit_code_eq` constructors on `MetricCheck`). Merged
+  with per-test `.checks(...)`.
 - `metrics: &'static [MetricHint]` — declared metrics the payload
   emits (name, unit, polarity). Drives `list-metrics` and
   comparison thresholds.
+- `metric_bounds: Option<&'static MetricBounds>` — optional
+  per-metric host-side bounds applied AFTER the payload exits.
+  Consumed by `LlmExtract` payloads (where extraction runs
+  host-side post-VM-exit); `Json` and `ExitCode` payloads ignore
+  this field and route assertions through `default_checks`
+  instead.
 - `include_files: &'static [&'static str]` — extra files packaged
   into the guest alongside the binary (config files, datasets).
 - `uses_parent_pgrp: bool` — when true, the payload child inherits

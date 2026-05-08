@@ -76,7 +76,7 @@ so most tests do not need to set `numa_nodes`. See
 |---|---|---|
 | `scheduler = CONST` | `&Payload::KERNEL_DEFAULT` | Rust const path to a `&'static Payload` whose kind is `PayloadKind::Scheduler`. The `_PAYLOAD` wrapper emitted by `#[derive(Scheduler)]` (e.g. `MY_SCHED_PAYLOAD`) is the expected form here; the bare `Scheduler` const will not type-check. The default `Payload::KERNEL_DEFAULT` wraps `Scheduler::EEVDF` (the kernel's default scheduler — EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
-| `watchdog_timeout_s` | 4 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
+| `watchdog_timeout_s` | 5 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 
 ### Payloads
 
@@ -176,14 +176,73 @@ example.
 |---|---|---|
 | `auto_repro` | `true` | On scheduler crash, boot a second VM with probes attached. Set to `false` for fast iteration. |
 | `performance_mode` | `false` | Pin vCPUs to host cores, hugepages, NUMA mbind, RT scheduling, LLC exclusivity validation |
-| `duration_s` | 2 | Per-scenario duration in seconds |
+| `no_perf_mode` | `false` | Decouple the virtual topology from host hardware: build the VM with the declared `numa_nodes` / `llcs` / `cores` / `threads` even on smaller hosts; skip vCPU pinning, hugepages, NUMA mbind, RT scheduling, and KVM exit suppression; relax gauntlet preset filtering to the single "host has enough total CPUs" check. Mutually exclusive with `performance_mode = true` (validated at compile time). Equivalent to setting `KTSTR_NO_PERF_MODE=1` per-test — either source forces the no-perf path. See [Performance Mode](../concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation). |
+| `duration_s` | 12 | Per-scenario duration in seconds |
 | `workers_per_cgroup` | 2 | Workers per cgroup |
 | `expect_err` | `false` | Test expects `run_ktstr_test` to return `Err`; disables auto-repro |
 | `bpf_map_write = CONST` | empty | Rust const path to a `BpfMapWrite`; host writes this value to a BPF map after the scheduler loads. The entry field is a slice; the macro wraps the single path in a one-element slice. |
 | `host_only` | `false` | Run the test function directly on the host instead of inside a VM. Use for tests that need host tools (e.g. cargo, nested VMs) unavailable in the guest initramfs. |
+| `num_snapshots = N` | `0` | Fire `N` periodic `freeze_and_capture(false)` boundaries inside the workload's 10 %–90 % window; each capture is stored on the host `SnapshotBridge` under `periodic_NNN`. `0` disables periodic capture entirely. Validated against `MAX_STORED_SNAPSHOTS` (= 64), `host_only = true`, and a 100 ms minimum-spacing rule. See [Periodic Capture](periodic-capture.md) and [Temporal Assertions](temporal-assertions.md). |
+| `cleanup_budget_ms = N` | `None` | Sub-watchdog cap on host-side VM teardown wall time. When the budget is exceeded the test's `AssertResult` is folded with a failing `AssertDetail`. `None` disables the check. |
+| `post_vm = PATH` | `None` | Host-side callback invoked after `vm.run()` returns. Signature: `fn(&VmResult) -> anyhow::Result<()>`. Use for assertions that need host-side state — e.g. draining `VmResult.snapshot_bridge` for periodic-capture analysis (see [Periodic Capture](periodic-capture.md)). |
+| `config = EXPR` | `None` | Inline scheduler config content (string literal or path to a `const &'static str`). Written to the guest path declared by the scheduler's `config_file_def`; the framework substitutes `{file}` in the scheduler's arg template with the guest path. Required when the scheduler declares `config_file_def`; rejected when it doesn't. The pairing is enforced at compile time via a `const` assertion against `Payload::config_file_def`, and again at runtime by `KtstrTestEntry::validate`. See [Inline scheduler config](#inline-scheduler-config). |
 
 See [Performance Mode](../concepts/performance-mode.md) for details on
 what `performance_mode` enables, prerequisites, and validation behavior.
+
+## Inline scheduler config
+
+Some schedulers (e.g. `scx_layered`, `scx_lavd`) accept a JSON config
+file via a CLI argument like `--config /path/to/config.json`. Two
+pieces wire this into a test:
+
+1. **Scheduler declaration** — the `Scheduler` builder declares the
+   arg template and the guest path via `.config_file_def`:
+
+   ```rust,ignore
+   const LAYERED_SCHED: Scheduler = Scheduler::new("layered")
+       .binary(SchedulerSpec::Discover("scx_layered"))
+       .config_file_def("--config {file}", "/include-files/layered.json");
+   const LAYERED_PAYLOAD: Payload = Payload::from_scheduler(&LAYERED_SCHED);
+   ```
+
+   `{file}` in the arg template is replaced with the guest path. The
+   framework `mkdir -p`s the parent and writes the config content to
+   `/include-files/layered.json` inside the guest before the
+   scheduler binary starts.
+
+2. **Test attribute** — the test supplies the inline JSON via
+   `config = …`:
+
+   ```rust,ignore
+   const LAYERED_CONFIG: &str = r#"{ "layers": [...] }"#;
+
+   #[ktstr_test(scheduler = LAYERED_PAYLOAD, config = LAYERED_CONFIG)]
+   fn layered_test(ctx: &Ctx) -> Result<AssertResult> {
+       Ok(AssertResult::pass())
+   }
+   ```
+
+   `config = "..."` (string literal) and `config = SOME_CONST` (path
+   to a `const &'static str`) are both accepted.
+
+The pairing gate is bidirectional:
+- A scheduler with `config_file_def` set **requires** `config = …`
+  on every test (otherwise the scheduler binary would launch
+  without `--config`).
+- A scheduler without `config_file_def` **rejects** `config = …` on
+  the test (the content would be silently dropped at dispatch).
+
+Both halves are validated at compile time via a `const` assertion
+emitted by the macro AND at runtime by `KtstrTestEntry::validate`,
+so direct programmatic-entry construction sees the same gate.
+
+For schedulers that take a config file from a host-side path
+instead of inline content, use `Scheduler::config_file(host_path)`
+instead of `config_file_def`. The framework packs the host file into
+the initramfs at `/include-files/{filename}` and prepends `--config
+/include-files/{filename}` to scheduler args; no `config = …` on
+the test is needed in that flavor.
 
 ## Example with custom scheduler
 

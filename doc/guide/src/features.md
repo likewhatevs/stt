@@ -210,7 +210,7 @@ Workers are `fork()`ed processes placed in cgroups:
 - `MutexContention` — N-way futex mutex contention
 - `PriorityInversion` — three-tier lock contention (Pi or Plain futex)
 - `ProducerConsumerImbalance` — unbalanced producer/consumer pipeline (queue grows)
-- `SignalStorm` — paired workers fire kill(partner, SIGUSR1) between CPU bursts
+- `SignalStorm` — paired workers fire tkill(partner, SIGUSR1) between CPU bursts
 - `PreemptStorm` — one SCHED_FIFO worker preempts CFS spinners at ~kHz
 - `RtStarvation` — SCHED_FIFO workers monopolise CPU; SCHED_NORMAL workers starve
 - `Custom` — user-supplied work function
@@ -252,6 +252,86 @@ Stimulus events (cgroup ops, cpuset changes, step transitions)
 correlated with monitor samples for per-phase scheduler behavior
 analysis. Each event carries timestamps, operation details, and
 cumulative worker iteration counts.
+
+</details>
+
+<details>
+<summary><b>Periodic capture + temporal assertions</b> — cadenced sampling across the workload window with monotonicity, rate, steady-state, convergence, and ratio patterns</summary>
+
+`#[ktstr_test(num_snapshots = N)]` fires `N` host-side
+`freeze_and_capture` boundaries inside the workload's 10 %–90 %
+window, anchored at the first `MSG_TYPE_SCENARIO_START`. Each
+capture is stored on the `SnapshotBridge` under `periodic_NNN`
+along with the parallel scx_stats JSON observed pre-freeze and a
+pause-adjusted elapsed-ms timestamp.
+
+A `post_vm` callback drains the bridge into a `SampleSeries` and
+projects per-sample columns (`SeriesField<T>`) along the BPF or
+stats axis. Six temporal patterns evaluate the projections:
+
+- `nondecreasing` / `strictly_increasing` — counter monotonicity
+- `rate_within(lo, hi)` — bounded delta-per-millisecond
+- `steady_within(warmup_ms, tolerance)` — post-warmup mean band
+- `converges_to(target, tolerance, deadline_ms)` — three-consecutive-in-band witness before deadline
+- `always_true` — boolean invariant at every sample
+- `ratio_within(other, lo, hi)` — cross-field correlation between two series
+
+Per-sample projection errors render with the underlying
+`SnapshotError` variant (PlaceholderSample, MissingStats,
+FieldNotFound, TypeMismatch, …) so coverage gaps surface with
+their cause without re-running. See
+[Periodic Capture](writing-tests/periodic-capture.md) and
+[Temporal Assertions](writing-tests/temporal-assertions.md).
+
+</details>
+
+<details>
+<summary><b>Worker comm / nice / pcomm</b> — set <code>task->comm</code>, nice level, and thread-group leader name on every worker</summary>
+
+`CgroupDef::comm("name")` calls `prctl(PR_SET_NAME)` on every
+worker. `CgroupDef::nice(n)` calls `setpriority(PRIO_PROCESS, 0, n)`
+on every worker. `CgroupDef::pcomm("name")` triggers ktstr's
+fork-then-thread spawn path: workers sharing a pcomm value coalesce
+into ONE forked thread-group leader whose `task->group_leader->comm`
+is the pcomm string, with worker threads inside it. Each worker
+thread additionally sets its own `task->comm` via the per-WorkSpec
+`.comm()`. Models real applications like `chrome` (pcomm) hosting
+`ThreadPoolForeg` (per-thread comm). `PipeIo`/`CachePipe` and
+`SignalStorm` work correctly under all clone modes (Fork, Thread,
+Pcomm). See [Tutorial: Step 9](tutorial.md#step-9-name-and-prioritize-workers).
+
+</details>
+
+<details>
+<summary><b>Inline scheduler configs</b> — pass JSON config strings directly into the test, framework writes to guest path</summary>
+
+Schedulers that take a `--config` JSON file (`scx_layered`,
+`scx_lavd`, …) declare the arg template + guest path via
+`Scheduler::config_file_def(arg_template, guest_path)`. Tests
+supply the inline JSON via `#[ktstr_test(config = LAYERED_CONFIG)]`.
+The framework writes the content to a temp file, packs it into the
+initramfs at the guest path, and substitutes `{file}` in the arg
+template before launching the scheduler. A bidirectional pairing
+gate (compile time + runtime) catches mismatched declarations: a
+scheduler with `config_file_def` REQUIRES `config = …` on every
+test, and a scheduler without it REJECTS `config = …`. See
+[Tutorial: Step 10](tutorial.md#step-10-inline-scheduler-config) and
+[The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md#inline-scheduler-config).
+
+</details>
+
+<details>
+<summary><b>no_perf_mode</b> — decouple virtual topology from host hardware for tests with NUMA / LLC counts the host can't satisfy</summary>
+
+`#[ktstr_test(no_perf_mode = true)]` (or `KTSTR_NO_PERF_MODE=1`)
+builds the VM with the declared `numa_nodes` / `llcs` / `cores` /
+`threads` even on smaller hosts. vCPU pinning, hugepages, NUMA
+mbind, RT scheduling, and KVM exit suppression are skipped, and
+gauntlet preset filtering relaxes host-topology checks to the
+single "host has enough total CPUs" inequality. Mutually exclusive
+with `performance_mode = true` (validated at compile time). See
+[Tutorial: Step 11](tutorial.md#step-11-decouple-virtual-topology-from-host-hardware)
+and [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation).
 
 </details>
 

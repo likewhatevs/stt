@@ -221,28 +221,28 @@ longer / heavier runs:
 
 | Attribute | Default | What it does |
 |---|---|---|
-| `duration_s` | `2` | Per-scenario wall-clock seconds. The framework keeps both cgroups running for `duration_s` seconds, then signals workers to stop and collects reports. |
-| `watchdog_timeout_s` | `4` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
+| `duration_s` | `12` | Per-scenario wall-clock seconds. The framework keeps both cgroups running for `duration_s` seconds, then signals workers to stop and collects reports. |
+| `watchdog_timeout_s` | `5` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 | `workers_per_cgroup` | `2` | Default worker count when a `CgroupDef` does not call `.workers(n)`. Per-cgroup `.workers(n)` overrides this. |
 | `memory_mb` | `2048` | VM memory in MiB. |
 
-`watchdog_timeout_s` should be `>= duration_s + slack`: the
-watchdog fires inside the kernel during the run, so a value
-shorter than the run guarantees a stall trigger before any
-workload completes. Pad by enough seconds to absorb worst-case
-phase + assertion overhead.
+`watchdog_timeout_s` is sched_ext's per-task stall threshold — if
+a runnable task is not picked for `watchdog_timeout_s` seconds,
+the scheduler exits with `SCX_EXIT_ERROR_STALL`. The scenario
+duration and watchdog are independent; a 12 s scenario with a 5 s
+watchdog is normal. Tune the watchdog only when the scheduler
+under test is expected to legitimately leave a runnable task
+parked longer than the default 5 s.
 
-For the run we're building, bump the duration to 10 s (so each
-phase iteration repeats many times) and stretch the watchdog to
-match:
+For the run we're building, set the duration to 20 s (so each
+phase iteration repeats many times):
 
 ```rust,ignore
 #[ktstr_test(
     llcs = 2,
     cores = 2,
     threads = 1,
-    duration_s = 10,
-    watchdog_timeout_s = 30,
+    duration_s = 20,
 )]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     // body unchanged from Step 4 -- two cgroups via execute_defs
@@ -284,8 +284,7 @@ use ktstr::prelude::*;
     llcs = 2,
     cores = 2,
     threads = 1,
-    duration_s = 10,
-    watchdog_timeout_s = 30,
+    duration_s = 20,
     isolation = true,
     max_spread_pct = 15.0,
     max_throughput_cv = 0.5,
@@ -485,6 +484,125 @@ Run it:
 cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
 ```
 
+## Step 9: Name and prioritize workers
+
+Per-cgroup defaults travel through `CgroupDef`'s builder methods so
+schedulers that key on `task->comm` or `task_struct->static_prio`
+can be exercised with realistic, distinguishable workers:
+
+```rust,ignore
+CgroupDef::named("background_spinner")
+    .workers(2)
+    .comm("bg_spinner")           // prctl(PR_SET_NAME, "bg_spinner")
+    .nice(10)                     // setpriority(PRIO_PROCESS, 0, 10)
+    .work_type(WorkType::SpinWait)
+```
+
+- **`.comm("name")`** — every worker calls `prctl(PR_SET_NAME, name)`
+  at startup. The kernel truncates `task->comm` to 15 bytes inside
+  `__set_task_comm`. Distinguishes workers in `top` / `ps` output
+  and in scheduler tracepoints.
+- **`.nice(n)`** — every worker calls
+  `setpriority(PRIO_PROCESS, 0, n)`. Values below the calling
+  task's current nice require `CAP_SYS_NICE`; ktstr always runs as
+  root in-VM so the full `-20..=19` range is available. Skips the
+  syscall entirely when `.nice(...)` is not chained (workers
+  inherit the parent's nice).
+- **`.pcomm("name")`** — set the *thread-group leader*'s
+  `task->comm`. Triggers ktstr's fork-then-thread spawn path:
+  workers sharing a `pcomm` value coalesce into ONE forked leader
+  process whose `task->group_leader->comm` is `name`, with worker
+  threads inside it. Models real applications like `chrome` (pcomm)
+  hosting `ThreadPoolForeg` (per-thread comm) and `java` (pcomm)
+  hosting `GC Thread` / `C2 CompilerThre`.
+
+`PipeIo` and `CachePipe` workers placed in a `.pcomm(...)` cgroup
+run as threads inside the pcomm container; their pipe-pair partner
+indices are computed within the container's thread group, not
+across forked siblings. `SignalStorm` uses `tkill` (per-task signal
+delivery, `PIDTYPE_PID`) rather than `kill` (`PIDTYPE_TGID`), so
+the partner-vs-self addressing is correct uniformly across
+`Fork`, `Thread`, and `Pcomm` clone modes.
+
+Per-`WorkSpec` overrides win over cgroup-level defaults — write
+`.work(WorkSpec::default().nice(0).comm("hot_spinner"))` to opt a
+specific worker out of the cgroup-level defaults.
+
+## Step 10: Inline scheduler config
+
+Schedulers like `scx_layered` and `scx_lavd` accept a JSON config via
+`--config /path/to/file.json`. Declare the arg template + guest path
+on a `Scheduler` const built via the manual builder, then supply the
+inline content from the test attribute:
+
+```rust,ignore
+const LAYERED_SCHED: Scheduler = Scheduler::new("layered")
+    .binary(SchedulerSpec::Discover("scx_layered"))
+    .topology(1, 2, 4, 1)
+    .config_file_def("--config {file}", "/include-files/layered.json");
+const LAYERED_PAYLOAD: Payload = Payload::from_scheduler(&LAYERED_SCHED);
+
+const LAYERED_CONFIG: &str = r#"{ "layers": [{ "name": "default" }] }"#;
+
+#[ktstr_test(scheduler = LAYERED_PAYLOAD, config = LAYERED_CONFIG)]
+fn layered_default(ctx: &Ctx) -> Result<AssertResult> {
+    Ok(AssertResult::pass())
+}
+```
+
+The framework writes `LAYERED_CONFIG` to the guest at the path
+declared on the scheduler (`/include-files/layered.json`) and
+substitutes `{file}` in the arg template with that path before
+launching the scheduler binary. A scheduler that declares
+`config_file_def` REQUIRES every test to supply `config = …`
+(compile-time + runtime gate); a scheduler that doesn't declare it
+REJECTS `config = …` (the content would be silently dropped). See
+[The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md#inline-scheduler-config)
+for the full pairing rules.
+
+For schedulers whose config lives on disk on the host (no inline
+content), use `Scheduler::config_file(host_path)` instead — the
+host file is packed into the initramfs and `--config` is injected
+into scheduler args automatically; no `config = …` on the test is
+needed in that flavor.
+
+## Step 11: Decouple virtual topology from host hardware
+
+By default, ktstr pins vCPUs to host cores in a layout that mirrors
+the declared virtual topology. A test declaring `numa_nodes = 3,
+llcs = 8` cannot run on a 1-NUMA-node host — the gauntlet preset
+filter rejects it. Set `no_perf_mode = true` to drop the host
+mirroring and run the declared virtual topology unchanged:
+
+```rust,ignore
+#[ktstr_test(
+    numa_nodes = 3,
+    llcs = 8,
+    cores = 4,
+    no_perf_mode = true,    // VM built as declared, even on 1-NUMA hosts
+    duration_s = 10,
+)]
+fn three_node_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
+```
+
+In `no_perf_mode`:
+- The VM's virtual topology is built as declared via KVM vCPU
+  layout, ACPI SRAT/SLIT (x86_64), or FDT cpu nodes (aarch64) —
+  the guest sees the full requested NUMA / LLC structure.
+- vCPU-to-host-core pinning, 2 MB hugepages, NUMA mbind, RT
+  scheduling, and KVM exit suppression are skipped.
+- Host topology constraints (`min_numa_nodes`, `min_llcs`,
+  `requires_smt`, per-LLC CPU widths) are NOT compared against
+  host hardware. The only host check that survives is "total host
+  CPUs >= total vCPUs".
+
+`no_perf_mode = true` is mutually exclusive with `performance_mode
+= true` (the macro rejects the combination). Equivalent to setting
+`KTSTR_NO_PERF_MODE=1` per-test — either source forces the
+no-perf path. See
+[Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation)
+for the full lifecycle.
+
 ## What's next
 
 - [Custom Scenarios](writing-tests/custom-scenarios.md) -- when the
@@ -500,6 +618,12 @@ cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
   `Op::watch_snapshot("symbol")` registers a hardware data-write
   watchpoint (up to 3 per scenario; slot 0 is reserved for the
   error-class exit_kind trigger).
+- [Periodic Capture](writing-tests/periodic-capture.md) -- cadenced
+  `freeze_and_capture(false)` across the workload window (set
+  `num_snapshots = N`); produces a time-ordered `SampleSeries`.
+- [Temporal Assertions](writing-tests/temporal-assertions.md) --
+  patterns over a `SampleSeries` (`nondecreasing`, `rate_within`,
+  `steady_within`, `converges_to`, `always_true`, `ratio_within`).
 - [MemPolicy](concepts/mem-policy.md) -- NUMA-aware tests that bind
   memory allocations to specific nodes and check page locality.
 - [Performance Mode](concepts/performance-mode.md) -- pinned vCPUs,
