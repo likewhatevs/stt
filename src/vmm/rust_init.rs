@@ -961,6 +961,27 @@ pub(crate) fn ktstr_guest_init() -> ! {
 
     // Phase 6: Scheduler cleanup.
     let _s_phase6 = tracing::debug_span!("phase6_cleanup").entered();
+
+    // Stop the sched-exit monitor BEFORE killing the scheduler.
+    // Without this ordering, child.kill() makes the scheduler
+    // exit, the monitor's pidfd poll wakes, it sees /proc/{pid}
+    // gone and emits MSG_TYPE_SCHED_EXIT on the bulk port, the
+    // host promotes kill=true, and the BSP exits with ExternalKill
+    // before the guest reaches send_exit — producing exit_code=-1
+    // on an otherwise clean run.
+    //
+    // `stop_and_join` sets stop=true (Release), writes the wake
+    // eventfd to drop poll wake latency from 250 ms to
+    // microseconds, then joins the monitor thread. Joining is
+    // event-driven: the monitor's loop checks stop at the top,
+    // exits cleanly after `poll(2)` returns, and the join
+    // returns. After this call the monitor is guaranteed to have
+    // exited without sending MSG_TYPE_SCHED_EXIT, so the
+    // subsequent child.kill() cannot trigger the race.
+    if let Some(handle) = sched_exit_stop {
+        handle.stop_and_join();
+    }
+
     if let Some(ref mut child) = sched_child {
         let _ = child.kill();
         let _ = child.wait();
@@ -970,28 +991,11 @@ pub(crate) fn ktstr_guest_init() -> ! {
     }
     exec_shell_script("/sched_disable");
 
-    // Stop background threads.
+    // Stop remaining background threads.
     if let Some(ref stop) = vc_poll_stop {
         stop.store(true, Ordering::Release);
     }
-    // Flip the AtomicBool source-of-truth THEN write the stop
-    // eventfd. The relay's poll() loop watches stop_evt as one of
-    // its fds; the eventfd write wakes any blocked poll() within
-    // microseconds. We don't join the relay thread because the
-    // kernel reboot path tears down userspace synchronously and
-    // the relay exits when its blocking I/O returns EBADF/EOF.
     stats_relay_stop.signal_stop();
-    if let Some(ref handle) = sched_exit_stop {
-        // Order: store `true` first so the monitor's `Acquire` load
-        // at the top of its loop sees the stop flag. Then write the
-        // wake eventfd to drop the monitor's `poll(2)` wait latency
-        // from the legacy 250 ms cadence to microseconds. A
-        // monitor that races the eventfd write into its
-        // `Acquire` load still observes `stop=true` immediately —
-        // the eventfd is the wake edge, not the source of truth.
-        handle.stop.store(true, Ordering::Release);
-        handle.wake();
-    }
 
     // Flush COM1 trace data before reboot. The reader thread runs on
     // a poll(POLLIN, 200ms) cadence over a non-blocking trace_pipe fd
@@ -3558,13 +3562,23 @@ fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
     }
 }
 
-/// Stop handle for the sched-exit monitor. Carries both the
-/// `Arc<AtomicBool>` source-of-truth flag and a writable eventfd handle
+/// Stop handle for the sched-exit monitor. Carries the
+/// `Arc<AtomicBool>` source-of-truth flag, a writable eventfd handle
 /// the cleanup site uses to wake the monitor thread out of `poll(2)`
-/// without waiting for the legacy 250 ms cadence.
+/// without waiting for the legacy 250 ms cadence, and the monitor
+/// thread's `JoinHandle` so the cleanup site can wait for the
+/// thread to actually exit before proceeding.
 ///
-/// Cleanup contract: before reading `stop`, the cleanup site MUST
-/// `store(true, Release)` the bool AND call [`SchedExitStop::wake`].
+/// Cleanup contract: before any action that could be misinterpreted
+/// by the monitor as an unexpected scheduler exit (e.g. `child.kill()`
+/// on the scheduler), the cleanup site MUST call
+/// [`SchedExitStop::stop_and_join`] (or its equivalent of
+/// `store(true, Release)` + [`SchedExitStop::wake`] + joining the
+/// thread). Otherwise the monitor races: it sees `/proc/{pid}` gone
+/// after the kill, takes the `if exited` branch, and emits
+/// `MSG_TYPE_SCHED_EXIT` to the host, which terminates the VM
+/// before the orderly `MSG_TYPE_EXIT` frame can be sent.
+///
 /// The bool is the source of truth; the eventfd write delivers the
 /// edge that pulls the thread out of an indefinite `poll`. The
 /// eventfd is owned by this struct on the writer side and by the
@@ -3581,6 +3595,11 @@ pub(crate) struct SchedExitStop {
     /// `eventfd(2)` failed at monitor spawn (legacy 250 ms timeout
     /// still bounds wake latency in that degraded path).
     wake_fd: Option<OwnedFd>,
+    /// Monitor thread join handle. `None` when
+    /// `std::thread::Builder::spawn` failed (the monitor never
+    /// started; nothing to join). Consumed by
+    /// [`SchedExitStop::stop_and_join`].
+    join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SchedExitStop {
@@ -3609,6 +3628,27 @@ impl SchedExitStop {
             };
         }
     }
+
+    /// Atomically request stop and wait for the monitor thread to
+    /// exit. Sets `stop=true` (Release) and writes the wake eventfd
+    /// so the monitor's `poll(2)` returns within microseconds, then
+    /// joins the thread. After this returns, the monitor has
+    /// observed `stop=true` at the top of its loop and exited
+    /// without sending `MSG_TYPE_SCHED_EXIT` — making it safe for
+    /// the caller to proceed with actions (like killing the
+    /// scheduler child) that the monitor would otherwise interpret
+    /// as an unexpected scheduler exit.
+    ///
+    /// `JoinHandle::join` propagates a panic from the monitor closure
+    /// as `Err`; it is consumed and ignored — a panicked monitor is
+    /// already dead and there is no recovery path during teardown.
+    pub(crate) fn stop_and_join(self) {
+        self.stop.store(true, Ordering::Release);
+        self.wake();
+        if let Some(handle) = self.join_handle {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Monitor the scheduler child process for unexpected exit.
@@ -3630,10 +3670,14 @@ impl SchedExitStop {
 /// Uses procfs instead of waitpid because SIGCHLD is SIG_IGN (the kernel
 /// auto-reaps children, making waitpid return ECHILD).
 ///
-/// The returned [`SchedExitStop`] carries both the `Arc<AtomicBool>` the
-/// monitor reads and an eventfd the cleanup site writes via
+/// The returned [`SchedExitStop`] carries the `Arc<AtomicBool>` the
+/// monitor reads, an eventfd the cleanup site writes via
 /// [`SchedExitStop::wake`] to drop wake latency from 250 ms (legacy
-/// poll timeout) to microseconds.
+/// poll timeout) to microseconds, and the monitor thread's
+/// `JoinHandle` so [`SchedExitStop::stop_and_join`] can confirm the
+/// thread has exited before the caller proceeds with actions
+/// (e.g. `child.kill()`) the monitor would otherwise interpret as
+/// an unexpected scheduler exit.
 ///
 /// Returns None when no scheduler is running.
 fn start_sched_exit_monitor(
@@ -3695,7 +3739,7 @@ fn start_sched_exit_monitor(
         }
     };
 
-    std::thread::Builder::new()
+    let join_handle = std::thread::Builder::new()
         .name("sched-exit-mon".into())
         .spawn(move || {
             // pidfd_open lets us block on SIGCHLD-equivalent
@@ -3798,16 +3842,20 @@ fn start_sched_exit_monitor(
                     } else if let Some(ref path) = log_path {
                         dump_sched_output(path);
                     }
-                    // Signal SCHED_EXIT after the optional probe
-                    // drain (above) and the optional COM2 dump.
-                    // The host kills the VM on SCHED_EXIT, so
-                    // issuing it AFTER the probe pipeline finishes
-                    // ensures probe JSON has hit COM2 before
-                    // teardown. The probe thread sets
-                    // `output_done` only after writing
-                    // PROBE_PAYLOAD_END, so a successful wait
-                    // guarantees the marker has landed in COM2's
-                    // host-side capture buffer.
+                    // Suppress SchedExit when the host cleanup
+                    // initiated the kill (stop flag set before
+                    // child.kill). Without this gate, Phase 6
+                    // child.kill → pidfd POLLIN → monitor enters
+                    // this branch → sends SchedExit → host sets
+                    // kill=true → BSP exits with ExternalKill
+                    // before the guest reaches send_exit,
+                    // producing exit_code=-1 on a clean run.
+                    if stop_clone.load(Ordering::Acquire) {
+                        unsafe {
+                            libc::close(pidfd);
+                        }
+                        return;
+                    }
                     let exit_code: i32 = 1;
                     crate::vmm::guest_comms::send_sched_exit(exit_code);
                     // SAFETY: pidfd is owned by this thread
@@ -3856,6 +3904,7 @@ fn start_sched_exit_monitor(
     Some(SchedExitStop {
         stop,
         wake_fd: writer_fd,
+        join_handle,
     })
 }
 
