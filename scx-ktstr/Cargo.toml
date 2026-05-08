@@ -11,9 +11,13 @@ categories = ["development-tools::testing"]
 
 [dependencies]
 anyhow = "1"
+crossbeam = "0.8"
 ctrlc = "3"
 libbpf-rs = { version = "0.26", features = ["vendored"] }
+scx_stats = "1.1.0"
+scx_stats_derive = "1.1.0"
 scx_utils = "1.1.0"
+serde = { version = "1", features = ["derive"] }
 
 [build-dependencies]
 scx_cargo = "1.1.0"

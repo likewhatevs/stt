@@ -116,6 +116,16 @@ volatile int degrade_rt;
 u32 degrade_cnt;
 u32 slow_cnt;
 
+/* Cumulative counters surfaced via the scx_stats userspace protocol
+ * (KtstrStats in scx-ktstr/src/stats.rs). Updated with
+ * `__sync_fetch_and_add` because each ops callback runs concurrently
+ * across all CPUs. .bss-resident so the userspace
+ * `bss_data.nr_*` accessor reads them atomically with respect to the
+ * BPF-side increments. */
+volatile u64 nr_dispatched;
+volatile u64 nr_enqueued;
+volatile u64 nr_select_cpu;
+
 
 s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
 		   s32 prev_cpu, u64 wake_flags)
@@ -124,11 +134,13 @@ s32 BPF_STRUCT_OPS(ktstr_select_cpu, struct task_struct *p,
 	s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle)
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+	__sync_fetch_and_add(&nr_select_cpu, 1);
 	return cpu;
 }
 
 void BPF_STRUCT_OPS(ktstr_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	__sync_fetch_and_add(&nr_enqueued, 1);
 	if (scattershot || degrade || degrade_rt) {
 		const struct cpumask *online;
 		u32 nr = scx_bpf_nr_cpu_ids();
@@ -192,6 +204,7 @@ void BPF_STRUCT_OPS(ktstr_dispatch, s32 cpu, struct task_struct *prev)
 			return;
 	}
 	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	__sync_fetch_and_add(&nr_dispatched, 1);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init)

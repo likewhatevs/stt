@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 mod bpf_skel;
+mod stats;
 pub use bpf_skel::*;
 
 use std::mem::MaybeUninit;
@@ -11,12 +12,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use anyhow::Result;
+use scx_stats::prelude::StatsServer;
 use scx_utils::UserExitInfo;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
+
+use stats::KtstrStats;
 
 fn parse_delay_flag(flag: &str) -> Option<u64> {
     let args: Vec<String> = std::env::args().collect();
@@ -85,6 +89,19 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
 
     let mut skel = scx_ops_load!(skel, ktstr_ops, uei)?;
     let _link = scx_ops_attach!(skel, ktstr_ops)?;
+
+    // Bind the scx_stats Unix-socket server at the default path
+    // (`/var/run/scx/root/stats`). The server's listener thread
+    // accepts connections and dispatches "stats" / "stats_meta"
+    // verbs through the channel pair we drain inline below; the
+    // main run loop owns the BPF skeleton and is the only thread
+    // that reads bss_data, so reads stay serialised against the
+    // userspace mutator paths above. ktstr's host-side
+    // `SchedStatsClient` reaches this socket through the in-guest
+    // stats relay that bridges `/dev/vport0p2` → `/var/run/scx/root/stats`.
+    let stats_server: StatsServer<(), KtstrStats> =
+        StatsServer::new(stats::server_data()).launch()?;
+    let (res_ch, req_ch) = stats_server.channels();
 
     if degrade {
         eprintln!("scx-ktstr: degrade mode enabled");
@@ -168,9 +185,56 @@ fn run(shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
                 eprintln!("scx-ktstr: degrade enabled via /tmp/ktstr_degrade");
             }
         }
+        // Drain every queued stats request this tick. The scx_stats
+        // server thread sends `()` over `req_ch` for each "stats"
+        // verb its accept loop receives; we reply with one fresh
+        // BPF .bss read per request so concurrent requesters each
+        // get their own snapshot. `try_recv` is non-blocking — the
+        // main loop's pacing is owned by the existing
+        // `thread::sleep(POLL_CADENCE)` above. Using
+        // `recv_timeout` here would either redundantly block on
+        // top of the cadence or starve the trigger logic. The
+        // BPF .bss read is naturally aligned 64-bit per field and
+        // the BPF side uses `__sync_fetch_and_add`, so a
+        // concurrent in-flight increment is observed as a single
+        // atomic value rather than a torn read.
+        loop {
+            match req_ch.try_recv() {
+                Ok(()) => {
+                    let snapshot = current_stats(&skel);
+                    if let Err(e) = res_ch.send(snapshot) {
+                        eprintln!("scx-ktstr: stats response send failed ({e})");
+                        break;
+                    }
+                }
+                Err(crossbeam::channel::TryRecvError::Empty) => break,
+                Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                    eprintln!("scx-ktstr: stats request channel disconnected");
+                    break;
+                }
+            }
+        }
     }
 
     uei_report!(&skel, uei)
+}
+
+/// Snapshot the BPF .bss counters into a `KtstrStats`. None-bss
+/// (skel still loading or maps unmapped) yields an all-zero
+/// snapshot — the response is still valid JSON and the host can
+/// distinguish "scheduler running but no traffic" from "scheduler
+/// not running" via the wire-level errno (the latter never reaches
+/// this function because the run loop wouldn't be running).
+fn current_stats(skel: &BpfSkel<'_>) -> KtstrStats {
+    skel.maps
+        .bss_data
+        .as_ref()
+        .map(|bss| KtstrStats {
+            nr_dispatched: bss.nr_dispatched,
+            nr_enqueued: bss.nr_enqueued,
+            nr_select_cpu: bss.nr_select_cpu,
+        })
+        .unwrap_or_default()
 }
 
 fn main() -> Result<()> {
