@@ -53,7 +53,7 @@ site: docs api-docs
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p _site/guide _site/api
-    cp -r doc/guide/book/* _site/guide/
+    cp -r doc/guide/book/html/* _site/guide/
     cp -r target/doc/* _site/api/
     cat > _site/index.html <<'HTML'
     <!DOCTYPE html>
