@@ -84,6 +84,7 @@ so most tests do not need to set `numa_nodes`. See
 |---|---|---|
 | `payload = CONST` | `None` | Rust const path to a binary-kind `Payload` (`PayloadKind::Binary`). Populates `KtstrTestEntry::payload`; the test body can run it via `ctx.payload(&CONST)`. Scheduler-kind payloads are rejected at compile time — use the `scheduler = …` slot for those. |
 | `workloads = [CONST, …]` | `[]` | Array of binary-kind `Payload` const paths composed alongside the primary `payload`. Each entry is runnable from the test body via `ctx.payload(&CONST)`; the include-file pipeline packages every referenced binary into the guest automatically. |
+| `extra_include_files = ["path", …]` | `[]` | Array of string-literal paths to extra host-side files (datasets, fixture configs, helper scripts) that the framework packages into the guest initramfs alongside the binaries declared by `scheduler` / `payload` / `workloads`. Maps onto `KtstrTestEntry::extra_include_files` (`&'static [&'static str]`); union with per-payload `Payload::include_files` is computed at run time via `KtstrTestEntry::all_include_files`. Use this slot for test-level dependencies that don't belong on a specific `Payload`. |
 
 See [Payload Definitions](scheduler-definitions.md#derive-payload) for
 authoring new `Payload` fixtures; `tests/common/fixtures.rs` carries

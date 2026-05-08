@@ -315,7 +315,7 @@ template before launching the scheduler. A bidirectional pairing
 gate (compile time + runtime) catches mismatched declarations: a
 scheduler with `config_file_def` REQUIRES `config = …` on every
 test, and a scheduler without it REJECTS `config = …`. See
-[Tutorial: Step 10](tutorial.md#step-10-inline-scheduler-config) and
+[Tutorial: Step 11](tutorial.md#step-11-inline-scheduler-config) and
 [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md#inline-scheduler-config).
 
 </details>
@@ -330,7 +330,7 @@ mbind, RT scheduling, and KVM exit suppression are skipped, and
 gauntlet preset filtering relaxes host-topology checks to the
 single "host has enough total CPUs" inequality. Mutually exclusive
 with `performance_mode = true` (validated at compile time). See
-[Tutorial: Step 11](tutorial.md#step-11-decouple-virtual-topology-from-host-hardware)
+[Tutorial: Step 12](tutorial.md#step-12-decouple-virtual-topology-from-host-hardware)
 and [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation).
 
 </details>

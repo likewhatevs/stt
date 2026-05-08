@@ -444,46 +444,6 @@ on the attribute. See
 [Gauntlet Tests](writing-tests/gauntlet-tests.md) for the full
 filtering and worked examples.
 
-## The complete test
-
-```rust,ignore
-use std::time::Duration;
-use ktstr::prelude::*;
-
-#[ktstr_test(
-    llcs = 2,
-    cores = 2,
-    threads = 1,
-    duration_s = 10,
-    watchdog_timeout_s = 30,
-    isolation = true,
-    max_spread_pct = 15.0,
-    max_throughput_cv = 0.5,
-    min_work_rate = 1.0,
-)]
-fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
-    execute_defs(ctx, vec![
-        CgroupDef::named("background_spinner")
-            .workers(2)
-            .work_type(WorkType::SpinWait)
-            .with_cpuset(CpusetSpec::Llc(0)),
-        CgroupDef::named("phased_worker")
-            .workers(2)
-            .work_type(WorkType::sequence(
-                Phase::Spin(Duration::from_millis(100)),
-                [Phase::Yield(Duration::from_millis(20))],
-            ))
-            .with_cpuset(CpusetSpec::Llc(1)),
-    ])
-}
-```
-
-Run it:
-
-```sh
-cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
-```
-
 ## Step 10: Name and prioritize workers
 
 Per-cgroup defaults travel through `CgroupDef`'s builder methods so
@@ -516,13 +476,20 @@ CgroupDef::named("background_spinner")
   hosting `ThreadPoolForeg` (per-thread comm) and `java` (pcomm)
   hosting `GC Thread` / `C2 CompilerThre`.
 
-`PipeIo` and `CachePipe` workers placed in a `.pcomm(...)` cgroup
-run as threads inside the pcomm container; their pipe-pair partner
-indices are computed within the container's thread group, not
-across forked siblings. `SignalStorm` uses `tkill` (per-task signal
-delivery, `PIDTYPE_PID`) rather than `kill` (`PIDTYPE_TGID`), so
-the partner-vs-self addressing is correct uniformly across
-`Fork` and `Thread` clone modes, including inside pcomm-coalesced thread groups.
+`pcomm` is a `WorkSpec` field, NOT a `CloneMode` variant. The two
+real `CloneMode` variants are `Fork` (default; each worker is its
+own thread group) and `Thread` (workers share the harness's tgid as
+`std::thread::spawn` threads). `pcomm` triggers an in-process
+fork-then-thread shape that combines per-process leader visibility
+schedulers expect with the in-process thread-spawn dispatch the
+worker bodies use. `PipeIo` and `CachePipe` workers placed in a
+`.pcomm(...)` cgroup run as threads inside the pcomm container;
+their pipe-pair partner indices are computed within the
+container's thread group, not across forked siblings.
+`SignalStorm` uses `tkill` (per-task signal delivery,
+`PIDTYPE_PID`) rather than `kill` (`PIDTYPE_TGID`), so the
+partner-vs-self addressing is correct uniformly across `Fork` and
+`Thread` modes — including inside pcomm-coalesced thread groups.
 
 Per-`WorkSpec` overrides win over cgroup-level defaults — write
 `.work(WorkSpec::default().nice(0).comm("hot_spinner"))` to opt a
@@ -569,20 +536,19 @@ needed in that flavor.
 ## Step 12: Decouple virtual topology from host hardware
 
 By default, ktstr pins vCPUs to host cores in a layout that mirrors
-the declared virtual topology. A test declaring `numa_nodes = 3,
+the declared virtual topology. A test declaring `numa_nodes = 2,
 llcs = 8` cannot run on a 1-NUMA-node host — the gauntlet preset
 filter rejects it. Set `no_perf_mode = true` to drop the host
 mirroring and run the declared virtual topology unchanged:
 
 ```rust,ignore
 #[ktstr_test(
-    numa_nodes = 3,
-    llcs = 8,
+    numa_nodes = 2,
+    llcs = 8,             // 8 % 2 == 0; the macro requires divisibility
     cores = 4,
-    no_perf_mode = true,    // VM built as declared, even on 1-NUMA hosts
-    duration_s = 10,
+    no_perf_mode = true,  // VM built as declared, even on 1-NUMA hosts
 )]
-fn three_node_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
+fn two_node_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
 In `no_perf_mode`:
@@ -602,6 +568,45 @@ In `no_perf_mode`:
 no-perf path. See
 [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation)
 for the full lifecycle.
+
+## The complete test
+
+```rust,ignore
+use std::time::Duration;
+use ktstr::prelude::*;
+
+#[ktstr_test(
+    llcs = 2,
+    cores = 2,
+    threads = 1,
+    duration_s = 20,
+    isolation = true,
+    max_spread_pct = 15.0,
+    max_throughput_cv = 0.5,
+    min_work_rate = 1.0,
+)]
+fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
+    execute_defs(ctx, vec![
+        CgroupDef::named("background_spinner")
+            .workers(2)
+            .work_type(WorkType::SpinWait)
+            .with_cpuset(CpusetSpec::Llc(0)),
+        CgroupDef::named("phased_worker")
+            .workers(2)
+            .work_type(WorkType::sequence(
+                Phase::Spin(Duration::from_millis(100)),
+                [Phase::Yield(Duration::from_millis(20))],
+            ))
+            .with_cpuset(CpusetSpec::Llc(1)),
+    ])
+}
+```
+
+Run it:
+
+```sh
+cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
+```
 
 ## What's next
 

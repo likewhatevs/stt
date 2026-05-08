@@ -129,7 +129,7 @@ let def = CgroupDef::named("cg_0")
   (default: `NONE`). See [MemPolicy](mem-policy.md#mpolflags).
 - `.nice(n)` -- cgroup-level default per-worker nice value, merged
   into every WorkSpec whose own `nice` is unset. See
-  [Tutorial: Step 9](../tutorial.md#step-9-name-and-prioritize-workers).
+  [Tutorial: Step 10](../tutorial.md#step-10-name-and-prioritize-workers).
 - `.comm(name)` -- cgroup-level default per-worker `task->comm` via
   `prctl(PR_SET_NAME)`. Merged into every WorkSpec whose own `comm`
   is unset.

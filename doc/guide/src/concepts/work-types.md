@@ -404,7 +404,8 @@ as `std::thread::spawn` threads, reaped via `JoinHandle`).
 
 `pcomm` is **not** a `CloneMode` variant — it is a `WorkSpec`
 field set via `WorkSpec::pcomm(name)` /
-[`CgroupDef::pcomm(name)`](../tutorial.md#step-10-name-and-prioritize-workers).
+[`CgroupDef::pcomm(name)`](../tutorial.md#step-10-name-and-prioritize-workers)
+in the tutorial.
 When a `WorkSpec` carries `pcomm = Some(name)`, `apply_setup`
 routes it through the fork-then-thread spawn path: ONE forked
 thread-group leader whose `task->comm` is `name` hosts every
