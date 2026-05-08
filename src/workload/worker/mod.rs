@@ -2517,21 +2517,12 @@ pub(super) fn worker_main(
                         // per-task queue, not the tgid-wide queue.
                         // Works across Fork, Thread, and Pcomm
                         // modes (see arm doc above).
-                        let rc = unsafe {
-                            libc::syscall(
-                                libc::SYS_tkill,
-                                partner_tid,
-                                libc::SIGUSR1,
-                            )
-                        };
+                        let rc =
+                            unsafe { libc::syscall(libc::SYS_tkill, partner_tid, libc::SIGUSR1) };
                         if rc == -1 {
                             let errno = std::io::Error::last_os_error().raw_os_error();
                             if !tkill_warned {
-                                tracing::warn!(
-                                    errno,
-                                    partner_tid,
-                                    "SignalStorm tkill failed"
-                                );
+                                tracing::warn!(errno, partner_tid, "SignalStorm tkill failed");
                                 tkill_warned = true;
                             }
                         }

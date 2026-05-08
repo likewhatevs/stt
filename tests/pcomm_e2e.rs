@@ -87,12 +87,14 @@ fn assert_pcomm_ran_clean(result: &VmResult) -> Result<()> {
 fn pcomm_fork_then_thread_e2e(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     let steps = vec![Step {
-        setup: vec![CgroupDef::named("cg_chrome").work(
-            WorkSpec::default()
-                .workers(2)
-                .comm("ThreadPool")
-                .pcomm("chrome"),
-        )]
+        setup: vec![
+            CgroupDef::named("cg_chrome").work(
+                WorkSpec::default()
+                    .workers(2)
+                    .comm("ThreadPool")
+                    .pcomm("chrome"),
+            ),
+        ]
         .into(),
         ops: vec![],
         hold: HoldSpec::FULL,

@@ -1035,11 +1035,7 @@ mod tests {
             .values_iter()
             .filter_map(|r| r.as_ref().ok().copied())
             .collect();
-        assert_eq!(
-            values.len(),
-            2,
-            "balance must surface one f64 per sample",
-        );
+        assert_eq!(values.len(), 2, "balance must surface one f64 per sample",);
         assert!((values[0] - 1.5).abs() < f64::EPSILON);
         assert!((values[1] - 2.5).abs() < f64::EPSILON);
     }

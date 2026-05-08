@@ -1335,11 +1335,10 @@ fn worker_report_bincode_all_exit_info_variants_roundtrip() {
     for variant in variants {
         let mut report = fully_populated_report();
         report.exit_info = Some(variant);
-        let bytes = bincode::serde::encode_to_vec(&report, bincode::config::standard())
-            .expect("encode");
+        let bytes =
+            bincode::serde::encode_to_vec(&report, bincode::config::standard()).expect("encode");
         let (decoded, consumed): (WorkerReport, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                .expect("decode");
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
         assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
         assert_worker_report_eq(&report, &decoded);
     }

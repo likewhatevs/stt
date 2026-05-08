@@ -555,4 +555,3 @@ fn pcomm_rejects_cgroup_churn() {
         "diagnostic must name the CgroupChurn incompatibility, got: {msg}",
     );
 }
-
