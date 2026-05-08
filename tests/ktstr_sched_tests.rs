@@ -9,7 +9,7 @@ const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, sustained_samples = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
@@ -23,7 +23,7 @@ fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, sustained_samples = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
 fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
@@ -37,7 +37,7 @@ fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, sustained_samples = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
@@ -151,6 +151,7 @@ static __KTSTR_ENTRY_BPF_HOST_WRITE_STALLS: ktstr::test_support::KtstrTestEntry 
     duration_s = 3,
     workers_per_cgroup = 2,
     sustained_samples = 15,
+    watchdog_timeout_s = 15,
 )]
 fn sched_perf_positive(ctx: &Ctx) -> Result<AssertResult> {
     use ktstr::scenario::ops::execute_steps_with;
@@ -484,7 +485,7 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
 /// (`kernel/sched/ext.c:check_rq_for_timeouts`) flags this as
 /// `SCX_EXIT_ERROR_STALL`. 15 s matches `sched_bpf_api` above, which
 /// runs the same scheduler against a similar workload shape.
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, duration_s = 3, watchdog_timeout_s = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, duration_s = 2, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
 fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),

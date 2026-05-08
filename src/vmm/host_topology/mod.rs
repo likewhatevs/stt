@@ -718,13 +718,13 @@ fn try_acquire_all(
 /// lands within a small contiguous range, every `pid % max_start`
 /// lands within an equally small contiguous slice of the offset
 /// space, and they all probe overlapping windows on the first
-/// pass. GxHasher avalanche on the pid bytes diffuses adjacent
+/// pass. AHasher avalanche on the pid bytes diffuses adjacent
 /// pids across the whole `[0, max_start)` range, so the
 /// walk-around-once loop in [`acquire_cpu_locks`] has a fair
 /// chance of finding a free window without burning the entire
 /// lockfile pool.
 ///
-/// The hash key is `GxHasher::with_seed(0)` — a per-run random
+/// The hash key is `AHasher::default()` — a per-run random
 /// seed would defeat reproducibility for unit-test fixtures and
 /// for any future debug logging that wants to confirm "pid X
 /// picks offset Y for window N".
@@ -733,11 +733,9 @@ fn try_acquire_all(
 /// (modulo-by-zero); callers must enforce this upstream — the
 /// `count > total_host_cpus` early-bail in [`acquire_cpu_locks`]
 /// is the production guarantee.
-#[allow(dead_code)]
-fn pid_window_offset(pid: u32, max_start: usize) -> usize {
-    use gxhash::GxHasher;
-    use std::hash::Hasher;
-    let mut hasher = GxHasher::with_seed(0);
+pub(crate) fn pid_window_offset(pid: u32, max_start: usize) -> usize {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
     hasher.write(&pid.to_le_bytes());
     (hasher.finish() as usize) % max_start
 }

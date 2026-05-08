@@ -2827,3 +2827,121 @@ mod tests {
         assert_eq!(ts.to_string(), quote! { Some(true) }.to_string());
     }
 }
+
+/// Convert JSON-like Rust tokens into a `&'static str` at compile time.
+///
+/// Accepts a superset of JSON syntax using Rust token trees:
+/// - Objects: `{ "key": value, ... }`
+/// - Arrays: `[value, ...]`
+/// - Strings: `"hello"`
+/// - Numbers: `42`, `3.14`, `-1`
+/// - Booleans: `true`, `false`
+/// - Null: `null`
+/// - Trailing commas are stripped
+///
+/// ```rust,ignore
+/// const CFG: &str = ktstr::json!({
+///     "layers": [{
+///         "name": "batch",
+///         "kind": { "Grouped": { "cpus_range": [0, 4] } },
+///     }],
+/// });
+/// ```
+#[proc_macro]
+pub fn json(input: TokenStream) -> TokenStream {
+    let mut out = String::new();
+    tokens_to_json(&mut out, proc_macro2::TokenStream::from(input));
+    let lit = syn::LitStr::new(&out, proc_macro2::Span::call_site());
+    TokenStream::from(quote! { #lit })
+}
+
+fn tokens_to_json(out: &mut String, tokens: proc_macro2::TokenStream) {
+    for tt in tokens {
+        match tt {
+            proc_macro2::TokenTree::Group(g) => match g.delimiter() {
+                proc_macro2::Delimiter::Brace => {
+                    out.push('{');
+                    emit_comma_separated(out, g.stream(), true);
+                    out.push('}');
+                }
+                proc_macro2::Delimiter::Bracket => {
+                    out.push('[');
+                    emit_comma_separated(out, g.stream(), false);
+                    out.push(']');
+                }
+                proc_macro2::Delimiter::Parenthesis => {
+                    out.push('(');
+                    tokens_to_json(out, g.stream());
+                    out.push(')');
+                }
+                proc_macro2::Delimiter::None => {
+                    tokens_to_json(out, g.stream());
+                }
+            },
+            proc_macro2::TokenTree::Literal(lit) => {
+                out.push_str(&lit.to_string());
+            }
+            proc_macro2::TokenTree::Ident(id) => {
+                let s = id.to_string();
+                match s.as_str() {
+                    "true" | "false" | "null" => out.push_str(&s),
+                    _ => {
+                        out.push('"');
+                        out.push_str(&s);
+                        out.push('"');
+                    }
+                }
+            }
+            proc_macro2::TokenTree::Punct(p) => {
+                let ch = p.as_char();
+                if ch == '-' {
+                    out.push('-');
+                } else if ch == ':' {
+                    out.push(':');
+                } else if ch == ',' {
+                    // Don't emit yet — emit_comma_separated handles commas
+                    // and strips trailing ones. If we're in a raw stream,
+                    // just emit.
+                    out.push(',');
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+}
+
+fn emit_comma_separated(out: &mut String, tokens: proc_macro2::TokenStream, _is_object: bool) {
+    let items = split_on_commas(tokens);
+    let mut first = true;
+    for item in &items {
+        if item.is_empty() {
+            continue;
+        }
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        tokens_to_json(out, item.clone());
+    }
+}
+
+fn split_on_commas(tokens: proc_macro2::TokenStream) -> Vec<proc_macro2::TokenStream> {
+    let mut result = Vec::new();
+    let mut current = proc_macro2::TokenStream::new();
+    for tt in tokens {
+        match &tt {
+            proc_macro2::TokenTree::Punct(p) if p.as_char() == ',' => {
+                result.push(current);
+                current = proc_macro2::TokenStream::new();
+            }
+            _ => {
+                current.extend(std::iter::once(tt));
+            }
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}

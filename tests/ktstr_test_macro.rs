@@ -917,3 +917,58 @@ fn derive_payload_workloads_accepts_derived_const(ctx: &Ctx) -> Result<AssertRes
     assert_eq!(entry.workloads[0].name, "true");
     Ok(AssertResult::pass())
 }
+
+// -- json! macro tests --
+
+#[test]
+fn json_macro_simple_object() {
+    let s = ktstr::json!({"key": "value", "num": 42});
+    assert_eq!(s, r#"{"key":"value","num":42}"#);
+}
+
+#[test]
+fn json_macro_nested() {
+    let s = ktstr::json!({
+        "layers": [{
+            "name": "batch",
+            "kind": { "Grouped": { "cpus_range": [0, 4] } },
+        }],
+    });
+    assert_eq!(
+        s,
+        r#"{"layers":[{"name":"batch","kind":{"Grouped":{"cpus_range":[0,4]}}}]}"#
+    );
+}
+
+#[test]
+fn json_macro_booleans_and_null() {
+    let s = ktstr::json!({"a": true, "b": false, "c": null});
+    assert_eq!(s, r#"{"a":true,"b":false,"c":null}"#);
+}
+
+#[test]
+fn json_macro_negative_number() {
+    let s = ktstr::json!({"n": -1});
+    assert_eq!(s, r#"{"n":-1}"#);
+}
+
+#[test]
+fn json_macro_trailing_commas_stripped() {
+    let s = ktstr::json!({
+        "a": 1,
+        "b": 2,
+    });
+    assert_eq!(s, r#"{"a":1,"b":2}"#);
+}
+
+#[test]
+fn json_macro_array_trailing_comma() {
+    let s = ktstr::json!([1, 2, 3,]);
+    assert_eq!(s, "[1,2,3]");
+}
+
+#[test]
+fn json_macro_const_context() {
+    const CFG: &str = ktstr::json!({"hello": "world"});
+    assert_eq!(CFG, r#"{"hello":"world"}"#);
+}

@@ -79,6 +79,10 @@ pub(super) struct BulkDispatchSinks<'a> {
         std::time::Duration,
         std::time::Instant,
     )>,
+    /// Pause timestamp (nanos since run_start). 0 = not paused.
+    /// ScenarioPause stores current elapsed; ScenarioStart clears
+    /// it and extends the deadline by the pause duration.
+    pub watchdog_pause_ns: &'a std::sync::atomic::AtomicU64,
 }
 
 /// Classify and dispatch a single [`BulkMessage`] from the port-1
@@ -230,6 +234,46 @@ pub(super) fn dispatch_bulk_message(
                 let target_ns = elapsed.as_nanos().saturating_add(duration.as_nanos());
                 let encoded = u64::try_from(target_ns).unwrap_or(u64::MAX).max(1);
                 reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+            }
+            Some(crate::vmm::wire::ShmEntry {
+                msg_type: msg.msg_type,
+                payload: msg.payload.to_vec(),
+                crc_ok: msg.crc_ok,
+            })
+        }
+        Some(crate::vmm::wire::MsgType::ScenarioPause) => {
+            if msg.crc_ok {
+                let elapsed = sinks
+                    .watchdog_reset
+                    .as_ref()
+                    .map(|(_, _, run_start)| run_start.elapsed().as_nanos())
+                    .unwrap_or(0);
+                let encoded = u64::try_from(elapsed).unwrap_or(u64::MAX).max(1);
+                sinks
+                    .watchdog_pause_ns
+                    .store(encoded, std::sync::atomic::Ordering::Release);
+            }
+            Some(crate::vmm::wire::ShmEntry {
+                msg_type: msg.msg_type,
+                payload: msg.payload.to_vec(),
+                crc_ok: msg.crc_ok,
+            })
+        }
+        Some(crate::vmm::wire::MsgType::ScenarioResume) => {
+            if msg.crc_ok
+                && let Some((reset_ns, _, run_start)) = sinks.watchdog_reset.as_ref()
+            {
+                let paused_at = sinks
+                    .watchdog_pause_ns
+                    .swap(0, std::sync::atomic::Ordering::AcqRel);
+                if paused_at > 0 {
+                    let elapsed = run_start.elapsed();
+                    let pause_duration = elapsed.as_nanos().saturating_sub(paused_at as u128);
+                    let prior = reset_ns.load(std::sync::atomic::Ordering::Acquire);
+                    let extended = (prior as u128).saturating_add(pause_duration);
+                    let encoded = u64::try_from(extended).unwrap_or(u64::MAX).max(1);
+                    reset_ns.store(encoded, std::sync::atomic::Ordering::Release);
+                }
             }
             Some(crate::vmm::wire::ShmEntry {
                 msg_type: msg.msg_type,

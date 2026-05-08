@@ -9,6 +9,7 @@ use crate::assert::{Assert, AssertResult};
 use crate::workload::AffinityIntent;
 use anyhow::Result;
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 /// Two cgroups with worker affinities randomized four times during the
 /// run. Each randomization assigns half the available CPUs to each worker.
@@ -60,11 +61,15 @@ pub fn custom_cgroup_multicpu_pin(ctx: &Ctx) -> Result<AssertResult> {
     // spread under EEVDF; relax the default 35% threshold.
     let checks = Assert::default_checks().max_spread_pct(75.0);
 
+    // Settle step uses a fixed minimum so `ctx.settle = Duration::ZERO`
+    // (the production default) does not produce a vacuous
+    // `HoldSpec::Fixed(ZERO)` that `run_scenario` rejects up front.
+    let settle = ctx.settle.max(Duration::from_millis(500));
     let backdrop = Backdrop::new()
         .with_cgroup(CgroupDef::named("cg_0"))
         .with_cgroup(CgroupDef::named("cg_1"));
     let steps = vec![
-        Step::new(vec![], HoldSpec::Fixed(ctx.settle)),
+        Step::new(vec![], HoldSpec::Fixed(settle)),
         Step::new(
             vec![
                 Op::set_affinity("cg_0", AffinityIntent::Exact(pin_cpus.clone())),

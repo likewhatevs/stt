@@ -118,11 +118,11 @@ pub struct KtstrVmBuilder {
     /// first time the host monitor observes `*scx_root` transition
     /// from null to non-null in guest memory — i.e. the moment a
     /// scheduler attaches and the workload's clock should start.
-    /// The reset is bounded above by the original `timeout`-derived
-    /// deadline (the watchdog uses `min(reset, original)`), so a
-    /// late-attaching scheduler cannot extend past the outer kill
-    /// timer. `None` (the default) disables the reset and the
-    /// watchdog uses `timeout` as a single deadline counted from
+    /// The reset CAN extend past the original `timeout`-derived
+    /// deadline (the watchdog uses `reset.unwrap_or(original)` with
+    /// no min clamp), so boot-time delays do not eat into the
+    /// workload budget. `None` (the default) disables the reset and
+    /// the watchdog uses `timeout` as a single deadline counted from
     /// VM boot.
     workload_duration: Option<Duration>,
 }
@@ -303,10 +303,10 @@ impl KtstrVmBuilder {
     /// `now + workload_duration` the first time the monitor
     /// observes `*scx_root` transition from null to non-null —
     /// i.e. the moment a scheduler attaches and the workload's
-    /// clock should start. The reset is bounded above by the
-    /// original `timeout`-derived deadline, so a late-attaching
-    /// scheduler cannot extend past the outer kill timer. `None`
-    /// (the default) disables the reset.
+    /// clock should start. The reset CAN extend past the original
+    /// `timeout`-derived deadline (no min clamp), so boot-time
+    /// delays do not eat into the workload budget. `None` (the
+    /// default) disables the reset.
     pub fn workload_duration(mut self, d: Duration) -> Self {
         self.workload_duration = Some(d);
         self

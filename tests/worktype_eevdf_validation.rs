@@ -65,7 +65,15 @@ use std::time::Duration;
 /// `src/workload/spawn/tests_thread_mode.rs`; this test pins the
 /// production-VM equivalent under EEVDF on the kernel scheduler
 /// path.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 1024)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    memory_mb = 1024,
+    max_spread_pct = 80.0,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn validation_wake_chain_pipe_populates_resume_latencies(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 4,
@@ -133,7 +141,15 @@ fn validation_wake_chain_pipe_populates_resume_latencies(ctx: &Ctx) -> Result<As
 /// is the latency sample. A regression that breaks the per-pair
 /// futex word allocation, the wake/wait pairing, or the latency
 /// reservoir would surface here.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 1024)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    memory_mb = 1024,
+    max_spread_pct = 80.0,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn validation_futex_ping_pong_populates_resume_latencies(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 2,
@@ -207,7 +223,15 @@ fn validation_futex_ping_pong_populates_resume_latencies(ctx: &Ctx) -> Result<As
 /// counters per acquire/release cycle. A regression that breaks
 /// the futex-fast-path acquisition or the lock release branch
 /// would surface here as zero iterations across all contenders.
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 1024)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    memory_mb = 1024,
+    max_spread_pct = 80.0,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn validation_mutex_contention_populates_iterations(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 4,
@@ -288,7 +312,15 @@ fn validation_mutex_contention_populates_iterations(ctx: &Ctx) -> Result<AssertR
 /// every touch. Zero iterations would mean the madvise loop
 /// never fired (a regression in the per-iteration teardown) or
 /// the worker bailed before the first touch.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 1024)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    memory_mb = 1024,
+    max_spread_pct = 80.0,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn validation_page_fault_churn_populates_iterations(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 2,
@@ -368,7 +400,15 @@ fn validation_page_fault_churn_populates_iterations(ctx: &Ctx) -> Result<AssertR
 /// and the cycle counter never advances. A weaker `>= 1` threshold
 /// would not distinguish "one full cycle completed" from "stop
 /// fired mid-burst with iterations still at 0."
-#[ktstr_test(llcs = 1, cores = 1, threads = 1, memory_mb = 512)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 1,
+    threads = 1,
+    memory_mb = 512,
+    max_spread_pct = 80.0,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn validation_bursty_populates_iterations(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 1,

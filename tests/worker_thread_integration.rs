@@ -62,7 +62,14 @@ use ktstr::workload::{
 /// `spawn_thread_worker` (e.g. start-rendezvous deadlock under a
 /// low-CPU guest topology) would surface here even when the
 /// host-side `spawn_thread_clone_mode_runs_to_completion` passes.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 1024)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    memory_mb = 1024,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 2,
@@ -154,7 +161,14 @@ fn thread_integration_spin_wait(ctx: &Ctx) -> Result<AssertResult> {
 /// mm, the futex word is automatically shared without explicit
 /// MAP_SHARED — a regression that breaks the per-pair allocation
 /// would surface as zero latency samples.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 1024)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    memory_mb = 1024,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 2,
@@ -233,7 +247,14 @@ fn thread_integration_futex_ping_pong(ctx: &Ctx) -> Result<AssertResult> {
 /// re-fault must occur regardless of address-space sharing. A
 /// regression where the madvise call returns -EINVAL under shared
 /// mm would surface here as zero iterations.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 1024)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    memory_mb = 1024,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn thread_integration_page_fault_churn(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 2,
@@ -309,7 +330,14 @@ fn thread_integration_page_fault_churn(ctx: &Ctx) -> Result<AssertResult> {
 /// (which may differ from the host in CONFIG_FUTEX2 / PREEMPT).
 /// All four contenders must produce work_units, and total
 /// iterations must be non-zero.
-#[ktstr_test(llcs = 1, cores = 4, threads = 1, memory_mb = 1024)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 4,
+    threads = 1,
+    memory_mb = 1024,
+    duration_s = 5,
+    watchdog_timeout_s = 15
+)]
 fn thread_integration_mutex_contention(ctx: &Ctx) -> Result<AssertResult> {
     let config = WorkloadConfig {
         num_workers: 4,

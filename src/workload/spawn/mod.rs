@@ -1192,6 +1192,10 @@ pub(super) struct GroupParams {
     mem_policy: MemPolicy,
     mpol_flags: MpolFlags,
     nice: i32,
+    comm: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    numa_node: Option<u32>,
     affinity: ResolvedAffinity,
     num_workers: usize,
     group_idx: usize,
@@ -1224,6 +1228,10 @@ impl GroupParams {
             mem_policy: spec.mem_policy.clone(),
             mpol_flags: spec.mpol_flags,
             nice: spec.nice,
+            comm: spec.comm.as_ref().map(|c| c.to_string()),
+            uid: spec.uid,
+            gid: spec.gid,
+            numa_node: spec.numa_node,
             affinity: resolved_affinity,
             num_workers: resolved_num_workers,
             group_idx,
@@ -1333,6 +1341,10 @@ impl GroupParams {
             mem_policy: config.mem_policy.clone(),
             mpol_flags: config.mpol_flags,
             nice: config.nice,
+            comm: None,
+            uid: None,
+            gid: None,
+            numa_node: None,
         };
         Ok(Self::from_work_spec(
             &spec,
@@ -1439,6 +1451,10 @@ pub(super) fn spawn_thread_worker(
     let mem_policy = group.mem_policy.clone();
     let mpol_flags = group.mpol_flags;
     let nice = group.nice;
+    let comm = group.comm.clone();
+    let uid = group.uid;
+    let gid = group.gid;
+    let numa_node = group.numa_node;
     let group_idx = group.group_idx;
     let num_workers = group.num_workers;
 
@@ -1511,6 +1527,10 @@ pub(super) fn spawn_thread_worker(
                 mem_policy,
                 mpol_flags,
                 nice,
+                comm.as_deref(),
+                uid,
+                gid,
+                numa_node,
                 worker_pipe_fds,
                 futex,
                 slot,
@@ -2772,6 +2792,10 @@ impl WorkloadHandle {
                                 group.mem_policy.clone(),
                                 group.mpol_flags,
                                 group.nice,
+                                group.comm.as_deref(),
+                                group.uid,
+                                group.gid,
+                                group.numa_node,
                                 worker_pipe_fds,
                                 worker_futex,
                                 iter_slot,

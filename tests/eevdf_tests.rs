@@ -72,15 +72,12 @@ fn eevdf_empty_run_exits_under_watchdog(_ctx: &Ctx) -> Result<AssertResult> {
 /// the single source of truth for the thresholds — the body does not
 /// rebuild them.
 ///
-/// `memory_mb = 512` overrides the macro default of 2048 to minimize
-/// the host footprint when this test runs in parallel with others.
-/// The 4 logical CPUs and 8 spin-burst workers fit comfortably in
-/// 512MB (kernel + initramfs + worker stacks + slack).
 #[ktstr_test(
     llcs = 1,
     cores = 2,
     threads = 2,
-    memory_mb = 512,
+    duration_s = 5,
+    watchdog_timeout_s = 15,
     max_gap_ms = 2000,
     max_spread_pct = 80.0
 )]

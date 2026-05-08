@@ -58,6 +58,28 @@ pub(crate) fn config_file_parts(entry: &KtstrTestEntry) -> Option<(String, PathB
     Some((archive_path, PathBuf::from(config_path), guest_path))
 }
 
+/// Resolve inline config content into a temp file on disk, returning
+/// `(archive_path, host_path, guest_path, sched_args)` where
+/// `sched_args` are the CLI args derived from the scheduler's
+/// `config_file_def` arg template. Returns `None` when the entry has
+/// no `config_content`.
+pub(crate) fn config_content_parts(
+    entry: &KtstrTestEntry,
+) -> Option<(String, PathBuf, String, Vec<String>)> {
+    use std::hash::{Hash, Hasher};
+    let content = entry.config_content?;
+    let (arg_template, guest_path) = entry.scheduler.config_file_def()?;
+    let archive_path = guest_path.trim_start_matches('/').to_string();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    let hash = hasher.finish();
+    let tmp = std::env::temp_dir().join(format!("ktstr-config-{hash:x}.json"));
+    std::fs::write(&tmp, content).expect("failed to write inline config to temp file");
+    let expanded = arg_template.replace("{file}", guest_path);
+    let sched_args: Vec<String> = expanded.split_whitespace().map(|s| s.to_string()).collect();
+    Some((archive_path, tmp, guest_path.to_string(), sched_args))
+}
+
 /// Build the shared `cmdline=` string appended to every ktstr_test
 /// guest boot. Per-scheduler sysctls, per-scheduler kargs,
 /// `RUST_BACKTRACE` / `RUST_LOG` propagation, and the host-resolved
@@ -164,21 +186,20 @@ pub(crate) fn append_base_sched_args(entry: &KtstrTestEntry, args: &mut Vec<Stri
     args.extend(entry.extra_sched_args.iter().map(|s| s.to_string()));
 }
 
-/// Headroom added to the test's base duration to derive the
-/// host-side VM kill timer. Zero: the watchdog_duration reset
-/// handles the workload phase. Tests that need more time set
-/// their own duration/timeout via the #[ktstr_test] attribute.
-const VM_TIMEOUT_HEADROOM: Duration = Duration::ZERO;
+/// Boot headroom: covers kernel init, scheduler attach, and BPF
+/// verifier time before the workload phase begins. Without this,
+/// tests where `duration ≈ watchdog_timeout` race the boot budget.
+const VM_BOOT_HEADROOM: Duration = Duration::from_secs(10);
 
 /// Derive the host-side VM timeout from the test entry's watchdog
-/// and duration. The VM should die shortly after the stall fires
-/// and the dump completes — not linger for a hardcoded 60s.
+/// and duration. Adds boot headroom so the workload gets its full
+/// duration even after a slow boot.
 pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Duration {
     let base = entry
         .watchdog_timeout
         .max(entry.duration)
         .max(Duration::from_secs(1));
-    base + VM_TIMEOUT_HEADROOM
+    base + VM_BOOT_HEADROOM
 }
 
 /// Configure the ktstr_test VM builder prefix shared by the main
@@ -661,8 +682,6 @@ mod tests {
 
     // -- vm_timeout_from_entry tests --
 
-    /// VM timeout = max(watchdog, duration, 1s) + VM_TIMEOUT_HEADROOM.
-    /// Watchdog dominates when it's the largest.
     #[test]
     fn vm_timeout_from_entry_uses_watchdog_when_largest() {
         let entry = KtstrTestEntry {
@@ -671,11 +690,9 @@ mod tests {
             duration: Duration::from_secs(30),
             ..KtstrTestEntry::DEFAULT
         };
-        // base = max(60, 30, 1) = 60s + 0 headroom = 60s.
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(60));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(70));
     }
 
-    /// Duration dominates when it's larger than the watchdog.
     #[test]
     fn vm_timeout_from_entry_uses_duration_when_largest() {
         let entry = KtstrTestEntry {
@@ -684,11 +701,9 @@ mod tests {
             duration: Duration::from_secs(120),
             ..KtstrTestEntry::DEFAULT
         };
-        // base = max(5, 120, 1) = 120s + 0 headroom = 120s.
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(120));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(130));
     }
 
-    /// Both watchdog and duration well under 1s → 1s floor.
     #[test]
     fn vm_timeout_from_entry_floor_when_both_small() {
         let entry = KtstrTestEntry {
@@ -697,13 +712,12 @@ mod tests {
             duration: Duration::from_millis(50),
             ..KtstrTestEntry::DEFAULT
         };
-        // base = max(10ms, 50ms, 1s) = 1s + 0 headroom = 1s.
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(1));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(11));
     }
 
     #[test]
-    fn vm_timeout_headroom_is_zero() {
-        assert_eq!(VM_TIMEOUT_HEADROOM, Duration::ZERO);
+    fn vm_timeout_boot_headroom_is_ten() {
+        assert_eq!(VM_BOOT_HEADROOM, Duration::from_secs(10));
     }
 
     #[test]
@@ -712,7 +726,6 @@ mod tests {
             name: "default",
             ..KtstrTestEntry::DEFAULT
         };
-        // max(watchdog=5, duration=12, 1) + 0 = 12
-        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(12));
+        assert_eq!(vm_timeout_from_entry(&entry), Duration::from_secs(22));
     }
 }

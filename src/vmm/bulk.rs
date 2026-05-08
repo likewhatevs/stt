@@ -50,7 +50,7 @@ use super::wire::{FRAME_HEADER_SIZE, ShmMessage};
 /// the one-shot parser rejects frames whose announced `length`
 /// exceeds the cap so a corrupt or hostile buffer cannot trigger
 /// an oversized per-frame allocation downstream.
-pub const MAX_BULK_FRAME_PAYLOAD: u32 = 256 * 1024;
+pub const MAX_BULK_FRAME_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 /// One complete message extracted from the bulk byte stream.
 ///

@@ -563,6 +563,39 @@ pub(crate) fn ktstr_guest_init() -> ! {
     mount_filesystems();
     let t_mounts = t0.elapsed();
 
+    // Install the tracing subscriber as early as possible — right after
+    // `mount_filesystems()` so /proc is available for the RUST_LOG
+    // cmdline extraction below, and BEFORE the rest of guest init runs
+    // so every subsequent `tracing::*` call is captured. Earlier
+    // versions installed the subscriber after `redirect_stdio_to_bulk_port`,
+    // which silently dropped every tracing event before the redirect.
+    //
+    // EnvFilter respects RUST_LOG when set; default is `warn` so
+    // teardown diagnostics (`tracing::warn!`, `tracing::error!`)
+    // surface without requiring RUST_LOG to be plumbed through the
+    // guest cmdline. `from_default_env()` alone would collapse to
+    // the implicit `error` level and swallow warn-level output —
+    // exactly the diagnostics needed to debug teardown failures.
+    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline")
+        && let Some(val) = cmdline
+            .split_whitespace()
+            .find(|s| s.starts_with("RUST_LOG="))
+            .and_then(|s| s.strip_prefix("RUST_LOG="))
+    {
+        // SAFETY: single-threaded PID 1 context.
+        unsafe { std::env::set_var("RUST_LOG", val) };
+    }
+    let t_pre_subscriber = t0.elapsed();
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+    let t_subscriber = t0.elapsed();
+
     // Verify initramfs extraction completed. The sentinel file is the
     // last entry written by build_initramfs_base — its absence means
     // the kernel ran out of memory during cpio extraction. The memory
@@ -579,7 +612,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
                    try `--memory N` with a larger value.";
         let _ = fs::write(COM2, msg);
         let _ = fs::write(COM1, msg);
-        eprintln!("{msg}");
+        tracing::error!("{msg}");
         force_reboot();
     }
 
@@ -629,6 +662,12 @@ pub(crate) fn ktstr_guest_init() -> ! {
             break;
         }
         if attempt == 99 {
+            // The tracing subscriber was installed right after
+            // `mount_filesystems()`, so this surfaces through the
+            // subscriber — which writes to stderr. fd 2 here is
+            // still the pre-redirect stderr (kernel console / COM2);
+            // after `redirect_stdio_to_bulk_port` runs later, fd 2
+            // is a pipe drained into the bulk port forwarder.
             tracing::warn!("ktstr-init: send_sys_rdy retry budget exhausted (10 s)");
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -656,37 +695,6 @@ pub(crate) fn ktstr_guest_init() -> ! {
     }
     redirect_stdio_to_bulk_port();
     let t_stdio = t0.elapsed();
-
-    // Extract RUST_LOG from kernel cmdline before installing the
-    // tracing subscriber so EnvFilter picks it up.
-    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline")
-        && let Some(val) = cmdline
-            .split_whitespace()
-            .find(|s| s.starts_with("RUST_LOG="))
-            .and_then(|s| s.strip_prefix("RUST_LOG="))
-    {
-        // SAFETY: single-threaded PID 1 context.
-        unsafe { std::env::set_var("RUST_LOG", val) };
-    }
-
-    // Install tracing subscriber so tracing calls in guest code produce
-    // output on stderr (COM2). Without this, they are silently dropped.
-    // EnvFilter respects RUST_LOG when set; default is `warn` so
-    // teardown diagnostics (`tracing::warn!`, `tracing::error!`)
-    // surface without requiring RUST_LOG to be plumbed through the
-    // guest cmdline. `from_default_env()` alone would collapse to
-    // the implicit `error` level and swallow warn-level output —
-    // exactly the diagnostics needed to debug teardown failures.
-    let t_pre_subscriber = t0.elapsed();
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
-    let t_subscriber = t0.elapsed();
 
     tracing::debug!(
         mount_ms = t_mounts.as_millis() as u64,
@@ -789,7 +797,7 @@ pub(crate) fn ktstr_guest_init() -> ! {
             let code = match status {
                 Ok(s) => s.code().unwrap_or(1),
                 Err(e) => {
-                    eprintln!("ktstr-init: exec failed: {e}");
+                    tracing::error!(err = %e, "ktstr-init: exec failed");
                     1
                 }
             };
@@ -918,11 +926,15 @@ pub(crate) fn ktstr_guest_init() -> ! {
     let _s_phase5 = tracing::debug_span!("phase5_dispatch").entered();
     tracing::debug!("dispatching test");
     crate::vmm::guest_comms::send_lifecycle(crate::vmm::wire::LifecyclePhase::PayloadStarting, "");
+    crate::vmm::guest_comms::send_scenario_start();
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
     let code = if let Some(pa) = probe_phase_a {
         crate::test_support::maybe_dispatch_vm_test_with_phase_a(&args, pa).unwrap_or(1)
     } else {
         crate::test_support::maybe_dispatch_vm_test_with_args(&args).unwrap_or(1)
     };
+    unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+    crate::vmm::guest_comms::send_scenario_pause();
     drop(_s_phase5);
 
     // Flush test output before teardown. Rust's BufWriter on stdout
@@ -1064,10 +1076,10 @@ const STDIO_CHUNK_BYTES: usize = 4 * 1024;
 /// stream now travels over the bulk port.
 ///
 /// On any pipe / dup2 / thread-spawn failure the function logs via
-/// `eprintln!` (fd 2 is still attached to the kernel console at the
-/// failure point, so the operator sees the misroute) and returns —
-/// stdout/stderr stay attached to whatever fd they pointed at on
-/// entry.
+/// the tracing subscriber (which writes to stderr; fd 2 is still
+/// attached to the kernel console at the failure point, so the
+/// operator sees the misroute) and returns — stdout/stderr stay
+/// attached to whatever fd they pointed at on entry.
 fn redirect_stdio_to_bulk_port() {
     use std::io::Read;
     use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -1117,11 +1129,11 @@ fn redirect_stdio_to_bulk_port() {
     }
 
     let Some((stdout_r, stdout_w)) = make_pipe() else {
-        eprintln!("ktstr-init: redirect_stdio_to_bulk_port: pipe(stdout) failed");
+        tracing::error!("ktstr-init: redirect_stdio_to_bulk_port: pipe(stdout) failed");
         return;
     };
     let Some((stderr_r, stderr_w)) = make_pipe() else {
-        eprintln!("ktstr-init: redirect_stdio_to_bulk_port: pipe(stderr) failed");
+        tracing::error!("ktstr-init: redirect_stdio_to_bulk_port: pipe(stderr) failed");
         return;
     };
 
@@ -1144,10 +1156,10 @@ fn redirect_stdio_to_bulk_port() {
     // originals drop here is correct because `dup2` increments the
     // file's refcount.
     if rc1 < 0 {
-        eprintln!("ktstr-init: redirect_stdio_to_bulk_port: dup2(stdout) failed: {err1}");
+        tracing::error!(err = %err1, "ktstr-init: redirect_stdio_to_bulk_port: dup2(stdout) failed");
     }
     if rc2 < 0 {
-        eprintln!("ktstr-init: redirect_stdio_to_bulk_port: dup2(stderr) failed: {err2}");
+        tracing::error!(err = %err2, "ktstr-init: redirect_stdio_to_bulk_port: dup2(stderr) failed");
     }
 
     spawn_forwarder(stdout_r, "ktstr-stdout-fwd", |b| {
@@ -1240,7 +1252,7 @@ fn run_disk_template_mode() -> i32 {
     match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
-            eprintln!("ktstr-init: failed to spawn {MKFS}: {e}");
+            tracing::error!(mkfs = MKFS, err = %e, "ktstr-init: failed to spawn mkfs");
             1
         }
     }
@@ -1301,11 +1313,11 @@ fn build_include_path() -> String {
 /// Shell mode needs all three fds on the console device: stdin for
 /// reading input, stdout/stderr for writing output.
 ///
-/// `dup2` failures are logged via `eprintln!`. A failing `dup2`
-/// leaves the target fd unchanged, so the eprintln still reaches the
-/// pre-redirect stderr (kernel console / COM1) and the operator sees
-/// the misroute rather than the failing path silently writing to a
-/// wrong device.
+/// `dup2` failures are logged via `tracing::error!`. A failing `dup2`
+/// leaves the target fd unchanged, so the diagnostic still reaches
+/// the pre-redirect stderr (kernel console / COM1) through the
+/// tracing subscriber and the operator sees the misroute rather than
+/// the failing path silently writing to a wrong device.
 fn redirect_all_stdio_to(path: &str) {
     use std::os::unix::io::AsRawFd;
 
@@ -1327,13 +1339,13 @@ fn redirect_all_stdio_to(path: &str) {
         (r0, e0, r1, e1, r2, e2)
     };
     if rc0 < 0 {
-        eprintln!("ktstr-init: redirect_all_stdio_to({path}): dup2(stdin) failed: {err0}");
+        tracing::error!(path, err = %err0, "ktstr-init: redirect_all_stdio_to: dup2(stdin) failed");
     }
     if rc1 < 0 {
-        eprintln!("ktstr-init: redirect_all_stdio_to({path}): dup2(stdout) failed: {err1}");
+        tracing::error!(path, err = %err1, "ktstr-init: redirect_all_stdio_to: dup2(stdout) failed");
     }
     if rc2 < 0 {
-        eprintln!("ktstr-init: redirect_all_stdio_to({path}): dup2(stderr) failed: {err2}");
+        tracing::error!(path, err = %err2, "ktstr-init: redirect_all_stdio_to: dup2(stderr) failed");
     }
 }
 
@@ -1357,7 +1369,7 @@ fn mount_devpts() {
         None::<&str>,
     );
     if let Err(e) = result {
-        eprintln!("ktstr-init: mount devpts on /dev/pts: {e}");
+        tracing::error!(err = %e, "ktstr-init: mount devpts on /dev/pts failed");
     }
 }
 
@@ -1375,7 +1387,7 @@ fn spawn_shell_with_pty() {
     let pty = match openpty(None, None) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("ktstr-init: openpty failed: {e}");
+            tracing::error!(err = %e, "ktstr-init: openpty failed");
             return;
         }
     };
@@ -1432,7 +1444,7 @@ fn spawn_shell_with_pty() {
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("ktstr-init: spawn shell: {e}");
+            tracing::error!(err = %e, "ktstr-init: spawn shell failed");
             return;
         }
     };
@@ -1460,7 +1472,7 @@ fn spawn_shell_with_pty() {
         }
         Err(e) if e.raw_os_error() == Some(libc::ECHILD) => {}
         Err(e) => {
-            eprintln!("ktstr-init: wait for shell: {e}");
+            tracing::warn!(err = %e, "ktstr-init: wait for shell failed");
         }
     }
 
@@ -1681,7 +1693,17 @@ fn mount_filesystems() {
         if let Err(e) = result
             && required
         {
-            eprintln!("ktstr-init: mount {fstype} on {target}: {e}");
+            // mount_filesystems() runs BEFORE the tracing subscriber
+            // is installed (the subscriber needs /proc mounted to read
+            // RUST_LOG from /proc/cmdline, so subscriber init follows
+            // this call). Until that point fd 2 still routes to the
+            // kernel console, but a `tracing::error!` event is dropped
+            // because no subscriber is installed yet — this is the
+            // tradeoff for installing the subscriber as early as
+            // possible. A failed required-mount this early is itself
+            // diagnosed downstream when /proc, /sys, or /dev are
+            // missing for subsequent guest init steps.
+            tracing::error!(fstype, target, err = %e, "ktstr-init: mount failed");
         }
     }
 
@@ -1742,7 +1764,7 @@ fn auto_mount_data_disks() {
              skipping auto-mount of /dev/vda"
         );
         let _ = fs::write(COM2, &msg);
-        eprintln!("{msg}");
+        tracing::warn!("{msg}");
         return;
     }
     // RO bit. Absent or any value other than "1" means RW.
@@ -1778,7 +1800,7 @@ fn auto_mount_data_disks() {
              (ro={ro}): {e}"
         );
         let _ = fs::write(COM2, &msg);
-        eprintln!("{msg}");
+        tracing::warn!("{msg}");
     }
 }
 
@@ -1806,15 +1828,16 @@ fn mkdir_p(path: &str) {
 }
 
 /// Write a line to COM2 (the application serial port).
-/// Falls back to stderr (kernel console) if COM2 is not available.
+/// Falls back to the tracing subscriber (writing to stderr) if COM2
+/// is not available.
 fn write_com2(msg: &str) {
     if let Ok(mut f) = fs::OpenOptions::new().write(true).open(COM2) {
         let _ = writeln!(f, "{msg}");
     } else {
         // COM2 unavailable (devtmpfs mount failed or device missing).
-        // Write to kernel console as fallback so the host sees
-        // something on COM1.
-        eprintln!("ktstr-init [COM1 fallback]: {msg}");
+        // Surface via the tracing subscriber so the host sees
+        // something on the COM1 fallback path.
+        tracing::warn!(target: "com1_fallback", "ktstr-init: {msg}");
     }
 }
 
@@ -2375,7 +2398,7 @@ fn start_scheduler(probe_drain: Option<ProbeDrain>) -> (Option<Child>, Option<St
             }
         }
         Err(e) => {
-            eprintln!("ktstr-init: spawn scheduler: {e}");
+            tracing::error!(err = %e, "ktstr-init: spawn scheduler failed");
             // Synthesize a minimal sched-log payload framed by the
             // existing SCHED_OUTPUT_START/END markers so the host's
             // `parse_sched_output` returns the spawn-failure
@@ -2730,7 +2753,7 @@ fn hvc0_poll_loop(stop: &AtomicBool, trace_stop: Option<&AtomicBool>) {
             bpf_map_write_done_latch().set();
         }
         if buf[..n].contains(&crate::vmm::virtio_console::SIGNAL_VC_SHUTDOWN) {
-            eprintln!("ktstr-init: shutdown request received, draining");
+            tracing::info!("ktstr-init: shutdown request received, draining");
             if let Some(ts) = trace_stop {
                 ts.store(true, Ordering::Release);
             }
@@ -2909,10 +2932,10 @@ fn start_sched_exit_monitor(
                 libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0u32) as libc::c_int
             };
             if pidfd < 0 {
-                eprintln!(
-                    "ktstr-init: pidfd_open failed for sched pid {pid}: {} \
-                     — sched exit monitor disabled",
-                    std::io::Error::last_os_error(),
+                tracing::error!(
+                    pid,
+                    err = %std::io::Error::last_os_error(),
+                    "ktstr-init: pidfd_open failed for sched — sched exit monitor disabled",
                 );
                 return;
             }
@@ -3086,11 +3109,11 @@ fn exec_shell_line(line: &str) {
         let value = value.trim();
         let path = path.trim();
         if let Err(e) = fs::write(path, format!("{value}\n")) {
-            eprintln!("ktstr-init: echo '{value}' > {path}: {e}");
+            tracing::error!(value, path, err = %e, "ktstr-init: echo redirect failed");
         }
         return;
     }
-    eprintln!("ktstr-init: unsupported command: {line}");
+    tracing::error!(line, "ktstr-init: unsupported command");
 }
 
 #[cfg(test)]

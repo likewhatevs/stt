@@ -205,6 +205,7 @@ pub(crate) static SCHED_TEST: Scheduler = Scheduler {
     },
     constraints: TopologyConstraints::DEFAULT,
     config_file: None,
+    config_file_def: None,
 };
 
 /// Payload wrapper around [`SCHED_TEST`] so tests can plug it into

@@ -26,7 +26,9 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use gxhash::GxHasher;
+use std::hash::BuildHasher;
+
+use ahash::AHasher;
 
 use super::initramfs;
 
@@ -52,21 +54,21 @@ struct HashFileKey {
     mtime_nsecs: i64,
 }
 
-/// Process-local cache: file identity + mtime → gxhash of contents.
+/// Process-local cache: file identity + mtime → ahash of contents.
 fn hash_file_cache() -> &'static Mutex<HashMap<HashFileKey, u64>> {
     static CACHE: OnceLock<Mutex<HashMap<HashFileKey, u64>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Hash a file's content for cache keying via mmap + gxhash.
+/// Hash a file's content for cache keying via mmap + ahash.
 ///
-/// Uses gxhash for speed — hardware-accelerated via AES-NI (x86_64)
-/// and AES intrinsics (aarch64). The file is memory-mapped read-only
-/// so the kernel handles I/O via page faults against the page cache;
-/// no intermediate buffer copies. Process-local memoisation keyed on
-/// `(path, dev, ino, mtime)` short-circuits repeat calls within the
-/// same run; the inode-plus-mtime tuple invalidates the cached hash
-/// whenever the underlying file changes.
+/// Uses ahash for speed — AES-NI accelerated on x86_64/aarch64 via
+/// runtime detection, software fallback otherwise. The file is
+/// memory-mapped read-only so the kernel handles I/O via page faults
+/// against the page cache; no intermediate buffer copies. Process-local
+/// memoisation keyed on `(path, dev, ino, mtime)` short-circuits repeat
+/// calls within the same run; the inode-plus-mtime tuple invalidates
+/// the cached hash whenever the underlying file changes.
 pub(crate) fn hash_file(path: &Path) -> Result<u64> {
     use std::fs::File;
     use std::os::unix::fs::MetadataExt;
@@ -89,7 +91,9 @@ pub(crate) fn hash_file(path: &Path) -> Result<u64> {
     let mmap = unsafe {
         memmap2::Mmap::map(&file).with_context(|| format!("mmap for hash: {}", path.display()))?
     };
-    let digest = gxhash::gxhash64(&mmap, 0);
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    hasher.write(&mmap);
+    let digest = hasher.finish();
     hash_file_cache().lock().unwrap().insert(cache_key, digest);
     Ok(digest)
 }
@@ -115,7 +119,7 @@ impl BaseKey {
         probe: Option<&Path>,
         worker: Option<&Path>,
     ) -> Result<Self> {
-        let mut hasher = GxHasher::with_seed(0);
+        let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
 
         hash_file(payload)?.hash(&mut hasher);
         Self::hash_shared_libs(payload, &mut hasher);
@@ -164,7 +168,7 @@ impl BaseKey {
         include_files: &[(String, PathBuf)],
         busybox: bool,
     ) -> Result<Self> {
-        let mut hasher = GxHasher::with_seed(0);
+        let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
 
         "ktstr-shell".hash(&mut hasher);
         busybox.hash(&mut hasher);
@@ -218,7 +222,7 @@ impl BaseKey {
 
     /// Hash shared library paths and content samples for a binary so
     /// the cache key changes when any shared lib is updated on the host.
-    fn hash_shared_libs(binary: &Path, hasher: &mut GxHasher) {
+    fn hash_shared_libs(binary: &Path, hasher: &mut AHasher) {
         if let Ok(result) = initramfs::resolve_shared_libs(binary) {
             let mut entries: Vec<_> = result.found.iter().map(|(_, p)| p.clone()).collect();
             entries.sort();
@@ -295,7 +299,6 @@ pub(crate) fn get_or_build_base(
     let seg_name = initramfs::shm_segment_name(key.0);
     match shm_try_create_excl(&seg_name) {
         ShmCreateResult::Winner(fd) => {
-            // We won the race — build, write, release.
             tracing::debug!("initramfs shm: builder (O_EXCL won)");
             let t0 = std::time::Instant::now();
             let data = initramfs::build_initramfs_base(payload, extras, include_files, busybox)?;
@@ -304,19 +307,11 @@ pub(crate) fn get_or_build_base(
                 bytes = data.len(),
                 "build_initramfs_base",
             );
-
-            // Write data to the segment and release the exclusive lock.
             shm_write_and_release(fd, &data, &seg_name);
-
-            // Load back via mmap for zero-copy return.
-            // Skip process-local cache insert — the SHM mmap is persistent
-            // and fast to re-acquire, so copying into an Arc is waste.
+            hold_shm_lock(&seg_name);
             if let Some(mapped) = initramfs::shm_load_base(key.0) {
                 return Ok(BaseRef::Mapped(mapped));
             }
-
-            // shm_load_base failed after we just wrote — fall through
-            // to return an owned copy.
             let arc = Arc::new(data);
             base_cache()
                 .lock()
@@ -325,21 +320,17 @@ pub(crate) fn get_or_build_base(
             return Ok(BaseRef::Owned(arc));
         }
         ShmCreateResult::Exists => {
-            // Another process is building (or has built). Block on
-            // LOCK_SH via shm_load_base until the builder finishes.
             tracing::debug!("initramfs shm: waiting for builder (EEXIST)");
             if let Some(mapped) = initramfs::shm_load_base(key.0) {
                 tracing::debug!("initramfs base cache hit (shm, after wait)");
+                hold_shm_lock(&seg_name);
                 return Ok(BaseRef::Mapped(mapped));
             }
-            // Builder may have failed and unlinked — fall through to build.
         }
         ShmCreateResult::Error => {
-            // shm_open failed for a reason other than EEXIST (e.g. no /dev/shm).
-            // Try a plain load in case the segment exists but O_EXCL had
-            // a transient error.
             if let Some(mapped) = initramfs::shm_load_base(key.0) {
                 tracing::debug!("initramfs base cache hit (shm)");
+                hold_shm_lock(&seg_name);
                 return Ok(BaseRef::Mapped(mapped));
             }
         }
@@ -367,34 +358,10 @@ pub(crate) fn get_or_build_base(
 }
 
 /// Remove stale SHM segments from `/dev/shm` that don't match `current`.
-/// Scans for `ktstr-base-*`, `ktstr-lz4-*`, and legacy `ktstr-gz-*`
-/// entries and unlinks any whose `<arch>-<hash>` suffix differs from
-/// the current key. Segments without an arch tag (pre-arch-aware
-/// builds) never match the new format and are unconditionally treated
-/// as stale.
-///
-/// Only unlinks segments that are not held by another process. Tries
-/// `LOCK_EX | LOCK_NB` on each candidate — if the lock succeeds, no
-/// reader or writer holds it, so it's safe to unlink. If the lock
-/// fails (`EWOULDBLOCK`), another process is actively using the
-/// segment and it is skipped.
-///
-/// Path-rebind defense: between the initial `shm_open(RDONLY)` and the
-/// `LOCK_EX | LOCK_NB` acquisition, a peer can `unlink + O_CREAT|O_EXCL`
-/// to recreate the segment at the same name with a new inode. Our held
-/// fd then references the orphaned old inode while the path resolves to
-/// the peer's fresh inode; an unconditional unlink would remove the
-/// peer's directory entry. After the lock succeeds, fstat the held fd
-/// and re-resolve the name to a second fd via `shm_open(RDONLY)`, then
-/// fstat that. If `(st_dev, st_ino)` differ, the path was rebound — drop
-/// both fds without unlinking. This narrows the residual window from
-/// "open-to-flock" (potentially long, since flock can block) to
-/// "fstat-recheck-to-unlink" (two adjacent syscalls).
-///
-/// Called once per process via the [`OnceLock`] gate in
-/// [`get_or_build_base`]. Sweeping on every call is wasteful when many
-/// tests share a process — the first cache lookup pays for the scan
-/// and every subsequent lookup is free.
+/// Only unlinks segments not held by any process (`LOCK_EX | LOCK_NB`).
+/// Parallel nextest workers hold `LOCK_SH` on their segments for the
+/// process lifetime (via `HELD_SHM_LOCKS`), so their segments survive
+/// cleanup from other workers.
 fn cleanup_stale_shm(current: &BaseKey) {
     let current_suffix = format!("{}-{:016x}", initramfs::SHM_ARCH_TAG, current.0);
     let shm_dir = match std::fs::read_dir("/dev/shm") {
@@ -411,7 +378,6 @@ fn cleanup_stale_shm(current: &BaseKey) {
         } else if let Some(s) = name_str.strip_prefix("ktstr-lz4-") {
             s
         } else if let Some(s) = name_str.strip_prefix("ktstr-gz-") {
-            // Legacy prefix from previous compression format.
             s
         } else {
             continue;
@@ -420,10 +386,6 @@ fn cleanup_stale_shm(current: &BaseKey) {
             continue;
         }
         let shm_name = format!("/{name_str}");
-        // rustix owns the fd via OwnedFd, so flock-then-drop is the
-        // only cleanup path — no manual close required, and unlinks
-        // happen before the fd drops so the segment is gone atomically
-        // with lock release.
         let Ok(fd) = rustix::shm::open(
             shm_name.as_str(),
             rustix::shm::OFlags::RDONLY,
@@ -434,11 +396,6 @@ fn cleanup_stale_shm(current: &BaseKey) {
         if rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
             continue;
         }
-        // Rebind probe: re-resolve the name. If the second open fails
-        // (e.g. ENOENT — peer unlinked between our flock and now),
-        // skip — there's nothing to unlink, and unlinking the name
-        // could clobber a future peer recreation that lands before
-        // our unlink would run.
         let Ok(recheck_fd) = rustix::shm::open(
             shm_name.as_str(),
             rustix::shm::OFlags::RDONLY,
@@ -451,18 +408,32 @@ fn cleanup_stale_shm(current: &BaseKey) {
         let stat_recheck = rustix::fs::fstat(&recheck_fd);
         match (stat_fd, stat_recheck) {
             (Ok(a), Ok(b)) if a.st_dev == b.st_dev && a.st_ino == b.st_ino => {
-                // Path still names the inode we hold. Safe to unlink.
                 let _ = rustix::shm::unlink(shm_name.as_str());
             }
-            _ => {
-                // Either fstat failed (skip — can't prove identity) or
-                // the path now names a different inode (peer rebound
-                // between our open and our flock). Close both fds
-                // without unlinking; the live segment at the path is
-                // not ours to remove.
-            }
+            _ => {}
         }
         let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+/// Process-lifetime `LOCK_SH` holds on SHM segments. Prevents
+/// `cleanup_stale_shm` in parallel nextest workers from deleting
+/// segments this process built or loaded.
+static HELD_SHM_LOCKS: Mutex<Vec<rustix::fd::OwnedFd>> = Mutex::new(Vec::new());
+
+fn hold_shm_lock(shm_name: &str) {
+    for name in [
+        shm_name.to_string(),
+        shm_name.replace("ktstr-base-", "ktstr-lz4-"),
+    ] {
+        if let Ok(fd) = rustix::shm::open(
+            name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        ) && rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockShared).is_ok()
+        {
+            HELD_SHM_LOCKS.lock().unwrap().push(fd);
+        }
     }
 }
 
@@ -674,8 +645,8 @@ mod tests {
     }
 
     #[test]
-    fn hash_file_is_gxhash_stable_golden() {
-        // hash_file must use gxhash64 so the value is stable across
+    fn hash_file_is_ahash_stable_golden() {
+        // hash_file must use ahash so the value is stable across
         // Rust toolchain versions. Golden check pins the concrete
         // algorithm — if this value changes, the cache silently
         // invalidates every prior artifact.
@@ -686,10 +657,12 @@ mod tests {
         std::fs::write(&f, b"ktstr cache key probe").unwrap();
         let observed = hash_file(&f).unwrap();
 
-        let expected = gxhash::gxhash64(b"ktstr cache key probe", 0);
+        let mut h = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+        h.write(b"ktstr cache key probe");
+        let expected = h.finish();
         assert_eq!(
             observed, expected,
-            "hash_file must match gxhash::gxhash64(data, 0)"
+            "hash_file must match ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher()"
         );
 
         std::fs::remove_dir_all(&tmp).unwrap();

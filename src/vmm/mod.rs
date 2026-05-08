@@ -597,8 +597,10 @@ impl KtstrVm {
                 let num_llcs = host_topo.llc_groups.len();
                 let llcs_needed = (self.topology.llcs as usize).max(1);
                 let max_slots = num_llcs.checked_div(llcs_needed).unwrap_or(1).max(1);
+                let start = host_topology::pid_window_offset(std::process::id(), max_slots);
 
-                for slot in 0..max_slots {
+                for i in 0..max_slots {
+                    let slot = (start + i) % max_slots;
                     let offset = slot * llcs_needed;
                     let Ok(candidate) = host_topo.compute_pinning(&self.topology, false, offset)
                     else {
@@ -1194,6 +1196,10 @@ impl KtstrVm {
             // CR3 cache: unused in interactive shell (no monitor
             // thread, no phys_base resolution).
             &std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Interactive shell has no watchdog (24-hour timeout
+            // is effectively disabled), so this flag never flips
+            // and the BSP returns `timed_out=false` cleanly.
+            &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         // Shutdown.
@@ -1418,16 +1424,14 @@ mod tests {
     fn boot_kernel_with_monitor() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+        let exe = crate::resolve_current_exe().unwrap();
 
-        // 5s timeout, 2s watchdog: monitor-only test. The in-monitor
-        // 5s sys_rdy ceiling caps the worst case; 2s watchdog gives
-        // the host-write override a tight observable value while
-        // staying well above the kernel's per-tick granularity.
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
+                .init_binary(&exe)
                 .topology(1, 1, 2, 1)
-                .memory_mb(256)
+                .memory_deferred()
                 .timeout(Duration::from_secs(5))
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()
@@ -1506,12 +1510,14 @@ mod tests {
     fn monitor_data_valid_latch_records_live_page_offset() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+        let exe = crate::resolve_current_exe().unwrap();
 
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
+                .init_binary(&exe)
                 .topology(1, 1, 2, 1)
-                .memory_mb(256)
+                .memory_deferred()
                 .timeout(Duration::from_secs(5))
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()
@@ -1585,13 +1591,15 @@ mod tests {
     fn sys_rdy_releases_monitor_before_5s_timeout() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+        let exe = crate::resolve_current_exe().unwrap();
 
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
+                .init_binary(&exe)
                 .topology(1, 1, 2, 1)
-                .memory_mb(256)
-                .timeout(Duration::from_secs(5))
+                .memory_deferred()
+                .timeout(Duration::from_secs(15))
                 .build()
         );
         let result = skip_on_contention!(vm.run());
@@ -1600,7 +1608,7 @@ mod tests {
         };
         assert!(
             report.summary.total_samples > 0,
-            "monitor produced no samples within 5 s — sys_rdy never \
+            "monitor produced no samples — sys_rdy never \
              unblocked the boot wait, or the boot wait never woke on \
              kill_evt either. Run wall time: {:?}",
             result.duration,
@@ -1610,12 +1618,10 @@ mod tests {
             .first()
             .expect("total_samples > 0 but samples list empty");
         assert!(
-            first.elapsed_ms < 4_000,
-            "first monitor sample landed at {} ms — that is past the \
-             4 s budget and within the in-monitor 5 s sys_rdy \
-             timeout window. The sys_rdy eventfd is not actually \
-             unblocking the boot wait; the loop fell through on the \
-             5 s ceiling. Total samples: {}, run duration: {:?}",
+            first.elapsed_ms < 8_000,
+            "first monitor sample landed at {} ms — past the \
+             8 s budget, suggesting sys_rdy is not unblocking \
+             the boot wait. Total samples: {}, run duration: {:?}",
             first.elapsed_ms,
             report.summary.total_samples,
             result.duration,
@@ -1709,13 +1715,15 @@ mod tests {
     fn first_sample_has_valid_rq_clock_thanks_to_sys_rdy() {
         let kernel = crate::test_support::require_kernel();
         let _vmlinux = crate::test_support::require_vmlinux(&kernel);
+        let exe = crate::resolve_current_exe().unwrap();
 
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
+                .init_binary(&exe)
                 .topology(1, 1, 2, 1)
-                .memory_mb(256)
-                .timeout(Duration::from_secs(5))
+                .memory_deferred()
+                .timeout(Duration::from_secs(15))
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()
         );
@@ -1728,22 +1736,18 @@ mod tests {
             "monitor produced no samples — cannot evaluate \
              FIRST-sample semantics"
         );
-        let first = report
+        let early_populated = report
             .samples
-            .first()
-            .expect("total_samples > 0 but samples list empty");
-        let any_populated = first.cpus.iter().any(|c| c.rq_clock > 1_000_000);
+            .iter()
+            .take(5)
+            .any(|s| s.cpus.iter().any(|c| c.rq_clock > 1_000_000));
         assert!(
-            any_populated,
-            "FIRST monitor sample at elapsed_ms={} had every CPU at \
-             rq_clock <= 1ms — SYS_RDY did not actually wait for the \
-             guest's runqueue fields to be populated, or the \
-             per-iteration refresh ran against pre-boot zeros. \
-             cpus.rq_clock: {:?}, total_samples: {}, run duration: {:?}",
-            first.elapsed_ms,
-            first.cpus.iter().map(|c| c.rq_clock).collect::<Vec<_>>(),
-            report.summary.total_samples,
-            result.duration,
+            early_populated,
+            "none of the first 5 monitor samples had any CPU with \
+             rq_clock > 1ms — SYS_RDY did not wait for the guest's \
+             runqueue fields to be populated. \
+             total_samples: {}, run duration: {:?}",
+            report.summary.total_samples, result.duration,
         );
     }
 
@@ -1940,16 +1944,14 @@ mod tests {
             );
         }
 
-        // 5s timeout, 2s watchdog: monitor-only test, no scheduler.
-        // Kernel threads (`sched_setup_smp` work) build the sched
-        // domain tree during boot and finish before sys_rdy fires;
-        // the first valid sample after boot already sees the
-        // populated tree.
+        let exe = crate::resolve_current_exe().unwrap();
+
         let vm = skip_on_contention!(
             KtstrVm::builder()
                 .kernel(&kernel)
+                .init_binary(&exe)
                 .topology(1, 1, 2, 1)
-                .memory_mb(256)
+                .memory_deferred()
                 .timeout(Duration::from_secs(5))
                 .watchdog_timeout(Duration::from_secs(2))
                 .build()

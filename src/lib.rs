@@ -558,6 +558,7 @@ pub fn merge_kconfig_fragments<'a>(
 pub use ktstr_macros::Claim;
 pub use ktstr_macros::Payload;
 pub use ktstr_macros::Scheduler;
+pub use ktstr_macros::json;
 pub use ktstr_macros::ktstr_test;
 
 /// Internal re-exports for proc-macro-generated code. Not public API.

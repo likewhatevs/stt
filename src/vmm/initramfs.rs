@@ -612,11 +612,22 @@ fn strip_debug(path: &Path) -> Result<Vec<u8>> {
 
     for src in &paths_to_try {
         if let Ok(data) = std::fs::read(src) {
-            if let Ok(stripped) = strip_debug_sections(&data) {
-                return Ok(stripped);
+            match strip_debug_sections(&data) {
+                Ok(stripped) => return Ok(stripped),
+                Err(e) => {
+                    // object crate failed to parse/write — log and
+                    // fall back to the unstripped binary so the VM
+                    // boot proceeds. Without the warn the operator
+                    // sees a 900 MiB initramfs with no clue why
+                    // stripping silently no-op'd.
+                    tracing::warn!(
+                        binary = %src.display(),
+                        error = %e,
+                        "strip_debug_sections failed, using unstripped binary"
+                    );
+                    return Ok(data);
+                }
             }
-            // object crate failed to parse/write — return unstripped.
-            return Ok(data);
         }
     }
 

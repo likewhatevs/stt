@@ -69,10 +69,16 @@ use zerocopy::{FromBytes, IntoBytes};
 pub enum MsgType {
     /// Stimulus event from the guest step executor.
     Stimulus,
-    /// Scenario start marker.
+    /// Scenario start marker. Sets a fresh watchdog deadline.
     ScenarioStart,
     /// Scenario end marker (payload: 8-byte LE u64 elapsed_ms).
     ScenarioEnd,
+    /// Pause the watchdog clock. Wall time while paused doesn't
+    /// count against the workload budget.
+    ScenarioPause,
+    /// Resume the watchdog clock after a pause. Extends the deadline
+    /// by the pause duration — gives back the paused time.
+    ScenarioResume,
     /// Guest exit code (payload: 4-byte LE i32).
     Exit,
     /// Test result (payload: bincode-encoded `AssertResult`).
@@ -167,6 +173,8 @@ impl MsgType {
             MsgType::Stimulus => MSG_TYPE_STIMULUS,
             MsgType::ScenarioStart => MSG_TYPE_SCENARIO_START,
             MsgType::ScenarioEnd => MSG_TYPE_SCENARIO_END,
+            MsgType::ScenarioPause => MSG_TYPE_SCENARIO_PAUSE,
+            MsgType::ScenarioResume => MSG_TYPE_SCENARIO_RESUME,
             MsgType::Exit => MSG_TYPE_EXIT,
             MsgType::TestResult => MSG_TYPE_TEST_RESULT,
             MsgType::SchedExit => MSG_TYPE_SCHED_EXIT,
@@ -195,6 +203,8 @@ impl MsgType {
             MSG_TYPE_STIMULUS => Some(MsgType::Stimulus),
             MSG_TYPE_SCENARIO_START => Some(MsgType::ScenarioStart),
             MSG_TYPE_SCENARIO_END => Some(MsgType::ScenarioEnd),
+            MSG_TYPE_SCENARIO_PAUSE => Some(MsgType::ScenarioPause),
+            MSG_TYPE_SCENARIO_RESUME => Some(MsgType::ScenarioResume),
             MSG_TYPE_EXIT => Some(MsgType::Exit),
             MSG_TYPE_TEST_RESULT => Some(MsgType::TestResult),
             MSG_TYPE_SCHED_EXIT => Some(MsgType::SchedExit),
@@ -316,6 +326,12 @@ pub const MSG_TYPE_STIMULUS: u32 = 0x5354_494D; // "STIM"
 
 /// Scenario start marker.
 pub const MSG_TYPE_SCENARIO_START: u32 = 0x5343_5354; // "SCST"
+
+/// Pause watchdog clock.
+pub const MSG_TYPE_SCENARIO_PAUSE: u32 = 0x5343_5050; // "SCPP"
+
+/// Resume watchdog clock after pause.
+pub const MSG_TYPE_SCENARIO_RESUME: u32 = 0x5343_5252; // "SCRR"
 
 /// Scenario end marker.
 pub const MSG_TYPE_SCENARIO_END: u32 = 0x5343_454E; // "SCEN"

@@ -856,12 +856,8 @@ fn run_scenario(
             &mut sched_died_during_hold,
         );
 
-        // Signal hold-complete so the host watchdog resets its
-        // deadline. Teardown (collect_step) runs in the fresh
-        // budget, not the hold budget.
         if guest_comms::is_guest() {
-            let elapsed = scenario_start.elapsed().as_millis() as u64;
-            crate::vmm::guest_comms::send_scenario_end(elapsed);
+            crate::vmm::guest_comms::send_scenario_pause();
         }
 
         let step_result = collect_step(&mut step_state, effective_checks, ctx.topo, ctx.cgroups);
@@ -1192,6 +1188,9 @@ fn run_step<'a>(
                 crate::vmm::guest_comms::send_stimulus(zerocopy::IntoBytes::as_bytes(&payload));
             }
 
+            if guest_comms::is_guest() {
+                crate::vmm::guest_comms::send_scenario_resume();
+            }
             let hold_dur = match &step.hold {
                 HoldSpec::Frac(f) => Duration::from_secs_f64(ctx.duration.as_secs_f64() * f),
                 HoldSpec::Fixed(d) => *d,

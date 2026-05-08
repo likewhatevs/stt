@@ -17,6 +17,7 @@
 //! so existing `crate::workload::WorkloadConfig` paths continue to
 //! resolve.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -1131,6 +1132,24 @@ pub struct WorkSpec {
     /// for range, default-zero skip semantics, and `CAP_SYS_NICE`
     /// rules.
     pub nice: i32,
+    /// Worker process name set via `prctl(PR_SET_NAME)` after fork.
+    /// Kernel truncates to 15 bytes (TASK_COMM_LEN - 1). `None`
+    /// inherits the binary name. Useful for scheduler matchers
+    /// that filter on `task->comm` (e.g. layered's `CommPrefix`).
+    pub comm: Option<Cow<'static, str>>,
+    /// Effective UID set via `setresuid(uid, uid, uid)` after fork.
+    /// `None` inherits the parent's euid. Useful for scheduler
+    /// matchers that filter on `task->real_cred->euid` (e.g.
+    /// layered's `UIDEquals`).
+    pub uid: Option<u32>,
+    /// Effective GID set via `setresgid(gid, gid, gid)` after fork.
+    /// `None` inherits the parent's egid.
+    pub gid: Option<u32>,
+    /// Restrict worker affinity to the CPUs of this NUMA node.
+    /// Applied via `sched_setaffinity` after fork. Useful for
+    /// scheduler matchers that check `bpf_cpumask_subset(cpus_ptr,
+    /// node_cpumask)` (e.g. layered's `NumaNode`).
+    pub numa_node: Option<u32>,
 }
 
 impl Default for WorkSpec {
@@ -1143,6 +1162,10 @@ impl Default for WorkSpec {
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
             nice: 0,
+            comm: None,
+            uid: None,
+            gid: None,
+            numa_node: None,
         }
     }
 }
@@ -1197,6 +1220,35 @@ impl WorkSpec {
     #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
         self.nice = n;
+        self
+    }
+
+    /// Set the worker process name via `prctl(PR_SET_NAME)`.
+    /// Kernel truncates to 15 bytes.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn comm(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.comm = Some(name.into());
+        self
+    }
+
+    /// Set the worker's effective UID via `setresuid`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn uid(mut self, uid: u32) -> Self {
+        self.uid = Some(uid);
+        self
+    }
+
+    /// Set the worker's effective GID via `setresgid`.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn gid(mut self, gid: u32) -> Self {
+        self.gid = Some(gid);
+        self
+    }
+
+    /// Restrict worker affinity to a NUMA node's CPU set.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn numa_node(mut self, node: u32) -> Self {
+        self.numa_node = Some(node);
         self
     }
 }

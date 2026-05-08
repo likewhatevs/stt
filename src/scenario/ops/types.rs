@@ -1084,6 +1084,60 @@ impl CgroupDef {
         self
     }
 
+    /// Set the per-worker nice value for all WorkSpec groups in this
+    /// cgroup.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn nice(mut self, n: i32) -> Self {
+        self.ensure_default_work();
+        for w in &mut self.works {
+            w.nice = n;
+        }
+        self
+    }
+
+    /// Set the worker process name for all WorkSpec groups in this
+    /// cgroup. Every worker forked from any group calls
+    /// `prctl(PR_SET_NAME)` with this name.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn comm(mut self, name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        self.ensure_default_work();
+        let name = name.into();
+        for w in &mut self.works {
+            w.comm = Some(name.clone());
+        }
+        self
+    }
+
+    /// Set the worker effective UID for all WorkSpec groups.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn uid(mut self, uid: u32) -> Self {
+        self.ensure_default_work();
+        for w in &mut self.works {
+            w.uid = Some(uid);
+        }
+        self
+    }
+
+    /// Set the worker effective GID for all WorkSpec groups.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn gid(mut self, gid: u32) -> Self {
+        self.ensure_default_work();
+        for w in &mut self.works {
+            w.gid = Some(gid);
+        }
+        self
+    }
+
+    /// Restrict all workers to a NUMA node's CPU set.
+    #[must_use = "builder methods consume self; bind the result"]
+    pub fn numa_node(mut self, node: u32) -> Self {
+        self.ensure_default_work();
+        for w in &mut self.works {
+            w.numa_node = Some(node);
+        }
+        self
+    }
+
     /// When true, the gauntlet work_type override replaces each WorkSpec's work type.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn swappable(mut self, swappable: bool) -> Self {

@@ -331,6 +331,13 @@ pub struct Scheduler {
     /// `/include-files/{filename}` and `--config /include-files/{filename}`
     /// is prepended to `sched_args`.
     pub config_file: Option<&'static str>,
+    /// Declares how an inline config is passed to the scheduler.
+    /// First element: CLI arg template with `{file}` placeholder
+    /// (e.g. `"f:{file}"`, `"--config {file}"`). Second element:
+    /// guest filesystem path where the JSON is written
+    /// (e.g. `"/include-files/layered.json"`). The framework
+    /// `mkdir -p`s the parent and writes the config content there.
+    pub config_file_def: Option<(&'static str, &'static str)>,
 }
 
 impl Scheduler {
@@ -390,6 +397,7 @@ impl Scheduler {
         },
         constraints: TopologyConstraints::DEFAULT,
         config_file: None,
+        config_file_def: None,
     };
 
     /// Const constructor for defining schedulers in static context.
@@ -413,6 +421,7 @@ impl Scheduler {
             },
             constraints: TopologyConstraints::DEFAULT,
             config_file: None,
+            config_file_def: None,
         }
     }
 
@@ -529,6 +538,20 @@ impl Scheduler {
     /// guest initramfs and `--config` is injected into scheduler args.
     pub const fn config_file(mut self, path: &'static str) -> Self {
         self.config_file = Some(path);
+        self
+    }
+
+    /// Declare how inline config content is passed to the scheduler.
+    /// `arg_template`: CLI arg with `{file}` placeholder for the
+    /// guest path (e.g. `"f:{file}"`, `"--config {file}"`).
+    /// `guest_path`: where the JSON is written in the guest
+    /// (e.g. `"/include-files/layered.json"`).
+    pub const fn config_file_def(
+        mut self,
+        arg_template: &'static str,
+        guest_path: &'static str,
+    ) -> Self {
+        self.config_file_def = Some((arg_template, guest_path));
         self
     }
 
@@ -700,6 +723,11 @@ pub struct KtstrTestEntry {
     /// `#[ktstr_test(cleanup_budget_ms = N)]` or by direct entry
     /// construction.
     pub cleanup_budget: Option<Duration>,
+    /// Inline config content (JSON string) written to the guest path
+    /// declared by the scheduler's `config_file_def`. The framework
+    /// writes this string to a temp file, packs it into the initramfs,
+    /// and passes the scheduler's arg template with `{file}` replaced.
+    pub config_content: Option<&'static str>,
     /// Optional virtio-blk disk attached to the VM at `/dev/vda`.
     /// `None` (the default) boots without a disk; `Some(cfg)` calls
     /// [`crate::vmm::KtstrVmBuilder::disk`] in
@@ -791,6 +819,7 @@ impl KtstrTestEntry {
         host_only: false,
         extra_include_files: &[],
         cleanup_budget: None,
+        config_content: None,
         disk: None,
         post_vm: None,
     };

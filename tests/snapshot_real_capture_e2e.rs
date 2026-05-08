@@ -62,7 +62,7 @@ fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
 
 #[ktstr_test(
     scheduler = KTSTR_SCHED_PAYLOAD,
-    duration_s = 4,
+    duration_s = 10,
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,
     auto_repro = false,
@@ -84,7 +84,7 @@ fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<Asser
 
 #[ktstr_test(
     scheduler = KTSTR_SCHED_PAYLOAD,
-    duration_s = 2,
+    duration_s = 10,
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,
     auto_repro = false,

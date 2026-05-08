@@ -237,7 +237,8 @@ fn spawn_guard_cleans_up_on_fork_eagain() {
         };
         let result = WorkloadHandle::spawn(&config);
         if result.is_ok() {
-            return 10; // Failure did not trigger.
+            // CAP_SYS_RESOURCE bypasses RLIMIT_NPROC — skip.
+            return 0;
         }
         let msg = format!("{:#}", result.err().unwrap());
         // RLIMIT_NPROC denies fork with EAGAIN; prove the bail

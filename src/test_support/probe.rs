@@ -30,7 +30,7 @@ use super::args::{
 use super::entry::find_test;
 use super::output::{extract_sched_ext_dump, print_assert_result};
 use super::profraw::try_flush_profraw;
-use super::runtime::{config_file_parts, verbose};
+use super::runtime::{config_content_parts, config_file_parts, verbose};
 use super::{KtstrTestEntry, TopoOverride};
 use crate::verifier::{
     SCHED_OUTPUT_END, SCHED_OUTPUT_START, parse_sched_output, parse_sched_output_partial,
@@ -441,6 +441,11 @@ pub(crate) fn attempt_auto_repro(
             resolved_includes.push((archive_path, host_path, "scheduler config_file"));
             args.push("--config".to_string());
             args.push(guest_path);
+        }
+        if let Some((archive_path, host_path, _guest_path, cfg_args)) = config_content_parts(entry)
+        {
+            resolved_includes.push((archive_path, host_path, "inline config_content"));
+            args.extend(cfg_args);
         }
         match super::eval::dedupe_include_files(&resolved_includes) {
             Ok(unioned) if !unioned.is_empty() => {
@@ -1063,7 +1068,13 @@ fn build_dispatch_ctx_parts(
 /// with the probe thread `start_probe_phase_a` spawned in the split
 /// path, so it lives in the caller instead.
 pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
-    let name = extract_test_fn_arg(args)?;
+    let name = match extract_test_fn_arg(args) {
+        Some(n) => n,
+        None => {
+            eprintln!("ktstr-init: no --ktstr-test-fn in args, skipping dispatch");
+            return None;
+        }
+    };
 
     let entry = match find_test(name) {
         Some(e) => e,
@@ -1241,6 +1252,17 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
         .build();
+
+    // Send SCENARIO_START so the host-side watchdog resets its hard
+    // deadline to `now + workload_duration`. Tests that use
+    // `scenario::run()` send this from `ops::run_inner`; tests that
+    // call `(entry.func)(&ctx)` directly with `thread::sleep(duration)`
+    // do not, so the watchdog's boot-relative deadline can fire mid-
+    // test even when the test's own clock has not yet hit duration.
+    // Sending it here covers every dispatch path uniformly.
+    if crate::vmm::guest_comms::is_guest() {
+        crate::vmm::guest_comms::send_scenario_start();
+    }
 
     let result = match (entry.func)(&ctx) {
         Ok(r) => r,
@@ -1475,7 +1497,13 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     // `std::env::__environ` now would race with that thread. The
     // caller (`ktstr_guest_init`) invokes `propagate_rust_env_from_cmdline`
     // before Phase A spawns the thread.
-    let name = extract_test_fn_arg(args)?;
+    let name = match extract_test_fn_arg(args) {
+        Some(n) => n,
+        None => {
+            eprintln!("ktstr-init: no --ktstr-test-fn in args, skipping dispatch");
+            return None;
+        }
+    };
 
     let entry = match find_test(name) {
         Some(e) => e,
@@ -1613,6 +1641,12 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         param_names: pa_param_names,
         render_hints: pa_render_hints,
     };
+    // Send SCENARIO_START so the host-side watchdog resets its hard
+    // deadline to `now + workload_duration`. See the matching site
+    // in `maybe_dispatch_vm_test_with_args` for the full rationale.
+    if crate::vmm::guest_comms::is_guest() {
+        crate::vmm::guest_comms::send_scenario_start();
+    }
     let result = match (entry.func)(&ctx) {
         Ok(r) => r,
         Err(e) => {

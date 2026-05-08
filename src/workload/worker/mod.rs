@@ -96,6 +96,10 @@ pub(super) fn worker_main(
     mem_policy: MemPolicy,
     mpol_flags: MpolFlags,
     nice: i32,
+    comm: Option<&str>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    numa_node: Option<u32>,
     pipe_fds: Option<(i32, i32)>,
     futex: Option<(*mut u32, usize)>,
     iter_slot: *mut AtomicU64,
@@ -129,6 +133,34 @@ pub(super) fn worker_main(
     let _ = set_sched_policy(tid, sched_policy);
     apply_mempolicy_with_flags(&mem_policy, mpol_flags);
     apply_nice(nice);
+    if let Some(name) = comm {
+        let c_name = std::ffi::CString::new(name).unwrap_or_default();
+        unsafe { libc::prctl(libc::PR_SET_NAME, c_name.as_ptr()) };
+    }
+    if let Some(g) = gid {
+        unsafe { libc::setresgid(g, g, g) };
+    }
+    if let Some(u) = uid {
+        unsafe { libc::setresuid(u, u, u) };
+    }
+    if let Some(node) = numa_node {
+        let path = format!("/sys/devices/system/node/node{node}/cpulist");
+        if let Ok(cpulist) = std::fs::read_to_string(&path) {
+            let mut cpus = BTreeSet::new();
+            for part in cpulist.trim().split(',') {
+                if let Some((lo, hi)) = part.split_once('-') {
+                    if let (Ok(a), Ok(b)) = (lo.parse::<usize>(), hi.parse::<usize>()) {
+                        cpus.extend(a..=b);
+                    }
+                } else if let Ok(c) = part.parse::<usize>() {
+                    cpus.insert(c);
+                }
+            }
+            if !cpus.is_empty() {
+                let _ = set_thread_affinity(tid, &cpus);
+            }
+        }
+    }
 
     let start = Instant::now();
     let mut work_units: u64 = 0;

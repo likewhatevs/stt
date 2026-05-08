@@ -625,6 +625,15 @@ impl Payload {
         }
     }
 
+    /// Inline config file definition. `None` for binary-kind payloads
+    /// and for scheduler-kind payloads that did not set one.
+    pub const fn config_file_def(&self) -> Option<(&'static str, &'static str)> {
+        match self.kind {
+            PayloadKind::Scheduler(s) => s.config_file_def,
+            PayloadKind::Binary(_) => None,
+        }
+    }
+
     /// Scheduler-wide assertion overrides. For binary-kind payloads
     /// returns `Assert::NO_OVERRIDES` — the default identity value
     /// merge that leaves per-entry assertions untouched.

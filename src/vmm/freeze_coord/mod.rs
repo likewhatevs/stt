@@ -353,6 +353,17 @@ impl KtstrVm {
             .context("register virtio-console irqfd")?;
 
         let kill = Arc::new(AtomicBool::new(false));
+        // Watchdog-set timeout flag. Distinct from `kill` because
+        // `kill` flips on every shutdown path (BSP shutdown, AP
+        // panic, watchdog hard timeout) and the consumer
+        // (`VmResult::timed_out`) only wants to know when the
+        // watchdog fired its hard-deadline branch. The watchdog
+        // thread sets this to `true` ONLY on the
+        // `Instant::now() >= effective_deadline` arm; the BSP
+        // reads it post-loop and the resulting `(exit_code,
+        // timed_out)` tuple flows through `run_bsp_loop` →
+        // `VmRunState::timed_out` → `VmResult::timed_out`.
+        let timed_out_flag = Arc::new(AtomicBool::new(false));
         // Wake fd paired with the `kill` AtomicBool. Setters that
         // flip `kill` (run_vm post-BSP-exit, vCPU shutdown classifier,
         // panic hook) ALSO write to this EventFd so any consumer
@@ -578,10 +589,9 @@ impl KtstrVm {
         // `self.workload_duration` instead of being counted from
         // VM boot. `0` (the default) is the "no reset requested"
         // sentinel — the watchdog ignores it and keeps using the
-        // original `timeout`-derived deadline. The reset deadline
-        // is bounded above by that original deadline (`min(reset,
-        // original)`) so a late-attaching scheduler cannot extend
-        // past the outer kill timer. Defined ahead of
+        // original `timeout`-derived deadline. The reset CAN extend
+        // past the original deadline (no min clamp) so boot-time
+        // delays do not eat into the workload budget. Defined ahead of
         // `start_monitor` so the monitor closure can capture a
         // clone; the watchdog clone is taken below at the
         // watchdog setup site.
@@ -613,6 +623,9 @@ impl KtstrVm {
             kern_phys_base.clone(),
         )?;
         let watchdog_reset_for_coord = watchdog_reset_ns.clone();
+        let watchdog_pause_ns: Arc<std::sync::atomic::AtomicU64> =
+            Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let watchdog_pause_for_coord = watchdog_pause_ns.clone();
         let workload_duration_for_coord = self.workload_duration;
 
         // BPF map write thread: sleeps, discovers a BPF map, writes a value.
@@ -660,6 +673,7 @@ impl KtstrVm {
         // store) cannot stall — either edge is sufficient.
         let bsp_done_evt = Arc::new(EventFd::new(EFD_NONBLOCK).context("create bsp_done EventFd")?);
         let kill_for_watchdog = kill.clone();
+        let timed_out_for_watchdog = timed_out_flag.clone();
         // Wake fds the watchdog blocks on via epoll, paired with the
         // `kill_for_watchdog` and `bsp_done_for_wd` AtomicBools above.
         // The watchdog wakes within microseconds of either flip
@@ -1217,7 +1231,7 @@ impl KtstrVm {
                 // coordinator's stack.
                 let accessors_oncelock: Arc<std::sync::OnceLock<(
                     crate::monitor::bpf_map::GuestMemMapAccessorOwned,
-                    crate::monitor::bpf_prog::GuestMemProgAccessorOwned,
+                    Option<crate::monitor::bpf_prog::GuestMemProgAccessorOwned>,
                 )>> = Arc::new(std::sync::OnceLock::new());
                 // Borrowed views into the OnceLock pair. Reset to
                 // `Some(...)` on the first scan tick after the worker
@@ -1329,17 +1343,7 @@ impl KtstrVm {
                                     if kill_for_worker.load(Ordering::Acquire) {
                                         return;
                                     }
-                                    let prog_res = try_init_owned_prog_accessor_with_hint(
-                                        mem_for_worker.clone(),
-                                        &data_for_worker,
-                                        &vmlinux_for_worker,
-                                        tcr_for_worker.as_ref(),
-                                        &cr3_for_worker,
-                                        pb_hint,
-                                    );
-                                    if let (Ok(map), Ok(prog)) =
-                                        (map_res, prog_res)
-                                    {
+                                    if let Ok(map) = map_res {
                                         let phys_base =
                                             map.guest_kernel().phys_base();
                                         let _ = kern_phys_base_for_worker
@@ -1349,8 +1353,16 @@ impl KtstrVm {
                                                 Ordering::Release,
                                                 Ordering::Relaxed,
                                             );
+                                        let prog_res = try_init_owned_prog_accessor_with_hint(
+                                            mem_for_worker.clone(),
+                                            &data_for_worker,
+                                            &vmlinux_for_worker,
+                                            tcr_for_worker.as_ref(),
+                                            &cr3_for_worker,
+                                            pb_hint,
+                                        );
                                         let _ = oncelock_for_worker
-                                            .set((map, prog));
+                                            .set((map, prog_res.ok()));
                                         return;
                                     }
                                     // Wait on kill_evt with 200ms
@@ -1979,6 +1991,7 @@ impl KtstrVm {
                                         watchdog_reset: workload_duration_for_coord.map(|d| {
                                             (watchdog_reset_for_coord.as_ref(), d, run_start)
                                         }),
+                                        watchdog_pause_ns: watchdog_pause_for_coord.as_ref(),
                                     };
                                     for msg in &drained.messages {
                                         if let Some(entry) =
@@ -2039,7 +2052,9 @@ impl KtstrVm {
                         && let Some((map, prog)) = accessors_oncelock.get()
                     {
                         owned_accessor = Some(map);
-                        owned_prog_accessor = Some(prog);
+                        if let Some(prog) = prog.as_ref() {
+                            owned_prog_accessor = Some(prog);
+                        }
                     }
                     // Resolve the per-CPU offset array once the prog
                     // accessor lands. Reads `__per_cpu_offset` from
@@ -4193,8 +4208,46 @@ impl KtstrVm {
                                 // CAPTURE has no while-frozen work,
                                 // so thaw immediately after the
                                 // dump returns.
+                                let freeze_start = Instant::now();
                                 let on_demand = freeze_and_capture(false);
                                 thaw_and_barrier();
+                                // Extend the watchdog deadline by the
+                                // freeze duration. Without this, vCPU
+                                // freeze time consumed by the on-demand
+                                // capture eats into the test's wall-
+                                // clock budget — a 5s test that fires a
+                                // 2s freeze gets only 3s of guest
+                                // execution before the watchdog kicks.
+                                // Reads the current encoded reset target
+                                // (or falls back to `workload_duration`
+                                // counted from now) and writes back the
+                                // sum + freeze_duration so the watchdog
+                                // observes the extended deadline on its
+                                // next tick. The watchdog only consults
+                                // this atomic when `workload_duration`
+                                // is set; runs without a workload budget
+                                // remain on the boot-relative
+                                // hard_deadline and this push is a no-op.
+                                if let Some(d) = workload_duration_for_coord {
+                                    let freeze_duration = freeze_start.elapsed();
+                                    let prior = watchdog_reset_for_coord
+                                        .load(Ordering::Acquire);
+                                    let prior_ns = if prior == 0 {
+                                        run_start
+                                            .elapsed()
+                                            .as_nanos()
+                                            .saturating_add(d.as_nanos())
+                                    } else {
+                                        prior as u128
+                                    };
+                                    let new_target_ns = prior_ns
+                                        .saturating_add(freeze_duration.as_nanos());
+                                    let encoded = u64::try_from(new_target_ns)
+                                        .unwrap_or(u64::MAX)
+                                        .max(1);
+                                    watchdog_reset_for_coord
+                                        .store(encoded, Ordering::Release);
+                                }
                                 let mut reply_status =
                                     crate::vmm::wire::SNAPSHOT_STATUS_OK;
                                 let mut reply_reason = String::new();
@@ -5244,7 +5297,7 @@ impl KtstrVm {
                     let extracted = Arc::try_unwrap(accessors_oncelock)
                         .ok()
                         .and_then(|lock| lock.into_inner())
-                        .map(|(_map, prog)| prog);
+                        .and_then(|(_map, prog)| prog);
                     *slot.lock().unwrap_or_else(|e| e.into_inner()) = extracted;
                 }
                 eprintln!("CLEANUP: coord closure done {:?}", coord_exit_t.elapsed());
@@ -5277,10 +5330,10 @@ impl KtstrVm {
                 // clock has not started yet, so the original
                 // `hard_deadline` (counted from VM boot) still
                 // applies. Once `Some(reset)`, the effective
-                // deadline becomes `min(reset, hard_deadline)` —
-                // bounded above by the original ceiling so a
-                // late-attaching scheduler cannot extend past
-                // the outer kill timer. Cached so the per-tick
+                // deadline becomes the reset value
+                // (`reset_deadline.unwrap_or(hard_deadline)` — no
+                // min clamp), so boot-time delays do not eat
+                // into the workload budget. Cached so the per-tick
                 // check is a single compare against
                 // `effective_deadline` rather than re-decoding
                 // the encoded `Duration::from_nanos` form.
@@ -5379,12 +5432,8 @@ impl KtstrVm {
                             }
                         }
                     }
-                    // Effective deadline: the reset value when
-                    // present, otherwise the original boot-time
-                    // deadline. The reset extends past
-                    // hard_deadline so boot time does not eat
-                    // into the workload budget.
-                    let effective_deadline = reset_deadline.unwrap_or(hard_deadline);
+                    let effective_deadline =
+                        reset_deadline.map_or(hard_deadline, |r| r.max(hard_deadline));
                     if kill_for_watchdog.load(Ordering::Acquire)
                         || Instant::now() >= effective_deadline
                     {
@@ -5397,12 +5446,67 @@ impl KtstrVm {
                             eprintln!("watchdog: BSP already done, returning");
                             return;
                         }
-                        let reason = if Instant::now() >= effective_deadline {
+                        let hard_timeout_fired = Instant::now() >= effective_deadline;
+                        let reason = if hard_timeout_fired {
                             "hard timeout expired"
                         } else {
                             "kill set by AP"
                         };
                         eprintln!("watchdog: {reason}, kicking BSP");
+                        // Actionable diagnostics. Without this dump the
+                        // operator-visible failure is just `timed_out =
+                        // true` with no clue why. Print the deadline
+                        // values (`effective_deadline` is what actually
+                        // fired; `hard_deadline` is the original boot-
+                        // anchored deadline before any
+                        // scheduler-attach reset) plus the
+                        // `timeout`/`workload_duration` knobs the
+                        // operator can tune, the cause path
+                        // (hard-timeout-expired vs kill-set-by-AP),
+                        // and whether the deadline was reset. Both
+                        // deadlines are rendered as offsets from
+                        // `run_start` so the numbers line up with the
+                        // wall-clock the operator sees in the test
+                        // output. The `kill_set_by_AP` branch also
+                        // ages `effective_deadline` against now so
+                        // the operator can see how much budget was
+                        // unused when the kill arrived.
+                        let now = Instant::now();
+                        let effective_offset =
+                            effective_deadline.saturating_duration_since(run_start);
+                        let hard_offset = hard_deadline.saturating_duration_since(run_start);
+                        let elapsed = now.saturating_duration_since(run_start);
+                        let was_reset = reset_deadline.is_some();
+                        eprintln!("watchdog: deadline expired at {elapsed:?} from VM start");
+                        eprintln!(
+                            "  cause={reason}, hard_timeout_fired={hard_timeout_fired}, \
+                             kill_set_by_AP={}",
+                            !hard_timeout_fired
+                        );
+                        eprintln!(
+                            "  effective_deadline={effective_offset:?} from VM start \
+                             (reset_by_scheduler_attach={was_reset})"
+                        );
+                        eprintln!("  hard_deadline={hard_offset:?} from VM start (timeout knob)");
+                        eprintln!(
+                            "  timeout={timeout:?}, workload_duration={:?}",
+                            workload_duration_for_wd
+                        );
+                        eprintln!(
+                            "  hint: if the test body needs more wall time, increase \
+                             duration (the `duration` field on `KtstrTestEntry` / \
+                             `#[ktstr_test(duration_ms = ...)]`); the VM timeout is \
+                             derived as max(watchdog_timeout, duration) so raising \
+                             duration also extends the host watchdog deadline"
+                        );
+                        // Set `timed_out` ONLY for the hard-deadline
+                        // branch. The "kill set by AP" path is not a
+                        // watchdog timeout — propagating it as
+                        // `timed_out=true` would mislabel a panic-
+                        // driven kill as a deadline expiry.
+                        if hard_timeout_fired {
+                            timed_out_for_watchdog.store(true, Ordering::Release);
+                        }
                         // Propagate kill so handle_freeze's poll loop
                         // exits and the monitor + bpf-write threads stop.
                         kill_for_watchdog.store(true, Ordering::Release);
@@ -5428,10 +5532,10 @@ impl KtstrVm {
                     // Recompute the soft window from the effective
                     // deadline so a scheduler-attach reset shifts
                     // the soft deadline alongside the hard
-                    // deadline. `effective_deadline = min(reset,
-                    // hard_deadline) <= hard_deadline`, so the
-                    // recomputed `effective_deadline - 3s` is at
-                    // or before the original `soft_deadline`; the
+                    // deadline. The reset can extend past
+                    // hard_deadline (no min clamp), so the
+                    // recomputed `effective_deadline - 3s` shifts
+                    // forward whenever the reset extends; the
                     // guest still gets its 3s flush window
                     // relative to the deadline that actually
                     // fires. Skip when the original
@@ -5538,6 +5642,7 @@ impl KtstrVm {
                     Some(&kill_evt),
                     tcr_el1_cache.as_ref(),
                     &cr3_cache,
+                    &timed_out_flag,
                 )
             },
         );
@@ -6998,6 +7103,7 @@ impl KtstrVm {
         kill_evt: Option<&Arc<EventFd>>,
         tcr_el1_cache: Option<&Arc<std::sync::atomic::AtomicU64>>,
         cr3_cache: &Arc<std::sync::atomic::AtomicU64>,
+        timed_out_flag: &Arc<AtomicBool>,
     ) -> (i32, bool) {
         let mut exit_code: i32 = -1;
         // Track which path drove the BSP out of the loop so the
@@ -7213,7 +7319,15 @@ impl KtstrVm {
         }
 
         eprintln!("BSP: loop exit reason={exit_reason:?}");
-        (exit_code, false)
+        // The watchdog sets `timed_out_flag` only on its hard-
+        // deadline branch (NOT on "kill set by AP"). Reading it
+        // here propagates the watchdog's hard-timeout verdict
+        // through the BSP return tuple → `VmRunState::timed_out`
+        // → `VmResult::timed_out` so callers can distinguish a
+        // watchdog-driven kill from a clean shutdown or a
+        // panic-driven kill.
+        let timed_out = timed_out_flag.load(Ordering::Acquire);
+        (exit_code, timed_out)
     }
 
     /// Shutdown threads and collect output.

@@ -216,11 +216,21 @@ impl NumaMemoryLayout {
                 0,
             )
         };
-        anyhow::ensure!(
-            reservation != libc::MAP_FAILED,
-            "mmap VA reservation failed: {}",
-            std::io::Error::last_os_error()
-        );
+        if reservation == libc::MAP_FAILED {
+            // mmap can fail with the same host-resource errnos that
+            // [`super::map_transient_to_contention`] classifies — most
+            // commonly ENOMEM under host memory pressure when a peer is
+            // holding the GuestMemoryMmap budget. Routing through the
+            // classifier turns those into a SKIP banner instead of a
+            // hard test failure; non-transient errnos flow through
+            // unchanged so a real bug never gets misclassified.
+            let io_err = std::io::Error::last_os_error();
+            let errno = io_err.raw_os_error().unwrap_or(0);
+            return Err(super::map_transient_to_contention(
+                kvm_ioctls::Error::new(errno),
+                format!("mmap VA reservation ({} bytes) failed", total),
+            ));
+        }
 
         let guard = ReservationGuard {
             addr: reservation,
@@ -250,12 +260,23 @@ impl NumaMemoryLayout {
                     0,
                 )
             };
-            anyhow::ensure!(
-                node_ptr != libc::MAP_FAILED,
-                "MAP_FIXED mmap for node {} failed: {}",
-                region.node_id,
-                std::io::Error::last_os_error()
-            );
+            if node_ptr == libc::MAP_FAILED {
+                // mmap can fail with the same host-resource errnos that
+                // [`super::map_transient_to_contention`] classifies —
+                // most commonly ENOMEM (or EAGAIN under MAP_HUGETLB
+                // when 2MiB pages are exhausted). Route through the
+                // classifier so transient host pressure SKIPs cleanly
+                // instead of failing the test as a hard fault.
+                let io_err = std::io::Error::last_os_error();
+                let errno = io_err.raw_os_error().unwrap_or(0);
+                return Err(super::map_transient_to_contention(
+                    kvm_ioctls::Error::new(errno),
+                    format!(
+                        "MAP_FIXED mmap for node {} ({} bytes) failed",
+                        region.node_id, node_size
+                    ),
+                ));
+            }
 
             // Step 5: Wrap as vm-memory types. build_raw sets owned=false.
             let mmap_region = unsafe {

@@ -34,7 +34,7 @@ use super::topo::TopoOverride;
 use super::{KtstrTestEntry, SchedulerSpec, Topology};
 use crate::verifier::{SCHED_OUTPUT_START, parse_sched_output};
 
-use super::runtime::{config_file_parts, verbose};
+use super::runtime::{config_content_parts, config_file_parts, verbose, vm_timeout_from_entry};
 
 // ---------------------------------------------------------------------------
 // Failure-message constants
@@ -972,6 +972,10 @@ fn run_ktstr_test_inner_impl(
         sched_args.push("--config".to_string());
         sched_args.push(guest_path);
     }
+    if let Some((archive_path, host_path, _guest_path, args)) = config_content_parts(entry) {
+        resolved_includes.push((archive_path, host_path, "inline config_content"));
+        sched_args.extend(args);
+    }
     let unioned = dedupe_include_files(&resolved_includes)?;
     if !unioned.is_empty() {
         builder = builder.include_files(unioned);
@@ -1502,6 +1506,8 @@ fn run_ktstr_test_inner_impl(
                     | crate::vmm::wire::MsgType::SchedExit
                     | crate::vmm::wire::MsgType::ScenarioStart
                     | crate::vmm::wire::MsgType::ScenarioEnd
+                    | crate::vmm::wire::MsgType::ScenarioPause
+                    | crate::vmm::wire::MsgType::ScenarioResume
                     | crate::vmm::wire::MsgType::Stdout
                     | crate::vmm::wire::MsgType::Stderr
                     | crate::vmm::wire::MsgType::SchedLog
@@ -1967,12 +1973,42 @@ fn evaluate_vm_result(
         } else {
             String::new()
         };
+        // Watchdog diagnostic. The bare `timed out (no result via
+        // bulk port or COM2)` line tells the operator nothing about
+        // why the deadline fired. Append the four knobs the host
+        // watchdog actually consulted: the host VM timeout (the
+        // value the watchdog deadline was anchored to,
+        // `max(watchdog_timeout, duration)` per
+        // `vm_timeout_from_entry`), the scheduler watchdog timeout
+        // (`entry.watchdog_timeout`, the scx_sched.watchdog_timeout
+        // override applied to the guest kernel), the workload
+        // duration (`entry.duration`, what the test body asked for),
+        // and the wall-clock the run actually consumed
+        // (`result.duration`). The hint mirrors the watchdog-thread
+        // diagnostic in `freeze_coord/mod.rs` so the operator sees
+        // the same direction whether they read VM stderr or this
+        // test-output message.
+        let vm_timeout = vm_timeout_from_entry(entry);
+        let watchdog_section = format!(
+            "\n\n--- watchdog ---\n\
+             elapsed={:?} (VM run wall-clock)\n\
+             vm_timeout={:?} (host watchdog deadline; max(watchdog_timeout, duration))\n\
+             watchdog_timeout={:?} (scx_sched.watchdog_timeout override)\n\
+             duration={:?} (workload duration)\n\
+             hint: if the test body needs more wall time, increase \
+             duration (the `duration` field on `KtstrTestEntry` / \
+             `#[ktstr_test(duration_ms = ...)]`); the VM timeout is \
+             derived as max(watchdog_timeout, duration) so raising \
+             duration also extends the host watchdog deadline",
+            result.duration, vm_timeout, entry.watchdog_timeout, entry.duration,
+        );
         let msg = format!(
-            "{}ktstr_test '{}'{} [topo={}] {ERR_TIMED_OUT_NO_RESULT}{}{}{}{}{}{}{}",
+            "{}ktstr_test '{}'{} [topo={}] {ERR_TIMED_OUT_NO_RESULT}{}{}{}{}{}{}{}{}",
             fingerprint_line,
             entry.name,
             sched_label,
             topo,
+            watchdog_section,
             crash_section,
             console_section,
             timeline_section,

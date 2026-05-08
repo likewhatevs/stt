@@ -250,7 +250,7 @@ netlink-packet-generic = "0.3"
 # inside the guest. Disambiguates host-thread idle/spin/productive
 # work without any in-guest overhead.
 perf-event-open-sys = "6"
-gxhash = "3.5.0"
+ahash = "0.8"
 
 [profile.release]
 lto = "thin"

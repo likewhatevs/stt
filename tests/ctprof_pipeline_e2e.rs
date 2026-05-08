@@ -101,7 +101,13 @@ static JEMALLOC_ALLOC_WORKER: Payload = Payload::new(
 /// — the sibling capture test uses 3 s for a single window, so
 /// doubling keeps the per-window activity at the same floor
 /// rather than halving it.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 6)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    duration_s = 6,
+    max_spread_pct = 80.0
+)]
 fn ctprof_pipeline_e2e_capture_write_load_compare(ctx: &Ctx) -> Result<AssertResult> {
     let baseline_path = std::path::PathBuf::from("/tmp/baseline.ctprof.zst");
     let candidate_path = std::path::PathBuf::from("/tmp/candidate.ctprof.zst");

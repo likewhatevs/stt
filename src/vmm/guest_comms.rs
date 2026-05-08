@@ -314,7 +314,30 @@ pub fn send_exit(code: i32) {
 pub fn send_test_result(result: &crate::assert::AssertResult) {
     match bincode::serde::encode_to_vec(result, bincode::config::standard()) {
         Ok(bytes) => {
-            write_msg(MsgType::TestResult.wire_value(), &bytes);
+            if bytes.len() > crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD as usize {
+                tracing::error!(
+                    size = bytes.len(),
+                    max = crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD,
+                    "AssertResult exceeds bulk port frame limit, sending truncated verdict"
+                );
+                let truncated =
+                    crate::assert::AssertResult::fail(crate::assert::AssertDetail::new(
+                        crate::assert::DetailKind::Other,
+                        format!(
+                            "AssertResult bincode size {} exceeded bulk port limit {}; \
+                             original details dropped",
+                            bytes.len(),
+                            crate::vmm::bulk::MAX_BULK_FRAME_PAYLOAD,
+                        ),
+                    ));
+                if let Ok(small) =
+                    bincode::serde::encode_to_vec(&truncated, bincode::config::standard())
+                {
+                    write_msg(MsgType::TestResult.wire_value(), &small);
+                }
+            } else {
+                write_msg(MsgType::TestResult.wire_value(), &bytes);
+            }
         }
         Err(e) => {
             eprintln!("ktstr: bincode-encode AssertResult for bulk-port emit: {e}");
@@ -390,6 +413,14 @@ pub fn send_scenario_start() {
 /// milliseconds since scenario start.
 pub fn send_scenario_end(elapsed_ms: u64) {
     write_msg(MsgType::ScenarioEnd.wire_value(), &elapsed_ms.to_le_bytes());
+}
+
+pub fn send_scenario_pause() {
+    write_msg(MsgType::ScenarioPause.wire_value(), &[]);
+}
+
+pub fn send_scenario_resume() {
+    write_msg(MsgType::ScenarioResume.wire_value(), &[]);
 }
 
 /// Send the boot-complete signal to the host. Payload: empty.

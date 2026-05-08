@@ -11,7 +11,6 @@
 //! paths. [`run_cargo_sub`] folds the shared shape; thin
 //! per-subcommand wrappers fix the argv constants.
 
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -181,8 +180,52 @@ fn run_cargo_sub(
     }
 
     eprintln!("cargo ktstr: running {label}");
-    let err = cmd.exec();
-    Err(format!("exec cargo {}: {err}", sub_argv.join(" ")))
+    let status = cmd
+        .status()
+        .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;
+    cleanup_shm();
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo {} exited with {}",
+            sub_argv.join(" "),
+            status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string()),
+        ))
+    }
+}
+
+fn cleanup_shm() {
+    let Ok(dir) = std::fs::read_dir("/dev/shm") else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("ktstr-base-")
+            && !name_str.starts_with("ktstr-lz4-")
+            && !name_str.starts_with("ktstr-gz-")
+        {
+            continue;
+        }
+        let shm_name = format!("/{name_str}");
+        let Ok(fd) = rustix::shm::open(
+            shm_name.as_str(),
+            rustix::shm::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        ) else {
+            continue;
+        };
+        if rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_err() {
+            continue;
+        }
+        let _ = rustix::shm::unlink(shm_name.as_str());
+        let _ = rustix::fs::flock(&fd, rustix::fs::FlockOperation::Unlock);
+    }
 }
 
 pub(crate) fn run_test(

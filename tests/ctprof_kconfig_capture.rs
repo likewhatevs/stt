@@ -103,7 +103,13 @@ use ktstr::workload::WorkType;
 /// 16 × 4 KB pwrites + an fdatasync) before the capture fires.
 /// Shorter windows (< 1 s) risk the workers not having issued
 /// any writes yet on slow CI runners.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    duration_s = 3,
+    max_spread_pct = 80.0
+)]
 fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> {
     // IoSyncWrite workers issue 16 × 4 KB pwrites totalling 64 KB
     // per iteration directly to /dev/vda (or a host-side tempfile
@@ -205,7 +211,13 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
 /// load shape is right for `cpu.some` accumulation when the
 /// kernel observes it, and the snapshot's PSI struct is
 /// populated either way.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
+#[ktstr_test(
+    llcs = 1,
+    cores = 2,
+    threads = 1,
+    duration_s = 3,
+    max_spread_pct = 80.0
+)]
 fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
