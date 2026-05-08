@@ -4300,14 +4300,11 @@ mod tests {
         );
         let ctx = ctx_from(&cgroups, &topo);
         let cg_name = "should_never_exist";
-        let step = Step::new(
-            vec![Op::add_cgroup(cg_name)],
-            HoldSpec::Fixed(Duration::ZERO),
-        );
+        let step = Step::new(vec![Op::add_cgroup(cg_name)], HoldSpec::Frac(0.0));
         let err = execute_steps_with(&ctx, vec![step], None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("hold validation") && msg.contains("Fixed"),
+            msg.contains("hold validation") && msg.contains("Frac"),
             "error must cite hold validation + variant: {msg}"
         );
         assert!(
@@ -5736,11 +5733,11 @@ mod tests {
         let cgroups = CgroupManager::new("/nonexistent");
         let topo = mock_topo();
         let ctx = crate::scenario::Ctx::builder(&cgroups, &topo).build();
-        let step = Step::new(vec![], HoldSpec::Fixed(Duration::ZERO));
+        let step = Step::new(vec![], HoldSpec::Frac(0.0));
         let err = execute_steps_with(&ctx, vec![step], None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("hold validation") && msg.contains("vacuous"),
+            msg.contains("hold validation") && msg.contains("Frac"),
             "expected pre-ops validation err, got: {msg}"
         );
     }
