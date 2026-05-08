@@ -995,9 +995,9 @@ pub struct CgroupDef {
     pub pids: Option<PidsLimits>,
     /// Cgroup-level default for [`WorkSpec::nice`]. When `Some(n)`,
     /// every [`WorkSpec`] in [`Self::works`] whose own `nice` field
-    /// is `0` (the framework's "skip setpriority(2)" sentinel — see
+    /// is `None` (the framework's "skip setpriority(2)" state — see
     /// [`WorkloadConfig::nice`](crate::workload::WorkloadConfig::nice))
-    /// inherits `n` at apply-setup time. Set via [`Self::nice`];
+    /// inherits `Some(n)` at apply-setup time. Set via [`Self::nice`];
     /// merged in [`Self::merged_works`].
     pub default_nice: Option<i32>,
     /// Cgroup-level default for [`WorkSpec::comm`]. Merged into any
@@ -1149,16 +1149,18 @@ impl CgroupDef {
 
     /// Set the cgroup-level default per-worker nice value. Merged
     /// into every [`WorkSpec`] in [`Self::works`] whose own
-    /// [`WorkSpec::nice`] is `0` (the framework's "skip
-    /// setpriority(2)" sentinel) at apply-setup time, regardless of
+    /// [`WorkSpec::nice`] is `None` (the framework's "skip
+    /// setpriority(2)" state) at apply-setup time, regardless of
     /// declaration order — `def.work(spec).nice(n)` and
     /// `def.nice(n).work(spec)` are equivalent. A WorkSpec that
-    /// explicitly sets a non-zero nice keeps its value. The
-    /// cgroup-level default lives in [`Self::default_nice`].
+    /// explicitly sets `Some(n)` (including `Some(0)`) keeps its
+    /// value. The cgroup-level default lives in
+    /// [`Self::default_nice`].
     ///
-    /// Note: a WorkSpec that explicitly sets `.nice(0)` is treated
-    /// as "unset" and inherits this default — there is no way to
-    /// opt out of cgroup-level nice while keeping nice=0.
+    /// Note: `.nice(0)` on a WorkSpec stores `Some(0)` and opts out
+    /// of the cgroup-level merge — the worker's nice is set to 0
+    /// explicitly via `setpriority(PRIO_PROCESS, 0, 0)` rather than
+    /// inheriting the cgroup default.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
         self.default_nice = Some(n);
@@ -1511,14 +1513,14 @@ impl CgroupDef {
     /// `WorkSpec` field when that field is "unset" at the WorkSpec
     /// level.
     ///
-    /// "Unset" means `None` for every `Option`-typed field
-    /// (`comm`, `uid`, `gid`, `numa_node`). For `nice`, which is
-    /// `i32` with no sentinel, "unset" is `0` — the framework's
-    /// "skip setpriority(2)" sentinel per
-    /// [`WorkloadConfig::nice`](crate::workload::WorkloadConfig::nice).
-    /// A `WorkSpec` that explicitly sets a non-zero nice keeps its
-    /// value; the cgroup-level default applies only when the
-    /// WorkSpec is at the framework default of `0`.
+    /// "Unset" means `None` for every `Option`-typed field —
+    /// `nice`, `comm`, `uid`, `gid`, `numa_node` are all
+    /// `Option<_>`. The framework's "skip setpriority(2)" state per
+    /// [`WorkloadConfig::nice`](crate::workload::WorkloadConfig::nice)
+    /// is `None`. A `WorkSpec` that explicitly sets `Some(n)`
+    /// (including `Some(0)`) keeps its value; the cgroup-level
+    /// default applies only when the WorkSpec is at the framework
+    /// default of `None`.
     ///
     /// `pcomm` is NOT propagated through `merged_works`. The
     /// [`Self::pcomm`] convenience method writes `pcomm` directly
@@ -1538,10 +1540,10 @@ impl CgroupDef {
         };
         base.into_iter()
             .map(|mut w| {
-                if w.nice == 0
+                if w.nice.is_none()
                     && let Some(n) = self.default_nice
                 {
-                    w.nice = n;
+                    w.nice = Some(n);
                 }
                 if w.comm.is_none() {
                     w.comm = self.default_comm.clone();
@@ -2253,17 +2255,19 @@ mod cgroup_def_default_tests {
     //! `numa_node`) plus the per-WorkSpec [`CgroupDef::pcomm`] writer.
     //!
     //! The merged-works contract: each cgroup-level default is applied
-    //! to every [`WorkSpec`] in `works` whose own field is unset (or
-    //! the framework's "skip" sentinel for `nice`). Builder ordering
-    //! must not change the outcome — `def.work(spec).nice(n)` and
-    //! `def.nice(n).work(spec)` both produce a merged WorkSpec
-    //! carrying `nice = n`. WorkSpecs that explicitly set a non-default
-    //! value must keep their own. `pcomm` is the lone exception: it
-    //! lives only on `WorkSpec`, so `CgroupDef::pcomm` writes the
-    //! value into every WorkSpec at builder time and overwrites any
-    //! prior per-WorkSpec value, with `def.pcomm(..).work(spec)`
-    //! emitting a default leader and pushing the explicit `spec` after
-    //! (so the `spec`'s own pcomm survives).
+    //! to every [`WorkSpec`] in `works` whose own field is unset
+    //! (`None` across the board — `nice` is now `Option<i32>` and
+    //! shares the same `None`-as-unset polarity as the rest).
+    //! Builder ordering must not change the outcome —
+    //! `def.work(spec).nice(n)` and `def.nice(n).work(spec)` both
+    //! produce a merged WorkSpec carrying `nice = Some(n)`.
+    //! WorkSpecs that explicitly set `Some(_)` (including `Some(0)`)
+    //! must keep their own. `pcomm` is the lone exception: it lives
+    //! only on `WorkSpec`, so `CgroupDef::pcomm` writes the value
+    //! into every WorkSpec at builder time and overwrites any prior
+    //! per-WorkSpec value, with `def.pcomm(..).work(spec)` emitting
+    //! a default leader and pushing the explicit `spec` after (so
+    //! the `spec`'s own pcomm survives).
     use super::*;
     use crate::workload::WorkSpec;
 
@@ -2271,8 +2275,8 @@ mod cgroup_def_default_tests {
     fn merged_works_nice_order_independent() {
         let pre = CgroupDef::named("cg").nice(7).work(WorkSpec::default());
         let post = CgroupDef::named("cg").work(WorkSpec::default()).nice(7);
-        assert_eq!(pre.merged_works()[0].nice, 7);
-        assert_eq!(post.merged_works()[0].nice, 7);
+        assert_eq!(pre.merged_works()[0].nice, Some(7));
+        assert_eq!(post.merged_works()[0].nice, Some(7));
     }
 
     #[test]
@@ -2334,7 +2338,7 @@ mod cgroup_def_default_tests {
         let merged = def.merged_works();
         assert_eq!(merged.len(), 1);
         let w = &merged[0];
-        assert_eq!(w.nice, 3, "WorkSpec nice must beat default_nice");
+        assert_eq!(w.nice, Some(3), "WorkSpec nice must beat default_nice");
         assert_eq!(
             w.comm.as_deref(),
             Some("override"),
@@ -2346,6 +2350,25 @@ mod cgroup_def_default_tests {
             w.numa_node,
             Some(5),
             "WorkSpec numa_node must beat default_numa_node",
+        );
+    }
+
+    /// `Some(0)` on a WorkSpec is an explicit "use nice 0" — it
+    /// must opt out of the cgroup-level `default_nice` merge.
+    /// `merged_works` only fills `default_nice` when `w.nice.is_none()`,
+    /// so `Some(0)` keeps its own value and does not pick up the
+    /// cgroup default. Pins the core semantic differentiator that
+    /// `Option<i32>` provides over a plain `i32` (where 0 would be
+    /// ambiguous with "unset").
+    #[test]
+    fn merged_works_workspec_nice_some_zero_opts_out_of_default() {
+        let spec = WorkSpec::default().nice(0);
+        let def = CgroupDef::named("cg").nice(7).work(spec);
+        let merged = def.merged_works();
+        assert_eq!(
+            merged[0].nice,
+            Some(0),
+            "Some(0) must opt out of cgroup default nice(7)"
         );
     }
 
@@ -2423,7 +2446,7 @@ mod cgroup_def_default_tests {
             "empty works must yield exactly one default WorkSpec"
         );
         let w = &works[0];
-        assert_eq!(w.nice, 11);
+        assert_eq!(w.nice, Some(11));
         assert_eq!(w.comm.as_deref(), Some("default"));
         assert_eq!(w.uid, Some(7));
         assert_eq!(w.gid, Some(8));

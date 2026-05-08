@@ -23,18 +23,27 @@
 //!    `&'static str` the macro emitted. Any wiring break — wrong
 //!    archive path, missing include, lost bytes, encoding skew — fails
 //!    the comparison.
-//! 4. **CLI-arg substitution** from `arg_template`. The template
-//!    `"--config {file}"` expands to `--config /include-files/...`
-//!    and is appended to the scheduler's argv. `scx-ktstr` accepts
-//!    arbitrary unknown flags via `has_flag` / `parse_delay_flag` —
-//!    the binary inspects only the flags it cares about and ignores
-//!    the rest, so a non-zero argv survives intact through
-//!    `scx_ops_open`. The proof that the scheduler boots is
-//!    `execute_steps` returning a passing `AssertResult` — the
-//!    scenario hold runs to completion against a live scheduler.
+//!
+//! Step 1 (the file-bytes comparison) is the load-bearing assertion of
+//! this test. It is the only signal that the
+//! `config_file_def(arg_template, guest_path)` pipeline placed the
+//! macro-emitted bytes at the declared guest path — any wiring break
+//! lands as a guest read failure or a byte-level mismatch.
+//!
+//! Step 2 (the `execute_steps` hold) proves only that **the scheduler
+//! boots and the hold completes with the framework-injected argv
+//! appended**. `scx-ktstr` accepts arbitrary unknown flags via
+//! `has_flag` / `parse_delay_flag` and silently ignores anything it
+//! doesn't recognise, so a non-zero argv survives intact through
+//! `scx_ops_open` — but for the same reason Step 2 would pass
+//! identically if the `{file}` substitution produced the wrong path,
+//! or if `--config` were never injected at all. Step 2 is therefore a
+//! "still boots under the workload" check, not a substitution-path
+//! check; the substitution path is proven by Step 1 reading the file
+//! at the declared `guest_path`.
 
 use anyhow::Result;
-use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
+use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
@@ -93,46 +102,40 @@ fn config_file_def_e2e_pipeline(ctx: &Ctx) -> Result<AssertResult> {
     let observed = match std::fs::read_to_string(GUEST_CFG_PATH) {
         Ok(s) => s,
         Err(e) => {
-            return Ok(AssertResult::fail(AssertDetail::new(
-                DetailKind::Other,
-                format!(
-                    "guest read of {GUEST_CFG_PATH} failed ({e}). The \
-                     framework's `config_file_def` + `config = \
-                     ktstr::json!({{..}})` pipeline did not place the \
-                     inline content at the declared guest path. \
-                     Likely break sites: \
-                     `runtime::config_content_parts` (host temp file \
-                     + arg template), the `include_files` builder \
-                     wire-up in `eval.rs`, or the initramfs cpio \
-                     archive layout in `build_initramfs_base`."
-                ),
+            return Ok(AssertResult::fail_msg(format!(
+                "guest read of {GUEST_CFG_PATH} failed ({e}). The \
+                 framework's `config_file_def` + `config = \
+                 ktstr::json!({{..}})` pipeline did not place the \
+                 inline content at the declared guest path. Likely \
+                 break sites: `runtime::config_content_parts` (host \
+                 temp file + arg template), the `include_files` \
+                 builder wire-up in `eval.rs`, or the initramfs cpio \
+                 archive layout in `build_initramfs_base`."
             )));
         }
     };
     if observed != CFG_E2E_CONTENT {
-        return Ok(AssertResult::fail(AssertDetail::new(
-            DetailKind::Other,
-            format!(
-                "guest config bytes diverge from the macro-emitted \
-                 string. Expected len={}: {CFG_E2E_CONTENT:?}; \
-                 observed len={}: {observed:?}. The pipeline mutated \
-                 the bytes between host write and guest read — \
-                 inspect the temp-file write in \
-                 `runtime::config_content_parts` and the cpio entry \
-                 emitted by `build_initramfs_base`.",
-                CFG_E2E_CONTENT.len(),
-                observed.len(),
-            ),
+        return Ok(AssertResult::fail_msg(format!(
+            "guest config bytes diverge from the macro-emitted \
+             string. Expected len={}: {CFG_E2E_CONTENT:?}; observed \
+             len={}: {observed:?}. The pipeline mutated the bytes \
+             between host write and guest read — inspect the \
+             temp-file write in `runtime::config_content_parts` and \
+             the cpio entry emitted by `build_initramfs_base`.",
+            CFG_E2E_CONTENT.len(),
+            observed.len(),
         )));
     }
 
-    // Step 2: prove the scheduler boots with the framework-injected
-    // `--config <guest_path>` arg in argv. `execute_steps` driving a
-    // hold against a real `scx-ktstr` scheduler that successfully
-    // attached its sched_ext ops is the observable signal —
-    // `scx-ktstr`'s permissive CLI swallows the unknown `--config`
-    // flag without error, so a verifier-rejected scheduler or a
-    // failed attach would surface here as a scenario failure.
+    // Step 2: prove the scheduler still boots and the hold completes
+    // with the framework-injected argv appended. `scx-ktstr`'s
+    // permissive CLI swallows the `--config` flag without error
+    // regardless of value, so this step does NOT prove the `{file}`
+    // substitution was correct — that proof lives entirely in Step 1
+    // above. What Step 2 catches is a regression where a non-empty
+    // argv breaks boot (e.g. a future tightening of `scx_ops_open`
+    // that rejects unknown flags), which would surface here as a
+    // failed `execute_steps`.
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],

@@ -20,9 +20,10 @@ fn workload_config_default() {
     assert!(matches!(c.work_type, WorkType::SpinWait));
     assert!(matches!(c.sched_policy, SchedPolicy::Normal));
     assert!(matches!(c.affinity, AffinityIntent::Inherit));
-    // Default nice is 0 — `apply_nice(0)` short-circuits before
-    // the syscall, preserving inherit-from-parent semantics.
-    assert_eq!(c.nice, 0);
+    // Default nice is None — the `worker_main` gate skips the
+    // `setpriority(2)` call entirely so the worker inherits the
+    // parent's nice value.
+    assert_eq!(c.nice, None);
 }
 #[test]
 fn workload_config_builder_setters_chain() {
@@ -34,7 +35,7 @@ fn workload_config_builder_setters_chain() {
     assert_eq!(cfg.num_workers, 7);
     assert!(matches!(cfg.work_type, WorkType::SpinWait));
     assert!(matches!(cfg.sched_policy, SchedPolicy::Batch));
-    assert_eq!(cfg.nice, 5);
+    assert_eq!(cfg.nice, Some(5));
 }
 #[test]
 fn worker_report_serde_roundtrip() {
@@ -1290,12 +1291,11 @@ fn worker_report_bincode_sentinel_roundtrip() {
     assert_worker_report_eq(&report, &decoded);
 }
 
-/// Roundtrip a `Vec<WorkerReport>` — the pcomm-container shape
-/// the leader process writes to the report pipe before exit. The
-/// container holds one report per worker thread; per #6 the
-/// container will move from serde_json to bincode so a single
-/// codec governs both the fork-mode single-report and pcomm-mode
-/// multi-report payloads. This test pins that wire format.
+/// Roundtrip-verify that `Vec<WorkerReport>` survives bincode
+/// encode/decode, guarding the wire format for the fork-mode
+/// report path which already uses bincode. Pins per-element field
+/// fidelity through the bincode codec across a multi-report
+/// container.
 #[test]
 fn vec_worker_report_bincode_roundtrip() {
     let mut second = fully_populated_report();
@@ -1316,13 +1316,59 @@ fn vec_worker_report_bincode_roundtrip() {
     }
 }
 
-/// A truncated bincode frame must surface as a decode error, not a
-/// silent partial decode. The parent's pipe-drain code at
-/// `stop_and_collect` relies on this to detect short writes (worker
-/// died mid-flush) and synthesize a sentinel report. If
-/// `decode_from_slice` returned `Ok` on a partial buffer the
-/// parent would publish a half-populated report with garbage in
-/// the trailing fields.
+/// Roundtrip every `WorkerExitInfo` variant — Exited, Signaled,
+/// TimedOut, WaitFailed(String), Panicked(String) — through the
+/// bincode codec. Each variant carries a distinct payload shape
+/// (i32 / unit / String) and a serde-tagged enum encoding emits a
+/// discriminant byte plus the inner payload; a missing variant on
+/// either side would shift every downstream field per the
+/// positional decoder, so the roundtrip must cover all five.
+#[test]
+fn worker_report_bincode_all_exit_info_variants_roundtrip() {
+    let variants = [
+        WorkerExitInfo::Exited(1),
+        WorkerExitInfo::Signaled(9),
+        WorkerExitInfo::TimedOut,
+        WorkerExitInfo::WaitFailed("ECHILD".to_string()),
+        WorkerExitInfo::Panicked("custom worker panicked".to_string()),
+    ];
+    for variant in variants {
+        let mut report = fully_populated_report();
+        report.exit_info = Some(variant);
+        let bytes = bincode::serde::encode_to_vec(&report, bincode::config::standard())
+            .expect("encode");
+        let (decoded, consumed): (WorkerReport, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+                .expect("decode");
+        assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+        assert_worker_report_eq(&report, &decoded);
+    }
+}
+
+/// Roundtrip a `WorkerReport::default()` shape through bincode.
+/// Production sentinels are constructed via
+/// `WorkerReport { ..WorkerReport::default() }` with select fields
+/// overridden (mod.rs uses this shape at the catch_unwind arm,
+/// pcomm-decode-failure arm, and pcomm-empty-payload arm). A
+/// silent codec regression on the default shape would corrupt
+/// every sentinel without surfacing in tests that only encode
+/// fully-populated reports.
+#[test]
+fn worker_report_bincode_default_roundtrip() {
+    let sentinel = WorkerReport::default();
+    let bytes =
+        bincode::serde::encode_to_vec(&sentinel, bincode::config::standard()).expect("encode");
+    let (decoded, consumed): (WorkerReport, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("decode");
+    assert_eq!(consumed, bytes.len(), "decoder must consume entire frame");
+    assert_worker_report_eq(&sentinel, &decoded);
+}
+
+/// `decode_from_slice` rejects a truncated bincode frame
+/// (first half of a fully-populated `WorkerReport` encoding) with
+/// `Err`. Pins the codec-level rejection only — does not exercise
+/// the parent's sentinel-synthesis path, which is covered by
+/// dedicated `stop_and_collect` tests.
 #[test]
 fn truncated_frame_decodes_to_err() {
     let report = fully_populated_report();
@@ -1343,13 +1389,10 @@ fn truncated_frame_decodes_to_err() {
     );
 }
 
-/// An empty payload must surface as a decode error. The parent's
-/// pipe-drain code observes an empty buffer when the worker dies
-/// before writing anything (post-fork crash, OOM kill, or a
-/// SIGKILL that fired before bincode encoding) and the sentinel
-/// path depends on the empty-slice decode failing — otherwise a
-/// zero-byte buffer would round-trip as a default `WorkerReport`
-/// and mask the real failure.
+/// `decode_from_slice` rejects an empty input slice with `Err`.
+/// Pins the codec-level rejection only — does not exercise the
+/// parent's sentinel-synthesis path, which is covered by dedicated
+/// `stop_and_collect` tests.
 #[test]
 fn empty_payload_decodes_to_err() {
     let result: Result<(WorkerReport, usize), _> =

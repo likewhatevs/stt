@@ -61,8 +61,16 @@ impl<T> SeriesField<T> {
         elapsed_ms: Vec<u64>,
         values: Vec<SnapshotResult<T>>,
     ) -> Self {
-        debug_assert_eq!(tags.len(), values.len());
-        debug_assert_eq!(elapsed_ms.len(), values.len());
+        // Hard runtime check (not debug_assert_eq!) so the equal-
+        // length guarantee documented on iter_full() and relied on
+        // by tag(i) / elapsed_ms(i) holds in release builds. A
+        // length mismatch here would otherwise surface downstream
+        // as either a silent truncation in iter_full() (zip stops
+        // at the shortest input) or an out-of-bounds panic from
+        // the indexed accessors — both harder to diagnose than a
+        // panic at the construction site.
+        assert_eq!(tags.len(), values.len());
+        assert_eq!(elapsed_ms.len(), values.len());
         Self {
             label: label.into(),
             tags,
@@ -108,8 +116,9 @@ impl<T> SeriesField<T> {
     /// re-threading the source [`SampleSeries`](crate::scenario::sample::SampleSeries).
     /// Yields entries in the same order as the underlying
     /// `Vec<SnapshotResult<T>>` storage; tags and elapsed-ms
-    /// vectors are guaranteed equal-length to `values` (see
-    /// [`Self::from_parts`]'s `debug_assert_eq!`).
+    /// vectors are guaranteed equal-length to `values` by
+    /// [`Self::from_parts`]'s `assert_eq!` checks (which run in
+    /// both debug and release builds).
     pub fn iter_full(&self) -> impl Iterator<Item = (&str, u64, &SnapshotResult<T>)> {
         self.tags
             .iter()
@@ -765,7 +774,8 @@ impl SeriesField<f64> {
         let mut interrupting_errors: Vec<String> = Vec::new();
         for (i, slot) in self.values.iter().enumerate() {
             if self.elapsed_ms[i] > deadline_ms {
-                break;
+                consecutive = 0;
+                continue;
             }
             match slot {
                 Ok(v) => {
@@ -875,19 +885,28 @@ impl SeriesField<f64> {
             let (lhs, rhs) = match (lhs_slot, rhs_slot) {
                 (Ok(l), Ok(r)) => (*l, *r),
                 _ => {
+                    // Each side carries its own tag + elapsed_ms —
+                    // the two SeriesFields can be projected from
+                    // different rows of the same SampleSeries with
+                    // distinct tags at index `i`, so a single outer
+                    // tag would mislabel the RHS endpoint. Fold the
+                    // per-side identity into each entry instead.
                     let mut endpoints: Vec<String> = Vec::with_capacity(2);
                     if let Err(e) = lhs_slot {
-                        endpoints.push(format!("lhs {e}"));
+                        endpoints.push(format!(
+                            "lhs {tag}(+{elapsed_ms}ms): {e}",
+                            tag = self.tags[i],
+                            elapsed_ms = self.elapsed_ms[i],
+                        ));
                     }
                     if let Err(e) = rhs_slot {
-                        endpoints.push(format!("rhs {e}"));
+                        endpoints.push(format!(
+                            "rhs {tag}(+{elapsed_ms}ms): {e}",
+                            tag = other.tags[i],
+                            elapsed_ms = other.elapsed_ms[i],
+                        ));
                     }
-                    gaps.push(format!(
-                        "{tag}(+{elapsed_ms}ms): {endpoints}",
-                        tag = self.tags[i],
-                        elapsed_ms = self.elapsed_ms[i],
-                        endpoints = endpoints.join(" | "),
-                    ));
+                    gaps.push(endpoints.join(" | "));
                     continue;
                 }
             };
@@ -1170,6 +1189,72 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("projection error"))
         );
+    }
+
+    // ---- iter_full() ----
+
+    /// iter_full on an empty SeriesField yields no items. Guards
+    /// the trivial case so a caller threading the iterator into a
+    /// for-loop never triggers a phantom first iteration on a
+    /// freshly-constructed empty field.
+    #[test]
+    fn iter_full_empty_yields_no_items() {
+        let f: SeriesField<u64> =
+            SeriesField::from_parts("empty", Vec::new(), Vec::new(), Vec::new());
+        let collected: Vec<(&str, u64, &SnapshotResult<u64>)> = f.iter_full().collect();
+        assert!(collected.is_empty());
+        assert_eq!(f.iter_full().count(), 0);
+    }
+
+    /// iter_full on a populated SeriesField yields each
+    /// (tag, elapsed_ms, &SnapshotResult<T>) triple in the same
+    /// order as the underlying storage — both Ok and Err slots
+    /// flow through unchanged. Mixes a successfully-projected
+    /// sample with a SnapshotError variant so the test guards both
+    /// branches of the per-sample SnapshotResult.
+    #[test]
+    fn iter_full_yields_triples_in_storage_order() {
+        let tags = vec![
+            "periodic_000".to_string(),
+            "periodic_001".to_string(),
+            "periodic_002".to_string(),
+        ];
+        let elapsed = vec![100u64, 200u64, 300u64];
+        let values: Vec<SnapshotResult<u64>> = vec![
+            Ok(7u64),
+            Err(SnapshotError::VarNotFound {
+                requested: "missing".to_string(),
+                available: vec!["a".to_string()],
+            }),
+            Ok(42u64),
+        ];
+        let f = SeriesField::from_parts("counter", tags, elapsed, values);
+        let collected: Vec<(&str, u64, &SnapshotResult<u64>)> = f.iter_full().collect();
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0].0, "periodic_000");
+        assert_eq!(collected[0].1, 100u64);
+        assert_eq!(collected[0].2.as_ref().ok().copied(), Some(7u64));
+        assert_eq!(collected[1].0, "periodic_001");
+        assert_eq!(collected[1].1, 200u64);
+        assert!(collected[1].2.is_err());
+        assert_eq!(collected[2].0, "periodic_002");
+        assert_eq!(collected[2].1, 300u64);
+        assert_eq!(collected[2].2.as_ref().ok().copied(), Some(42u64));
+    }
+
+    /// iter_full's item count matches len(). Guards the
+    /// equal-length invariant enforced at construction time
+    /// (from_parts' assert_eq! checks): if any of the three
+    /// vectors drifts, zip's shortest-input behavior would silently
+    /// truncate the iterator, so a count mismatch would manifest
+    /// here even when no slot is dereferenced.
+    #[test]
+    fn iter_full_count_matches_len() {
+        let f = synthetic_field(
+            "counter",
+            vec![(100, 1u64), (200, 2u64), (300, 3u64), (400, 4u64)],
+        );
+        assert_eq!(f.iter_full().count(), f.len());
     }
 
     /// Vacuous holding when num_snapshots < 2 records a Note, not a
@@ -1516,6 +1601,86 @@ mod tests {
                 .iter()
                 .any(|d| d.kind == DetailKind::Note && d.message.contains("periodic_001")),
             "expected skip Note naming placeholder sample: {:?}",
+            r.details
+        );
+    }
+
+    /// nondecreasing skips MissingStats samples (stats=None at the
+    /// row, surfaced through `series.stats(...)` as the dedicated
+    /// `SnapshotError::MissingStats` variant) with a Note rather
+    /// than treating them as monotonicity regressions. Mirrors
+    /// `nondecreasing_skips_placeholder_samples` for the stats-
+    /// coverage gap dimension: a per-sample missing-stats slot must
+    /// NOT silently register as zero progress on a counter, and the
+    /// skip-with-Note path must name the offending sample so the
+    /// operator sees WHICH sample lacked stats.
+    #[test]
+    fn nondecreasing_skips_missing_stats_samples() {
+        use crate::monitor::dump::FailureDumpReport;
+        // Build three rows where sample[1]'s stats Option is None.
+        // `series.stats(...)` projection will produce a per-sample
+        // `Err(SnapshotError::MissingStats { tag: "periodic_001" })`
+        // for that row (see SampleSeries::stats at
+        // src/scenario/sample.rs lines 275-280) — the analogue of
+        // the placeholder path producing PlaceholderSample. The
+        // outer rows carry concrete JSON so their projection slot
+        // is Ok; only the middle row exercises the MissingStats
+        // skip path.
+        let stats_a: serde_json::Value = serde_json::json!({"counter": 1u64});
+        let stats_b: serde_json::Value = serde_json::json!({"counter": 2u64});
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                FailureDumpReport::default(),
+                Some(stats_a),
+                Some(100u64),
+            ),
+            (
+                "periodic_001".to_string(),
+                FailureDumpReport::default(),
+                None,
+                Some(200u64),
+            ),
+            (
+                "periodic_002".to_string(),
+                FailureDumpReport::default(),
+                Some(stats_b),
+                Some(300u64),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained);
+        let field: SeriesField<u64> = series.stats("counter", |sv| sv.path("counter").as_u64());
+        // Sanity-check the constructed field's middle slot is
+        // exactly the MissingStats variant the spec calls out, so a
+        // future refactor that drops or renames the variant fails
+        // here at the construction site rather than as an opaque
+        // verdict mismatch.
+        let middle = field.values_iter().nth(1).expect("3 samples");
+        assert!(
+            matches!(
+                middle,
+                Err(SnapshotError::MissingStats { tag }) if tag == "periodic_001"
+            ),
+            "middle slot must be MissingStats('periodic_001'), got {middle:?}"
+        );
+        let mut v = Verdict::new();
+        field.nondecreasing(&mut v);
+        let r = v.into_result();
+        // Verdict passes — MissingStats is structurally missing
+        // data, not a monotonicity regression.
+        assert!(
+            r.passed,
+            "nondecreasing must NOT flip on MissingStats: {:?}",
+            r.details
+        );
+        // The Note message names the MissingStats sample so the
+        // operator sees the stats-coverage gap without re-walking
+        // the source.
+        assert!(
+            r.details
+                .iter()
+                .any(|d| d.kind == DetailKind::Note && d.message.contains("periodic_001")),
+            "expected skip Note naming MissingStats sample: {:?}",
             r.details
         );
     }

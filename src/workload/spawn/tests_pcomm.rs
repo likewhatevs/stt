@@ -500,3 +500,59 @@ fn pcomm_multiple_workspecs_coalesce_into_one_leader() {
     assert_eq!(group0, 2, "WorkSpec[0] contributes 2 reports");
     assert_eq!(group1, 1, "WorkSpec[1] contributes 1 report");
 }
+
+/// `WorkSpec::pcomm + WorkType::ForkExit` is rejected at admission.
+/// A fork from a thread of a multi-threaded container inherits all
+/// locks held by sibling threads at fork time, producing undefined
+/// behaviour for any libc primitive in the child. The rejection
+/// fires before any resource is acquired, so the diagnostic must
+/// land synchronously from `spawn_pcomm_cgroup`.
+#[test]
+fn pcomm_rejects_fork_exit() {
+    let works = vec![
+        WorkSpec::default()
+            .work_type(WorkType::ForkExit)
+            .workers(1)
+            .pcomm("leader"),
+    ];
+    let result = WorkloadHandle::spawn_pcomm_cgroup("leader", None, None, &works);
+    let err = match result {
+        Ok(_) => panic!("pcomm + ForkExit must reject at spawn_pcomm_cgroup"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("incompatible with WorkType::ForkExit"),
+        "diagnostic must name the ForkExit incompatibility, got: {msg}",
+    );
+}
+
+/// `WorkSpec::pcomm + WorkType::CgroupChurn` is rejected at
+/// admission. CgroupChurn writes the worker tid to `cgroup.procs`,
+/// which the kernel resolves to the whole tgid and migrates every
+/// sibling thread (the entire pcomm container) instead of the
+/// intended single worker. The rejection fires before any resource
+/// is acquired.
+#[test]
+fn pcomm_rejects_cgroup_churn() {
+    let works = vec![
+        WorkSpec::default()
+            .work_type(WorkType::CgroupChurn {
+                groups: 2,
+                cycle_ms: 10,
+            })
+            .workers(1)
+            .pcomm("leader"),
+    ];
+    let result = WorkloadHandle::spawn_pcomm_cgroup("leader", None, None, &works);
+    let err = match result {
+        Ok(_) => panic!("pcomm + CgroupChurn must reject at spawn_pcomm_cgroup"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("incompatible with WorkType::CgroupChurn"),
+        "diagnostic must name the CgroupChurn incompatibility, got: {msg}",
+    );
+}
+

@@ -860,16 +860,26 @@ pub struct WorkloadConfig {
     /// Per-worker nice value applied via `setpriority(2)` after
     /// fork, before the work loop. Range `-20..=19` per `MIN_NICE`
     /// / `MAX_NICE` in `kernel/sys.c`'s `setpriority` syscall;
-    /// values outside this window are clamped kernel-side. `0` (the
-    /// default) skips the syscall entirely so the worker inherits
-    /// the parent's nice value.
+    /// values outside this window are clamped kernel-side. `None`
+    /// (the default) skips the syscall entirely so the worker
+    /// inherits the parent's nice value; `Some(n)` invokes
+    /// `setpriority(PRIO_PROCESS, 0, n)` unconditionally — a user
+    /// who wants the worker to land on nice 0 regardless of the
+    /// parent's nice (or a cgroup-level default merged in by
+    /// [`CgroupDef::nice`](crate::scenario::ops::CgroupDef::nice))
+    /// writes `Some(0)`, distinct from `None`.
     ///
-    /// Negative values require `CAP_SYS_NICE` (the `set_one_prio`
-    /// → `can_nice` path returns `EACCES` to unprivileged callers
-    /// trying to lower nice below the parent's). Failures are
-    /// logged once via stderr and do not abort the worker — the
+    /// Values below the calling task's current nice require
+    /// `CAP_SYS_NICE` (the kernel's `can_nice` check fires on
+    /// `niceval < task_nice(p)`, not only on negatives — the
+    /// `set_one_prio` gate at `kernel/sys.c` returns `EACCES` to
+    /// unprivileged callers when `is_nice_reduction` rejects the
+    /// requested value). With `Some(0)` on a parent at `nice=5`,
+    /// `setpriority` returns `EACCES` without the capability.
+    /// `None` (inherit) is always safe. Failures are logged once
+    /// via stderr and do not abort the worker — the
     /// scheduling-policy and affinity sites use the same idiom.
-    pub nice: i32,
+    pub nice: Option<i32>,
     /// How to create each worker. Defaults to [`CloneMode::Fork`].
     pub clone_mode: CloneMode,
     /// Worker process name set via `prctl(PR_SET_NAME)` after fork.
@@ -985,7 +995,7 @@ impl Default for WorkloadConfig {
             sched_policy: SchedPolicy::Normal,
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
-            nice: 0,
+            nice: None,
             clone_mode: CloneMode::Fork,
             comm: None,
             uid: None,
@@ -1050,11 +1060,17 @@ impl WorkloadConfig {
 
     /// Set the per-worker nice value applied via `setpriority(2)`.
     ///
-    /// `0` (the default) skips the syscall and inherits the
-    /// parent's nice. Negative values require `CAP_SYS_NICE`.
+    /// Stores `Some(n)` on the config; the spawn pipeline calls
+    /// `setpriority(PRIO_PROCESS, 0, n)` unconditionally (including
+    /// `n == 0`). The "skip the syscall, inherit the parent's nice"
+    /// state is the type-level default `None` — set the field via
+    /// `..Default::default()` (or leave the builder unchained) when
+    /// you want inherit semantics. Values below the calling task's
+    /// current nice require `CAP_SYS_NICE`; see
+    /// [`WorkloadConfig::nice`] for the full `can_nice` rule.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
-        self.nice = n;
+        self.nice = Some(n);
         self
     }
 
@@ -1178,9 +1194,9 @@ pub struct WorkSpec {
     pub mpol_flags: MpolFlags,
     /// Per-worker nice value applied via `setpriority(2)` after
     /// fork, before the work loop. See [`WorkloadConfig::nice`]
-    /// for range, default-zero skip semantics, and `CAP_SYS_NICE`
+    /// for range, `None`-vs-`Some(n)` semantics, and `CAP_SYS_NICE`
     /// rules.
-    pub nice: i32,
+    pub nice: Option<i32>,
     /// Per-worker comm set via `prctl(PR_SET_NAME)` at thread
     /// creation time (the kernel truncates to `TASK_COMM_LEN - 1 =
     /// 15` bytes inside `__set_task_comm`). `None` inherits the
@@ -1248,7 +1264,7 @@ impl Default for WorkSpec {
             affinity: AffinityIntent::Inherit,
             mem_policy: MemPolicy::Default,
             mpol_flags: MpolFlags::NONE,
-            nice: 0,
+            nice: None,
             comm: None,
             pcomm: None,
             uid: None,
@@ -1303,11 +1319,16 @@ impl WorkSpec {
 
     /// Set the per-worker nice value applied via `setpriority(2)`.
     ///
-    /// `0` (the default) skips the syscall and inherits the
-    /// parent's nice. Negative values require `CAP_SYS_NICE`.
+    /// Stores `Some(n)` on the spec; the spawn pipeline calls
+    /// `setpriority(PRIO_PROCESS, 0, n)` unconditionally (including
+    /// `n == 0`). The "skip the syscall, inherit the parent's nice"
+    /// state is the type-level default `None` — leave the builder
+    /// unchained for inherit semantics. Values below the calling
+    /// task's current nice require `CAP_SYS_NICE`; see
+    /// [`WorkloadConfig::nice`] for the full `can_nice` rule.
     #[must_use = "builder methods consume self; bind the result"]
     pub fn nice(mut self, n: i32) -> Self {
-        self.nice = n;
+        self.nice = Some(n);
         self
     }
 
@@ -1690,7 +1711,7 @@ mod tests {
         }
         assert!(matches!(w.sched_policy, SchedPolicy::Batch));
         assert!(matches!(w.affinity, AffinityIntent::SingleCpu));
-        assert_eq!(w.nice, 7);
+        assert_eq!(w.nice, Some(7));
     }
     #[test]
     fn work_default_values() {
@@ -1699,8 +1720,8 @@ mod tests {
         assert!(matches!(w.work_type, WorkType::SpinWait));
         assert!(matches!(w.sched_policy, SchedPolicy::Normal));
         assert!(matches!(w.affinity, AffinityIntent::Inherit));
-        // Default nice is 0 — same skip semantics as
+        // Default nice is None — same skip semantics as
         // [`WorkloadConfig::nice`].
-        assert_eq!(w.nice, 0);
+        assert_eq!(w.nice, None);
     }
 }

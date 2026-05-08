@@ -95,7 +95,7 @@ pub(super) fn worker_main(
     sched_policy: SchedPolicy,
     mem_policy: MemPolicy,
     mpol_flags: MpolFlags,
-    nice: i32,
+    nice: Option<i32>,
     comm: Option<&str>,
     uid: Option<u32>,
     gid: Option<u32>,
@@ -132,7 +132,9 @@ pub(super) fn worker_main(
     };
     let _ = set_sched_policy(tid, sched_policy);
     apply_mempolicy_with_flags(&mem_policy, mpol_flags);
-    apply_nice(nice);
+    if let Some(n) = nice {
+        apply_nice(n);
+    }
     if let Some(name) = comm {
         let c_name = std::ffi::CString::new(name).unwrap_or_default();
         unsafe { libc::prctl(libc::PR_SET_NAME, c_name.as_ptr()) };
@@ -268,6 +270,14 @@ pub(super) fn worker_main(
     // citation explaining why `1` (not `0`) is the value that
     // shrinks slack.
     let mut idle_churn_slack_applied = false;
+    // One-shot guard for SignalStorm's `tkill` failure log. Stack-
+    // local because Thread mode would race a process-wide static
+    // across multiple SignalStorm worker pairs in the same process:
+    // the first worker to fail would latch the static and silence
+    // every sibling's distinct failure. Per-worker latching keeps
+    // the log spam bounded (one warn per worker per session) while
+    // preserving visibility into per-worker failure modes.
+    let mut tkill_warned = false;
     // AluHot: the configured `AluWidth` is resolved to a concrete
     // arch-specific variant once at worker entry rather than on
     // every iteration. `Widest` resolves to the widest variant
@@ -2434,10 +2444,31 @@ pub(super) fn worker_main(
                 // with the partner via the per-pair futex shared
                 // region (slot 0 = worker 0's tid, slot 1 = worker
                 // 1's tid). Once both slots are populated, each
-                // worker fires `signals_per_iter` `kill` syscalls
+                // worker fires `signals_per_iter` `tkill` syscalls
                 // at the partner per iteration, with a
                 // `work_iters` CPU spin between bursts. Exercises
                 // `signal_wake_up_state` + `sighand->siglock`.
+                //
+                // `tkill(tid, sig)` is used (not `kill(tid, sig)`
+                // and not `tgkill(tgid, tid, sig)`) so the signal
+                // targets the partner thread specifically across
+                // all `CloneMode`s. `sys_tkill` calls
+                // `do_tkill(0, pid, sig)` → `do_send_specific(0,
+                // pid, ...)` (kernel/signal.c), which uses
+                // `find_task_by_vpid(pid)` and skips the tgid
+                // check (`tgid <= 0`), then delivers via
+                // `do_send_sig_info(sig, info, p, PIDTYPE_PID)` —
+                // the per-task pending queue, so only the
+                // addressed thread can dequeue. `kill(tid, ...)`
+                // resolves to the tgid-wide pending queue
+                // (`PIDTYPE_TGID`) so siblings could dequeue under
+                // Thread/Pcomm modes. `tgkill(self_tgid, partner,
+                // ...)` returns `-ESRCH` under Fork mode because
+                // each forked worker is its own tgid leader, so
+                // the partner's tgid does not match
+                // `self_tgid`. `tkill`'s
+                // ignore-the-tgid behavior is correct for Fork,
+                // Thread, and Pcomm uniformly.
                 use std::sync::Once;
                 use std::sync::atomic::AtomicU32;
                 static SIG_HANDLER_INSTALLED: Once = Once::new();
@@ -2472,8 +2503,37 @@ pub(super) fn worker_main(
                     unsafe { (*slots.add(partner_slot_idx)).load(Ordering::Acquire) as i32 };
                 if partner_tid != 0 {
                     for _ in 0..signals_per_iter {
-                        unsafe {
-                            libc::kill(partner_tid, libc::SIGUSR1);
+                        // Per-iteration stop check: a hostile or
+                        // simply large `signals_per_iter` would
+                        // otherwise let the worker keep firing
+                        // `tkill`s for the entire burst after the
+                        // test timeout fires. Mirrors the Bursty
+                        // arm's stop-aware inner loop above.
+                        if stop_requested(stop) {
+                            break;
+                        }
+                        // `tkill` delivers via `PIDTYPE_PID` so the
+                        // signal hits the addressed thread's
+                        // per-task queue, not the tgid-wide queue.
+                        // Works across Fork, Thread, and Pcomm
+                        // modes (see arm doc above).
+                        let rc = unsafe {
+                            libc::syscall(
+                                libc::SYS_tkill,
+                                partner_tid,
+                                libc::SIGUSR1,
+                            )
+                        };
+                        if rc == -1 {
+                            let errno = std::io::Error::last_os_error().raw_os_error();
+                            if !tkill_warned {
+                                tracing::warn!(
+                                    errno,
+                                    partner_tid,
+                                    "SignalStorm tkill failed"
+                                );
+                                tkill_warned = true;
+                            }
                         }
                         work_units = std::hint::black_box(work_units.wrapping_add(1));
                     }

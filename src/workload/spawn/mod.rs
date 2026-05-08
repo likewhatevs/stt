@@ -145,8 +145,15 @@ pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
 
 /// Apply `nice` to the calling worker via `setpriority(2)`.
 ///
-/// `nice == 0` is a fast-path skip — the worker inherits the
-/// parent's nice value. The kernel clamps `niceval` to
+/// Always invokes `setpriority(PRIO_PROCESS, 0, nice)` — including
+/// for `nice == 0`, which writes 0 explicitly rather than
+/// inheriting. The "skip the syscall, inherit the parent's nice"
+/// state lives one layer up: callers gate the call on
+/// [`WorkSpec::nice`](crate::workload::WorkSpec::nice) /
+/// [`WorkloadConfig::nice`](crate::workload::WorkloadConfig::nice)
+/// being `Some(_)` and pass through the inner value (so `Some(0)`
+/// becomes a real `setpriority(0)` and `None` skips the call
+/// entirely). The kernel clamps `niceval` to
 /// `[MIN_NICE, MAX_NICE]` (-20..19) inside `setpriority`, so any
 /// out-of-range input is normalised by the syscall itself rather
 /// than rejected.
@@ -158,9 +165,6 @@ pub(super) fn apply_mempolicy_with_flags(policy: &MemPolicy, flags: MpolFlags) {
 /// `set_one_prio` → `can_nice` when an unprivileged worker tries
 /// to lower nice (negative niceval) without `CAP_SYS_NICE`.
 pub(super) fn apply_nice(nice: i32) {
-    if nice == 0 {
-        return;
-    }
     let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
     if rc != 0 {
         warn_setpriority_failed_once();
@@ -1264,7 +1268,7 @@ pub(super) struct GroupParams {
     sched_policy: SchedPolicy,
     mem_policy: MemPolicy,
     mpol_flags: MpolFlags,
-    nice: i32,
+    nice: Option<i32>,
     comm: Option<String>,
     uid: Option<u32>,
     gid: Option<u32>,
@@ -1288,7 +1292,9 @@ impl GroupParams {
     /// (`work_type`, `sched_policy`, `mem_policy`, `mpol_flags`,
     /// `nice`) are copied verbatim — they need no resolution
     /// because both [`WorkSpec`] and [`GroupParams`] carry them in
-    /// their final runtime form.
+    /// their final runtime form (`nice` round-trips as
+    /// `Option<i32>` so `None` continues to mean "skip the
+    /// `setpriority(2)` call" at the spawn-time gate).
     fn from_work_spec(
         spec: &WorkSpec,
         group_idx: usize,
@@ -2708,10 +2714,10 @@ impl WorkloadHandle {
         // shared rules (worker_group_size divisibility,
         // chain-depth-< 2, IdleChurn / IpcVariance zero rejection)
         // and adds pcomm-specific rejections (ForkExit,
-        // CgroupChurn, PipeIo, CachePipe) since the container's
-        // threaded shape — every worker is a thread of one
-        // forked tgid sharing one fd table — introduces hazards
-        // those variants cannot tolerate.
+        // CgroupChurn) since the container's threaded shape —
+        // every worker is a thread of one forked tgid sharing one
+        // fd table — introduces hazards those variants cannot
+        // tolerate.
         for group in &groups {
             if matches!(group.work_type, WorkType::ForkExit) {
                 anyhow::bail!(
@@ -2731,48 +2737,6 @@ impl WorkloadHandle {
                      `cgroup.procs`, which the kernel resolves to the whole \
                      tgid and migrates the entire pcomm container (every \
                      sibling thread). Drop pcomm or pick a different work type.",
-                    group.group_idx,
-                );
-            }
-            // C5: PipeIo / CachePipe pair workers (A=even, B=odd
-            // of each pair) hold opposite halves of a single
-            // (ab, ba) pipe pair — A keeps `ba[0]`/`ab[1]`, B
-            // keeps `ab[0]`/`ba[1]`. Fork-mode workers each
-            // close the inverse halves so EOF propagates when a
-            // peer exits (see [`Self::spawn_group`]'s
-            // close-other-fds block). In a pcomm container every
-            // worker is a thread of one forked tgid sharing a
-            // single fd table — the pre-fork allocation puts
-            // every pipe end into the container's table and
-            // every thread sees the same entries. There is no
-            // per-thread close path that closes one peer's half
-            // without also closing the other peer's: a thread
-            // closing `ab[0]` evicts that fd from the table the
-            // peer thread reads from. Reject at admission time
-            // rather than ship a half-working pair-shape that
-            // races on EOF and corrupts byte ordering.
-            if matches!(group.work_type, WorkType::PipeIo { .. }) {
-                anyhow::bail!(
-                    "WorkSpec::pcomm is incompatible with WorkType::PipeIo \
-                     (works[{}]): PipeIo's pair shape (worker A=even, \
-                     B=odd) holds inverse halves of a single pipe pair, \
-                     which fork-mode dispatch separates by closing each \
-                     peer's inverse fds in its own fd table. The pcomm \
-                     container's threads share one fd table, so closing \
-                     A's inverse halves also closes B's working halves \
-                     — and not closing them leaves every writer alive \
-                     across the container so EOF never propagates. Drop \
-                     pcomm or pick a non-paired work type.",
-                    group.group_idx,
-                );
-            }
-            if matches!(group.work_type, WorkType::CachePipe { .. }) {
-                anyhow::bail!(
-                    "WorkSpec::pcomm is incompatible with WorkType::CachePipe \
-                     (works[{}]): CachePipe shares the same paired-pipe \
-                     shape as PipeIo and inherits the same fd-table \
-                     hazard inside a pcomm container. Drop pcomm or pick \
-                     a non-paired work type.",
                     group.group_idx,
                 );
             }

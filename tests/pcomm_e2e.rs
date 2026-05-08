@@ -1,9 +1,8 @@
 //! End-to-end coverage for the pcomm fork-then-thread spawn path
-//! via [`CgroupDef::pcomm`].
+//! via [`WorkSpec::pcomm`].
 //!
-//! `CgroupDef::pcomm("chrome")` writes `pcomm = Some("chrome")` into
-//! every [`WorkSpec`] in the cgroup's `works` slice. `apply_setup`
-//! routes every WorkSpec sharing that pcomm value through
+//! Setting `WorkSpec::pcomm("chrome")` on a single WorkSpec routes
+//! it through
 //! [`crate::workload::WorkloadHandle::spawn_pcomm_cgroup`]: ONE
 //! forked thread-group leader whose `task->comm` is `"chrome"`,
 //! hosting every requested worker as a thread under that leader.
@@ -21,22 +20,18 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
-use ktstr::prelude::VmResult;
+use ktstr::prelude::{VmResult, WorkSpec};
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
-use ktstr::workload::config::WorkSpec;
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
-/// Host-side gate: a clean run means the in-VM dispatch routed every
-/// pcomm-tagged WorkSpec through `spawn_pcomm_cgroup`, the container
-/// leader forked successfully, threads spawned, the work loop ran to
-/// the hold deadline, and the per-worker reports streamed back
-/// through the bincode pipe to the parent without faulting. Any
-/// regression in the pcomm path collapses one of these signals.
+/// Host-side gate: a clean run means the in-VM dispatch processed
+/// the pcomm-tagged WorkSpec without crashing. Any regression in
+/// the pcomm path collapses one of these signals.
 fn assert_pcomm_ran_clean(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         !result.timed_out,
@@ -72,17 +67,15 @@ fn assert_pcomm_ran_clean(result: &VmResult) -> Result<()> {
     Ok(())
 }
 
-/// Boots a real guest, declares one cgroup with `.pcomm("chrome")`
-/// and a [`WorkSpec`] of two workers whose per-thread `comm` is
-/// `"ThreadPool"`. The cgroup-level `.pcomm("chrome")` builder
-/// writes `pcomm = Some("chrome")` into every WorkSpec in `works`,
-/// which causes `apply_setup` to coalesce them into a single
-/// `spawn_pcomm_cgroup` call: ONE forked leader whose `task->comm`
-/// is `"chrome"`, hosting two worker threads whose own `task->comm`
-/// is `"ThreadPool"`. Completion alone — gated by
-/// `assert_pcomm_ran_clean` — is the assertion: any regression in
-/// the fork-then-thread spawn pipeline collapses one of the
-/// host-visible signals checked there.
+/// Boots a real guest, declares one cgroup with a single
+/// [`WorkSpec`] of two workers carrying `pcomm = "chrome"` and per-
+/// thread `comm = "ThreadPool"`. With `pcomm` set on the WorkSpec,
+/// `apply_setup` routes it through `spawn_pcomm_cgroup`: ONE forked
+/// leader whose `task->comm` is `"chrome"`, hosting two worker
+/// threads whose own `task->comm` is `"ThreadPool"`. Completion
+/// alone — gated by `assert_pcomm_ran_clean` — is the assertion:
+/// any regression that crashes, times out, or exits non-zero
+/// collapses one of the host-visible signals checked there.
 #[ktstr_test(
     scheduler = KTSTR_SCHED_PAYLOAD,
     duration_s = 3,
@@ -94,11 +87,12 @@ fn assert_pcomm_ran_clean(result: &VmResult) -> Result<()> {
 fn pcomm_fork_then_thread_e2e(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     let steps = vec![Step {
-        setup: vec![
-            CgroupDef::named("cg_chrome")
-                .pcomm("chrome")
-                .work(WorkSpec::default().workers(2).comm("ThreadPool")),
-        ]
+        setup: vec![CgroupDef::named("cg_chrome").work(
+            WorkSpec::default()
+                .workers(2)
+                .comm("ThreadPool")
+                .pcomm("chrome"),
+        )]
         .into(),
         ops: vec![],
         hold: HoldSpec::FULL,

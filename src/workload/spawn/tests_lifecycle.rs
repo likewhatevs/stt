@@ -166,19 +166,19 @@ fn extract_panic_payload_handles_all_canonical_shapes() {
     let custom: Box<dyn std::any::Any + Send> = Box::new(CustomPayload(42));
     assert_eq!(extract_panic_payload(custom), "<non-string panic payload>");
 }
-/// `apply_nice(0)` is a documented short-circuit — when the
-/// caller leaves the field at its default, the worker MUST
-/// inherit the parent's nice value rather than have
-/// `setpriority(PRIO_PROCESS, 0, 0)` reset it to zero. The
-/// distinction matters when scenario-level code already
-/// elevated the parent to a non-default nice (e.g. via a
-/// wrapper that wants every worker to inherit) — a
-/// non-skipping `apply_nice(0)` would silently clobber that.
-/// Test by setting the calling thread's nice via direct
-/// syscall, calling `apply_nice(0)`, and asserting the nice
-/// did not change.
+/// `apply_nice(0)` writes 0 explicitly via `setpriority(2)` —
+/// the inherit-the-parent's-nice state is now expressed as
+/// `WorkSpec::nice = None` / `WorkloadConfig::nice = None`, gated
+/// at the `worker_main` call site. With `Option<i32>` carrying
+/// "skip" as `None`, `Some(0)` (and the corresponding
+/// `apply_nice(0)`) is a real, observable nice override — a test
+/// author who wants the worker to land on nice 0 regardless of
+/// what scenario-level code did to the parent's nice writes
+/// `Some(0)` and gets exactly that. Test by elevating the
+/// calling thread's nice via direct syscall, calling
+/// `apply_nice(0)`, and asserting the kernel-side nice is now 0.
 #[test]
-fn apply_nice_zero_is_noop() {
+fn apply_nice_zero_writes_zero() {
     // Set nice to 5 directly (positive — works without
     // CAP_SYS_NICE because raising nice is always permitted
     // for own task).
@@ -214,7 +214,8 @@ fn apply_nice_zero_is_noop() {
         "setpriority must have stuck before apply_nice runs"
     );
 
-    // Now invoke apply_nice(0) — should NOT touch priority.
+    // Now invoke apply_nice(0) — must write 0 via setpriority,
+    // overriding the prior nice=5.
     apply_nice(0);
 
     unsafe {
@@ -224,9 +225,11 @@ fn apply_nice_zero_is_noop() {
     let errno_after = unsafe { *libc::__errno_location() };
     assert_eq!(errno_after, 0, "getpriority must succeed after apply_nice");
     assert_eq!(
-        nice_after, 5,
-        "apply_nice(0) must not touch nice — observed change \
-         from {nice_before} to {nice_after}",
+        nice_after, 0,
+        "apply_nice(0) must write 0 explicitly — observed nice {nice_after} \
+         after starting at {nice_before} (no-op behaviour was the old \
+         `0`-as-skip semantic, replaced when WorkSpec::nice became \
+         Option<i32> and `None` took over the skip role)",
     );
 
     // Restore default (rare-path cleanup).
@@ -250,7 +253,7 @@ fn worker_nice_applied_via_setpriority() {
         affinity: AffinityIntent::Inherit,
         work_type: WorkType::SpinWait,
         sched_policy: SchedPolicy::Normal,
-        nice: 10,
+        nice: Some(10),
         ..Default::default()
     };
     let mut h = WorkloadHandle::spawn(&config).unwrap();

@@ -75,9 +75,17 @@ pub struct Sample<'a> {
     /// BEFORE the freeze rendezvous. `None` when the stats client
     /// was not wired (`scheduler_binary` is absent) or the request
     /// failed (relay rejected, non-zero envelope errno, scheduler
-    /// not yet listening). Temporal assertions over `.stats(...)`
-    /// must tolerate the `None` case — typically by skipping the
-    /// sample or by failing fast when stats coverage is required.
+    /// not yet listening). [`SampleSeries::stats`] surfaces this
+    /// `None` as a per-sample
+    /// [`SnapshotError::MissingStats`](crate::scenario::snapshot::SnapshotError::MissingStats)
+    /// slot in the resulting [`SeriesField`] rather than vacuously
+    /// skipping; temporal patterns handle that error per their own
+    /// policy (gap-tolerant patterns like `nondecreasing`,
+    /// `rate_within`, `steady_within`, `converges_to`, and
+    /// `ratio_within` skip the sample with a rendered Note, while
+    /// strict patterns like `always_true` and `each` fail the
+    /// assertion so a stats-coverage gap can never silently slip
+    /// past the call site).
     pub stats: Option<&'a serde_json::Value>,
 }
 
@@ -851,5 +859,353 @@ mod tests {
             .collect();
         assert_eq!(values.len(), 1);
         assert!((values[0] - 25.0).abs() < f64::EPSILON);
+    }
+
+    /// Build a synthetic report with mixed-shape members so the
+    /// `u64_fields` / `f64_fields` auto-projectors exercise the
+    /// "at least one Ok" filter:
+    ///   - `nr_dispatched`: Uint — projects Ok as u64.
+    ///   - `stall`: Uint — projects Ok as u64.
+    ///   - `balance`: Float — projects Err as u64 (TypeMismatch),
+    ///                        Ok as f64.
+    ///   - `flag_str`: Bytes — projects Err as both u64 and f64.
+    fn mixed_shape_report(disp: u64, balance: f64) -> FailureDumpReport {
+        let bss_value = RenderedValue::Struct {
+            type_name: Some(".bss".into()),
+            members: vec![
+                RenderedMember {
+                    name: "nr_dispatched".into(),
+                    value: RenderedValue::Uint {
+                        bits: 64,
+                        value: disp,
+                    },
+                },
+                RenderedMember {
+                    name: "stall".into(),
+                    value: RenderedValue::Uint { bits: 8, value: 0 },
+                },
+                RenderedMember {
+                    name: "balance".into(),
+                    value: RenderedValue::Float {
+                        bits: 64,
+                        value: balance,
+                    },
+                },
+                RenderedMember {
+                    name: "flag_str".into(),
+                    value: RenderedValue::Bytes {
+                        hex: "de ad".into(),
+                    },
+                },
+            ],
+        };
+        let bss_map = FailureDumpMap {
+            name: "scx_obj.bss".into(),
+            map_type: 2,
+            value_size: 32,
+            max_entries: 1,
+            value: Some(bss_value),
+            entries: Vec::new(),
+            percpu_entries: Vec::new(),
+            percpu_hash_entries: Vec::new(),
+            arena: None,
+            ringbuf: None,
+            stack_trace: None,
+            fd_array: None,
+            error: None,
+        };
+        FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: vec![bss_map],
+            ..Default::default()
+        }
+    }
+
+    /// `BpfMapProjector::u64_fields` keeps every member that yields
+    /// at least one `Ok` u64 across the series and drops members
+    /// whose every-sample projection errors. The mixed-shape report
+    /// above carries two u64 members (`nr_dispatched`, `stall`),
+    /// one f64-only member (`balance`) that errors on every u64
+    /// projection, and one bytes member (`flag_str`) that also
+    /// errors on every u64 projection. The returned vec must
+    /// surface only the two u64 names. The `SeriesField::label`
+    /// is set to the field name (see `BpfMapProjector::field_u64`),
+    /// so the tuple's first slot matches the struct member name
+    /// exactly.
+    #[test]
+    fn bpf_map_projector_u64_fields_keeps_at_least_one_ok_excludes_all_err() {
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                mixed_shape_report(10, 1.5),
+                None,
+                Some(100),
+            ),
+            (
+                "periodic_001".to_string(),
+                mixed_shape_report(20, 2.5),
+                None,
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained);
+        let fields = series.bpf_map("scx_obj.bss").at(0).u64_fields();
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"nr_dispatched"),
+            "u64-shaped member must be kept: {names:?}",
+        );
+        assert!(
+            names.contains(&"stall"),
+            "u64-shaped member must be kept: {names:?}",
+        );
+        assert!(
+            !names.contains(&"balance"),
+            "Float-shaped member must be excluded — every u64 projection errors: {names:?}",
+        );
+        assert!(
+            !names.contains(&"flag_str"),
+            "Bytes-shaped member must be excluded — every u64 projection errors: {names:?}",
+        );
+        // The kept fields must carry the projected u64 values
+        // verbatim — the tuple's SeriesField is the same object
+        // `field_u64(name)` would return.
+        let dispatched = fields
+            .iter()
+            .find(|(n, _)| n == "nr_dispatched")
+            .expect("nr_dispatched kept above");
+        let values: Vec<u64> = dispatched
+            .1
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        assert_eq!(
+            values,
+            vec![10, 20],
+            "kept SeriesField must carry the per-sample u64 projection",
+        );
+    }
+
+    /// Mirror of the u64 test for `f64_fields`. Float, Uint, Int,
+    /// and Enum members coerce to f64 (see `SnapshotField::as_f64`),
+    /// so all three numeric members are kept; the Bytes member
+    /// errors and is dropped. This pins the "at least one Ok"
+    /// filter for the f64 axis distinctly from the u64 axis.
+    #[test]
+    fn bpf_map_projector_f64_fields_keeps_at_least_one_ok_excludes_all_err() {
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                mixed_shape_report(10, 1.5),
+                None,
+                Some(100),
+            ),
+            (
+                "periodic_001".to_string(),
+                mixed_shape_report(20, 2.5),
+                None,
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained);
+        let fields = series.bpf_map("scx_obj.bss").at(0).f64_fields();
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"nr_dispatched"),
+            "Uint coerces to f64 — must be kept: {names:?}",
+        );
+        assert!(
+            names.contains(&"stall"),
+            "Uint coerces to f64 — must be kept: {names:?}",
+        );
+        assert!(
+            names.contains(&"balance"),
+            "Float coerces to f64 — must be kept: {names:?}",
+        );
+        assert!(
+            !names.contains(&"flag_str"),
+            "Bytes does not coerce to f64 — must be excluded: {names:?}",
+        );
+        let balance = fields
+            .iter()
+            .find(|(n, _)| n == "balance")
+            .expect("balance kept above");
+        let values: Vec<f64> = balance
+            .1
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        assert_eq!(
+            values.len(),
+            2,
+            "balance must surface one f64 per sample",
+        );
+        assert!((values[0] - 1.5).abs() < f64::EPSILON);
+        assert!((values[1] - 2.5).abs() < f64::EPSILON);
+    }
+
+    /// Empty series — no rows to discover member names from, so
+    /// `member_names()` returns an empty vec and both auto-projectors
+    /// yield empty results without panicking. Pins the "no first
+    /// row" branch in `BpfMapProjector::member_names`.
+    #[test]
+    fn bpf_map_projector_field_helpers_empty_series_yields_empty_vec() {
+        let series = SampleSeries::empty();
+        let u64s = series.bpf_map("scx_obj.bss").at(0).u64_fields();
+        assert!(
+            u64s.is_empty(),
+            "empty series must yield empty u64_fields, got {} entries",
+            u64s.len(),
+        );
+        let f64s = series.bpf_map("scx_obj.bss").at(0).f64_fields();
+        assert!(
+            f64s.is_empty(),
+            "empty series must yield empty f64_fields, got {} entries",
+            f64s.len(),
+        );
+    }
+
+    /// Build stats payloads with mixed shapes so the
+    /// `StatsPathProjector` auto-projectors exercise the same
+    /// "at least one Ok" filter on the JSON axis:
+    ///   - `busy`: Number — projects Ok as u64 and f64.
+    ///   - `count`: Number — projects Ok as u64 and f64.
+    ///   - `ratio`: Number(float) — projects Ok as f64;
+    ///             u64 errors when the float has a non-zero
+    ///             fraction (see `json_to_u64`).
+    ///   - `name`: String("nope") — never coerces to numeric.
+    fn mixed_stats(busy: u64, count: u64) -> serde_json::Value {
+        serde_json::json!({
+            "busy": busy,
+            "count": count,
+            "ratio": 0.5,
+            "name": "nope",
+        })
+    }
+
+    /// `StatsPathProjector::u64_fields` keeps JSON keys whose
+    /// per-sample projection lands at least one Ok and drops keys
+    /// whose every projection errors. `busy` / `count` are integer
+    /// numbers (Ok u64); `ratio` is `0.5` and lands TypeMismatch
+    /// on every sample (`json_to_u64` rejects non-integer floats);
+    /// `name` is a string that does not parse — also Err.
+    #[test]
+    fn stats_path_projector_u64_fields_keeps_at_least_one_ok_excludes_all_err() {
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                synthetic_report(0),
+                Some(mixed_stats(50, 7)),
+                Some(100),
+            ),
+            (
+                "periodic_001".to_string(),
+                synthetic_report(0),
+                Some(mixed_stats(60, 9)),
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained);
+        let fields = series.stats_path("").u64_fields();
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"busy"),
+            "Number(integer) key must be kept: {names:?}",
+        );
+        assert!(
+            names.contains(&"count"),
+            "Number(integer) key must be kept: {names:?}",
+        );
+        assert!(
+            !names.contains(&"ratio"),
+            "Number(non-integer float) errors on every u64 projection — must be excluded: {names:?}",
+        );
+        assert!(
+            !names.contains(&"name"),
+            "String('nope') errors on every u64 projection — must be excluded: {names:?}",
+        );
+        let busy = fields
+            .iter()
+            .find(|(n, _)| n == "busy")
+            .expect("busy kept above");
+        let values: Vec<u64> = busy
+            .1
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        assert_eq!(values, vec![50, 60]);
+    }
+
+    /// Mirror of the u64 test for `f64_fields`. Numbers coerce to
+    /// f64 unconditionally (`json_to_f64`) — `busy`, `count`, and
+    /// `ratio` are all kept. `name` is a non-numeric string and
+    /// is excluded.
+    #[test]
+    fn stats_path_projector_f64_fields_keeps_at_least_one_ok_excludes_all_err() {
+        let drained = vec![
+            (
+                "periodic_000".to_string(),
+                synthetic_report(0),
+                Some(mixed_stats(50, 7)),
+                Some(100),
+            ),
+            (
+                "periodic_001".to_string(),
+                synthetic_report(0),
+                Some(mixed_stats(60, 9)),
+                Some(200),
+            ),
+        ];
+        let series = SampleSeries::from_drained(drained);
+        let fields = series.stats_path("").f64_fields();
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"busy"),
+            "Number coerces to f64 — must be kept: {names:?}",
+        );
+        assert!(
+            names.contains(&"count"),
+            "Number coerces to f64 — must be kept: {names:?}",
+        );
+        assert!(
+            names.contains(&"ratio"),
+            "Number(float) coerces to f64 — must be kept: {names:?}",
+        );
+        assert!(
+            !names.contains(&"name"),
+            "String('nope') errors on every f64 projection — must be excluded: {names:?}",
+        );
+        let ratio = fields
+            .iter()
+            .find(|(n, _)| n == "ratio")
+            .expect("ratio kept above");
+        let values: Vec<f64> = ratio
+            .1
+            .values_iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert!((values[0] - 0.5).abs() < f64::EPSILON);
+        assert!((values[1] - 0.5).abs() < f64::EPSILON);
+    }
+
+    /// Empty series — `key_names()` returns an empty vec because
+    /// there is no sample 0 to resolve the path against, so both
+    /// auto-projectors yield empty results without panicking.
+    #[test]
+    fn stats_path_projector_field_helpers_empty_series_yields_empty_vec() {
+        let series = SampleSeries::empty();
+        let u64s = series.stats_path("").u64_fields();
+        assert!(
+            u64s.is_empty(),
+            "empty series must yield empty u64_fields, got {} entries",
+            u64s.len(),
+        );
+        let f64s = series.stats_path("").f64_fields();
+        assert!(
+            f64s.is_empty(),
+            "empty series must yield empty f64_fields, got {} entries",
+            f64s.len(),
+        );
     }
 }

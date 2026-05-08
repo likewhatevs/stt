@@ -2563,9 +2563,12 @@ fn start_sched_stats_relay() -> RelayStopSignal {
 /// before this function was called) and drives the outer
 /// inotify-wait → connect → poll-relay-session cycle until `stop`
 /// flips.
-/// Maximum consecutive `port.read` Ok(0) returns we tolerate
-/// across the relay loop's inner functions before declaring the
-/// virtio-console port dead and exiting the relay thread.
+/// Maximum consecutive `PortEof` returns from the inner functions
+/// (`wait_for_stats_socket` and `run_relay_session`) we tolerate
+/// before declaring the virtio-console port dead and exiting the
+/// relay thread. Any non-`PortEof` exit (`RelaySessionExit::Other`,
+/// `WaitSocketResult::Connected`, `WaitSocketResult::Stopped`)
+/// resets the counter.
 ///
 /// B14: the stats-port reader can return Ok(0) when the host
 /// hasn't connected its end of `/dev/vport0p2` yet, when the host
@@ -2630,6 +2633,15 @@ fn sched_stats_relay_loop(stop: Arc<AtomicBool>, stop_evt: Arc<vmm_sys_util::eve
         let wait_exit = wait_for_stats_socket(&mut port, &stop, &stop_evt);
         match wait_exit {
             WaitSocketResult::Connected(socket) => {
+                // F14.4: a successful connect refreshes the
+                // consecutive-EOF budget. Without this reset, a
+                // run of inotify-wait Ok(0)s could leave the
+                // counter near the cap; if the next session
+                // happens to return PortEof once it would push
+                // past the cap and exit even though the port
+                // proved live enough to deliver a connect-edge
+                // and run a session.
+                consecutive_port_eof = 0;
                 let exit = run_relay_session(&mut port, socket, &stop, &stop_evt);
                 match exit {
                     RelaySessionExit::PortEof => {
@@ -3034,13 +3046,31 @@ fn run_relay_session(
             // B6: any POLLHUP or POLLERR on the socket — with or
             // without POLLIN — is a permanent transition to
             // unhealthy. POLLHUP+POLLIN means buffered data is
-            // still drainable; we mark unhealthy AFTER reading
-            // that data.
+            // still drainable; the same-iteration drain of the
+            // socket POLLIN happens below after `socket_healthy`
+            // is flipped, because reading from a HUP'd socket with
+            // buffered data is well-defined — only WRITES need the
+            // gate.
             let socket_hup_seen = socket_rev
                 .is_some_and(|r| r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR));
             let stop_ready = stop_rev.is_some_and(|r| r.contains(PollFlags::POLLIN));
             (port_ready, socket_in, socket_hup_seen, stop_ready)
         };
+
+        // F6.1: flip `socket_healthy` to false IMMEDIATELY when
+        // POLLHUP/POLLERR is observed in the current iteration —
+        // before any port-read processing. Earlier code flipped
+        // the flag at the END of the loop body, which raced when
+        // POLLHUP and port-POLLIN arrived in the same revents:
+        // the port arm at `if !socket_healthy` saw stale `true`
+        // and forwarded the host's request into the HUP'd socket
+        // (EPIPE / SIGPIPE). The socket-POLLIN drain below still
+        // runs because reading buffered scheduler responses
+        // across a half-close remains well-defined; only the
+        // WRITE side needs gating.
+        if socket_hup_seen {
+            socket_healthy = false;
+        }
 
         // Stop edge: drain and exit.
         if stop_ready {
@@ -3115,8 +3145,10 @@ fn run_relay_session(
         // forward to port. B6: read POLLIN data even when POLLHUP
         // arrived in the same poll — buffered scheduler responses
         // remain readable across the half-close until the kernel
-        // socket buffer drains. After this read the POLLHUP-only
-        // branch below marks the socket unhealthy.
+        // socket buffer drains. F6.1: `socket_healthy` was already
+        // flipped at the top of the loop body if POLLHUP/POLLERR
+        // appeared in the same revents; the `!socket_healthy`
+        // reconnect block below catches that case after this drain.
         if socket_in {
             let m = match socket.read(&mut buf) {
                 Ok(0) => {
@@ -3145,17 +3177,16 @@ fn run_relay_session(
             }
         }
 
-        // B6: POLLHUP/POLLERR observed on socket. If POLLIN arrived
-        // in the same revents we already drained the buffered data
-        // above; mark the socket unhealthy now and fall through to
-        // the !socket_healthy reconnect below. If POLLHUP arrived
-        // alone we exit immediately so we don't spin re-arming
-        // poll on a dead fd. The reconnect path is identical for
-        // both: emit the inline error envelope plus drain any
-        // queued port requests.
-        if socket_hup_seen {
-            socket_healthy = false;
-        }
+        // F6.1: with `socket_healthy` already flipped at the top
+        // of the loop body when POLLHUP/POLLERR arrived, the
+        // post-drain reconnect just checks the flag. Reaching
+        // this point with `!socket_healthy` means either (a)
+        // POLLHUP arrived alone — we exit immediately so we don't
+        // spin re-arming poll on a dead fd; or (b) POLLHUP+POLLIN
+        // arrived together — we drained the buffered scheduler
+        // responses above and now exit. Both cases share the
+        // reconnect path: emit the inline error envelope plus
+        // drain any queued port requests.
         if !socket_healthy {
             tracing::debug!(
                 drained_in = socket_in,

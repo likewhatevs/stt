@@ -32,22 +32,20 @@ const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
-/// Host-side gate: a clean run means the in-VM spawn pipeline applied
-/// the cgroup-level `comm`/`nice` defaults to every worker without
-/// faulting. Any propagation regression collapses one of these
+/// Host-side gate: a clean run means the in-VM spawn pipeline
+/// processed the cgroup-level `comm`/`nice` defaults without
+/// crashing. Any propagation regression collapses one of these
 /// signals.
 fn assert_workers_ran_clean(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         !result.timed_out,
         "guest timed out under the watchdog — the worker spawn or \
-         hold never completed; comm/nice propagation likely faulted \
-         in `apply_setup` or `worker_main`"
+         hold never completed"
     );
     anyhow::ensure!(
         result.crash_message.is_none(),
         "guest panicked during the run — `crash_message` = {:?}; \
-         a regression in `prctl(PR_SET_NAME)` or `setpriority` from \
-         the merged WorkSpec defaults would surface here",
+         a panic in the worker spawn path would surface here",
         result.crash_message,
     );
     anyhow::ensure!(

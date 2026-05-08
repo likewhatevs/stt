@@ -1,30 +1,32 @@
 //! End-to-end coverage for the `no_perf_mode = true` test property.
 //!
-//! `no_perf_mode = true` decouples the requested virtual topology from
-//! the host hardware. With it set, the dispatch path in
-//! `KtstrTestEntry::accepts_no_perf_mode` (see
-//! `src/test_support/entry.rs`) relaxes the per-LLC and per-NUMA
-//! shape checks while still requiring the host to provide enough
-//! total CPUs for the requested topology — so the test runs on
+//! `no_perf_mode = true` decouples the requested virtual topology
+//! from the host hardware at runtime. With it set, the framework
+//! routes through `acquire_llc_plan` to reserve a small host CPU
+//! pool and KVM oversubscribes the requested vCPUs (here 64) onto
+//! that pool, instead of `compute_pinning` which would 1:1 map
+//! vCPUs to host CPUs and require the host to physically provide
+//! them. That oversubscription path is what lets the test run on
 //! basic hardware that would otherwise hardware-skip.
 //!
-//! A regression that re-tightens the constraints surfaces as a
-//! hardware-skip in dispatch and the in-VM scenario never executes,
-//! so `vm.run()` returns without `success`. A regression that
-//! breaks the `no_perf_mode` plumbing through the macro (see the
-//! `no_perf_mode` arm in `ktstr-macros/src/lib.rs` and
-//! `KtstrTestEntry::no_perf_mode` in `entry.rs`) collapses one of
-//! the same host-visible signals checked below.
+//! A regression that breaks the `no_perf_mode` plumbing through
+//! the macro (see the `no_perf_mode` arm in
+//! `ktstr-macros/src/lib.rs` and `KtstrTestEntry::no_perf_mode` in
+//! `entry.rs`) or the runtime branch that picks `acquire_llc_plan`
+//! over `compute_pinning` collapses one of the host-visible
+//! signals checked below — either the host fails to acquire CPUs
+//! for the requested topology, or the VM fails to boot under
+//! oversubscription.
 //!
 //! The `post_vm` callback runs on the host after `vm.run()` returns
 //! and gates on `timed_out`, `crash_message`, `exit_code`, and
 //! `success` — the strongest proof available to the host that the
-//! relaxed-topology dispatch admitted this test and the in-VM run
-//! completed cleanly.
+//! oversubscription path acquired CPUs and booted the 64-vCPU
+//! guest cleanly.
 //!
-//! The default cgroup with two workers exercises the standard
-//! worker-spawn path under the relaxed-topology dispatch; the value
-//! of `no_perf_mode` is that the test RUNS on hardware that would
+//! The named cgroup with two workers exercises the standard
+//! worker-spawn path under the oversubscribed VM; the value of
+//! `no_perf_mode` is that the test RUNS on hardware that would
 //! otherwise skip, so a clean completion is the assertion.
 
 use anyhow::Result;
@@ -39,18 +41,18 @@ const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
 const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
-/// Host-side gate: a clean run means the relaxed-topology dispatch
-/// admitted the test on the available hardware and the in-VM
-/// scenario completed without faulting. Any regression in
-/// `no_perf_mode` plumbing or in
-/// `KtstrTestEntry::accepts_no_perf_mode` collapses one of these
-/// signals.
+/// Host-side gate: a clean run means `acquire_llc_plan` reserved a
+/// host CPU pool, KVM oversubscribed 64 vCPUs onto it, and the
+/// in-VM scenario completed without faulting. Any regression in
+/// `no_perf_mode` plumbing or in the runtime branch that picks
+/// `acquire_llc_plan` over `compute_pinning` collapses one of
+/// these signals.
 fn assert_no_perf_mode_ran_clean(result: &VmResult) -> Result<()> {
     anyhow::ensure!(
         !result.timed_out,
         "guest timed out under the watchdog — the in-VM scenario \
-         never completed; a regression in no_perf_mode dispatch or \
-         the relaxed topology checks would surface here"
+         never completed; a regression in the no_perf_mode \
+         oversubscription path would surface here"
     );
     anyhow::ensure!(
         result.crash_message.is_none(),
@@ -63,14 +65,14 @@ fn assert_no_perf_mode_ran_clean(result: &VmResult) -> Result<()> {
         result.exit_code == 0,
         "guest exit_code = {} (expected 0) — non-zero typically \
          means the in-guest scenario bailed before completing the \
-         hold under the relaxed-topology dispatch",
+         hold under the oversubscribed VM",
         result.exit_code,
     );
     anyhow::ensure!(
         result.success,
         "VM run reported success = false (timed_out = {}, exit_code = \
-         {}, crash_message = {:?}); the no_perf_mode relaxed-topology \
-         dispatch did not produce a clean run",
+         {}, crash_message = {:?}); the no_perf_mode \
+         oversubscription path did not produce a clean run",
         result.timed_out,
         result.exit_code,
         result.crash_message,
@@ -79,13 +81,14 @@ fn assert_no_perf_mode_ran_clean(result: &VmResult) -> Result<()> {
 }
 
 /// Boots a real guest with `no_perf_mode = true`, declaring a wild
-/// virtual topology (8 LLCs × 4 cores × 2 threads = 64 CPUs) that
-/// would normally only dispatch on hardware whose per-LLC and
-/// per-NUMA shape matches. With `no_perf_mode = true`,
-/// `KtstrTestEntry::accepts_no_perf_mode` relaxes those shape checks
-/// while still requiring enough total CPUs, so the test runs on
-/// basic hardware. Completion alone — gated by
-/// `assert_no_perf_mode_ran_clean` — is the assertion.
+/// virtual topology (8 LLCs × 4 cores × 2 threads = 64 vCPUs) that
+/// would normally require 64 host CPUs to back the 1:1 pinning
+/// from `compute_pinning`. With `no_perf_mode = true` the framework
+/// routes through `acquire_llc_plan` instead and KVM oversubscribes
+/// the 64 vCPUs onto a small host CPU pool, so the test runs on
+/// basic hardware that would otherwise hardware-skip. Completion
+/// alone — gated by `assert_no_perf_mode_ran_clean` — is the
+/// assertion.
 #[ktstr_test(
     scheduler = KTSTR_SCHED_PAYLOAD,
     no_perf_mode = true,

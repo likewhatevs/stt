@@ -72,14 +72,16 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
     // .stats() projects the scheduler-stats JSON axis: every sample's
     // stats slot must be present (None would surface as
     // SnapshotError::MissingStats; absence here means the port-2
-    // relay never delivered an envelope).
+    // relay never delivered an envelope). The `series.is_empty()`
+    // guard above ensures iter_full() yields at least one entry —
+    // any Err slot bails immediately, so reaching the post-loop
+    // assertion proves every slot was Ok and at least one sample
+    // existed.
     let nr_dispatched = series.stats("nr_dispatched", |sv| sv.path("nr_dispatched").as_u64());
-    let mut any_present = false;
     let mut any_progress = false;
     for (tag, _elapsed_ms, slot) in nr_dispatched.iter_full() {
         match slot {
             Ok(v) => {
-                any_present = true;
                 if *v > 0 {
                     any_progress = true;
                 }
@@ -90,11 +92,6 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
             ),
         }
     }
-    anyhow::ensure!(
-        any_present,
-        "stats projection produced no samples — port-2 relay \
-         delivered nothing to the bridge"
-    );
     anyhow::ensure!(
         any_progress,
         "scheduler reported nr_dispatched = 0 across every periodic \

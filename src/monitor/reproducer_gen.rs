@@ -705,7 +705,7 @@ fn map_sched_policy(fp: &WorkloadFingerprint, spec: &mut ReproducerSpec) {
     match primary {
         SchedPolicyHint::Other { nice } => {
             spec.config.sched_policy = SchedPolicy::Normal;
-            spec.config.nice = *nice;
+            spec.config.nice = Some(*nice);
         }
         SchedPolicyHint::Fifo { priority } => {
             spec.config.sched_policy = SchedPolicy::Fifo(*priority);
@@ -805,10 +805,15 @@ pub fn render_run_file_source(spec: &ReproducerSpec, template_name: &str) -> Str
         "        .sched_policy({})\n",
         render_sched_policy(&spec.config.sched_policy)
     ));
-    // Always emit `.nice(...)` so the rendered config does not
-    // silently inherit a future-changed `WorkloadConfig::nice`
-    // default.
-    s.push_str(&format!("        .nice({})\n", spec.config.nice));
+    // Emit `.nice(n)` only when the spec carries `Some(n)`; `None`
+    // is the framework's "skip the `setpriority(2)` call, inherit
+    // the parent's nice" state, which is the type-level default
+    // — emitting nothing here lands the same `nice = None` on the
+    // generated `WorkloadConfig` and avoids a spurious `.nice(0)`
+    // override of an unset field.
+    if let Some(n) = spec.config.nice {
+        s.push_str(&format!("        .nice({n})\n"));
+    }
     s.push_str("}\n");
 
     if !spec.cgroup_hints.is_empty() {
@@ -1131,7 +1136,7 @@ mod tests {
         cap.fingerprint.sched_policy_hints = vec![SchedPolicyHint::Other { nice: 5 }];
         let spec = generate_spec(&cap);
         assert!(matches!(spec.config.sched_policy, SchedPolicy::Normal));
-        assert_eq!(spec.config.nice, 5);
+        assert_eq!(spec.config.nice, Some(5));
     }
 
     /// Multiple work-type hints → first wins, rest in notes.
@@ -1666,23 +1671,38 @@ mod tests {
         assert!(src.contains("pub fn auto_repro"));
     }
 
-    /// `render_run_file_source` always emits `.nice(N)` even when
-    /// `N == 0`. Pins the explicit-render guarantee from #521: the
-    /// rendered spec must NOT silently inherit a future-changed
-    /// upstream `WorkloadConfig::nice` default. A regression that
-    /// suppresses the call when nice is 0 surfaces here.
+    /// `render_run_file_source` mirrors the spec's `nice` polarity:
+    /// `Some(n)` (including `Some(0)`) emits `.nice(n)`, while
+    /// `None` emits no `.nice(...)` call at all so the generated
+    /// config inherits the type-level `None` default. Pins the
+    /// renderer's faithful round-trip from `Option<i32>` to
+    /// builder syntax — a regression that drops `.nice(0)` for
+    /// `Some(0)` (collapsing the explicit override into the inherit
+    /// state) or that emits `.nice(0)` for `None` (forcing a
+    /// spurious `setpriority(0)` syscall) surfaces here.
     #[test]
-    fn render_run_file_source_emits_nice_zero_explicitly() {
+    fn render_run_file_source_emits_nice_only_when_some() {
         let cap = DebugCapture::default();
-        let spec = generate_spec(&cap);
-        // Default fingerprint → no sched-policy hints → nice stays 0.
-        assert_eq!(spec.config.nice, 0);
-
-        let src = render_run_file_source(&spec, "explicit_nice");
+        let mut spec_none = generate_spec(&cap);
+        // Default fingerprint → no sched-policy hints → nice stays None.
+        assert_eq!(spec_none.config.nice, None);
+        let src_none = render_run_file_source(&spec_none, "nice_none");
         assert!(
-            src.contains(".nice(0)"),
-            "rendered source must always emit `.nice(0)` (no silent \
-             inheritance of upstream defaults): {src}",
+            !src_none.contains(".nice("),
+            "rendered source must skip `.nice(...)` when the spec carries \
+             `None` so the generated config lands at the type-level default: \
+             {src_none}",
+        );
+
+        // Force `Some(0)` to verify the explicit-override path lands
+        // the literal builder call (and is distinct from `None`).
+        spec_none.config.nice = Some(0);
+        let src_zero = render_run_file_source(&spec_none, "nice_zero");
+        assert!(
+            src_zero.contains(".nice(0)"),
+            "rendered source must emit `.nice(0)` when the spec carries \
+             `Some(0)` — `None` is the inherit state, `Some(0)` is the \
+             explicit override: {src_zero}",
         );
     }
 

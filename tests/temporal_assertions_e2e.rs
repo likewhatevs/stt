@@ -21,7 +21,7 @@
 //! * `series.stats("nr_dispatched", ...).each(&mut verdict).at_most(N)` —
 //!   pins that the stats-axis dispatch counter stays under a generous
 //!   ceiling. The ceiling is far above what a 10 s ktstr-fixture run
-//!   can plausibly accumulate, so the bound is satisfied; the patternly
+//!   can plausibly accumulate, so the bound is satisfied; the pattern
 //!   exercised is the per-sample comparator path.
 //!
 //! Together they cover both projection axes (`bpf` and `stats`),
@@ -67,6 +67,33 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
          periodic_fired={})",
         result.periodic_target,
         result.periodic_fired,
+    );
+    anyhow::ensure!(
+        result.periodic_target == 3,
+        "periodic_target must mirror the configured num_snapshots = 3, got {}",
+        result.periodic_target,
+    );
+    anyhow::ensure!(
+        series.len() >= 2,
+        "need at least 2 periodic samples for nondecreasing to be \
+         non-vacuous, got {}",
+        series.len(),
+    );
+
+    // Cross-sample monotonicity is vacuous if every sample reads zero;
+    // require the BPF dispatch counter to advance at least once across
+    // the periodic timeline so the nondecreasing check actually
+    // discriminates progress from a stuck axis. Mirrors the
+    // `any_progress` pattern in stats_bridge_e2e.rs.
+    let bpf_dispatched = series.bpf("nr_dispatched", |snap| snap.var("nr_dispatched").as_u64());
+    let any_progress = bpf_dispatched
+        .iter_full()
+        .any(|(_, _, slot)| matches!(slot, Ok(v) if *v > 0));
+    anyhow::ensure!(
+        any_progress,
+        "BPF nr_dispatched read 0 across every periodic sample — the \
+         dispatch path never advanced under the 10 s workload (was \
+         scx-ktstr loaded?)",
     );
 
     let mut verdict = Verdict::new();
