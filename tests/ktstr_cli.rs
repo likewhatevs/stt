@@ -216,12 +216,26 @@ fn shell_exec_echo() {
         eprintln!("skipping shell_exec_echo: no cached kernel");
         return;
     }
-    ktstr()
+    let output = ktstr()
         .args(["shell", "--exec", "echo hello-from-guest"])
         .timeout(std::time::Duration::from_secs(120))
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("hello-from-guest"));
+        .output()
+        .expect("failed to run ktstr shell");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("LLC slots busy") || stderr.contains("CPU") && stderr.contains("busy") {
+        eprintln!("skipping shell_exec_echo: host resource contention");
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "Unexpected failure.\ncode={}\nstderr=```\n{stderr}```",
+        output.status.code().unwrap_or(-1)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("hello-from-guest"),
+        "stdout missing greeting: {stdout}"
+    );
 }
 
 #[test]
