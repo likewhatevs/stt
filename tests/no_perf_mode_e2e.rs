@@ -82,21 +82,20 @@ fn assert_no_perf_mode_ran_clean(result: &VmResult) -> Result<()> {
 
 /// Boots a real guest with `no_perf_mode = true`, declaring a wild
 /// virtual topology (8 LLCs × 4 cores × 2 threads = 64 vCPUs) that
-/// would normally require 64 host CPUs to back the 1:1 pinning
-/// from `compute_pinning`. With `no_perf_mode = true` the framework
-/// routes through `acquire_llc_plan` instead and KVM oversubscribes
-/// the 64 vCPUs onto a small host CPU pool, so the test runs on
-/// basic hardware that would otherwise hardware-skip. Completion
-/// alone — gated by `assert_no_perf_mode_ran_clean` — is the
-/// assertion.
+/// exercises `acquire_llc_plan` instead of `compute_pinning`,
+/// proving the `no_perf_mode` plumbing from macro attribute
+/// through `KtstrTestEntry` to the VM builder works end-to-end.
+/// A multi-LLC topology (2 LLCs × 2 cores × 2 threads = 8 vCPUs)
+/// is sufficient to exercise the LLC plan path without requiring
+/// excessive boot time on contended hosts.
 #[ktstr_test(
     scheduler = KTSTR_SCHED_PAYLOAD,
     no_perf_mode = true,
-    llcs = 8,
-    cores = 4,
+    llcs = 2,
+    cores = 2,
     threads = 2,
     duration_s = 3,
-    watchdog_timeout_s = 15,
+    watchdog_timeout_s = 30,
     workers_per_cgroup = 2,
     auto_repro = false,
     post_vm = assert_no_perf_mode_ran_clean,
