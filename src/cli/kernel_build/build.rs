@@ -200,11 +200,13 @@ pub(crate) fn acquire_build_reservation(
 /// directory under the user-controlled cache root is exempt from
 /// those sweeps.
 ///
-/// Non-blocking — fails fast with an actionable error pointing the
-/// operator at `cargo ktstr locks` when a concurrent peer holds the
-/// lock. A blocking acquire would silently stall the operator's
-/// terminal with no signal why; surfacing the contention immediately
-/// lets them inspect peers (or wait deliberately and retry).
+/// Try-then-wait: attempts a non-blocking acquire first. If
+/// contended, logs the holder (pid + cmdline from /proc/locks)
+/// and falls through to a blocking acquire that parks until the
+/// peer releases. When the blocking acquire returns, the peer's
+/// build is done and the cache likely contains the artifact —
+/// the caller checks the cache after we return and skips the
+/// build if the slot is populated.
 ///
 /// Distinct from the cache-entry flock acquired inside
 /// [`crate::cache::CacheDir::store`]: that lock serializes the
@@ -228,30 +230,38 @@ pub(crate) fn acquire_source_tree_lock(
         .with_context(|| "create cache `.locks/` subdir for source-tree lock")?;
     let lock_path = cache.lock_path(&format!("source-{path_hash}"));
 
-    let fd = crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
+    match crate::flock::try_flock(&lock_path, crate::flock::FlockMode::Exclusive)
         .with_context(|| format!("acquire source-tree flock {}", lock_path.display()))?
-        .ok_or_else(|| {
-            // Best-effort holder lookup: if /proc/locks reports a
-            // peer, surface the pid + cmdline so the operator can
-            // identify the conflict without running `cargo ktstr
-            // locks` separately. A holder-lookup failure is
-            // non-fatal — the EWOULDBLOCK message is already
-            // actionable on its own.
+    {
+        Some(fd) => Ok(fd),
+        None => {
+            // Non-blocking acquire failed (EWOULDBLOCK) — a live
+            // peer holds the lock. Surface the holder, then block
+            // until they release. When the blocking acquire
+            // returns, the peer's build is done and the cache
+            // likely contains the artifact we need — the caller
+            // checks the cache after we return, so it will skip
+            // the build if the peer populated the slot.
             let holders = crate::flock::read_holders(&lock_path).unwrap_or_default();
             let holder_text = if holders.is_empty() {
-                String::new()
+                String::from("(holder not identified via /proc/locks)")
             } else {
-                format!("\n{}", crate::flock::format_holder_list(&holders))
+                crate::flock::format_holder_list(&holders)
             };
-            anyhow::anyhow!(
-                "{cli_label}: source tree {} is locked by a concurrent ktstr build \
-                 (lockfile {}). Wait for the peer to finish, or run \
-                 `cargo ktstr locks` to identify it.{holder_text}",
+            eprintln!(
+                "{cli_label}: source tree {} is locked by a concurrent ktstr \
+                 build — waiting for it to finish.\n{holder_text}",
                 canonical.display(),
-                lock_path.display(),
-            )
-        })?;
-    Ok(fd)
+            );
+            crate::flock::block_flock(&lock_path, crate::flock::FlockMode::Exclusive)
+                .with_context(|| {
+                    format!(
+                        "blocking wait on source-tree flock {}",
+                        lock_path.display()
+                    )
+                })
+        }
+    }
 }
 
 /// Post-acquisition kernel build pipeline.

@@ -312,6 +312,29 @@ pub fn try_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<Option<Owne
     }
 }
 
+/// Blocking variant of [`try_flock`]. Opens the lockfile (creating
+/// it if absent), then issues a blocking `flock(2)` that parks the
+/// caller in the kernel until the lock is available. Use after
+/// [`try_flock`] returns `None` to wait for a live peer to finish.
+pub fn block_flock<P: AsRef<Path>>(path: P, mode: FlockMode) -> Result<OwnedFd> {
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, open};
+
+    let path = path.as_ref();
+    reject_remote_fs(path)?;
+    let fd = open(
+        path,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o666),
+    )
+    .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let op = match mode {
+        FlockMode::Exclusive => FlockOperation::LockExclusive,
+        FlockMode::Shared => FlockOperation::LockShared,
+    };
+    flock(&fd, op).map_err(|e| anyhow::anyhow!("flock (blocking) {}: {e}", path.display()))?;
+    Ok(fd)
+}
+
 /// Parse `/proc/locks` and return [`HolderInfo`] entries for every
 /// process holding an advisory `FLOCK` matching `needle`.
 ///
