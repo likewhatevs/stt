@@ -1008,25 +1008,35 @@ mod tests {
     /// acquire of the same lockfile returns `Ok(None)` and the
     /// helper bails with the actionable error.
     #[test]
-    fn acquire_source_tree_lock_contention_waits_then_succeeds() {
+    fn acquire_source_tree_lock_contention_returns_actionable_error() {
         use crate::test_support::test_helpers::{isolated_cache_dir, lock_env};
         let _env_lock = lock_env();
         let _cache = isolated_cache_dir();
         let canonical = std::path::PathBuf::from("/tmp/fake-source-contention");
-        let holder = acquire_source_tree_lock(&canonical, "test")
+        let _holder = acquire_source_tree_lock(&canonical, "test")
             .expect("first acquire must succeed under isolated cache");
-        let canonical2 = canonical.clone();
-        let waiter = std::thread::spawn(move || {
-            acquire_source_tree_lock(&canonical2, "test")
-        });
-        // Give the waiter thread time to hit the blocking flock,
-        // then release the holder so it unblocks.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        drop(holder);
-        let result = waiter
-            .join()
-            .expect("waiter thread must not panic");
-        result.expect("second acquire must succeed after holder releases");
+        // Second acquire of the same path — must fail because the
+        // first FD still holds the exclusive flock. Note: flock(2)
+        // semantics mean two acquire attempts in the same process
+        // CAN collide because each acquire opens a fresh fd
+        // (different FDs are distinct from the kernel's POV).
+        let err = acquire_source_tree_lock(&canonical, "test")
+            .expect_err("second acquire must fail while the first holds the lock");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("source tree"),
+            "error must name the source tree: {msg}",
+        );
+        assert!(
+            msg.contains("cargo ktstr locks"),
+            "error must point at `cargo ktstr locks` for diagnosis: {msg}",
+        );
+        // The cli_label must surface in the diagnostic so the
+        // operator sees which binary's invocation surfaced it.
+        assert!(
+            msg.contains("test"),
+            "error must include the cli_label `test`: {msg}",
+        );
     }
 
     /// `BuildReservation` field declaration order is load-bearing:
