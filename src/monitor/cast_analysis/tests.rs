@@ -8654,6 +8654,38 @@
         );
     }
 
+    #[test]
+    fn helper_map_lookup_elem_value_type_void_keeps_r0_unknown() {
+        let (blob, datasec_id, var_off, _value_sid, parent_id) =
+            btf_with_maps_and_task_ctx(MapValueShape::Void);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0);
+        let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 0, 8);
+        let insns = vec![ld_lo, ld_hi, mov_key, call_lookup, stx_kptr, exit()];
+        let datasec_pointers = vec![DatasecPointer {
+            insn_offset: 0,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        }];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: parent_id,
+            }],
+            &[],
+            &datasec_pointers,
+            &[],
+        );
+        assert!(
+            map.is_empty(),
+            "void-value map (`Ptr -> Void`) must keep R0 Unknown: {map:?}"
+        );
+    }
+
     /// Typedef-wrapped value type: `__type(value, cbw_cgrp_entry_t)`
     /// where `typedef struct cbw_cgrp_entry cbw_cgrp_entry_t;`. The
     /// analyzer must peel the typedef via `peel_modifiers` /
