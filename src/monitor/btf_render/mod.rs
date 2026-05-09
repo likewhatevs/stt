@@ -2655,6 +2655,60 @@ fn render_member(
         return rv;
     }
 
+    if let Some(parent) = parent_type_id {
+        if let Type::Array(arr) = &member_ty {
+            if let (Ok(elem_tid), Some(elem_size)) = (
+                arr.get_type_id(),
+                peel_modifiers(btf, arr.get_type_id().unwrap_or(0))
+                    .and_then(|t| type_size(btf, &t)),
+            ) {
+                if elem_size == 8 {
+                    if let Some(elem_term) = peel_modifiers(btf, elem_tid) {
+                        if matches!(
+                            elem_term,
+                            Type::Int(ref i) if i.size() == 8 && !i.is_signed() && !i.is_bool() && !i.is_char()
+                        ) {
+                            let arr_len = arr.len();
+                            let has_any_cast = mem.map_or(false, |m| {
+                                (0..arr_len).any(|i| {
+                                    let elem_off = (byte_off + i * 8) as u32;
+                                    m.cast_lookup(parent, elem_off).is_some()
+                                })
+                            });
+                            if has_any_cast {
+                                let cap = arr_len.min(MAX_ARRAY_ELEMS);
+                                let mut elements = Vec::with_capacity(cap);
+                                for i in 0..cap {
+                                    let elem_off = byte_off + i * 8;
+                                    let elem_bytes = parent_bytes.get(elem_off..elem_off + 8).unwrap_or_default();
+                                    if let Some(rv) = try_cast_intercept(
+                                        btf,
+                                        (parent, elem_off),
+                                        &elem_term,
+                                        elem_bytes,
+                                        depth + 1,
+                                        mem,
+                                        visited,
+                                    ) {
+                                        elements.push(rv);
+                                    } else {
+                                        elements.push(render_value_inner(
+                                            btf, elem_tid, elem_bytes, depth + 1, mem, visited,
+                                        ));
+                                    }
+                                }
+                                return RenderedValue::Array {
+                                    len: arr_len,
+                                    elements,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // `checked_add` guards against pathological BTF where
     // `byte_off + size` would overflow `usize` (a torn member with
     // a wild bit_offset / size pair). Without the check, the wrap
