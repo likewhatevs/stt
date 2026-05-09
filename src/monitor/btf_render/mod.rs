@@ -2474,6 +2474,102 @@ fn chase_gate(val: u64, depth: u32, visited: &HashSet<u64>) -> ChaseGate {
     ChaseGate::Proceed
 }
 
+/// Compose a `deref_skipped_reason` string for a pointer chase
+/// whose peeled target type has no BTF-resolvable storage size.
+///
+/// [`type_size`] returns `None` for [`Type::Fwd`] (forward-declared
+/// struct/union with body in another BTF), [`Type::Func`],
+/// [`Type::FuncProto`], [`Type::Datasec`], [`Type::Var`],
+/// [`Type::Void`], and [`Type::DeclTag`] (which `peel_modifiers`
+/// peels in practice — listed for completeness in case a future
+/// analyzer or BTF shape leaks one through). Each variant has a
+/// distinct cause; surfacing the variant name plus, when available,
+/// the BTF-declared name of the type lets operators correlate the
+/// failure with their source layout (e.g. `struct sdt_data` lives
+/// in the sdt_alloc library's BTF and surfaces as Fwd in the
+/// scheduler's own BTF).
+///
+/// `kind_label` is the call site's chase prefix (`"arena chase"` /
+/// `"kernel cast"`) so the reason matches the existing message
+/// style at each site without forcing each caller to thread the
+/// label through a `format!`.
+fn unsizable_chase_reason(
+    btf: &Btf,
+    kind_label: &'static str,
+    target_type_id: u32,
+    target_ty: &Type,
+) -> String {
+    match target_ty {
+        Type::Fwd(fwd) => {
+            // A Fwd is `struct X;` or `union X;` with no body in
+            // this BTF — typical when a scheduler library defines
+            // the struct (e.g. `struct sdt_data` in the sdt_alloc
+            // library) and the using program only references it
+            // via pointer. The chase has no BTF-declared size to
+            // bound the read, so it skips. Body availability would
+            // require a multi-BTF lookup the renderer doesn't
+            // perform today.
+            let aggregate = if fwd.is_union() { "union" } else { "struct" };
+            let name = btf.resolve_name(fwd).ok().filter(|n| !n.is_empty());
+            match name {
+                Some(n) => format!(
+                    "{kind_label} target {aggregate} {n} (type id \
+                     {target_type_id}) is a forward declaration; \
+                     body not in this BTF"
+                ),
+                None => format!(
+                    "{kind_label} target type id {target_type_id} \
+                     is an anonymous {aggregate} forward declaration; \
+                     body not in this BTF"
+                ),
+            }
+        }
+        Type::Func(_) => format!(
+            "{kind_label} target type id {target_type_id} is a \
+             function (BTF_KIND_FUNC); functions have no storage size"
+        ),
+        Type::FuncProto(_) => format!(
+            "{kind_label} target type id {target_type_id} is a \
+             function prototype (BTF_KIND_FUNC_PROTO); prototypes \
+             have no storage size"
+        ),
+        Type::Datasec(_) => format!(
+            "{kind_label} target type id {target_type_id} is a \
+             datasec (BTF_KIND_DATASEC); not a pointer chase target"
+        ),
+        Type::Var(_) => format!(
+            "{kind_label} target type id {target_type_id} is a \
+             var (BTF_KIND_VAR); not a pointer chase target"
+        ),
+        Type::Void => format!(
+            "{kind_label} target type id {target_type_id} is void; \
+             chasing a void* requires runtime type info"
+        ),
+        // `peel_modifiers` peels DeclTag in practice, so reaching
+        // it here implies a malformed BTF chain — keep the
+        // diagnostic explicit rather than collapsing into the
+        // generic fall-through.
+        Type::DeclTag(_) => format!(
+            "{kind_label} target type id {target_type_id} is a \
+             decl-tag (BTF_KIND_DECL_TAG); modifiers should have \
+             peeled (malformed BTF chain?)"
+        ),
+        // Defense-in-depth fall-through: every other variant
+        // ([`Type::Int`], [`Type::Float`], [`Type::Enum`],
+        // [`Type::Enum64`], [`Type::Struct`], [`Type::Union`],
+        // [`Type::Ptr`], [`Type::Array`], and the modifier
+        // wrappers `peel_modifiers` strips) returns `Some` from
+        // [`type_size`], so reaching this arm means a future
+        // [`Type`] variant slipped through without a sizing rule.
+        // Keep the legacy generic message rather than pretending
+        // we know the cause.
+        _ => format!(
+            "{kind_label} target type id {target_type_id} has \
+             unresolvable size"
+        ),
+    }
+}
+
 /// Chase an arena pointer and render the target struct.
 ///
 /// Returns `(deref, deref_skipped_reason)` for the caller to plug
@@ -2483,10 +2579,10 @@ fn chase_gate(val: u64, depth: u32, visited: &HashSet<u64>) -> ChaseGate {
 ///     [`RenderedValue::Truncated`] when the BTF-declared size
 ///     exceeds [`POINTER_CHASE_CAP`].
 ///   * `(None, Some(reason))` — the chase was attempted but failed
-///     (target type unresolvable, BTF size 0 / unresolvable, or
-///     `read_arena` returned `None`). `reason` is suitable for
-///     `deref_skipped_reason` so the operator sees why the
-///     subtree did not land.
+///     (target type unresolvable, body absent (forward decl),
+///     BTF size 0 / unresolvable, or `read_arena` returned `None`).
+///     `reason` is suitable for `deref_skipped_reason` so the
+///     operator sees why the subtree did not land.
 ///
 /// Preconditions the caller must satisfy:
 ///   * The [`chase_gate`] outcome was [`ChaseGate::Proceed`] for
@@ -2521,8 +2617,11 @@ fn chase_arena_pointer(
     let Some(btf_size) = type_size(btf, &target_ty) else {
         return (
             None,
-            Some(format!(
-                "arena chase target type id {target_type_id} has unresolvable size"
+            Some(unsizable_chase_reason(
+                btf,
+                "arena chase",
+                target_type_id,
+                &target_ty,
             )),
         );
     };
@@ -2704,9 +2803,11 @@ fn render_cast_pointer(
         return cast_ptr(
             value,
             None,
-            Some(format!(
-                "kernel cast target type id {} has unresolvable size",
-                hit.target_type_id
+            Some(unsizable_chase_reason(
+                btf,
+                "kernel cast",
+                hit.target_type_id,
+                &target_ty,
             )),
             super::cast_analysis::AddrSpace::Kernel,
         );
