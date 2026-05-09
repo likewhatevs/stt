@@ -158,7 +158,7 @@
 //! `linux/include/uapi/linux/bpf.h`) so they track the upstream UAPI
 //! without duplicating numeric literals here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use btf_rs::{Btf, BtfType, Type};
 use libbpf_rs::libbpf_sys as bs;
@@ -2216,26 +2216,18 @@ impl<'a> Analyzer<'a> {
             // BTreeSet.
             let mut iter = accesses.iter();
             let first = iter.next().expect("non-empty checked above");
-            let empty = BTreeSet::new();
-            let mut candidates: BTreeSet<u32> = layout
+            let empty = HashSet::new();
+            let mut candidates: HashSet<u32> = layout
                 .get(&(first.offset, first.size))
                 .cloned()
                 .unwrap_or_default();
             for acc in iter {
                 let next = layout.get(&(acc.offset, acc.size)).unwrap_or(&empty);
-                candidates = candidates.intersection(next).copied().collect();
+                candidates.retain(|c| next.contains(c));
                 if candidates.is_empty() {
                     break;
                 }
             }
-
-            // Drop the source struct from candidates — a self-typed
-            // cast (source.f → source*) matches tautologically.
-            // Remove source and proceed: if exactly one non-source
-            // candidate remains, emit it. The source's presence in
-            // the candidate set is coincidental (it has a u64 field
-            // at the same offset as the target's layout), not
-            // evidence of ambiguity.
             candidates.remove(source);
 
             if candidates.len() == 1 {
@@ -2378,8 +2370,12 @@ fn jump_targets(insns: &[BpfInsn]) -> BTreeSet<usize> {
 /// whose member type has the given size. The matching phase
 /// intersects sets across observed accesses to collapse to a single
 /// candidate when one exists.
-fn build_layout_index(btf: &Btf, max_id: u32) -> BTreeMap<(u32, u32), BTreeSet<u32>> {
-    let mut out: BTreeMap<(u32, u32), BTreeSet<u32>> = BTreeMap::new();
+fn build_layout_index(
+    btf: &Btf,
+    max_id: u32,
+) -> HashMap<(u32, u32), HashSet<u32>> {
+    let mut out: HashMap<(u32, u32), HashSet<u32>> = HashMap::new();
+    let mut size_cache: HashMap<u32, Option<u32>> = HashMap::new();
     let mut consecutive_fail: u32 = 0;
     const CONSECUTIVE_FAIL_CAP: u32 = 256;
 
@@ -2397,7 +2393,7 @@ fn build_layout_index(btf: &Btf, max_id: u32) -> BTreeMap<(u32, u32), BTreeSet<u
                         continue;
                     }
                     let off = bit_off / 8;
-                    let size = match member_size_bytes(btf, m) {
+                    let size = match cached_member_size(btf, m, &mut size_cache) {
                         Some(sz) => sz,
                         None => continue,
                     };
@@ -2417,6 +2413,15 @@ fn build_layout_index(btf: &Btf, max_id: u32) -> BTreeMap<(u32, u32), BTreeSet<u
         tid += 1;
     }
     out
+}
+
+fn cached_member_size(
+    btf: &Btf,
+    m: &btf_rs::Member,
+    cache: &mut HashMap<u32, Option<u32>>,
+) -> Option<u32> {
+    let tid = m.get_type_id().ok()?;
+    *cache.entry(tid).or_insert_with(|| member_size_bytes(btf, m))
 }
 
 /// Resolve `bpf_member` to a byte size, peeling Const / Volatile /
