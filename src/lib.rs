@@ -443,6 +443,16 @@ pub mod verifier;
 pub(crate) mod vm;
 pub(crate) mod vmm;
 pub mod worker_ready;
+
+/// Pre-populate the on-disk cast analysis cache for a scheduler binary.
+///
+/// Called by cargo-ktstr before spawning nextest so test processes
+/// find a warm cache instead of each independently running the 30s
+/// analysis. Safe to call from a background thread — the function
+/// is idempotent (content-hash-keyed) and writes atomically.
+pub fn precompute_cast_analysis(path: &std::path::Path) {
+    vmm::cast_analysis_load::cached_cast_analysis_for_scheduler(path);
+}
 pub mod worker_ready_wait;
 pub mod workload;
 

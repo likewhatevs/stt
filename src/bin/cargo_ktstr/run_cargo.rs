@@ -183,6 +183,8 @@ fn run_cargo_sub(
         }
     }
 
+    precompute_cast_cache();
+
     eprintln!("cargo ktstr: running {label}");
     let status = cmd
         .status()
@@ -198,6 +200,41 @@ fn run_cargo_sub(
                 .code()
                 .map_or("signal".to_string(), |c| c.to_string()),
         ))
+    }
+}
+
+fn precompute_cast_cache() {
+    let target_dir = std::env::var("CARGO_TARGET_DIR")
+        .unwrap_or_else(|_| "target".to_string());
+    let mut binaries = Vec::new();
+    for profile in ["debug", "release"] {
+        let dir = std::path::Path::new(&target_dir).join(profile);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else { continue };
+            if name_str.starts_with("scx_") && !name_str.contains('.') {
+                let path = entry.path();
+                if path.is_file() {
+                    binaries.push(path);
+                }
+            }
+        }
+    }
+    if binaries.is_empty() {
+        return;
+    }
+    eprintln!(
+        "cargo ktstr: precomputing cast analysis for {} scheduler binaries",
+        binaries.len()
+    );
+    for binary in binaries {
+        let path = binary.clone();
+        std::thread::spawn(move || {
+            ktstr::precompute_cast_analysis(&path);
+        });
     }
 }
 
