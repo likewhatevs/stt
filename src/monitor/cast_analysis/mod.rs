@@ -673,6 +673,16 @@ struct Analyzer<'a> {
     /// matches the normal STX-flow path where the allocator IS
     /// inlined and its R0 reaches a STX into a typed slot.
     alloc_seeds_applied: u32,
+    /// Pre-call register state for BPF_PSEUDO_CALL sites, keyed by
+    /// the callee's entry PC (= call_pc + 1 + insn.imm). When
+    /// `seed_from_func_proto` finds a u64 parameter that the
+    /// FuncProto doesn't type as Ptr→Struct, it consults this map
+    /// to recover the caller's typed Pointer state for that argument
+    /// register. Covers the common BPF pattern where subprograms
+    /// take `u64 taskc_raw` parameters that are actually typed
+    /// arena pointers — the FuncProto declares u64, but the caller
+    /// passes a Pointer{T} that the linear walk tracked.
+    caller_arg_types: std::collections::HashMap<usize, [RegState; 5]>,
 }
 
 /// Kptr finding state: a single `(parent, offset)` slot may be
@@ -767,6 +777,7 @@ impl<'a> Analyzer<'a> {
             arena_stx_findings: BTreeMap::new(),
             max_seen_type_id: 0,
             alloc_seeds_applied: 0,
+            caller_arg_types: std::collections::HashMap::new(),
         }
     }
 
@@ -966,6 +977,20 @@ impl<'a> Analyzer<'a> {
                 for proto_id in protos {
                     self.seed_from_func_proto(*proto_id);
                 }
+                if let Some(caller_args) = self.caller_arg_types.get(&pc) {
+                    let args = *caller_args;
+                    for (i, &caller_state) in args.iter().enumerate() {
+                        let reg_idx = i + 1;
+                        if matches!(self.regs[reg_idx], RegState::Unknown) {
+                            if let RegState::Pointer { struct_type_id } = caller_state {
+                                self.regs[reg_idx] = RegState::Pointer { struct_type_id };
+                                self.note_type_id(struct_type_id);
+                            } else if matches!(caller_state, RegState::ArenaU64FromAlloc) {
+                                self.regs[reg_idx] = RegState::ArenaU64FromAlloc;
+                            }
+                        }
+                    }
+                }
             }
 
             // The `BPF_LD_IMM64` arm consults this entry to type the
@@ -984,6 +1009,20 @@ impl<'a> Analyzer<'a> {
             // field of a `Pointer{P}` parent records `(P, off)` as an
             // Arena cast finding.
             let alloc_seed = subprog_returns_by_pc.contains(&pc);
+
+            if insn.code == (BPF_CLASS_JMP | BPF_OP_CALL) && insn.src_reg() == BPF_PSEUDO_CALL {
+                let callee_pc = (pc as i64 + 1 + insn.imm as i64) as usize;
+                self.caller_arg_types.insert(
+                    callee_pc,
+                    [
+                        self.regs[1],
+                        self.regs[2],
+                        self.regs[3],
+                        self.regs[4],
+                        self.regs[5],
+                    ],
+                );
+            }
 
             self.step(*insn, &mut skip_next, datasec_hit, alloc_seed);
 

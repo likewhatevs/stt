@@ -9641,3 +9641,102 @@ fn ldx_nested_struct_loads_inner_key() {
         "outer id must NOT appear as key for nested member: {map:?}"
     );
 }
+
+#[test]
+fn cross_function_u64_param_inherits_caller_pointer_type() {
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = push_name(&mut strings, "u64");
+    let n_m = push_name(&mut strings, "M");
+    let n_cgx = push_name(&mut strings, "cgx_raw");
+    let n_caller = push_name(&mut strings, "caller");
+    let n_callee = push_name(&mut strings, "callee");
+    let n_taskc_raw = push_name(&mut strings, "taskc_raw");
+    let types = vec![
+        SynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        SynType::Struct {
+            name_off: n_m,
+            size: 16,
+            members: vec![SynMember {
+                name_off: n_cgx,
+                type_id: 1,
+                byte_offset: 8,
+            }],
+        },
+        SynType::FuncProto {
+            return_type_id: 0,
+            params: vec![SynParam {
+                name_off: n_taskc_raw,
+                type_id: 1,
+            }],
+        },
+        SynType::Func {
+            name_off: n_callee,
+            type_id: 3,
+            linkage: 1,
+        },
+        SynType::Func {
+            name_off: n_caller,
+            type_id: 3,
+            linkage: 1,
+        },
+    ];
+    let blob = build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    let m_id = 2;
+    // Caller at PC 0..2: R1 = Pointer{M}, BPF_PSEUDO_CALL to callee at PC 4.
+    // Callee at PC 4..6 (func_entry): FuncProto says param 0 is u64,
+    // but caller had R1 = Pointer{M}. Cross-function propagation
+    // should type R1 as Pointer{M} in the callee. Then:
+    // PC 4: (func entry, R1 = Pointer{M} via caller propagation)
+    // PC 5: STX [R1 + 8] = R6 (R6 = ArenaU64FromAlloc from seed)
+    // PC 6: EXIT
+    let insns = vec![
+        // PC 0: caller func entry (via FuncEntry at pc=0)
+        // R1 is seeded as Pointer{M} from InitialReg
+        mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 2),
+        // PC 1: EXIT
+        exit(),
+        // PC 2: padding (unreachable)
+        exit(),
+        // PC 3: callee func entry (via FuncEntry at pc=3)
+        // R1 typed as Pointer{M} via cross-function propagation
+        // Save R1 to R6 before inner call clobbers R1
+        mov_x(6, 1),
+        // PC 4: inner BPF_PSEUDO_CALL (allocator) → R0 = ArenaU64FromAlloc
+        mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0),
+        // PC 5: STX [R6 + 8] = R0 (store arena alloc return to
+        //        the u64 param's struct field via callee-saved R6)
+        stx(BPF_SIZE_DW, 6, 0, 8),
+        // PC 6: EXIT
+        exit(),
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 1,
+            struct_type_id: m_id,
+        }],
+        &[FuncEntry {
+            insn_offset: 3,
+            func_proto_id: 3,
+        }],
+        &[],
+        &[SubprogReturn { insn_offset: 4 }],
+    );
+    assert_eq!(
+        map.get(&(m_id, 8)),
+        Some(&CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        }),
+        "cross-function u64 param must inherit caller's Pointer{{M}} \
+         and record arena STX at (M, 8): {map:?}"
+    );
+}

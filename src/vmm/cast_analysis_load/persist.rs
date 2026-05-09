@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::FwdIndexEntry;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedAddrSpace(u8);
