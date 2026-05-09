@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::FwdIndexEntry;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedAddrSpace(u8);
@@ -91,7 +91,7 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 fn cache_path(hash: u64) -> Option<PathBuf> {
-    cache_dir().map(|d| d.join(format!("{hash:016x}.bin")))
+    cache_dir().map(|d| d.join(format!("v{SCHEMA_VERSION}_{hash:016x}.bin")))
 }
 
 pub(super) fn try_load(
