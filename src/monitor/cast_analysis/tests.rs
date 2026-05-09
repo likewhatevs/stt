@@ -9161,3 +9161,60 @@
             "all-LD_IMM64 stream must produce no findings, no OOB panic: {map:?}"
         );
     }
+
+    #[test]
+    fn arena_stx_pending_then_duplicate_is_idempotent() {
+        let (blob, t_id, _q_id) = btf_with_source_and_target(8, 0);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let cast = addr_space_cast(2, 3, 1);
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 3, 1, 8),
+            cast,
+            stx(BPF_SIZE_DW, 1, 2, 8),
+            stx(BPF_SIZE_DW, 1, 2, 8),
+            exit(),
+        ];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg { reg: 1, struct_type_id: t_id }],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            !map.is_empty(),
+            "duplicate STX to same slot must not conflict; map: {map:?}"
+        );
+    }
+
+    #[test]
+    fn three_way_conflict_arena_kptr_pattern_drops_all() {
+        let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let cast = addr_space_cast(3, 2, 1);
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            cast,
+            stx(BPF_SIZE_DW, 1, 3, 8),
+            stx(BPF_SIZE_DW, 1, 5, 8),
+            ldx(BPF_SIZE_DW, 6, 1, 8),
+            ldx(BPF_SIZE_DW, 7, 6, 0),
+            exit(),
+        ];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[
+                InitialReg { reg: 1, struct_type_id: t_id },
+                InitialReg { reg: 5, struct_type_id: q_id },
+            ],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            map.is_empty(),
+            "arena + kptr + pattern on same slot must all drop: {map:?}"
+        );
+    }
