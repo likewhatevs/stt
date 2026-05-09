@@ -2609,7 +2609,9 @@ fn render_member(
         };
     };
 
-    if let Some(width) = m.bitfield_size() {
+    if let Some(width) = m.bitfield_size()
+        && width > 0
+    {
         return render_bitfield(btf, member_type_id, parent_bytes, bit_off, width as usize);
     }
 
@@ -2654,7 +2656,6 @@ fn render_member(
     if let Some(rv) = cast_intercept {
         return rv;
     }
-
 
     if let Some(parent) = parent_type_id
         && let Type::Array(arr) = &member_ty
