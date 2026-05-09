@@ -1010,24 +1010,44 @@ fn read_percpu_array_value(
     result
 }
 
-/// Chase modifiers (Volatile, Const, Typedef, TypeTag, Restrict),
-/// pointers, and typedefs from `type_id` to find a Struct or Union.
+/// Chase modifiers (Volatile, Const, Typedef, TypeTag, Restrict,
+/// DeclTag) and pointers from `type_id` to find a Struct or Union.
 ///
 /// Returns `None` if the chain ends in a type that is neither Struct
-/// nor Union, or exceeds depth 20. Also resolves through Ptr (for
+/// nor Union, or exceeds depth 32. Also resolves through Ptr (for
 /// pointer-to-struct members).
 pub(crate) fn resolve_to_struct(btf: &btf_rs::Btf, type_id: u32) -> Option<btf_rs::Struct> {
-    let mut t = btf.resolve_type_by_id(type_id).ok()?;
-    for _ in 0..20 {
+    resolve_to_struct_with_id(btf, type_id).map(|(s, _)| s)
+}
+
+/// Same chain walk as [`resolve_to_struct`] but returns the BTF type
+/// id of the terminal struct/union instead of the struct value.
+/// Callers that key data structures on type ids (e.g. the cast
+/// analyzer's `RegState::Pointer { struct_type_id }`) need the id
+/// post-peel; callers that need the struct shape use
+/// [`resolve_to_struct`].
+pub(crate) fn resolve_to_struct_id(btf: &btf_rs::Btf, type_id: u32) -> Option<u32> {
+    resolve_to_struct_with_id(btf, type_id).map(|(_, tid)| tid)
+}
+
+/// Shared chain walk for [`resolve_to_struct`] and
+/// [`resolve_to_struct_id`]. Peels Ptr / Volatile / Const / Typedef /
+/// TypeTag / Restrict / DeclTag up to depth 32, returning `(struct,
+/// id)` at the first Struct or Union encountered.
+fn resolve_to_struct_with_id(btf: &btf_rs::Btf, type_id: u32) -> Option<(btf_rs::Struct, u32)> {
+    let mut tid = type_id;
+    for _ in 0..32 {
+        let t = btf.resolve_type_by_id(tid).ok()?;
         match t {
-            btf_rs::Type::Struct(s) | btf_rs::Type::Union(s) => return Some(s),
+            btf_rs::Type::Struct(s) | btf_rs::Type::Union(s) => return Some((s, tid)),
             btf_rs::Type::Ptr(_)
             | btf_rs::Type::Volatile(_)
             | btf_rs::Type::Const(_)
             | btf_rs::Type::Typedef(_)
             | btf_rs::Type::TypeTag(_)
-            | btf_rs::Type::Restrict(_) => {
-                t = btf.resolve_chained_type(t.as_btf_type()?).ok()?;
+            | btf_rs::Type::Restrict(_)
+            | btf_rs::Type::DeclTag(_) => {
+                tid = t.as_btf_type()?.get_type_id().ok()?;
             }
             _ => return None,
         }

@@ -45,7 +45,8 @@ use super::super::bpf_map::{
     BPF_MAP_TYPE_STRUCT_OPS, BPF_MAP_TYPE_TASK_STORAGE, BPF_MAP_TYPE_USER_RINGBUF,
     BPF_MAP_TYPE_XSKMAP, BpfMapAccessor, BpfMapInfo, GuestMemMapAccessor,
 };
-use super::super::btf_render::{MemReader, RenderedValue, render_value_with_mem};
+use super::super::btf_render::{CastHit, MemReader, RenderedValue, render_value_with_mem};
+use super::super::cast_analysis::CastMap;
 
 use super::{
     FailureDumpEntry, FailureDumpFdArray, FailureDumpMap, FailureDumpPercpuEntry,
@@ -184,6 +185,15 @@ struct AccessorMemReader<'a> {
     /// doesn't render bits past the actual guest CPU count as
     /// phantom cpus on top of slab padding / freelist garbage.
     num_cpus: u32,
+    /// Optional BPF cast-analysis output, threaded through from
+    /// [`RenderMapCtx::cast_map`]. When `Some`, the
+    /// [`MemReader::cast_lookup`] override forwards
+    /// `(parent_type_id, member_byte_offset)` queries into the map
+    /// so the renderer can promote `u64` fields the analyzer
+    /// flagged into typed-pointer renders. `None` disables the
+    /// intercept (the trait default returns `None`, leaving every
+    /// `u64` field as a plain unsigned counter).
+    cast_map: Option<&'a CastMap>,
 }
 
 impl MemReader for AccessorMemReader<'_> {
@@ -271,6 +281,22 @@ impl MemReader for AccessorMemReader<'_> {
     fn nr_cpu_ids(&self) -> u32 {
         self.num_cpus
     }
+
+    fn cast_lookup(&self, parent_type_id: u32, member_byte_offset: u32) -> Option<CastHit> {
+        // CastMap key is `(source_btf_type_id, field_byte_offset)`,
+        // value is `(target_btf_type_id, AddrSpace)` — see
+        // [`super::super::cast_analysis::CastMap`]. The cast analyzer
+        // already keys on the underlying *struct* type id (see
+        // `cast_analysis::resolve_to_struct_id`), matching the form
+        // [`super::super::btf_render::render_struct`] threads down
+        // as `parent_type_id` after [`super::super::btf_render::peel_modifiers_with_id`].
+        let map = self.cast_map?;
+        let &(target_type_id, addr_space) = map.get(&(parent_type_id, member_byte_offset))?;
+        Some(CastHit {
+            target_type_id,
+            addr_space,
+        })
+    }
 }
 
 impl<'a> GuestMemMapAccessor<'a> {
@@ -303,17 +329,25 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// [`MemReader::nr_cpu_ids`] so the cpumask renderer can cap
     /// the bit walk at the guest's actual CPU count instead of
     /// rendering NR_CPUS-wide slab padding as phantom cpus.
+    ///
+    /// `cast_map` carries the BPF cast-analysis output for the
+    /// scheduler's program — `Some(&map)` lets the renderer promote
+    /// `u64` fields the analyzer flagged into typed-pointer renders
+    /// via [`MemReader::cast_lookup`]; `None` keeps every `u64`
+    /// rendered as a plain unsigned counter (the trait default).
     pub(crate) fn mem_reader(
         &self,
         arena_snapshot: Option<&'a super::super::arena::ArenaSnapshot>,
         arena_page_index: &'a ArenaPageIndex,
         num_cpus: u32,
+        cast_map: Option<&'a CastMap>,
     ) -> impl MemReader + 'a {
         AccessorMemReader {
             kernel: self.kernel(),
             arena_snapshot,
             arena_page_index,
             num_cpus,
+            cast_map,
         }
     }
 }
@@ -443,6 +477,14 @@ pub(super) struct RenderMapCtx<'a> {
     pub(super) shared_arena: Option<(&'a ArenaSnapshot, u64)>,
     pub(super) arena_page_index: &'a ArenaPageIndex,
     pub(super) sdt_alloc_metas: &'a [SdtAllocMeta],
+    /// Cast analysis output for the scheduler's BPF program. Threaded
+    /// into every per-map [`AccessorMemReader`] so
+    /// [`MemReader::cast_lookup`] can promote `u64` fields the
+    /// analyzer flagged into typed-pointer renders. `None` (no
+    /// analysis available, e.g. older program-BTF without
+    /// instructions) leaves the renderer's existing `u64`-as-counter
+    /// behavior untouched.
+    pub(super) cast_map: Option<&'a CastMap>,
 }
 
 /// Render `bytes` via BTF when both a `Btf` is available AND the
@@ -916,11 +958,13 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         shared_arena,
         arena_page_index,
         sdt_alloc_metas,
+        cast_map,
     } = ctx;
     let mem_reader = accessor.mem_reader(
         shared_arena.map(|(snap, _map_kva)| snap),
         arena_page_index,
         num_cpus,
+        cast_map,
     );
     // Per-map allocator selection. The TASK_STORAGE / HASH chase
     // arms consult this to pick the matching allocator metadata when

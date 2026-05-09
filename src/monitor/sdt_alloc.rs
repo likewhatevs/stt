@@ -126,7 +126,11 @@ const MAX_ELEM_SIZE: u64 = 4096;
 /// `continue` and walk up to this cap. 100k is well above the largest
 /// program-BTF type tables ktstr sees in practice (~10k for a complex
 /// scheduler) while still keeping the worst-case probe cost bounded.
-const MAX_BTF_ID_PROBE: u32 = 100_000;
+///
+/// Shared with [`super::cast_analysis`]'s candidate-search id walk:
+/// both probes use the same heuristic against the same per-program
+/// BTFs, so a single ceiling keeps them aligned.
+pub(crate) const MAX_BTF_ID_PROBE: u32 = 100_000;
 
 /// Byte offsets within the sdt_alloc data structures.
 ///

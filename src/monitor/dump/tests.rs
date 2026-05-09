@@ -4035,6 +4035,7 @@ fn render_map_struct_ops_no_offsets_returns_error() {
         shared_arena: None,
         arena_page_index: &arena_page_index,
         sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered
@@ -4099,6 +4100,7 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
         shared_arena: None,
         arena_page_index: &arena_page_index,
         sdt_alloc_metas: &sdt_alloc_metas,
+        cast_map: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered

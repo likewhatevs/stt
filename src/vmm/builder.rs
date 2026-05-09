@@ -833,6 +833,26 @@ impl KtstrVmBuilder {
             );
         }
 
+        // Run BPF cast analysis on the scheduler binary's embedded
+        // `.bpf.objs` ELF blob now, while the host has the file open
+        // and before the binary is consumed by the initramfs builder.
+        // The analysis is host-only (raw ELF parse + register-state
+        // walk over BPF instructions; no libbpf, no kernel
+        // interaction, no CAP_BPF). It runs in milliseconds on the
+        // schedulers we target. Failures (missing section, malformed
+        // BTF, parse errors) silently produce an empty CastMap; we
+        // collapse empty to `None` here so the dump path's
+        // `Option<&CastMap>` borrow expresses "no analysis
+        // available" cleanly. Both branches keep the failure-dump
+        // renderer's default (every `u64` rendered as a plain
+        // counter — the pre-integration behavior). See
+        // [`super::cast_analysis_load::build_cast_map_from_scheduler`]
+        // for the full pipeline.
+        let cast_map = self.scheduler_binary.as_deref().and_then(|p| {
+            let m = super::cast_analysis_load::build_cast_map_from_scheduler(p);
+            (!m.is_empty()).then_some(m)
+        });
+
         Ok(KtstrVm {
             kernel,
             init_binary: self.init_binary,
@@ -868,6 +888,7 @@ impl KtstrVmBuilder {
             template_staging_image: self.template_staging_image,
             workload_duration: self.workload_duration,
             num_snapshots: self.num_snapshots,
+            cast_map,
         })
     }
 

@@ -1601,6 +1601,18 @@ pub struct DumpContext<'a> {
     /// time at truncation can exceed the deadline by one phase's
     /// worth of work.
     pub deadline: Option<std::time::Instant>,
+    /// BPF cast-analysis output for the scheduler's program object,
+    /// produced once at builder time by parsing the scheduler
+    /// binary's `.bpf.objs` ELF blob (no libbpf, no kernel
+    /// interaction). Threaded into every per-map [`RenderMapCtx`]
+    /// so the renderer's
+    /// [`super::btf_render::MemReader::cast_lookup`] can promote
+    /// `u64` fields the analyzer flagged into typed-pointer
+    /// renders. `None` skips cast-driven promotion entirely (every
+    /// `u64` renders as a plain unsigned counter, the
+    /// pre-integration default); same effect as passing an empty
+    /// map but cheaper to thread.
+    pub cast_map: Option<&'a super::cast_analysis::CastMap>,
 }
 
 /// Reconstruct an `ScxSchedState` from the probe BPF program's
@@ -1902,6 +1914,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         scx_walker_capture,
         perf_capture,
         deadline,
+        cast_map,
     } = ctx;
     // Wall-clock origin for per-phase elapsed_us tracing and the
     // soft-deadline bailout. Each heavy phase compares
@@ -2413,6 +2426,15 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             shared_arena_snapshot.as_ref().map(|(_, snap)| snap),
             &arena_page_index,
             num_cpus,
+            // Threaded in from [`DumpContext::cast_map`]: same
+            // cast-analysis output the per-map renderer below
+            // consumes. Letting the sdt_alloc pre-pass see it
+            // means typed-allocator payload chases (per-task /
+            // per-cgroup contents inside arena) get the same
+            // `u64` → typed-pointer promotion as the rest of
+            // the dump, instead of degrading to plain counters
+            // for fields the analyzer recovered.
+            cast_map,
         );
         // Locate every sdt_alloc allocator instance declared in
         // `.bss`. The Datasec walk gives us each variable's name and
@@ -2582,6 +2604,16 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 shared_arena: shared_arena_ref,
                 arena_page_index: &arena_page_index,
                 sdt_alloc_metas: &sdt_alloc_metas,
+                // Threaded in from
+                // [`DumpContext::cast_map`]: the BPF
+                // cast-analysis output for the scheduler's
+                // program object. `Some(&map)` lets the
+                // renderer promote `u64` fields the analyzer
+                // flagged into typed-pointer renders via
+                // [`super::btf_render::MemReader::cast_lookup`];
+                // `None` keeps every `u64` rendered as a plain
+                // unsigned counter (the trait default).
+                cast_map,
             },
             &info,
         );

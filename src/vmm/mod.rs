@@ -64,6 +64,7 @@ pub(crate) mod builder;
 pub(crate) mod capture_numa;
 pub(crate) mod capture_scx;
 pub(crate) mod capture_tasks;
+pub(crate) mod cast_analysis_load;
 pub(crate) mod contention;
 pub(crate) mod exit_dispatch;
 pub(crate) mod freeze_coord;
@@ -409,6 +410,22 @@ pub struct KtstrVm {
     /// test-entry plumbing comes from
     /// [`crate::test_support::entry::KtstrTestEntry::num_snapshots`].
     pub(crate) num_snapshots: u32,
+    /// BPF cast-analysis output for the scheduler binary's embedded
+    /// BPF object(s). Populated by [`KtstrVmBuilder::build`] via
+    /// [`super::cast_analysis_load::build_cast_map_from_scheduler`]
+    /// when [`Self::scheduler_binary`] is `Some` AND the analysis
+    /// produces at least one finding. Threaded into
+    /// [`crate::monitor::dump::DumpContext::cast_map`] at freeze
+    /// time so the failure-dump renderer can promote `u64` fields
+    /// the analyzer flagged into typed-pointer renders via
+    /// [`crate::monitor::btf_render::MemReader::cast_lookup`].
+    ///
+    /// `None` covers every degraded case (no scheduler binary,
+    /// scheduler binary missing `.bpf.objs`, BTF parse failure,
+    /// instruction-stream parse failure, analyzer returned an
+    /// empty map). All paths render every `u64` as a plain
+    /// unsigned counter — the pre-integration default.
+    pub(crate) cast_map: Option<crate::monitor::cast_analysis::CastMap>,
 }
 
 struct RunLocks {
