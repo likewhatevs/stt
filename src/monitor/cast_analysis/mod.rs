@@ -1733,7 +1733,7 @@ impl<'a> Analyzer<'a> {
                 // gate fires only on the `Pointer{struct}` case in
                 // practice. The unconditional check is the
                 // simplest safe form.
-                if parent_btf_id == target {
+                if canonical_parent == target {
                     return;
                 }
                 self.note_type_id(target);
