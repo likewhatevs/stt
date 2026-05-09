@@ -372,7 +372,7 @@ pub struct SdtAllocatorSnapshot {
     /// and suppressing it on default would make consumers conflate "zero
     /// skipped" with "field absent / older schema". Mirrors the
     /// always-serialize policy used by sibling `elem_size` and
-    /// `payload_btf_type_id`.
+    /// `target_type_id`.
     pub skipped_subtrees: u32,
     /// Diagnostic: the per-pool slot stride. Surfaces alongside the
     /// rendered entries so a consumer can spot when the rendered
@@ -381,7 +381,7 @@ pub struct SdtAllocatorSnapshot {
     /// Diagnostic: the BTF type id used to render payload bytes.
     /// 0 when [`discover_payload_btf_id`] returned no candidate and
     /// the renderer fell back to hex.
-    pub payload_btf_type_id: u32,
+    pub target_type_id: u32,
     /// Diagnostic: when [`discover_payload_btf_id`] returned 0, the
     /// reason (e.g. `"no candidate of size 16"`,
     /// `"ambiguous: 3 candidates"`, `"payload_size == 0"`). Empty on
@@ -397,8 +397,8 @@ impl std::fmt::Display for SdtAllocatorSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "sdt_alloc {} (elem_size={}, btf_type_id={}",
-            self.allocator_name, self.elem_size, self.payload_btf_type_id
+            "sdt_alloc {} (elem_size={}, target_type_id={}",
+            self.allocator_name, self.elem_size, self.target_type_id
         )?;
         if !self.payload_type_reason.is_empty() {
             write!(f, ", reason={}", self.payload_type_reason)?;
@@ -434,12 +434,12 @@ impl std::fmt::Display for SdtAllocatorSnapshot {
 /// so every translation goes:
 ///   `kern_va = kern_vm_start + (ptr & 0xFFFF_FFFF)`
 ///
-/// `payload_btf_type_id` is the BTF type id the renderer applies to
+/// `target_type_id` is the BTF type id the renderer applies to
 /// the bytes after the `tid` header. Pass 0 (or a discovered id from
 /// [`discover_payload_btf_id`]) — 0 routes to a hex dump.
 ///
 /// `payload_type_reason` is a human-readable string describing why
-/// `payload_btf_type_id` is 0 (when it is); ignored when the id is
+/// `target_type_id` is 0 (when it is); ignored when the id is
 /// non-zero. Surfaces in [`SdtAllocatorSnapshot::payload_type_reason`]
 /// so an operator can distinguish "no candidate of this size" from
 /// "ambiguous candidates" without re-deriving the heuristic.
@@ -462,7 +462,7 @@ pub fn walk_sdt_allocator(
     allocator_bytes: &[u8],
     offsets: &SdtAllocOffsets,
     btf: &Btf,
-    payload_btf_type_id: u32,
+    target_type_id: u32,
     payload_type_reason: impl Into<String>,
     allocator_name: impl Into<String>,
     mem: &dyn MemReader,
@@ -473,7 +473,7 @@ pub fn walk_sdt_allocator(
         truncated: false,
         skipped_subtrees: 0,
         elem_size: 0,
-        payload_btf_type_id,
+        target_type_id,
         payload_type_reason: payload_type_reason.into(),
     };
 
@@ -514,7 +514,7 @@ pub fn walk_sdt_allocator(
         kern_vm_start,
         offsets,
         btf,
-        payload_btf_type_id,
+        target_type_id,
         payload_size,
         mem,
         out: &mut snap,
@@ -529,7 +529,7 @@ pub fn walk_sdt_allocator(
 /// fallback path when the id is 0.
 #[derive(Debug, Clone)]
 pub struct PayloadTypeChoice {
-    pub btf_type_id: u32,
+    pub target_type_id: u32,
     pub reason: String,
 }
 
@@ -560,7 +560,7 @@ pub struct PayloadTypeChoice {
 pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeChoice {
     if payload_size == 0 {
         return PayloadTypeChoice {
-            btf_type_id: 0,
+            target_type_id: 0,
             reason: "payload_size == 0".into(),
         };
     }
@@ -608,11 +608,11 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeCho
 
     match size_matches.len() {
         0 => PayloadTypeChoice {
-            btf_type_id: 0,
+            target_type_id: 0,
             reason: format!("no candidate of size {payload_size}"),
         },
         1 => PayloadTypeChoice {
-            btf_type_id: size_matches[0].0,
+            target_type_id: size_matches[0].0,
             reason: String::new(),
         },
         n => {
@@ -638,7 +638,7 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeCho
                     0 => continue,
                     1 => {
                         return PayloadTypeChoice {
-                            btf_type_id: hits[0],
+                            target_type_id: hits[0],
                             reason: String::new(),
                         };
                     }
@@ -655,7 +655,7 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeCho
             }
             // No unambiguous pattern winner — fall back to hex.
             PayloadTypeChoice {
-                btf_type_id: 0,
+                target_type_id: 0,
                 reason: format!("ambiguous: {n} candidates"),
             }
         }
@@ -670,7 +670,7 @@ struct TreeWalker<'a> {
     kern_vm_start: u64,
     offsets: &'a SdtAllocOffsets,
     btf: &'a Btf,
-    payload_btf_type_id: u32,
+    target_type_id: u32,
     payload_size: usize,
     /// `MemReader` used by [`render_value_with_mem`] when rendering
     /// each leaf payload — lets the BTF renderer chase `__arena`
@@ -807,8 +807,8 @@ impl<'a> TreeWalker<'a> {
             return;
         }
 
-        let payload = if self.payload_btf_type_id != 0 {
-            render_value_with_mem(self.btf, self.payload_btf_type_id, &payload_bytes, self.mem)
+        let payload = if self.target_type_id != 0 {
+            render_value_with_mem(self.btf, self.target_type_id, &payload_bytes, self.mem)
         } else {
             RenderedValue::Bytes {
                 hex: hex_dump(&payload_bytes),
@@ -892,7 +892,7 @@ mod tests {
         assert!(!json.contains("\"entries\""));
         assert!(!json.contains("\"truncated\""));
         assert!(!json.contains("\"payload_type_reason\""));
-        // elem_size, allocator_name, payload_btf_type_id, and
+        // elem_size, allocator_name, target_type_id, and
         // skipped_subtrees are always emitted — zero values carry
         // diagnostic information that suppression would mask.
         assert!(json.contains("\"elem_size\":0"));
@@ -915,7 +915,7 @@ mod tests {
             truncated: false,
             skipped_subtrees: 2,
             elem_size: 24,
-            payload_btf_type_id: 42,
+            target_type_id: 42,
             payload_type_reason: String::new(),
         };
         let json = serde_json::to_string(&snap).expect("serialize");
@@ -924,7 +924,7 @@ mod tests {
         assert_eq!(parsed.entries[0].idx, 7);
         assert_eq!(parsed.entries[0].genn, 1);
         assert_eq!(parsed.elem_size, 24);
-        assert_eq!(parsed.payload_btf_type_id, 42);
+        assert_eq!(parsed.target_type_id, 42);
         assert_eq!(parsed.skipped_subtrees, 2);
         assert_eq!(parsed.allocator_name, "scx_task_allocator");
     }
@@ -937,7 +937,7 @@ mod tests {
             truncated: true,
             skipped_subtrees: 0,
             elem_size: 24,
-            payload_btf_type_id: 0,
+            target_type_id: 0,
             payload_type_reason: String::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -952,7 +952,7 @@ mod tests {
             truncated: false,
             skipped_subtrees: 0,
             elem_size: 24,
-            payload_btf_type_id: 0,
+            target_type_id: 0,
             payload_type_reason: "no candidate of size 16".into(),
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -1023,7 +1023,7 @@ mod tests {
             truncated: false,
             skipped_subtrees: 0,
             elem_size: 24,
-            payload_btf_type_id: 42,
+            target_type_id: 42,
             payload_type_reason: String::new(),
         };
         let out = format!("{snap}");
@@ -1032,7 +1032,7 @@ mod tests {
             "missing header: {out}"
         );
         assert!(out.contains("elem_size=24"), "missing elem_size: {out}");
-        assert!(out.contains("btf_type_id=42"), "missing btf_type_id: {out}");
+        assert!(out.contains("target_type_id=42"), "missing target_type_id: {out}");
         assert!(out.contains("1 live"), "missing entry count: {out}");
         assert!(out.contains("idx=7"), "missing entry render: {out}");
     }
@@ -1045,7 +1045,7 @@ mod tests {
             truncated: true,
             skipped_subtrees: 5,
             elem_size: 24,
-            payload_btf_type_id: 0,
+            target_type_id: 0,
             payload_type_reason: "no candidate of size 16".into(),
         };
         let out = format!("{snap}");
@@ -1093,7 +1093,7 @@ mod tests {
             }
         };
         let choice = discover_payload_btf_id(&btf, 0);
-        assert_eq!(choice.btf_type_id, 0, "zero-size must yield btf_type_id=0");
+        assert_eq!(choice.target_type_id, 0, "zero-size must yield target_type_id=0");
         assert_eq!(
             choice.reason, "payload_size == 0",
             "zero-size reason must be the early-return marker, got: {}",
@@ -1127,7 +1127,7 @@ mod tests {
         };
         let impossible_size = usize::MAX / 2;
         let choice = discover_payload_btf_id(&btf, impossible_size);
-        assert_eq!(choice.btf_type_id, 0);
+        assert_eq!(choice.target_type_id, 0);
         let expected = format!("no candidate of size {impossible_size}");
         assert_eq!(
             choice.reason, expected,

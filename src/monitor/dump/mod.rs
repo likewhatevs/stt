@@ -2425,7 +2425,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // the scheduler's `.bss` raw bytes. Both inputs feed the
     // sdt_alloc walk below — moving them out of the main render loop
     // means the allocator metadata that decoration in the
-    // TASK_STORAGE arm needs (`elem_size`, `payload_btf_type_id`) is
+    // TASK_STORAGE arm needs (`elem_size`, `target_type_id`) is
     // available BEFORE any map renders, instead of getting derived
     // post-loop only to be unusable for per-entry payload chase.
     let mut sched_bss_bytes: Option<(Vec<u8>, u64)> = None; // (bytes, btf_kva)
@@ -2457,7 +2457,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
 
     // Pre-pass: walk sdt_alloc trees if all prerequisites lined up.
     // Runs BEFORE the main render loop so the allocator metadata it
-    // discovers (`elem_size`, `payload_btf_type_id`,
+    // discovers (`elem_size`, `target_type_id`,
     // `data_header_size`) is available to per-map decoration —
     // specifically, the TASK_STORAGE arm uses it to expand each
     // entry's `struct sdt_data __arena *` pointer into a typed
@@ -2675,7 +2675,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 slice,
                 &sdt_offsets,
                 prog_btf,
-                choice.btf_type_id,
+                choice.target_type_id,
                 choice.reason.clone(),
                 var_name.clone(),
                 &sdt_mem,
@@ -2694,12 +2694,12 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // BTF id to surface to the renderer, and the index
             // would just point every chase at 0 (which the bridge
             // gate filters as "no payload type").
-            if choice.btf_type_id != 0 {
+            if choice.target_type_id != 0 {
                 sdt_alloc_metas.push(crate::monitor::dump::render_map::SdtAllocMeta {
                     allocator_name: var_name.clone(),
                     elem_size,
                     header_size: sdt_offsets.data_header_size,
-                    payload_btf_type_id: choice.btf_type_id,
+                    target_type_id: choice.target_type_id,
                     kern_vm_start: arena_kern_vm_start,
                 });
                 // Append this allocator's slots to the bridge index.
@@ -2707,14 +2707,14 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // dedup-on-duplicate-slot-start, and the
                 // `tracing::debug!` collision diagnostic — see
                 // [`append_arena_type_index_for_allocator`] for the
-                // full contract. Bridge gate (`payload_btf_type_id
+                // full contract. Bridge gate (`target_type_id
                 // != 0`) is encoded inside the helper as well; the
                 // outer guard here is a fast-path bail before we
                 // even allocate metadata for the allocator.
                 crate::monitor::dump::render_map::append_arena_type_index_for_allocator(
                     &mut arena_type_index,
                     &var_name,
-                    choice.btf_type_id,
+                    choice.target_type_id,
                     sdt_offsets.data_header_size,
                     elem_size,
                     &snap.entries,

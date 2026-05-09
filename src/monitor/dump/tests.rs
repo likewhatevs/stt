@@ -2296,7 +2296,7 @@ fn accessor_mem_reader_resolve_arena_type_slot_start_returns_header_skip() {
         ArenaSlotInfo {
             elem_size: 24, // 8-byte header + 16-byte payload
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
 
@@ -2338,7 +2338,7 @@ fn accessor_mem_reader_resolve_arena_type_payload_start_returns_zero_skip() {
         ArenaSlotInfo {
             elem_size: 24,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
 
@@ -2377,7 +2377,7 @@ fn accessor_mem_reader_resolve_arena_type_interior_returns_none() {
         ArenaSlotInfo {
             elem_size: 24,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
 
@@ -2420,7 +2420,7 @@ fn accessor_mem_reader_resolve_arena_type_range_picks_correct_slot() {
         ArenaSlotInfo {
             elem_size: 16,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
     index.insert(
@@ -2428,7 +2428,7 @@ fn accessor_mem_reader_resolve_arena_type_range_picks_correct_slot() {
         ArenaSlotInfo {
             elem_size: 16,
             header_size: 8,
-            payload_btf_type_id: 11,
+            target_type_id: 11,
         },
     );
 
@@ -2505,7 +2505,7 @@ fn accessor_mem_reader_resolve_arena_type_rejects_out_of_window() {
         ArenaSlotInfo {
             elem_size: 16,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
 
@@ -2576,7 +2576,7 @@ fn accessor_mem_reader_resolve_arena_type_slot_end_boundary_excluded() {
         ArenaSlotInfo {
             elem_size: 16,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
 
@@ -2623,7 +2623,7 @@ fn accessor_mem_reader_resolve_arena_type_adjacent_slots_picked_correctly() {
         ArenaSlotInfo {
             elem_size: 16,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
     // Slot B at 0x1010, elem_size=16 → range [0x1010, 0x1020).
@@ -2633,7 +2633,7 @@ fn accessor_mem_reader_resolve_arena_type_adjacent_slots_picked_correctly() {
         ArenaSlotInfo {
             elem_size: 16,
             header_size: 8,
-            payload_btf_type_id: 11,
+            target_type_id: 11,
         },
     );
 
@@ -2704,7 +2704,7 @@ fn accessor_mem_reader_resolve_arena_type_high_edge_slot_resolves() {
         ArenaSlotInfo {
             elem_size: 4096,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
 
@@ -2768,7 +2768,7 @@ fn resolve_arena_type_with_static_fallback_returns_sdt_alloc_hit() {
         ArenaSlotInfo {
             elem_size: 24,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
     // scx_static index intentionally empty for this test; the
@@ -2856,7 +2856,7 @@ fn resolve_arena_type_with_static_fallback_out_of_window_returns_none() {
         ArenaSlotInfo {
             elem_size: 24,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         },
     );
     let scx_static_snap = ScxStaticSnapshot {
@@ -3167,7 +3167,7 @@ fn find_sdt_data_field_offset_none_for_unrelated_struct() {
 
 /// `chase_sdt_data_payload` returns `None` whenever any of its
 /// prerequisite inputs is missing: no BTF, no field offset, no
-/// allocator metadata, zero `payload_btf_type_id`,
+/// allocator metadata, zero `target_type_id`,
 /// `elem_size <= header_size`, or `kern_vm_start == 0`. Each
 /// early-return is one of the gates the surface render relies on
 /// to NOT spuriously decorate non-arena entries.
@@ -3208,7 +3208,7 @@ fn chase_sdt_data_payload_returns_none_on_missing_prereqs() {
         allocator_name: "scx_test_allocator".into(),
         elem_size: 32,
         header_size: 8,
-        payload_btf_type_id: placeholder_type_id,
+        target_type_id: placeholder_type_id,
         kern_vm_start: 0xFFFF_8000_0000_0000,
     };
     // 24 bytes of value bytes: tid (8) + tptr (8) + data (8 = pointer
@@ -3232,10 +3232,10 @@ fn chase_sdt_data_payload_returns_none_on_missing_prereqs() {
         chase_sdt_data_payload(Some(&btf), Some(16), None, &value_bytes, &reader).is_none(),
         "missing allocator metadata must yield None",
     );
-    // Zero payload_btf_type_id (allocator pre-pass returned 0 for
+    // Zero target_type_id (allocator pre-pass returned 0 for
     // ambiguous / no-candidate paths).
     let zero_payload = SdtAllocMeta {
-        payload_btf_type_id: 0,
+        target_type_id: 0,
         ..valid_meta.clone()
     };
     assert!(
@@ -3247,7 +3247,7 @@ fn chase_sdt_data_payload_returns_none_on_missing_prereqs() {
             &reader,
         )
         .is_none(),
-        "payload_btf_type_id=0 must yield None",
+        "target_type_id=0 must yield None",
     );
     // elem_size <= header_size: corrupt allocator metadata; payload
     // would slice empty.
@@ -3349,7 +3349,7 @@ fn chase_sdt_data_payload_yields_none_on_unmapped_kva() {
         allocator_name: "scx_test_allocator".into(),
         elem_size: 32,
         header_size: 8,
-        payload_btf_type_id: 1,
+        target_type_id: 1,
         kern_vm_start: 0xFFFF_8000_0000_0000,
     };
     assert!(
@@ -5513,26 +5513,26 @@ fn mk_alloc_entry(idx: i32, genn: i32, user_addr: u64) -> super::super::sdt_allo
     }
 }
 
-/// `payload_btf_type_id == 0` short-circuits — the helper does not
+/// `target_type_id == 0` short-circuits — the helper does not
 /// produce any index entries because the bridge gate would filter
 /// them as "no payload type" anyway. Pinning the early bail keeps
 /// callers from accidentally polluting the index with zero ids.
 #[test]
-fn append_arena_type_index_for_allocator_zero_btf_type_id_skips() {
+fn append_arena_type_index_for_allocator_zero_target_type_id_skips() {
     use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
     let mut index = ArenaTypeIndex::new();
     let entries = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
     append_arena_type_index_for_allocator(
         &mut index,
         "test_allocator",
-        0, // payload_btf_type_id == 0 ⇒ short-circuit
+        0, // target_type_id == 0 ⇒ short-circuit
         8,
         16,
         &entries,
     );
     assert!(
         index.is_empty(),
-        "zero btf_type_id must skip every entry; got {} index entries",
+        "zero target_type_id must skip every entry; got {} index entries",
         index.len(),
     );
 }
@@ -5579,7 +5579,7 @@ fn append_arena_type_index_for_allocator_multi_entry_insert() {
     let expected_info = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
-        payload_btf_type_id: 7,
+        target_type_id: 7,
     };
     assert_eq!(index.len(), 3);
     assert_eq!(index.get(&0x0000_1000), Some(&expected_info));
@@ -5611,7 +5611,7 @@ fn append_arena_type_index_for_allocator_duplicate_slot_keeps_first() {
         Some(&ArenaSlotInfo {
             elem_size: 16,
             header_size: 8,
-            payload_btf_type_id: 7,
+            target_type_id: 7,
         }),
         "duplicate slot_start must keep first entry's payload type",
     );
@@ -5641,12 +5641,12 @@ fn append_arena_type_index_for_allocator_multi_allocator_merge() {
     let info_a = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
-        payload_btf_type_id: 7,
+        target_type_id: 7,
     };
     let info_b = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
-        payload_btf_type_id: 11,
+        target_type_id: 11,
     };
     assert_eq!(index.len(), 4);
     assert_eq!(index.get(&0x0000_1000), Some(&info_a));

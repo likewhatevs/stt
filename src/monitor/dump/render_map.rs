@@ -137,7 +137,7 @@ pub(super) type ArenaPageIndex = std::collections::HashMap<u64, usize>;
 ///   `lib/sdt_task_defs.h`). Pointers landing in the first
 ///   `header_size` bytes of the slot are inside the header, not the
 ///   payload.
-/// - `payload_btf_type_id` — the BTF type id of the payload struct
+/// - `target_type_id` — the BTF type id of the payload struct
 ///   (everything after the header). Resolved by the sdt_alloc
 ///   pre-pass via [`super::super::sdt_alloc::discover_payload_btf_id`]
 ///   from `payload_size = elem_size - header_size`.
@@ -161,7 +161,7 @@ pub(super) type ArenaPageIndex = std::collections::HashMap<u64, usize>;
 pub(super) struct ArenaSlotInfo {
     pub(super) elem_size: u32,
     pub(super) header_size: u32,
-    pub(super) payload_btf_type_id: u32,
+    pub(super) target_type_id: u32,
 }
 
 /// `slot_start → ArenaSlotInfo` lookup populated by the sdt_alloc
@@ -268,7 +268,7 @@ pub(super) fn build_arena_page_index(
 /// produced (`SdtAllocEntry::user_addr` already masked to the low
 /// 32 bits — see
 /// [`super::super::sdt_alloc::TreeWalker::emit_leaf`]).
-/// `payload_btf_type_id` is the resolved per-slot payload type;
+/// `target_type_id` is the resolved per-slot payload type;
 /// `header_size` and `elem_size` come from the allocator's `pool`
 /// metadata via [`super::super::sdt_alloc::SdtAllocOffsets`] +
 /// `walk_sdt_allocator`.
@@ -278,7 +278,7 @@ pub(super) fn build_arena_page_index(
 /// is 8 on every kernel that ships sdt_alloc and `elem_size` is
 /// bounded above by `MAX_ELEM_SIZE = 4096` in the walker, so the
 /// conversions never fail in practice; a future drift surfaces as
-/// a no-op rather than a panic. `payload_btf_type_id == 0` short-
+/// a no-op rather than a panic. `target_type_id == 0` short-
 /// circuits — the bridge filters zero ids as "no payload type" and
 /// adding such entries would just point every chase at 0.
 ///
@@ -296,14 +296,14 @@ pub(super) fn build_arena_page_index(
 pub(super) fn append_arena_type_index_for_allocator<'a, I>(
     index: &mut ArenaTypeIndex,
     allocator_name: &str,
-    payload_btf_type_id: u32,
+    target_type_id: u32,
     header_size: usize,
     elem_size: u64,
     entries: I,
 ) where
     I: IntoIterator<Item = &'a super::super::sdt_alloc::SdtAllocEntry>,
 {
-    if payload_btf_type_id == 0 {
+    if target_type_id == 0 {
         return;
     }
     let Ok(header_low32) = u32::try_from(header_size) else {
@@ -315,7 +315,7 @@ pub(super) fn append_arena_type_index_for_allocator<'a, I>(
     let info = ArenaSlotInfo {
         elem_size: elem_low32,
         header_size: header_low32,
-        payload_btf_type_id,
+        target_type_id,
     };
     for entry in entries {
         // `user_addr` is the slot-start address already masked to
@@ -338,8 +338,8 @@ pub(super) fn append_arena_type_index_for_allocator<'a, I>(
                 // — `debug` would have hidden the cause.
                 tracing::warn!(
                     slot_start = format_args!("{:#x}", slot_start),
-                    first_btf_type_id = o.get().payload_btf_type_id,
-                    duplicate_btf_type_id = payload_btf_type_id,
+                    first_target_type_id = o.get().target_type_id,
+                    duplicate_target_type_id = target_type_id,
                     allocator = %allocator_name,
                     "sdt_alloc bridge has duplicate slot_start (low-32 collision \
                      across allocators or torn snapshot); keeping first entry",
@@ -411,12 +411,12 @@ pub(super) fn resolve_arena_type_in_index(
     let offset_in_slot = key - slot_start;
     if offset_in_slot == 0 {
         Some(ArenaResolveHit {
-            target_type_id: info.payload_btf_type_id,
+            target_type_id: info.target_type_id,
             header_skip: info.header_size as usize,
         })
     } else if offset_in_slot == info.header_size {
         Some(ArenaResolveHit {
-            target_type_id: info.payload_btf_type_id,
+            target_type_id: info.target_type_id,
             header_skip: 0,
         })
     } else {
@@ -814,7 +814,7 @@ impl<'a> GuestMemMapAccessor<'a> {
 /// `struct sdt_data __arena *` entry pointers into typed payload
 /// renders.
 ///
-/// `payload_btf_type_id` and `header_size` come from the sdt_alloc
+/// `target_type_id` and `header_size` come from the sdt_alloc
 /// pre-pass: `discover_payload_btf_id` matches `payload_size = elem_size
 /// - sizeof(sdt_data)` against program-BTF struct sizes, and
 /// [`super::super::sdt_alloc::SdtAllocOffsets::data_header_size`]
@@ -824,7 +824,7 @@ impl<'a> GuestMemMapAccessor<'a> {
 /// `pool.elem_size`; the renderer reads `elem_size` bytes from the arena
 /// at each entry's `data` pointer, skips `header_size` bytes, and
 /// renders the remaining `payload_size = elem_size - header_size` bytes
-/// against `payload_btf_type_id`.
+/// against `target_type_id`.
 ///
 /// `kern_vm_start` is the kernel-side base of the arena's user_vm
 /// window — `bpf_arena.kern_vm->addr + GUARD_HALF`, the same value
@@ -848,7 +848,7 @@ pub(super) struct SdtAllocMeta {
     pub(super) allocator_name: String,
     pub(super) elem_size: u64,
     pub(super) header_size: usize,
-    pub(super) payload_btf_type_id: u32,
+    pub(super) target_type_id: u32,
     pub(super) kern_vm_start: u64,
 }
 
@@ -1183,7 +1183,7 @@ fn resolve_struct_ops_payload_type_id(btf: &Btf, wrapper_type_id: u32) -> Option
 }
 
 /// Read the `struct sdt_data __arena *` pointer out of `value_bytes` at
-/// `offset` and render its payload via `meta.payload_btf_type_id`.
+/// `offset` and render its payload via `meta.target_type_id`.
 ///
 /// Returns `None` when:
 /// - `btf`, `field_offset`, or `meta` is missing (caller skipped
@@ -1192,7 +1192,7 @@ fn resolve_struct_ops_payload_type_id(btf: &Btf, wrapper_type_id: u32) -> Option
 ///   resolved offset.
 /// - The arena pointer reads as 0 (entry not yet populated by
 ///   `scx_task_alloc`).
-/// - `meta.payload_btf_type_id` is 0 (allocator's payload type was
+/// - `meta.target_type_id` is 0 (allocator's payload type was
 ///   ambiguous or unresolved).
 /// - `meta.elem_size` is smaller than `meta.header_size` (corrupt
 ///   pre-pass metadata).
@@ -1233,7 +1233,7 @@ pub(super) fn chase_sdt_data_payload(
     let btf = btf?;
     let off = field_offset?;
     let meta = meta?;
-    if meta.payload_btf_type_id == 0 {
+    if meta.target_type_id == 0 {
         return None;
     }
     if meta.elem_size as usize <= meta.header_size {
@@ -1263,7 +1263,7 @@ pub(super) fn chase_sdt_data_payload(
     let payload = elem_bytes.get(meta.header_size..)?;
     Some(render_value_with_mem(
         btf,
-        meta.payload_btf_type_id,
+        meta.target_type_id,
         payload,
         mem_reader,
     ))

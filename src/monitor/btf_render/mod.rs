@@ -1580,6 +1580,16 @@ pub struct CrossBtfRef<'a> {
     pub type_id: u32,
 }
 
+/// # CrossBtfMemReader contract
+///
+/// [`CrossBtfMemReader`] wraps a `&dyn MemReader` and selectively
+/// suppresses id-keyed lookups (cast_lookup, resolve_arena_type)
+/// at cross-BTF boundaries. When adding a new method to this trait:
+/// check whether the method is id-keyed (operates on BTF type IDs
+/// from the entry BTF). If yes, CrossBtfMemReader MUST override it
+/// to return `None`/default. If no (raw addresses, string names),
+/// CrossBtfMemReader should delegate to inner. Failing to audit
+/// causes silent wrong-renders in cross-BTF chase paths.
 pub trait MemReader {
     fn read_kva(&self, kva: u64, len: usize) -> Option<Vec<u8>>;
     /// Check if an address is in the arena range. Arena pointers
