@@ -1,4 +1,3 @@
-
 //! Unit coverage for the freeze-rendezvous decision logic that
 //! lives inside the run-loop closure: `expected_parks`
 //! arithmetic, the still-parked pre-seed compensation, and the

@@ -1,4 +1,3 @@
-
 //! Unit coverage for the TLV-based snapshot req/reply wiring.
 //!
 //! `decode_snapshot_request` and `frame_snapshot_reply` are

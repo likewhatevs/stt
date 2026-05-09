@@ -2659,8 +2659,7 @@ fn render_member(
         && let Type::Array(arr) = &member_ty
         && let (Ok(elem_tid), Some(elem_size)) = (
             arr.get_type_id(),
-            peel_modifiers(btf, arr.get_type_id().unwrap_or(0))
-                .and_then(|t| type_size(btf, &t)),
+            peel_modifiers(btf, arr.get_type_id().unwrap_or(0)).and_then(|t| type_size(btf, &t)),
         )
         && elem_size == 8
         && let Some(elem_term) = peel_modifiers(btf, elem_tid)
@@ -2681,9 +2680,7 @@ fn render_member(
             let mut elements = Vec::with_capacity(cap);
             for i in 0..cap {
                 let elem_off = byte_off + i * 8;
-                let elem_bytes = parent_bytes
-                    .get(elem_off..elem_off + 8)
-                    .unwrap_or_default();
+                let elem_bytes = parent_bytes.get(elem_off..elem_off + 8).unwrap_or_default();
                 if let Some(rv) = try_cast_intercept(
                     btf,
                     (parent, elem_off),
@@ -3237,12 +3234,7 @@ fn resolve_chase_target<'a>(
     let btf_size = {
         let Some(sz) = type_size(current_btf, &target_ty) else {
             return ChaseResolve::Skip {
-                reason: unsizable_chase_reason(
-                    current_btf,
-                    kind_label,
-                    target_type_id,
-                    &target_ty,
-                ),
+                reason: unsizable_chase_reason(current_btf, kind_label, target_type_id, &target_ty),
                 sdt_alloc_resolved,
             };
         };

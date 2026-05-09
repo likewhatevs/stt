@@ -2614,6 +2614,13 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // for fields the analyzer recovered.
             cast_map,
             None,
+            // The sdt_alloc pre-pass populates `sdt_alloc_metas`
+            // itself; the metas slice is empty until this loop
+            // finishes, so pass an empty slice here. The
+            // metas-driven fallback only fires for the per-map
+            // renders below (after this loop has produced every
+            // allocator's metadata).
+            &[],
             // The sdt_alloc pre-pass reads BTF type metadata for
             // the typed allocator payload from the scheduler's
             // own program BTF; no cross-BTF Fwd resolution is

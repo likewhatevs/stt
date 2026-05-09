@@ -917,7 +917,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 42,
             payload_type_reason: String::new(),
-        all_slot_addrs: Vec::new(),
+            all_slot_addrs: Vec::new(),
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let parsed: SdtAllocatorSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -940,7 +940,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 0,
             payload_type_reason: String::new(),
-        all_slot_addrs: Vec::new(),
+            all_slot_addrs: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"truncated\":true"));
@@ -956,7 +956,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 0,
             payload_type_reason: "no candidate of size 16".into(),
-        all_slot_addrs: Vec::new(),
+            all_slot_addrs: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"payload_type_reason\":\"no candidate of size 16\""));
@@ -1028,7 +1028,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 42,
             payload_type_reason: String::new(),
-        all_slot_addrs: Vec::new(),
+            all_slot_addrs: Vec::new(),
         };
         let out = format!("{snap}");
         assert!(
@@ -1054,7 +1054,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 0,
             payload_type_reason: "no candidate of size 16".into(),
-        all_slot_addrs: Vec::new(),
+            all_slot_addrs: Vec::new(),
         };
         let out = format!("{snap}");
         assert!(out.contains("(truncated)"), "missing truncated: {out}");

@@ -1,4 +1,3 @@
-
 //! Coverage for the production TOKEN_TX `match
 //! MsgType::from_wire(...)` arm structure inside the freeze
 //! coordinator's run-loop closure.

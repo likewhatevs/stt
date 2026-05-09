@@ -1,4 +1,3 @@
-
 //! Unit coverage for the TOKEN_TX dispatch's CRC-gated promotion
 //! and decode paths.
 //!

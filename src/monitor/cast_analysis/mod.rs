@@ -1435,11 +1435,15 @@ impl<'a> Analyzer<'a> {
                 // the renderer's `(parent, member_offset)` lookup
                 // matches `VarSecinfo` boundaries. For struct
                 // members, the queried offset IS the member start.
-                let canonical_field_off = match &member {
-                    MemberAt::Struct { .. } => field_off,
+                let (canonical_parent, canonical_field_off) = match &member {
+                    MemberAt::Struct {
+                        resolved_parent_type_id,
+                        resolved_member_offset,
+                        ..
+                    } => (*resolved_parent_type_id, *resolved_member_offset),
                     MemberAt::Datasec {
                         var_byte_offset, ..
-                    } => *var_byte_offset,
+                    } => (parent_btf_id, *var_byte_offset),
                 };
                 match (size_bytes, resolved) {
                     // Ptr field directly -- BTF already typed.
@@ -1495,19 +1499,19 @@ impl<'a> Analyzer<'a> {
                             // still an arena VA.
                             let dst_state = if self
                                 .arena_stx_findings
-                                .contains_key(&(parent_btf_id, canonical_field_off))
+                                .contains_key(&(canonical_parent, canonical_field_off))
                             {
                                 RegState::ArenaU64FromAlloc
                             } else {
                                 RegState::LoadedU64Field {
-                                    source_struct_id: parent_btf_id,
+                                    source_struct_id: canonical_parent,
                                     field_offset: canonical_field_off,
                                 }
                             };
                             self.set_reg(dst, dst_state);
-                            self.note_type_id(parent_btf_id);
+                            self.note_type_id(canonical_parent);
                             self.patterns
-                                .entry((parent_btf_id, canonical_field_off))
+                                .entry((canonical_parent, canonical_field_off))
                                 .or_default();
                         } else {
                             self.set_reg(dst, RegState::Unknown);
@@ -1705,14 +1709,18 @@ impl<'a> Analyzer<'a> {
         // boundary. Lookups through the BSS-DATASEC parent then
         // surface the per-variable kptr / arena finding just like
         // a struct member would.
-        let canonical_field_off = match member {
-            MemberAt::Struct { .. } => field_off,
+        let (canonical_parent, canonical_field_off) = match &member {
+            MemberAt::Struct {
+                resolved_parent_type_id,
+                resolved_member_offset,
+                ..
+            } => (*resolved_parent_type_id, *resolved_member_offset),
             MemberAt::Datasec {
                 var_byte_offset, ..
-            } => var_byte_offset,
+            } => (parent_btf_id, *var_byte_offset),
         };
-        self.note_type_id(parent_btf_id);
-        let key = (parent_btf_id, canonical_field_off);
+        self.note_type_id(canonical_parent);
+        let key = (canonical_parent, canonical_field_off);
         match value_state {
             StxValueKind::Kptr { target } => {
                 // Self-store is almost always a structural error
@@ -2458,8 +2466,16 @@ fn member_size_bytes(btf: &Btf, m: &btf_rs::Member) -> Option<u32> {
 enum MemberAt {
     /// Hit on a `BTF_KIND_STRUCT` / `BTF_KIND_UNION` member at the
     /// queried byte offset. `member_type_id` is the BTF id of the
-    /// member's declared type.
-    Struct { member_type_id: u32 },
+    /// member's declared type. `resolved_parent_type_id` is the
+    /// BTF id of the struct that directly contains this member —
+    /// for nested structs this is the INNERMOST struct, not the
+    /// outermost base register's struct. The CastMap keys on this
+    /// id so the renderer's per-struct cast_lookup matches.
+    Struct {
+        member_type_id: u32,
+        resolved_parent_type_id: u32,
+        resolved_member_offset: u32,
+    },
     /// Hit on a `BTF_KIND_DATASEC` `VarSecinfo` whose byte range
     /// contains the queried offset. `var_underlying_type_id` is
     /// the BTF id of the `BTF_KIND_VAR`'s underlying type (the
@@ -2481,7 +2497,7 @@ impl MemberAt {
     /// kptr slot.
     fn member_type_id(&self) -> u32 {
         match self {
-            Self::Struct { member_type_id } => *member_type_id,
+            Self::Struct { member_type_id, .. } => *member_type_id,
             Self::Datasec {
                 var_underlying_type_id,
                 ..
@@ -2524,25 +2540,42 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                 let member_off = bit_off / 8;
                 let member_type_id = m.get_type_id().ok()?;
                 if member_off == byte_offset {
-                    return Some(MemberAt::Struct { member_type_id });
+                    return Some(MemberAt::Struct {
+                        member_type_id,
+                        resolved_parent_type_id: parent_type_id,
+                        resolved_member_offset: byte_offset,
+                    });
                 }
                 if member_off < byte_offset
-                    && let Some(Type::Array(arr)) =
-                        super::btf_render::peel_modifiers(btf, member_type_id)
+                    && let Some(terminal) = super::btf_render::peel_modifiers(btf, member_type_id)
                 {
-                    let elem_tid = arr.get_type_id().ok()?;
-                    let elem_size = super::btf_render::type_size(btf, &{
-                        super::btf_render::peel_modifiers(btf, elem_tid)?
-                    })? as u32;
-                    if elem_size > 0 {
-                        let arr_len = arr.len() as u32;
-                        let arr_byte_size = elem_size * arr_len;
-                        let rel = byte_offset - member_off;
-                        if rel < arr_byte_size && rel.is_multiple_of(elem_size) {
-                            return Some(MemberAt::Struct {
-                                member_type_id: elem_tid,
-                            });
+                    match &terminal {
+                        Type::Array(arr) => {
+                            let elem_tid = arr.get_type_id().ok()?;
+                            let elem_size = super::btf_render::type_size(btf, &{
+                                super::btf_render::peel_modifiers(btf, elem_tid)?
+                            })? as u32;
+                            if elem_size > 0 {
+                                let arr_len = arr.len() as u32;
+                                let arr_byte_size = elem_size * arr_len;
+                                let rel = byte_offset - member_off;
+                                if rel < arr_byte_size && rel.is_multiple_of(elem_size) {
+                                    return Some(MemberAt::Struct {
+                                        member_type_id: elem_tid,
+                                        resolved_parent_type_id: parent_type_id,
+                                        resolved_member_offset: byte_offset,
+                                    });
+                                }
+                            }
                         }
+                        Type::Struct(_) | Type::Union(_) => {
+                            let member_size = super::btf_render::type_size(btf, &terminal)? as u32;
+                            let rel = byte_offset - member_off;
+                            if rel < member_size {
+                                return struct_member_at(btf, member_type_id, rel);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

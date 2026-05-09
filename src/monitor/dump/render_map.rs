@@ -452,6 +452,7 @@ pub(super) fn resolve_arena_type_with_static_fallback(
     arena_snapshot: Option<&super::super::arena::ArenaSnapshot>,
     arena_type_index: Option<&ArenaTypeIndex>,
     scx_static_index: Option<&super::super::scx_static_alloc::ScxStaticRangeIndex>,
+    sdt_alloc_metas: &[SdtAllocMeta],
     addr: u64,
 ) -> Option<ArenaResolveHit> {
     if let Some(hit) = resolve_arena_type_in_index(arena_snapshot, arena_type_index, addr) {
@@ -474,6 +475,27 @@ pub(super) fn resolve_arena_type_with_static_fallback(
              type recovery available, falling through to caller's \
              skip path",
         );
+        return None;
+    }
+    // Meta fallback: if the address is in the arena range and at
+    // least one sdt_alloc meta has a resolved payload type, use
+    // that as a best-effort resolve. Covers allocations missed by
+    // the index (snapshot truncation, MAX_SDT_ALLOC_ENTRIES cap).
+    // Same data chase_sdt_data_payload uses — same correctness.
+    if is_arena_addr_in_snapshot(arena_snapshot, addr)
+        && let Some(meta) = sdt_alloc_metas.iter().find(|m| m.target_type_id != 0)
+    {
+        tracing::debug!(
+            addr = format_args!("{:#x}", addr),
+            target_type_id = meta.target_type_id,
+            header_size = meta.header_size,
+            allocator = %meta.allocator_name,
+            "resolve_arena_type: index miss, falling back to sdt_alloc meta",
+        );
+        return Some(ArenaResolveHit {
+            target_type_id: meta.target_type_id,
+            header_skip: meta.header_size,
+        });
     }
     None
 }
@@ -531,6 +553,16 @@ struct AccessorMemReader<'a> {
     /// without a complete sibling in the BTF surfaces as
     /// "forward declaration; body not in this BTF".
     arena_type_index: Option<&'a ArenaTypeIndex>,
+    /// Discovered sdt_alloc allocator metadata for the dump pass.
+    /// When [`Self::arena_type_index`] misses but the chased address
+    /// lies inside the arena window, the
+    /// [`MemReader::resolve_arena_type`] override falls back to the
+    /// first metadata entry with a resolved `target_type_id`, using
+    /// it as a best-effort payload type. Covers allocations the
+    /// per-slot index could not capture (snapshot truncation,
+    /// `MAX_SDT_ALLOC_ENTRIES` cap). Empty slice (no allocator with
+    /// a typed payload was discovered) disables the fallback.
+    sdt_alloc_metas: &'a [SdtAllocMeta],
     /// Optional cross-BTF Fwd resolution context — see
     /// [`CrossBtfFwdIndex`]. When `Some`, the
     /// [`MemReader::cross_btf_resolve_fwd`] override looks up
@@ -662,6 +694,7 @@ impl MemReader for AccessorMemReader<'_> {
             self.arena_snapshot,
             self.arena_type_index,
             self.scx_static_index,
+            self.sdt_alloc_metas,
             addr,
         )
     }
@@ -786,6 +819,7 @@ impl<'a> GuestMemMapAccessor<'a> {
         num_cpus: u32,
         cast_map: Option<&'a CastMap>,
         arena_type_index: Option<&'a ArenaTypeIndex>,
+        sdt_alloc_metas: &'a [SdtAllocMeta],
         cross_btf_fwd_index: Option<&'a CrossBtfFwdIndex<'a>>,
         scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
     ) -> impl MemReader + 'a {
@@ -796,6 +830,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             num_cpus,
             cast_map,
             arena_type_index,
+            sdt_alloc_metas,
             cross_btf_fwd_index,
             scx_static_index,
         }
@@ -1417,6 +1452,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         num_cpus,
         cast_map,
         arena_type_index,
+        sdt_alloc_metas,
         cross_btf_fwd_index,
         scx_static_index,
     );
