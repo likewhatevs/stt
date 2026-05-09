@@ -785,6 +785,7 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// complete struct/union definitions) keeps the renderer's
     /// default "forward declaration; body not in this BTF" skip
     /// path intact.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn mem_reader(
         &self,
         arena_snapshot: Option<&'a super::super::arena::ArenaSnapshot>,

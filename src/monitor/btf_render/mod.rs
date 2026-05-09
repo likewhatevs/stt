@@ -2655,64 +2655,60 @@ fn render_member(
         return rv;
     }
 
-    if let Some(parent) = parent_type_id {
-        if let Type::Array(arr) = &member_ty {
-            if let (Ok(elem_tid), Some(elem_size)) = (
-                arr.get_type_id(),
-                peel_modifiers(btf, arr.get_type_id().unwrap_or(0))
-                    .and_then(|t| type_size(btf, &t)),
-            ) {
-                if elem_size == 8 {
-                    if let Some(elem_term) = peel_modifiers(btf, elem_tid) {
-                        if matches!(
-                            elem_term,
-                            Type::Int(ref i) if i.size() == 8 && !i.is_signed() && !i.is_bool() && !i.is_char()
-                        ) {
-                            let arr_len = arr.len();
-                            let has_any_cast = mem.map_or(false, |m| {
-                                (0..arr_len).any(|i| {
-                                    let elem_off = (byte_off + i * 8) as u32;
-                                    m.cast_lookup(parent, elem_off).is_some()
-                                })
-                            });
-                            if has_any_cast {
-                                let cap = arr_len.min(MAX_ARRAY_ELEMS);
-                                let mut elements = Vec::with_capacity(cap);
-                                for i in 0..cap {
-                                    let elem_off = byte_off + i * 8;
-                                    let elem_bytes = parent_bytes
-                                        .get(elem_off..elem_off + 8)
-                                        .unwrap_or_default();
-                                    if let Some(rv) = try_cast_intercept(
-                                        btf,
-                                        (parent, elem_off),
-                                        &elem_term,
-                                        elem_bytes,
-                                        depth + 1,
-                                        mem,
-                                        visited,
-                                    ) {
-                                        elements.push(rv);
-                                    } else {
-                                        elements.push(render_value_inner(
-                                            btf,
-                                            elem_tid,
-                                            elem_bytes,
-                                            depth + 1,
-                                            mem,
-                                            visited,
-                                        ));
-                                    }
-                                }
-                                return RenderedValue::Array {
-                                    len: arr_len,
-                                    elements,
-                                };
-                            }
-                        }
-                    }
+    if let Some(parent) = parent_type_id
+        && let Type::Array(arr) = &member_ty
+        && let (Ok(elem_tid), Some(elem_size)) = (
+            arr.get_type_id(),
+            peel_modifiers(btf, arr.get_type_id().unwrap_or(0))
+                .and_then(|t| type_size(btf, &t)),
+        )
+        && elem_size == 8
+        && let Some(elem_term) = peel_modifiers(btf, elem_tid)
+        && matches!(
+            elem_term,
+            Type::Int(ref i) if i.size() == 8 && !i.is_signed() && !i.is_bool() && !i.is_char()
+        )
+    {
+        let arr_len = arr.len();
+        let has_any_cast = mem.is_some_and(|m| {
+            (0..arr_len).any(|i| {
+                let elem_off = (byte_off + i * 8) as u32;
+                m.cast_lookup(parent, elem_off).is_some()
+            })
+        });
+        if has_any_cast {
+            let cap = arr_len.min(MAX_ARRAY_ELEMS);
+            let mut elements = Vec::with_capacity(cap);
+            for i in 0..cap {
+                let elem_off = byte_off + i * 8;
+                let elem_bytes = parent_bytes
+                    .get(elem_off..elem_off + 8)
+                    .unwrap_or_default();
+                if let Some(rv) = try_cast_intercept(
+                    btf,
+                    (parent, elem_off),
+                    &elem_term,
+                    elem_bytes,
+                    depth + 1,
+                    mem,
+                    visited,
+                ) {
+                    elements.push(rv);
+                } else {
+                    elements.push(render_value_inner(
+                        btf,
+                        elem_tid,
+                        elem_bytes,
+                        depth + 1,
+                        mem,
+                        visited,
+                    ));
                 }
             }
+            return RenderedValue::Array {
+                len: arr_len,
+                elements,
+            };
         }
     }
 
@@ -3032,7 +3028,7 @@ fn apply_header_skip(raw_bytes: &[u8], header_skip: usize) -> Option<&[u8]> {
 ///   with a "type id unresolvable" skip reason against an id that is
 ///   only meaningful in the entry BTF.
 ///
-/// - [`MemReader::resolve_arena_type`]: the
+/// - [`MemReader::resolve_arena_type`][]: the
 ///   [`super::dump::render_map::ArenaTypeIndex`] populates
 ///   [`ArenaResolveHit::target_type_id`] with BTF type ids resolved
 ///   against the **entry BTF** at index-build time (the sdt_alloc

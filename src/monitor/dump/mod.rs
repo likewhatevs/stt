@@ -2775,19 +2775,18 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // rather than returning a wrong type — the "no invalid data
     // made" contract.
     let scx_static_t0 = std::time::Instant::now();
-    if !deadline_exceeded(&mut truncated_at_us) {
-        if let Some((bss_bytes, prog_btf)) = relocate_sched_bss(&maps, accessor, &program_btfs)
-            && let Ok(scx_static_offsets) =
-                crate::monitor::scx_static_alloc::ScxStaticOffsets::from_btf(prog_btf)
-        {
-            let snap = crate::monitor::scx_static_alloc::walk_scx_static(
-                &bss_bytes,
-                &scx_static_offsets,
-                iter_bss_vars_with_type(prog_btf, ".bss"),
-                |type_id| is_scx_static_type(prog_btf, type_id),
-            );
-            report.scx_static_ranges = snap;
-        }
+    if !deadline_exceeded(&mut truncated_at_us)
+        && let Some((bss_bytes, prog_btf)) = relocate_sched_bss(&maps, accessor, &program_btfs)
+        && let Ok(scx_static_offsets) =
+            crate::monitor::scx_static_alloc::ScxStaticOffsets::from_btf(prog_btf)
+    {
+        let snap = crate::monitor::scx_static_alloc::walk_scx_static(
+            &bss_bytes,
+            &scx_static_offsets,
+            iter_bss_vars_with_type(prog_btf, ".bss"),
+            |type_id| is_scx_static_type(prog_btf, type_id),
+        );
+        report.scx_static_ranges = snap;
     }
     let scx_static_index =
         crate::monitor::scx_static_alloc::build_scx_static_range_index(&report.scx_static_ranges);

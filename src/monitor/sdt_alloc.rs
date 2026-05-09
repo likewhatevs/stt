@@ -1271,8 +1271,8 @@ mod tests {
     /// Header layout matches `cast_analysis::tests::build_btf`:
     /// 24-byte header (magic + version + flags + hdr_len + type_off
     /// + type_len + str_off + str_len) followed by the type section
-    /// then the string section. Type ids start at 1 (id 0 is Void)
-    /// and increase in `types` order.
+    ///   then the string section. Type ids start at 1 (id 0 is Void)
+    ///   and increase in `types` order.
     fn sdta_build_btf(types: &[SdtaSynType], strings: &[u8]) -> Vec<u8> {
         let mut type_section: Vec<u8> = Vec::new();
         for ty in types {

@@ -29,6 +29,13 @@ const BTF_HEADER_LEN: u32 = 24;
 
 const BTF_KIND_INT: u32 = 1;
 const BTF_KIND_PTR: u32 = 2;
+/// `BTF_KIND_ARRAY = 3` — fixed-length array. Wire layout:
+/// header + `btf_array { u32 type, u32 index_type, u32 nelems }`
+/// (12 bytes after the 12-byte common header). Per linux uapi
+/// `btf.h` and `btf-rs::cbtf::btf_array`, an Array's `size_type`
+/// field in the common header is 0 (storage size derives from
+/// `elem_size * nelems`, not the header).
+const BTF_KIND_ARRAY: u32 = 3;
 const BTF_KIND_STRUCT: u32 = 4;
 const BTF_KIND_UNION: u32 = 5;
 const BTF_KIND_FWD: u32 = 7;
@@ -105,6 +112,18 @@ enum SynType {
     },
     Ptr {
         type_id: u32,
+    },
+    /// `BTF_KIND_ARRAY` — fixed-length array. Wire layout:
+    /// header (with `name_off=0`, `vlen=0`, `kind_flag=0`,
+    /// `size_type=0` per linux uapi `btf.h`) followed by
+    /// `btf_array { u32 type, u32 index_type, u32 nelems }`
+    /// (12 bytes), matching `btf-rs::cbtf::btf_array::from_reader`.
+    /// `type_id` is the element type, `index_type_id` is the
+    /// index type (typically `u32`), `nelems` is the array length.
+    Array {
+        type_id: u32,
+        index_type_id: u32,
+        nelems: u32,
     },
     Struct {
         name_off: u32,
@@ -240,6 +259,27 @@ fn build_btf(types: &[SynType], strings: &[u8]) -> Vec<u8> {
                 let info = (BTF_KIND_PTR << 24) & 0x1f00_0000;
                 type_section.extend_from_slice(&info.to_le_bytes());
                 type_section.extend_from_slice(&type_id.to_le_bytes());
+            }
+            SynType::Array {
+                type_id,
+                index_type_id,
+                nelems,
+            } => {
+                // Per linux uapi `btf.h` (`btf_array_check_meta`):
+                // ARRAY's `name_off`, `vlen`, `kind_flag`, and
+                // `size_type` are all 0; the trailing `btf_array`
+                // record carries `type`, `index_type`, `nelems`.
+                let name_off: u32 = 0;
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let info = (BTF_KIND_ARRAY << 24) & 0x1f00_0000;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                let size_type: u32 = 0;
+                type_section.extend_from_slice(&size_type.to_le_bytes());
+                // Trailing `btf_array` (12 bytes) — matches
+                // `btf-rs::cbtf::btf_array::from_reader` field order.
+                type_section.extend_from_slice(&type_id.to_le_bytes());
+                type_section.extend_from_slice(&index_type_id.to_le_bytes());
+                type_section.extend_from_slice(&nelems.to_le_bytes());
             }
             SynType::Struct {
                 name_off,
@@ -9274,5 +9314,114 @@ fn three_way_conflict_arena_kptr_pattern_drops_all() {
     assert!(
         map.is_empty(),
         "arena + kptr + pattern on same slot must all drop: {map:?}"
+    );
+}
+
+/// Verify `struct_member_at` recognises offsets that land INSIDE
+/// an array member as the array's element type. The new code peels
+/// the member type, detects `Type::Array(arr)`, and uses
+/// `arr.len()` × `elem_size` to bound `byte_offset` relative to
+/// `member_off`; matches with `(byte_offset - member_off) % elem_size
+/// == 0` return `MemberAt::Struct { member_type_id: elem_tid }` so
+/// the LDX / STX paths see the element's BTF type rather than the
+/// array's.
+///
+/// Pattern: `struct T { u64 history[4] @ 0 }`. The third element
+/// (`history[2]`) sits at byte offset 16. The BPF program loads
+/// from `r1 + 16`, casts the loaded u64 with `bpf_addr_space_cast
+/// (off=1, imm=1)` so the source slot tags `arena_confirmed`, and
+/// stores the cast result back into the same slot. The cast →
+/// confirmed path keys on `(parent_struct_id, field_offset)` —
+/// without the array peel that landed `field_offset = 16` in
+/// `struct_member_at`, the LDX would have dropped the destination
+/// register to `Unknown` and `arena_confirmed` would never have
+/// gained `(3, 16)`. The presence of `(3, 16)` in the resulting
+/// `CastMap` is the witness that the array peel produced
+/// `MemberAt::Struct { member_type_id = u64_id }`, allowing the
+/// LDX `Plain u64 field` arm to set `LoadedU64Field { ... ,
+/// field_offset: 16 }` — the prerequisite for the cast-driven
+/// arena confirmation.
+#[test]
+fn struct_member_at_resolves_array_element_offset() {
+    // Strings: \0 + names. `_n_index` keeps the index-type name
+    // alive so the string section retains a stable layout if more
+    // names are added later.
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = push_name(&mut strings, "u64");
+    let _n_index = push_name(&mut strings, "u32");
+    let n_t = push_name(&mut strings, "T");
+    let n_history = push_name(&mut strings, "history");
+
+    // id 1: u64 (size=8, bits=64). Used as array element type AND
+    //       as the index-type stand-in (the analyzer never inspects
+    //       the index type, so we reuse id 1 to keep the BTF small).
+    // id 2: u64[4] — 32-byte total, array-of-u64.
+    // id 3: struct T { u64 history[4] @ 0 } — size 32.
+    let types = vec![
+        SynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        SynType::Array {
+            type_id: 1,
+            index_type_id: 1,
+            nelems: 4,
+        },
+        SynType::Struct {
+            name_off: n_t,
+            size: 32,
+            members: vec![SynMember {
+                name_off: n_history,
+                type_id: 2,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    let t_id = 3u32;
+
+    // r2 = *(u64 *)(r1 + 16)         -- load history[2]
+    // r4 = bpf_addr_space_cast(r2, 0, 1)
+    //                                 -- arena_confirmed gains (T, 16)
+    // *(u64 *)(r1 + 16) = r4         -- STX back into the same slot
+    //
+    // The first LDX is the array-recognition exercise: with r1 typed
+    // `Pointer{T}`, `struct_member_at(btf, 3, 16)` walks the single
+    // member at offset 0, peels its type to `Type::Array(u64; 4)`,
+    // computes `elem_size = 8` × `nelems = 4 = 32`, checks `16 < 32
+    // && 16 % 8 == 0`, and returns `MemberAt::Struct { member_type_id
+    // = 1 (u64) }`. The Plain u64 field arm then tags r2 as
+    // `LoadedU64Field { source_struct_id: 3, field_offset: 16 }` —
+    // canonical_field_off = 16 because `MemberAt::Struct` keys on
+    // the queried offset directly. The addr_space_cast inserts (3,
+    // 16) into `arena_confirmed`. Without the array peel the LDX
+    // would have dropped r2 to Unknown and the cast would have been
+    // a no-op for arena_confirmed.
+    let insns = vec![
+        ldx(BPF_SIZE_DW, 2, 1, 16),
+        addr_space_cast(4, 2, 1),
+        stx(BPF_SIZE_DW, 1, 4, 16),
+        exit(),
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 1,
+            struct_type_id: t_id,
+        }],
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        map.contains_key(&(t_id, 16)),
+        "(T={t_id}, 16) — third u64 element of `history[4]` — must \
+         appear in the cast map after struct_member_at peels the \
+         array member type to `u64`: {map:?}"
     );
 }

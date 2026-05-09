@@ -2526,23 +2526,22 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                 if member_off == byte_offset {
                     return Some(MemberAt::Struct { member_type_id });
                 }
-                if member_off < byte_offset {
-                    if let Some(terminal) = super::btf_render::peel_modifiers(btf, member_type_id) {
-                        if let Type::Array(arr) = &terminal {
-                            let elem_tid = arr.get_type_id().ok()?;
-                            let elem_size = super::btf_render::type_size(btf, &{
-                                super::btf_render::peel_modifiers(btf, elem_tid)?
-                            })? as u32;
-                            if elem_size > 0 {
-                                let arr_len = arr.len() as u32;
-                                let arr_byte_size = elem_size * arr_len;
-                                let rel = byte_offset - member_off;
-                                if rel < arr_byte_size && rel % elem_size == 0 {
-                                    return Some(MemberAt::Struct {
-                                        member_type_id: elem_tid,
-                                    });
-                                }
-                            }
+                if member_off < byte_offset
+                    && let Some(Type::Array(arr)) =
+                        super::btf_render::peel_modifiers(btf, member_type_id)
+                {
+                    let elem_tid = arr.get_type_id().ok()?;
+                    let elem_size = super::btf_render::type_size(btf, &{
+                        super::btf_render::peel_modifiers(btf, elem_tid)?
+                    })? as u32;
+                    if elem_size > 0 {
+                        let arr_len = arr.len() as u32;
+                        let arr_byte_size = elem_size * arr_len;
+                        let rel = byte_offset - member_off;
+                        if rel < arr_byte_size && rel.is_multiple_of(elem_size) {
+                            return Some(MemberAt::Struct {
+                                member_type_id: elem_tid,
+                            });
                         }
                     }
                 }
@@ -2792,10 +2791,10 @@ fn map_value_struct_id(btf: &Btf, datasec_id: u32, var_offset: u32) -> Option<u3
 /// [`crate::vmm::cast_analysis_load`]: that list is for in-tree
 /// library subprograms (BPF-to-BPF calls with `BPF_PSEUDO_CALL`
 /// + symbol resolution against the program ELF); this list is
-/// for kernel kfuncs (`BPF_PSEUDO_KFUNC_CALL` + BTF id resolution
-/// in [`Analyzer::handle_kfunc_call`]). The kernel kfunc and
-/// in-tree subprog code paths are independent — a single name
-/// belongs to exactly one of the two allowlists.
+///   for kernel kfuncs (`BPF_PSEUDO_KFUNC_CALL` + BTF id resolution
+///   in [`Analyzer::handle_kfunc_call`]). The kernel kfunc and
+///   in-tree subprog code paths are independent — a single name
+///   belongs to exactly one of the two allowlists.
 pub(crate) const ARENA_ALLOC_KFUNC_NAMES: &[&str] = &[
     // Generic BPF arena page allocator. Returns `void *` per
     // `kernel/bpf/arena.c::bpf_arena_alloc_pages` (`__bpf_kfunc

@@ -576,8 +576,8 @@ pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashM
 ///   `feat_supported`, which uses `READ_ONCE` / `WRITE_ONCE` and is
 ///   idempotent across racing readers (see
 ///   `libbpf-sys/libbpf/src/features.c::feat_supported`).
-/// All threads call only `attach_kprobe` on the inner reference; no
-/// mutating method is invoked here.
+///   All threads call only `attach_kprobe` on the inner reference; no
+///   mutating method is invoked here.
 ///
 /// `Send` is paired with `Sync` because `std::thread::scope` requires
 /// the captured reference's referent to be `Sync` for `&_` to be

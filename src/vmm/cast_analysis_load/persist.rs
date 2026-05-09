@@ -20,7 +20,7 @@ impl From<AddrSpace> for PersistedAddrSpace {
 }
 
 impl PersistedAddrSpace {
-    fn to_addr_space(self) -> Option<AddrSpace> {
+    fn into_addr_space(self) -> Option<AddrSpace> {
         match self.0 {
             0 => Some(AddrSpace::Arena),
             1 => Some(AddrSpace::Kernel),
@@ -45,10 +45,10 @@ impl From<CastHit> for PersistedCastHit {
 }
 
 impl PersistedCastHit {
-    fn to_cast_hit(self) -> Option<CastHit> {
+    fn into_cast_hit(self) -> Option<CastHit> {
         Some(CastHit {
             target_type_id: self.target_type_id,
-            addr_space: self.addr_space.to_addr_space()?,
+            addr_space: self.addr_space.into_addr_space()?,
         })
     }
 }
@@ -69,7 +69,7 @@ impl From<&FwdIndexEntry> for PersistedFwdIndexEntry {
 }
 
 impl PersistedFwdIndexEntry {
-    fn to_fwd_index_entry(self) -> FwdIndexEntry {
+    fn into_fwd_index_entry(self) -> FwdIndexEntry {
         FwdIndexEntry {
             btfs_idx: self.btfs_idx as usize,
             type_id: self.type_id,
@@ -120,12 +120,12 @@ pub(super) fn try_load(
 
     let mut cast_map = BTreeMap::new();
     for (key, hit) in persisted.cast_entries {
-        cast_map.insert(key, hit.to_cast_hit()?);
+        cast_map.insert(key, hit.into_cast_hit()?);
     }
 
     let mut fwd_index = HashMap::new();
     for (name, entry) in persisted.fwd_entries {
-        fwd_index.insert(name, entry.to_fwd_index_entry());
+        fwd_index.insert(name, entry.into_fwd_index_entry());
     }
 
     tracing::info!(
