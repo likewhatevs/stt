@@ -971,6 +971,7 @@
     const SYN_BTF_KIND_INT: u32 = 1;
     const SYN_BTF_KIND_PTR: u32 = 2;
     const SYN_BTF_KIND_STRUCT: u32 = 4;
+    const SYN_BTF_KIND_FWD: u32 = 7;
     const SYN_BTF_KIND_FUNC: u32 = 12;
     const SYN_BTF_KIND_FUNC_PROTO: u32 = 13;
 
@@ -1013,6 +1014,17 @@
             name_off: u32,
             size: u32,
             members: Vec<SynMember>,
+        },
+        /// `BTF_KIND_FWD` (kind 7) — forward declaration with no body.
+        /// Layout per `include/uapi/linux/btf.h` is the 12-byte common
+        /// `struct btf_type` header (name_off + info + size_type) with
+        /// no trailing payload. `kind_flag` (bit 31 of info) is 0 for
+        /// struct-kind, 1 for union-kind; `Fwd::is_struct()` /
+        /// `Fwd::is_union()` in btf-rs read it back. The third u32 of
+        /// the common header is unused for Fwd and emitted as 0.
+        Fwd {
+            name_off: u32,
+            kind_flag: u32,
         },
         Func {
             name_off: u32,
@@ -1066,6 +1078,19 @@
                         let bit_off = m.byte_offset * 8;
                         type_section.extend_from_slice(&bit_off.to_le_bytes());
                     }
+                }
+                SynKind::Fwd {
+                    name_off,
+                    kind_flag,
+                } => {
+                    type_section.extend_from_slice(&name_off.to_le_bytes());
+                    // Fwd info: kind in bits 24-28, kind_flag in bit
+                    // 31 (struct-vs-union tag), no vlen. The third u32
+                    // of btf_type (size_type) is unused for Fwd.
+                    let info =
+                        ((SYN_BTF_KIND_FWD << 24) & 0x1f00_0000) | ((*kind_flag & 1) << 31);
+                    type_section.extend_from_slice(&info.to_le_bytes());
+                    type_section.extend_from_slice(&0u32.to_le_bytes());
                 }
                 SynKind::Func {
                     name_off,
@@ -3374,6 +3399,189 @@
         );
     }
 
+    /// PhD-F gap G1: cross-BTF Fwd resolution — `BTF_KIND_FWD` entries
+    /// must not register in the index even when no complete body
+    /// shares the name. The renderer's chase consults the index to
+    /// resolve a Fwd terminal to a complete sibling; a Fwd-keyed
+    /// entry would point the chase at another Fwd (no body), defeating
+    /// the index. The function's `if let Type::Struct(s) | Type::Union(s)`
+    /// filter excludes Fwd before the name lookup.
+    ///
+    /// Fixture: BTF #0 declares `struct shared;` (Fwd) at id 2; BTF #1
+    /// defines `struct shared { u64 v @ 0 }` at id 2. Expected:
+    /// `index["shared"] = (1, 2)` — first-write-wins records BTF #1's
+    /// complete body, not BTF #0's Fwd. Even if BTF order were
+    /// reversed (Fwd-bearing BTF traversed first), the Fwd would be
+    /// filtered out so the complete body in the other BTF would still
+    /// win. This test pins the Fwd-skip behaviour explicitly.
+    #[test]
+    fn build_fwd_index_skips_fwd_when_complete_body_in_later_btf() {
+        // BTF #0: forward declaration only — `struct shared;` at id 2.
+        let mut strings_0 = vec![0u8];
+        let n_int_0 = push_btf_name(&mut strings_0, "u64");
+        let n_shared_0 = push_btf_name(&mut strings_0, "shared");
+        let types_0 = vec![
+            // id 1: u64 (filler so id=2 is the Fwd)
+            SynKind::Int {
+                name_off: n_int_0,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: BTF_KIND_FWD `struct shared;` (kind_flag=0 -> struct)
+            SynKind::Fwd {
+                name_off: n_shared_0,
+                kind_flag: 0,
+            },
+        ];
+        let blob_0 = build_btf_full(&types_0, &strings_0);
+        let btf_0 = Arc::new(Btf::from_bytes(&blob_0).expect("parse btf 0"));
+
+        // BTF #1: complete `struct shared { u64 v @ 0 }` at id 2 — the
+        // body the cross-BTF index keys to.
+        let mut strings_1 = vec![0u8];
+        let n_int_1 = push_btf_name(&mut strings_1, "u64");
+        let n_shared_1 = push_btf_name(&mut strings_1, "shared");
+        let n_v_1 = push_btf_name(&mut strings_1, "v");
+        let types_1 = vec![
+            SynKind::Int {
+                name_off: n_int_1,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynKind::Struct {
+                name_off: n_shared_1,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_v_1,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+        ];
+        let blob_1 = build_btf_full(&types_1, &strings_1);
+        let btf_1 = Arc::new(Btf::from_bytes(&blob_1).expect("parse btf 1"));
+
+        // Sanity: BTF #0's id 2 must be a Fwd (proves the synthesizer
+        // emitted the right kind). Without this, a Struct-encoding bug
+        // could pass the assertion below trivially.
+        let ty_0_id_2 = btf_0
+            .resolve_type_by_id(2)
+            .expect("BTF #0 id 2 must resolve");
+        assert!(
+            matches!(ty_0_id_2, Type::Fwd(_)),
+            "BTF #0 id 2 must be Fwd, got {ty_0_id_2:?}"
+        );
+
+        let btfs = vec![btf_0, btf_1];
+        let index = build_fwd_index(&btfs);
+        // The "shared" key must point at BTF #1 (the complete body),
+        // not BTF #0 (the Fwd that should be filtered out).
+        assert_eq!(
+            index.get("shared"),
+            Some(&FwdIndexEntry {
+                btfs_idx: 1,
+                type_id: 2,
+            }),
+            "Fwd in BTF #0 must not register; complete body in BTF #1 wins: {index:?}"
+        );
+        // No spurious entries from BTF #0.
+        assert_eq!(
+            index.len(),
+            1,
+            "only the BTF #1 complete body should be indexed: {index:?}"
+        );
+    }
+
+    /// PhD-F gap G1: a `BTF_KIND_FWD` with `name_off = 0` (no name in
+    /// the strtab) must be silently skipped without panicking the
+    /// id-space walk. The btf-rs parser only registers names when
+    /// `name_off > 0` (see obj.rs `if bt.name_off > 0`), so the type
+    /// entry exists in `types[id]` but has no string-table linkage.
+    /// `build_fwd_index`'s `if let Type::Struct(s) | Type::Union(s)`
+    /// filter excludes the Fwd before the name lookup runs, so
+    /// `resolve_name` is never called on the empty-named Fwd.
+    /// This test pins the no-panic guarantee — a future refactor that
+    /// drops the kind filter (e.g. broadening to also index Typedefs)
+    /// must not panic on a name_off=0 Fwd.
+    #[test]
+    fn build_fwd_index_handles_empty_name_fwd_without_panic() {
+        let mut strings = vec![0u8];
+        let n_int = push_btf_name(&mut strings, "u64");
+        let n_named = push_btf_name(&mut strings, "named");
+        let n_x = push_btf_name(&mut strings, "x");
+        let types = vec![
+            // id 1: u64
+            SynKind::Int {
+                name_off: n_int,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: BTF_KIND_FWD with name_off=0 (no strtab linkage).
+            // The btf-rs name-cache registration block at obj.rs is
+            // skipped because of the `if bt.name_off > 0` gate.
+            SynKind::Fwd {
+                name_off: 0,
+                kind_flag: 0,
+            },
+            // id 3: a complete named struct so the index has at
+            // least one positive entry, proving the walk continued
+            // past the empty-named Fwd at id 2 instead of aborting.
+            SynKind::Struct {
+                name_off: n_named,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_x,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+        ];
+        let blob = build_btf_full(&types, &strings);
+        let btf = Arc::new(Btf::from_bytes(&blob).expect("parse btf"));
+
+        // Sanity: BTF id 2 must be a Fwd (synthesizer encoded the
+        // kind correctly).
+        let ty_id_2 = btf.resolve_type_by_id(2).expect("BTF id 2 must resolve");
+        assert!(
+            matches!(ty_id_2, Type::Fwd(_)),
+            "BTF id 2 must be Fwd, got {ty_id_2:?}"
+        );
+
+        let btfs = vec![btf];
+        // The walk must not panic even though id 2's Fwd has no
+        // strtab name. Filter behaviour: Fwd kind never reaches
+        // `resolve_name`, so the empty-name path is structurally
+        // unreachable for the production filter.
+        let index = build_fwd_index(&btfs);
+        // The empty-named Fwd at id 2 must NOT be present, neither
+        // under "" (anonymous) nor under any other key.
+        assert!(
+            !index.contains_key(""),
+            "empty-string key must not appear (anonymous Fwd): {index:?}"
+        );
+        // The named struct at id 3 must be indexed — proves the walk
+        // continued past the Fwd at id 2 rather than terminating.
+        assert_eq!(
+            index.get("named"),
+            Some(&FwdIndexEntry {
+                btfs_idx: 0,
+                type_id: 3,
+            }),
+            "named struct at id 3 must register after the empty-named Fwd at id 2: {index:?}"
+        );
+        assert_eq!(
+            index.len(),
+            1,
+            "only the named struct should be indexed: {index:?}"
+        );
+    }
+
     /// Two-object end-to-end: object A's BTF declares
     /// `struct cgx_target;` (a `BTF_KIND_FWD`) and references it
     /// via a Ptr field; object B's BTF carries the full body
@@ -3399,12 +3607,13 @@
         let n_field_a = push_btf_name(&mut strings_a, "ptr_to_target");
         let n_func_a = push_btf_name(&mut strings_a, "func_a");
         let n_text_a = push_btf_name(&mut strings_a, ".text");
-        // SynKind doesn't have a Fwd variant in this test fixture,
-        // so we just emit a placeholder Struct (the body content
-        // doesn't matter — the cross-BTF test assertion only
-        // checks the index of the COMPLETE struct from BTF #1).
-        // The `outer_a` struct just exists so analyze_one_object_with_btf
-        // has something to traverse.
+        // This test omits a `cgx_target` Fwd in object A entirely;
+        // the cross-BTF index lookup is exercised purely via object
+        // B's complete body. `build_fwd_index_skips_fwd_when_complete_body_in_later_btf`
+        // covers the Fwd-in-A + body-in-B shape directly with the
+        // `SynKind::Fwd` synthesizer. The `outer_a` struct here just
+        // exists so `analyze_one_object_with_btf` has a non-empty
+        // type table to traverse.
         let types_a = vec![
             // id 1: u64
             SynKind::Int {
@@ -3441,7 +3650,7 @@
                 linkage: 1,
             },
         ];
-        let _ = n_cgx_a; // SynKind in this test module has no Fwd
+        let _ = n_cgx_a; // unused: this test omits a `cgx_target` Fwd
         let btf_blob_a = build_btf_full(&types_a, &strings_a);
         let insns_a = vec![exit_insn()];
         let text_a = insns_to_text_bytes(&insns_a);
@@ -3548,9 +3757,8 @@
         );
         // The cross-BTF index has cgx_target keyed at the FIRST
         // BTF that carries a complete body. Object A in this
-        // fixture exposes no `cgx_target` struct (SynKind has no
-        // Fwd variant in the test fixture so we omit it), so
-        // object B's id is what gets indexed.
+        // fixture exposes no `cgx_target` struct (this test omits
+        // the Fwd entirely), so object B's id is what gets indexed.
         let cgx_hit = out.fwd_index.get("cgx_target");
         assert_eq!(
             cgx_hit,

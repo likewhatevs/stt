@@ -772,6 +772,47 @@ mod tests {
         assert!(!is_arena_addr_in_scx_static_index(&index, 0xDEAD_BEEF));
     }
 
+    /// Fully-consumed region (`off > 0 && capacity == off`) walks
+    /// without panic, the surfaced range covers exactly the
+    /// allocated span, and the index admits no entries past the
+    /// fully-allocated endpoint. Distinct from
+    /// [`walk_scx_static_accepts_off_eq_capacity`], which only pins
+    /// emission shape — this test composes walk + index + boundary
+    /// to verify the end-of-region semantics: the address at
+    /// `start + capacity` (== `start + size`, the byte just past the
+    /// last live byte) must NOT match. Pins the invariant that the
+    /// reserved-but-unallocatable tail of a fully-consumed region —
+    /// i.e. nothing, since the region is full — does not falsely
+    /// admit chases against the immediately-following byte.
+    #[test]
+    fn walk_scx_static_fully_consumed_excludes_endpoint() {
+        let offsets = default_offsets();
+        // off > 0 && capacity == off (fully consumed).
+        let bytes = synth_scx_static(&offsets, 4096, 0xDEAD_BEEF, 4096);
+        let snap = walk_scx_static(
+            &bytes,
+            &offsets,
+            std::iter::once(("scx_static".to_string(), 0, 1)),
+            |_| true,
+        );
+        assert_eq!(snap.ranges.len(), 1);
+        assert_eq!(snap.skipped, 0);
+        assert_eq!(snap.ranges[0].size, 4096);
+        assert_eq!(snap.ranges[0].capacity, 4096);
+        let index = build_scx_static_range_index(&snap);
+        // Last live byte (start + size - 1) is IN.
+        assert!(is_arena_addr_in_scx_static_index(
+            &index,
+            0xDEAD_BEEF_u64 + 4095
+        ));
+        // start + size (== start + capacity) is OUT — no entries
+        // past the fully-consumed span.
+        assert!(!is_arena_addr_in_scx_static_index(
+            &index,
+            0xDEAD_BEEF_u64 + 4096
+        ));
+    }
+
     /// .bss-slice too short to hold a full `struct scx_static` →
     /// reject. The walker must not read past the slice end (which
     /// would wrap into an unrelated var). `read_u64_at`'s slice
@@ -933,6 +974,57 @@ mod tests {
         let index = build_scx_static_range_index(&snap);
         assert!(!is_arena_addr_in_scx_static_index(&index, 0x0FFF));
         assert!(!is_arena_addr_in_scx_static_index(&index, 0));
+    }
+
+    /// Boundary at `start + size` excluded — second fixture pinning
+    /// the same `<`-not-`<=` bound across a different range geometry
+    /// (larger start, larger size) than
+    /// [`is_arena_addr_in_scx_static_index_boundary_excluded`]. Two
+    /// fixtures protect against a regression that might happen to
+    /// pass the small-fixture test through accidental wrap or
+    /// off-by-one luck.
+    #[test]
+    fn is_arena_addr_in_scx_static_index_boundary_at_start_plus_size_excluded() {
+        let snap = ScxStaticSnapshot {
+            ranges: vec![ScxStaticRange {
+                instance_name: "scx_static".into(),
+                start_low32: 0x10_0000,
+                size: 0x4000,
+                capacity: 0x4000,
+            }],
+            skipped: 0,
+        };
+        let index = build_scx_static_range_index(&snap);
+        // Last live byte is IN.
+        assert!(is_arena_addr_in_scx_static_index(&index, 0x10_3FFF));
+        // start + size is OUT.
+        assert!(!is_arena_addr_in_scx_static_index(&index, 0x10_4000));
+    }
+
+    /// Address at `start - 1` (one byte below range start) returns
+    /// `false`. Second fixture (larger start than
+    /// [`is_arena_addr_in_scx_static_index_below_range_returns_false`])
+    /// pinning the lower-bound rejection across a different range
+    /// geometry. The `range(..=key).next_back()` lookup must yield
+    /// `None` for any key below every entry, and the helper must
+    /// return `false` rather than panic.
+    #[test]
+    fn is_arena_addr_in_scx_static_index_just_below_start_returns_false() {
+        let snap = ScxStaticSnapshot {
+            ranges: vec![ScxStaticRange {
+                instance_name: "scx_static".into(),
+                start_low32: 0x10_0000,
+                size: 0x4000,
+                capacity: 0x4000,
+            }],
+            skipped: 0,
+        };
+        let index = build_scx_static_range_index(&snap);
+        // start - 1 is OUT.
+        assert!(!is_arena_addr_in_scx_static_index(&index, 0x0F_FFFF));
+        // start is IN (sanity: confirms the boundary is on the
+        // correct side of the rejection).
+        assert!(is_arena_addr_in_scx_static_index(&index, 0x10_0000));
     }
 
     /// Range search across multiple ranges picks the range whose
