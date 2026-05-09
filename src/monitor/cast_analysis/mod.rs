@@ -2193,6 +2193,11 @@ impl<'a> Analyzer<'a> {
             if conflicting.contains(key) {
                 continue;
             }
+            tracing::debug!(
+                parent = key.0,
+                offset = key.1,
+                "cast_analysis: arena STX-flow hit emitted"
+            );
             out.insert(
                 *key,
                 CastHit {
@@ -2273,10 +2278,13 @@ impl<'a> Analyzer<'a> {
 
             if candidates.len() == 1 {
                 let target = candidates.into_iter().next().unwrap();
-                // Shape-inference target overwrites any STX-flow
-                // hit emitted above for the same key — the concrete
-                // id is more informative than the deferred `0`
-                // sentinel.
+                tracing::debug!(
+                    parent = source,
+                    offset = field_off,
+                    target,
+                    accesses = accesses.len(),
+                    "cast_analysis: shape-inference hit emitted"
+                );
                 out.insert(
                     (*source, *field_off),
                     CastHit {
@@ -2353,6 +2361,20 @@ impl<'a> Analyzer<'a> {
             );
         }
 
+        let arena_count = out
+            .values()
+            .filter(|h| h.addr_space == AddrSpace::Arena)
+            .count();
+        let kernel_count = out
+            .values()
+            .filter(|h| h.addr_space == AddrSpace::Kernel)
+            .count();
+        tracing::debug!(
+            total = out.len(),
+            arena = arena_count,
+            kernel = kernel_count,
+            "cast_analysis: finalize summary"
+        );
         out
     }
 }
