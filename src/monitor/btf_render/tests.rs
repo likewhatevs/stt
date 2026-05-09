@@ -2428,6 +2428,64 @@ fn ptr_cycle_visited_set_does_not_leak_across_calls() {
     assert_eq!(out1, out2, "fresh visited set per call: outputs must match",);
 }
 
+// ---- cast_annotation_for static-string mapping ------------------
+//
+// `cast_annotation_for` is the single source of truth for the
+// operator-visible cast tag emitted on `RenderedValue::Ptr`. A
+// 2x2 match over `(AddrSpace, sdt_alloc_resolved)` returns one of
+// four `&'static str` literals; the renderer borrows these via
+// `Cow::Borrowed` so the annotation costs zero per-chase
+// allocations. Because every cast-recovered `Ptr` consumer
+// (Display, JSON serializer, downstream operator tooling) keys
+// off these exact bytes, drift in any of the four cells is a
+// silent operator-visible behavior change.
+//
+// This test pins all four mappings directly. It is co-located
+// with the Cast intercept section below because the integration
+// tests assert the SAME strings via `cast_annotation.as_deref()`
+// — when one of those tests fails, this one localises the
+// regression to the mapping table itself rather than the chase
+// pipeline that calls it.
+
+/// Direct-call coverage of every `(AddrSpace, sdt_alloc_resolved)`
+/// pair handled by [`cast_annotation_for`]. Asserts the exact
+/// `&'static str` returned for each of the four cells:
+///
+/// - `(Arena, false)` → `"cast→arena"`
+/// - `(Arena, true)`  → `"cast→arena (sdt_alloc)"`
+/// - `(Kernel, false)`→ `"cast→kernel"`
+/// - `(Kernel, true)` → `"cast→kernel (sdt_alloc)"`
+///
+/// `AddrSpace` is `Copy` so the same enum value is reused for
+/// the two `sdt_alloc_resolved` polarities. The match in
+/// `cast_annotation_for` is exhaustive over `AddrSpace`, so a
+/// new variant fails compilation here AND in production —
+/// keeping the operator-visible tag set in lockstep with the
+/// analyzer's address-space taxonomy.
+#[test]
+fn cast_annotation_for_all_four_cells() {
+    assert_eq!(
+        cast_annotation_for(AddrSpace::Arena, false),
+        "cast→arena",
+        "(Arena, false) annotation drift",
+    );
+    assert_eq!(
+        cast_annotation_for(AddrSpace::Arena, true),
+        "cast→arena (sdt_alloc)",
+        "(Arena, true) annotation drift",
+    );
+    assert_eq!(
+        cast_annotation_for(AddrSpace::Kernel, false),
+        "cast→kernel",
+        "(Kernel, false) annotation drift",
+    );
+    assert_eq!(
+        cast_annotation_for(AddrSpace::Kernel, true),
+        "cast→kernel (sdt_alloc)",
+        "(Kernel, true) annotation drift",
+    );
+}
+
 // ---- Cast intercept (render_cast_pointer) ----------------------
 //
 // `render_member`'s cast intercept fires when:
