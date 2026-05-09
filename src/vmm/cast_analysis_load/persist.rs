@@ -184,3 +184,87 @@ pub(super) fn try_save(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_save_load() {
+        let dir = std::env::temp_dir().join(format!("ktstr_persist_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("KTSTR_CACHE_DIR", &dir) };
+
+        let mut cast_map = BTreeMap::new();
+        cast_map.insert(
+            (2, 8),
+            CastHit {
+                target_type_id: 5,
+                addr_space: AddrSpace::Arena,
+            },
+        );
+        cast_map.insert(
+            (3, 16),
+            CastHit {
+                target_type_id: 7,
+                addr_space: AddrSpace::Kernel,
+            },
+        );
+        let mut fwd_index = HashMap::new();
+        fwd_index.insert(
+            "cgx_target".to_string(),
+            FwdIndexEntry {
+                btfs_idx: 1,
+                type_id: 4,
+            },
+        );
+
+        let hash = 0xDEAD_BEEF_CAFE_1234u64;
+        try_save(hash, &cast_map, &fwd_index, 2);
+
+        let loaded = try_load(hash, 2);
+        assert!(loaded.is_some(), "roundtrip must succeed");
+        let (loaded_map, loaded_fwd) = loaded.unwrap();
+        assert_eq!(loaded_map.len(), 2);
+        assert_eq!(
+            loaded_map.get(&(2, 8)).unwrap().target_type_id, 5
+        );
+        assert_eq!(
+            loaded_map.get(&(2, 8)).unwrap().addr_space,
+            AddrSpace::Arena
+        );
+        assert_eq!(
+            loaded_map.get(&(3, 16)).unwrap().addr_space,
+            AddrSpace::Kernel
+        );
+        assert_eq!(loaded_fwd.len(), 1);
+        assert_eq!(loaded_fwd["cgx_target"].btfs_idx, 1);
+        assert_eq!(loaded_fwd["cgx_target"].type_id, 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_wrong_btf_count_returns_none() {
+        let dir = std::env::temp_dir().join(format!("ktstr_persist_btf_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("KTSTR_CACHE_DIR", &dir) };
+
+        let cast_map = BTreeMap::new();
+        let fwd_index = HashMap::new();
+        let hash = 0x1234_5678_9ABC_DEF0u64;
+        try_save(hash, &cast_map, &fwd_index, 3);
+
+        assert!(
+            try_load(hash, 5).is_none(),
+            "btf_count mismatch must return None"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_nonexistent_returns_none() {
+        assert!(try_load(0xFFFF_FFFF_FFFF_FFFFu64, 1).is_none());
+    }
+}
