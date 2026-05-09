@@ -275,6 +275,23 @@ its output:
    annotation alongside the resolved struct fields, so cast-
    recovered pointers are visually distinct from BTF-typed ones.
 
+The renderer also consults an `sdt_alloc` bridge whenever a chase
+target peels to a `BTF_KIND_FWD` forward declaration (typical for
+`struct sdt_data __arena *` fields whose body lives in the
+sdt_alloc library's BTF rather than the scheduler's program BTF).
+The dump-state pre-pass walks each live `scx_allocator` and
+populates a `payload_start_low32 → payload_btf_type_id` index that
+`MemReader::resolve_arena_type` (in
+`dump::render_map::AccessorMemReader`) consults during the
+chase. On a hit, the renderer recovers the real payload struct id
+and renders the chased subtree against it; the resulting `Ptr`
+carries a `sdt_alloc`-flavoured annotation: `"sdt_alloc"` on the
+BTF-typed `Type::Ptr` arm, and `"cast→arena (sdt_alloc)"` /
+`"cast→kernel (sdt_alloc)"` on the cast-analyzer-driven path.
+The bridge fires only when the BTF-only resolve has already
+exhausted same-name siblings — false-positive risk is bounded by
+the same arena-window check the analyzer's arena arm uses.
+
 The analyzer is deliberately conservative: branch joins reset
 register and stack state, conflicts drop the offending entry, and
 self-stores are rejected. False negatives fall back to raw `u64`

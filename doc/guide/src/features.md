@@ -264,6 +264,19 @@ cast-recovered pointers from BTF-typed ones. Failure dumps,
 periodic captures, and on-demand snapshots all benefit
 automatically.
 
+A complementary `sdt_alloc` bridge recovers a chase target's real
+struct id when the scheduler's program BTF declares the pointee as
+a `BTF_KIND_FWD` forward declaration (the typical shape for
+`struct sdt_data __arena *` fields whose body lives in a separate
+library BTF). The freeze pre-pass populates an
+`arena_payload_start → btf_type_id` index from each live
+`sdt_alloc` allocator slot; when a chase lands on a Fwd terminal,
+the renderer consults the index and renders the recovered struct
+with an `sdt_alloc` annotation suffix (`(sdt_alloc)` for the
+BTF-typed `Type::Ptr` arm, or `(cast→arena (sdt_alloc))` /
+`(cast→kernel (sdt_alloc))` when the chase originated from a
+cast-analyzer hit).
+
 Runs unconditionally on every scheduler load; no test-author
 configuration. False negatives (a missed cast — renderer falls
 back to raw `u64`, the prior behavior) are acceptable; false

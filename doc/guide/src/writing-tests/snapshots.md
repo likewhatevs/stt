@@ -221,9 +221,19 @@ target_struct` mapping, and feeds the result into the renderer.
 
 When the renderer encounters a `u64` slot the analyzer flagged, it
 emits a [`RenderedValue::Ptr`](#field-accessors-and-dotted-paths)
-with `cast_annotation` set to `"cast→arena"` or `"cast→kernel"` and
-chases the dereference through the address-space-appropriate
-reader. From the test author's perspective:
+with `cast_annotation` set and chases the dereference through the
+address-space-appropriate reader. The full set of
+`cast_annotation` values:
+
+| Annotation | Meaning |
+|---|---|
+| `"cast→arena"` | Cast analyzer flagged a `u64` field; chase resolved to an arena allocation via the BTF-typed pointee. |
+| `"cast→kernel"` | Cast analyzer flagged a `u64` field; chase resolved to a kernel slab / vmalloc / per-cpu allocation. |
+| `"sdt_alloc"` | BTF-typed `Type::Ptr` whose pointee was a `BTF_KIND_FWD`; the renderer recovered the real payload struct id via the `sdt_alloc` bridge. No cast-analyzer hit was involved. |
+| `"cast→arena (sdt_alloc)"` | Cast analyzer flagged a `u64` field AND the chase target peeled to a Fwd; the bridge recovered the real arena payload struct id. |
+| `"cast→kernel (sdt_alloc)"` | Cast analyzer flagged a `u64` field AND the chase target peeled to a Fwd; the bridge recovered the real kernel-side struct id. |
+
+From the test author's perspective:
 
 - `as_u64()` returns the raw pointer value (matching pre-analysis
   behavior, so existing tests do not need updating).

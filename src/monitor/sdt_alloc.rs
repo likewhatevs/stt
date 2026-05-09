@@ -302,10 +302,21 @@ pub struct SdtAllocEntry {
     /// `sdt_data.tid.genn` — incremented on recycle so consumers can
     /// distinguish reallocations of the same `idx`.
     pub genn: i32,
-    /// User-side virtual address of the `sdt_data` slot. 32-bit window
-    /// matching `arena.user_vm_start`; lets a consumer correlate the
-    /// rendered allocation against pointer values they see in BPF
-    /// program output.
+    /// Low 32 bits of the user-side arena pointer to the `sdt_data`
+    /// slot. Computed by [`TreeWalker::emit_leaf`] as
+    /// `data_ptr & 0xFFFF_FFFF`, NOT the full user-side VA — slot
+    /// addresses already live in the 32-bit `arena.user_vm_start`
+    /// window, so the masked low 32 bits are sufficient for
+    /// correlation against pointer values an operator sees in BPF
+    /// program output AND match the masking convention the renderer's
+    /// arena-type bridge keys on (see
+    /// [`super::btf_render::MemReader::resolve_arena_type`]).
+    ///
+    /// Distinct from [`super::arena::ArenaPage::user_addr`], which
+    /// carries the FULL user-side VA — the page-snapshot consumer
+    /// surfaces the unmasked address so cross-arena callers (multiple
+    /// arena maps with different `user_vm_start` bases) do not collide
+    /// on the same low-32 bits.
     pub user_addr: u64,
     /// BTF-rendered payload (everything after the 8-byte
     /// `union sdt_id` tid header). Falls back to a hex dump when

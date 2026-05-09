@@ -1008,3 +1008,354 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestE
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
+
+/// Asserts the sdt_alloc bridge resolves the Fwd-target chase on
+/// `scx_task_map_val.data` end-to-end. The dump pipeline produces
+/// per-entry `value` (the BTF-rendered surface struct) and
+/// `payload` (the chased per-task allocator payload). Both depend
+/// on the bridge:
+///
+///   - `scx_task_map_val.data` is `struct sdt_data __arena *` whose
+///     pointee is a `BTF_KIND_FWD` in scx-ktstr's program BTF
+///     (`struct sdt_data`'s body lives in the sdt_alloc library
+///     BTF, not the program BTF). Without the bridge, the renderer
+///     would skip the chase with
+///     `deref_skipped_reason="… forward declaration; body not in
+///     this BTF"` and never recover the per-task struct content.
+///     With the bridge, [`MemReader::resolve_arena_type`] returns
+///     the real payload BTF type id (the scheduler's
+///     `ktstr_arena_ctx`), the chase succeeds, and the resulting
+///     `Ptr` carries `cast_annotation: Some("sdt_alloc")`.
+///
+///   - `payload` is rendered via `chase_sdt_data_payload` against
+///     the discovered allocator's `payload_btf_type_id`. The
+///     bridge does not directly fire on this path, but the dump's
+///     `sdt_alloc_meta.payload_btf_type_id` (which the bridge
+///     consumes to populate its index) MUST be the same id, so a
+///     correctly-rendered `payload` proves the upstream allocator
+///     metadata is wired.
+///
+/// This scenario catches the regression where the Fwd chase
+/// previously surfaced "forward declaration" instead of recovered
+/// fields — that defect was historically only visible via manual
+/// dump inspection.
+fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
+    ctx: &ktstr::scenario::Ctx,
+) -> Result<AssertResult> {
+    let dump_path = failure_dump_path("cast_analysis_sdt_alloc_bridge_resolves_fwd");
+
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+
+    let json = match std::fs::read_to_string(&dump_path) {
+        Ok(s) => s,
+        Err(e) => {
+            result.passed = false;
+            result.details.push(ktstr::assert::AssertDetail::new(
+                ktstr::assert::DetailKind::Other,
+                format!(
+                    "failure dump file missing at {}: {e} (freeze coordinator did \
+                     not write -- either SCX_EXIT_ERROR_STALL never latched, the \
+                     dump path failed silently, or the run was torn down before \
+                     the dump completed)",
+                    dump_path.display()
+                ),
+            ));
+            anyhow::bail!("failure dump file missing at {}", dump_path.display());
+        }
+    };
+
+    let dump: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("dump JSON parse: {e}"))?;
+
+    let task_storage = find_task_storage_map(&dump)?;
+    let entries = task_storage
+        .get("entries")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "scx_task_map has no `entries` array; task_storage: {task_storage}"
+            )
+        })?;
+    if entries.is_empty() {
+        anyhow::bail!(
+            "scx_task_map.entries is empty -- ktstr_init_task never registered \
+             a per-task arena context for any task, so neither the surface-struct \
+             chase nor the payload chase has anything to operate on. \
+             task_storage: {task_storage}"
+        );
+    }
+
+    // ASSERTION 1: every entry whose `value` exists must NOT carry
+    // a `data` member with `deref_skipped_reason` containing
+    // "forward declaration". Iterate every entry rather than picking
+    // one — a single passing entry with the bulk failing would still
+    // be a regression, and the existing dump's structure makes the
+    // per-entry walk cheap.
+    let mut data_members_seen: usize = 0;
+    let mut any_bridge_fired: bool = false;
+    let mut any_data_with_chase: bool = false;
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(value) = entry.get("value") else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        // The `value` is a BTF-rendered Struct of `scx_task_map_val`.
+        let kind = value
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("<no-kind>");
+        if kind != "struct" {
+            // The entry is hex-only or rendered into a non-struct
+            // shape (e.g. Truncated wrapping a Bytes). Either way,
+            // there's no `data` member to assert on; skip.
+            continue;
+        }
+        let Some(members) = value.get("members").and_then(|m| m.as_array()) else {
+            continue;
+        };
+        let Some(data) = members
+            .iter()
+            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some("data"))
+        else {
+            // The renderer truncated before reaching `data`, or
+            // the value type doesn't carry that member name. The
+            // bridge is moot here — skip without flagging.
+            continue;
+        };
+        data_members_seen += 1;
+        let data_value = data
+            .get("value")
+            .ok_or_else(|| anyhow::anyhow!("`data` member has no `value`: {data}"))?;
+        let data_kind = data_value
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("<no-kind>");
+        // `data` is `struct sdt_data __arena *` -- the renderer
+        // emits Ptr (BTF Type::Ptr arm). Anything else is a
+        // regression in the surface-struct render itself.
+        if data_kind != "ptr" {
+            anyhow::bail!(
+                "entry[{idx}].value.data must render as Ptr (BTF Type::Ptr arm \
+                 for `struct sdt_data __arena *`); got kind={data_kind:?}. \
+                 data: {data}; entry: {entry}"
+            );
+        }
+        let data_value_u64 = data_value
+            .get("value")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("`data` Ptr has no `value`: {data_value}"))?;
+        if data_value_u64 == 0 {
+            // Null `data` cannot exercise the bridge -- skip without
+            // flagging. ktstr_init_task writes a non-null pointer on
+            // every alloc, but a freshly-stored entry can race the
+            // bridge index population in pathological cases.
+            continue;
+        }
+
+        any_data_with_chase = true;
+
+        // PRIMARY ASSERTION: no entry's `data` may surface a Fwd
+        // skip reason. The bridge's job is exactly to prevent that.
+        if let Some(reason) = data_value
+            .get("deref_skipped_reason")
+            .and_then(|r| r.as_str())
+            && reason.contains("forward declaration")
+        {
+            anyhow::bail!(
+                "REGRESSION: entry[{idx}].value.data surfaced a 'forward \
+                 declaration' skip reason -- the sdt_alloc bridge did NOT \
+                 fire. The chased pointer 0x{data_value_u64:x} fell outside \
+                 every known allocator slot's payload-start index, the dump \
+                 pre-pass failed to populate the index, or \
+                 [`MemReader::resolve_arena_type`] returned None. Without \
+                 the bridge the per-task struct content is unrenderable on \
+                 the surface-struct path. Skip reason: {reason:?}; \
+                 data: {data_value}"
+            );
+        }
+
+        // When the chase succeeded AND the bridge fired, the
+        // `cast_annotation` MUST be exactly "sdt_alloc". (BTF
+        // Type::Ptr arm -- not the cast-analyzer arm, so no
+        // "cast→arena" prefix.)
+        if let Some(ann) = data_value
+            .get("cast_annotation")
+            .and_then(|a| a.as_str())
+        {
+            if ann == "sdt_alloc" {
+                any_bridge_fired = true;
+            } else {
+                anyhow::bail!(
+                    "entry[{idx}].value.data carried unexpected \
+                     cast_annotation={ann:?}; the BTF Type::Ptr arm only \
+                     emits 'sdt_alloc' (no cast→ prefix) when the bridge \
+                     fires on a Fwd target. data: {data_value}"
+                );
+            }
+        }
+    }
+
+    if data_members_seen == 0 {
+        anyhow::bail!(
+            "no scx_task_map entry exposed a `data` member in its rendered \
+             value -- either every value-side render dropped to hex, the \
+             BTF was missing, or the value type did not include the \
+             `struct sdt_data __arena *` field. Without surfacing `data`, \
+             the bridge has no chase to gate. Total entries: {}",
+            entries.len()
+        );
+    }
+
+    if !any_data_with_chase {
+        anyhow::bail!(
+            "every scx_task_map entry's `value.data` was 0x0 -- ktstr_init_task \
+             never wrote a non-null `mval->data`, or every captured map slot \
+             was snapshotted between the create-zeroed-entry phase and the \
+             populate-fields phase of `scx_task_alloc`. The bridge has \
+             no chase to validate. data_members_seen={data_members_seen}, \
+             entries={}",
+            entries.len()
+        );
+    }
+
+    if !any_bridge_fired {
+        anyhow::bail!(
+            "REGRESSION: scx_task_map entries carried non-null `value.data` \
+             pointers with no `deref_skipped_reason`, but NONE surfaced \
+             cast_annotation='sdt_alloc'. That means the chase succeeded \
+             via the BTF-only path -- which would only happen if the \
+             program BTF carried a complete `struct sdt_data` body, \
+             contradicting scx-ktstr's compiled BTF where `sdt_data` is \
+             emitted as a Fwd. Either the bridge ran but failed to set \
+             the annotation, or the test fixture's BTF shape changed in \
+             a way that bypassed the Fwd path. \
+             data_members_seen={data_members_seen}"
+        );
+    }
+
+    // ASSERTION 2: per-entry `payload` (rendered via
+    // `chase_sdt_data_payload`) must show ktstr_arena_ctx fields
+    // populated by ktstr_init_task. Confirms the upstream
+    // allocator metadata (which the bridge index keys into) is
+    // wired. Reuse the same constants the existing scenarios pin.
+    const KTSTR_ARENA_MAGIC: u64 = 0xDEADBEEFCAFEBABE;
+    const KTSTR_TASK_COUNTER: u64 = 42;
+    let mut payloads_inspected: usize = 0;
+    for (idx, entry) in entries.iter().enumerate() {
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        if payload.is_null() {
+            continue;
+        }
+        let kind = payload
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("<no-kind>");
+        // Some entries can render `payload` as Truncated when the
+        // payload struct exceeds POINTER_CHASE_CAP, but
+        // ktstr_arena_ctx is 24 bytes; only Struct is expected.
+        if kind != "struct" {
+            continue;
+        }
+        let type_name = payload
+            .get("type_name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("<no-type-name>");
+        if type_name != "ktstr_arena_ctx" {
+            continue;
+        }
+        payloads_inspected += 1;
+
+        // magic must read the alloc-time sentinel.
+        let magic = struct_member(payload, "magic")?;
+        let magic_value = magic
+            .get("value")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("magic value not a u64: {magic}"))?;
+        if magic_value != KTSTR_ARENA_MAGIC {
+            anyhow::bail!(
+                "entry[{idx}].payload.magic mismatch: got 0x{magic_value:016x}, \
+                 expected 0x{KTSTR_ARENA_MAGIC:016x}. The chase landed on a \
+                 ktstr_arena_ctx-shaped struct but the bytes are not the \
+                 alloc-time sentinel -- either the upstream allocator \
+                 metadata pointed at a stale slot, or the .data chase / \
+                 payload chase landed on different allocator state. \
+                 magic: {magic}"
+            );
+        }
+
+        let counter = struct_member(payload, "counter")?;
+        let counter_value = counter
+            .get("value")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("counter not numeric: {counter}"))?;
+        if counter_value != KTSTR_TASK_COUNTER {
+            anyhow::bail!(
+                "entry[{idx}].payload.counter mismatch: got {counter_value}, \
+                 expected {KTSTR_TASK_COUNTER}. counter: {counter}"
+            );
+        }
+    }
+
+    if payloads_inspected == 0 {
+        anyhow::bail!(
+            "no scx_task_map entry surfaced a Struct(type_name=\"ktstr_arena_ctx\") \
+             payload -- `chase_sdt_data_payload` returned None for every \
+             entry, sdt_alloc_meta.payload_btf_type_id was unresolved, or \
+             every captured arena pointer fell outside the kern_vm window. \
+             Without a rendered payload the bridge index has no payload \
+             type id to publish, so the surface-struct bridge would also \
+             fail. entries: {}",
+            entries.len()
+        );
+    }
+
+    result.details.push(ktstr::assert::AssertDetail::new(
+        ktstr::assert::DetailKind::Other,
+        format!(
+            "sdt_alloc bridge E2E: dump at {} carries scx_task_map with \
+             {} entries; data_members_seen={data_members_seen}, \
+             any_bridge_fired={any_bridge_fired}, payloads_inspected={payloads_inspected}. \
+             No entry's `data` showed a 'forward declaration' skip reason; \
+             every chased ktstr_arena_ctx payload carries the alloc-time \
+             sentinel and counter.",
+            dump_path.display(),
+            entries.len(),
+        ),
+    ));
+
+    Ok(result)
+}
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_CAST_ANALYSIS_SDT_ALLOC_BRIDGE: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "cast_analysis_sdt_alloc_bridge_resolves_fwd",
+        func: scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        // Same trigger as the sibling scenarios: SCX_EXIT_ERROR_STALL
+        // latches the freeze-and-dump path so the bridge index is
+        // populated AND the surface-struct render sees a Fwd-pointee
+        // chase value. ktstr_init_task wires `scx_task_map_val.data`
+        // on every task it processes, so by the time the watchdog
+        // fires multiple per-task arena allocations exist for the
+        // bridge to resolve.
+        extra_sched_args: &["--stall-after=1"],
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_secs(10),
+        workers_per_cgroup: 2,
+        // SCX_EXIT_ERROR_STALL is the intentional kill; flip the
+        // framework's failed AssertResult to PASS. Real defects
+        // bail via `anyhow::bail!` and bypass `expect_err`.
+        expect_err: true,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
