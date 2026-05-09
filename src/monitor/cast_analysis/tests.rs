@@ -9318,45 +9318,93 @@ fn three_way_conflict_arena_kptr_pattern_drops_all() {
 }
 
 /// Verify `struct_member_at` recognises offsets that land INSIDE
-/// an array member as the array's element type. The new code peels
-/// the member type, detects `Type::Array(arr)`, and uses
-/// `arr.len()` × `elem_size` to bound `byte_offset` relative to
-/// `member_off`; matches with `(byte_offset - member_off) % elem_size
-/// == 0` return `MemberAt::Struct { member_type_id: elem_tid }` so
-/// the LDX / STX paths see the element's BTF type rather than the
-/// array's.
+/// an array member as the array's element type. The peel detects
+/// `Type::Array(arr)`, computes `arr.len()` × `elem_size` to bound
+/// `byte_offset` relative to `member_off`, and returns
+/// `MemberAt::Struct { member_type_id: elem_tid }` for queried
+/// offsets that fall within the array's bytes AND are
+/// `elem_size`-aligned, so the LDX / STX paths see the element's
+/// BTF type rather than the array's.
 ///
 /// Pattern: `struct T { u64 history[4] @ 0 }`. The third element
 /// (`history[2]`) sits at byte offset 16. The BPF program loads
-/// from `r1 + 16`, casts the loaded u64 with `bpf_addr_space_cast
-/// (off=1, imm=1)` so the source slot tags `arena_confirmed`, and
-/// stores the cast result back into the same slot. The cast →
-/// confirmed path keys on `(parent_struct_id, field_offset)` —
-/// without the array peel that landed `field_offset = 16` in
-/// `struct_member_at`, the LDX would have dropped the destination
-/// register to `Unknown` and `arena_confirmed` would never have
-/// gained `(3, 16)`. The presence of `(3, 16)` in the resulting
-/// `CastMap` is the witness that the array peel produced
-/// `MemberAt::Struct { member_type_id = u64_id }`, allowing the
-/// LDX `Plain u64 field` arm to set `LoadedU64Field { ... ,
-/// field_offset: 16 }` — the prerequisite for the cast-driven
-/// arena confirmation.
+/// `history[2]` through the typed pointer in r1, casts the loaded
+/// u64 through `bpf_addr_space_cast(off=1, imm=1)` so the source
+/// slot tags `arena_confirmed`, stores the cast result back into
+/// the same slot, then dereferences the cast result with a u64
+/// load at offset 0:
+///
+/// ```text
+/// r2 = *(u64 *)(r1 + 16)              -- load history[2]
+/// r4 = bpf_addr_space_cast(r2, 0, 1)  -- arena_confirmed += (T, 16)
+/// *(u64 *)(r1 + 16) = r4              -- STX back into the same slot
+/// r3 = *(u64 *)(r4 + 0)               -- deref the cast result
+/// ```
+///
+/// The first LDX is the array-recognition exercise: with r1 typed
+/// `Pointer{T}`, `struct_member_at(btf, T_id, 16)` walks T's
+/// single member at offset 0, peels its type to
+/// `Type::Array(u64; 4)`, computes `elem_size = 8 × nelems = 4 ⇒
+/// arr_byte_size = 32`, checks `rel = 16 < 32` AND `rel %
+/// elem_size == 0`, and returns
+/// `MemberAt::Struct { member_type_id = u64_id }`. The Plain u64
+/// field arm in `handle_ldx` then tags r2 as
+/// `LoadedU64Field { source_struct_id: T_id, field_offset: 16 }`
+/// — `canonical_field_off = 16` because `MemberAt::Struct` keys
+/// on the queried offset directly.
+///
+/// `addr_space_cast(4, 2, 1)` propagates r2's state into r4 and
+/// inserts `(T_id, 16)` into `arena_confirmed` (the F1 mitigation
+/// gate's "direct evidence" channel). The STX-back of r4 mirrors
+/// real schedulers' arena-pointer write-back idiom; its src is
+/// `LoadedU64Field` (cast propagates state verbatim) so the
+/// production STX path's value-state arm does not match
+/// `Pointer{T}` / `ArenaU64FromAlloc` and the store has no
+/// side-effect on the analyzer state — `addr_space_cast_arena_alone_does_not_emit`
+/// pins this exact "cast alone produces no map entry" property.
+///
+/// The trailing `r3 = *(u64 *)(r4 + 0)` records an `Access {
+/// offset: 0, size: 8 }` on `patterns[(T_id, 16)]` (because r4 is
+/// `LoadedU64Field`, the LDX-through-`LoadedU64Field` arm is the
+/// only path that adds accesses). Combined with the
+/// `arena_confirmed` evidence, `finalize`'s shape-inference loop
+/// intersects the BTF layout for `(off=0, size=8)`: only
+/// `Q { u64 @ 0 }` matches that shape, so the F1-gated emit fires
+/// with `target_type_id = Q`. The presence of `(T_id, 16) →
+/// CastHit { Q_id, Arena }` in the resulting `CastMap` is the
+/// witness that the array peel produced
+/// `MemberAt::Struct { member_type_id = u64_id }`: without it the
+/// LDX would have dropped r2 to `Unknown`, neither the cast nor
+/// the deref would have keyed `(T_id, 16)`, and the assertion
+/// would fail.
 #[test]
 fn struct_member_at_resolves_array_element_offset() {
-    // Strings: \0 + names. `_n_index` keeps the index-type name
-    // alive so the string section retains a stable layout if more
-    // names are added later.
     let mut strings: Vec<u8> = vec![0];
     let n_u64 = push_name(&mut strings, "u64");
-    let _n_index = push_name(&mut strings, "u32");
     let n_t = push_name(&mut strings, "T");
+    let n_q = push_name(&mut strings, "Q");
     let n_history = push_name(&mut strings, "history");
+    let n_x = push_name(&mut strings, "x");
 
-    // id 1: u64 (size=8, bits=64). Used as array element type AND
-    //       as the index-type stand-in (the analyzer never inspects
-    //       the index type, so we reuse id 1 to keep the BTF small).
-    // id 2: u64[4] — 32-byte total, array-of-u64.
-    // id 3: struct T { u64 history[4] @ 0 } — size 32.
+    // id 1: u64 (size=8, bits=64). Doubles as element type for the
+    //       array AND index-type stand-in — the analyzer never
+    //       inspects the index type, and `Array::index_type` is
+    //       not consulted along the `struct_member_at` path under
+    //       test, so reusing id 1 keeps the BTF minimal without
+    //       changing behaviour.
+    // id 2: u64[4] — 32-byte total array-of-u64. The new
+    //       `struct_member_at` array arm peels this when the
+    //       queried offset lands inside the array's bytes.
+    // id 3: struct T { u64 history[4] @ 0 } — size 32. Single
+    //       member that the LDX walks; the queried offset 16
+    //       falls into the array's range and the test verifies
+    //       it resolves to the u64 element type.
+    // id 4: struct Q { u64 x @ 0 } — size 8. Unique-shape target
+    //       so the F1-gated shape inference resolves the
+    //       cast-confirmed slot to a single candidate. T's only
+    //       member is the array (size 32), so T is not a
+    //       candidate for the (0, 8) access shape and the
+    //       intersection collapses to {Q} alone.
     let types = vec![
         SynType::Int {
             name_off: n_u64,
@@ -9379,32 +9427,26 @@ fn struct_member_at_resolves_array_element_offset() {
                 byte_offset: 0,
             }],
         },
+        SynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![SynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
     ];
     let blob = build_btf(&types, &strings);
     let btf = Btf::from_bytes(&blob).unwrap();
     let t_id = 3u32;
+    let q_id = 4u32;
 
-    // r2 = *(u64 *)(r1 + 16)         -- load history[2]
-    // r4 = bpf_addr_space_cast(r2, 0, 1)
-    //                                 -- arena_confirmed gains (T, 16)
-    // *(u64 *)(r1 + 16) = r4         -- STX back into the same slot
-    //
-    // The first LDX is the array-recognition exercise: with r1 typed
-    // `Pointer{T}`, `struct_member_at(btf, 3, 16)` walks the single
-    // member at offset 0, peels its type to `Type::Array(u64; 4)`,
-    // computes `elem_size = 8` × `nelems = 4 = 32`, checks `16 < 32
-    // && 16 % 8 == 0`, and returns `MemberAt::Struct { member_type_id
-    // = 1 (u64) }`. The Plain u64 field arm then tags r2 as
-    // `LoadedU64Field { source_struct_id: 3, field_offset: 16 }` —
-    // canonical_field_off = 16 because `MemberAt::Struct` keys on
-    // the queried offset directly. The addr_space_cast inserts (3,
-    // 16) into `arena_confirmed`. Without the array peel the LDX
-    // would have dropped r2 to Unknown and the cast would have been
-    // a no-op for arena_confirmed.
     let insns = vec![
         ldx(BPF_SIZE_DW, 2, 1, 16),
         addr_space_cast(4, 2, 1),
         stx(BPF_SIZE_DW, 1, 4, 16),
+        ldx(BPF_SIZE_DW, 3, 4, 0),
         exit(),
     ];
     let map = analyze_casts(
@@ -9418,10 +9460,15 @@ fn struct_member_at_resolves_array_element_offset() {
         &[],
         &[],
     );
-    assert!(
-        map.contains_key(&(t_id, 16)),
+    assert_eq!(
+        map.get(&(t_id, 16)),
+        Some(&CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        }),
         "(T={t_id}, 16) — third u64 element of `history[4]` — must \
-         appear in the cast map after struct_member_at peels the \
-         array member type to `u64`: {map:?}"
+         appear in the cast map with target=Q ({q_id}) after \
+         struct_member_at peels the array member type to `u64`: \
+         {map:?}"
     );
 }
