@@ -48,7 +48,7 @@
 //!        (the captured per-task page).
 //! 5. At freeze time, the dump pipeline walks every map. For
 //!    scx_task_map (TASK_STORAGE), `chase_sdt_data_payload`
-//!    renders `meta.payload_btf_type_id` (== `ktstr_arena_ctx`)
+//!    renders `meta.target_type_id` (== `ktstr_arena_ctx`)
 //!    against each per-task arena page. For the scheduler's
 //!    `.bss` map, the BTF Datasec walker surfaces every global
 //!    variable, including `ktstr_bss_arena_holder`, as a struct
@@ -254,7 +254,7 @@ fn scenario_cast_analysis_chases_kernel_kptr(ctx: &ktstr::scenario::Ctx) -> Resu
         anyhow::bail!(
             "no scx_task_map entry has a non-null `payload` — \
              chase_sdt_data_payload returned None for every entry. The \
-             allocator metadata may be unresolved (no payload_btf_type_id \
+             allocator metadata may be unresolved (no target_type_id \
              discovery), the per-task `sdt_data __arena *` field offset \
              was not found, or every captured arena pointer fell outside \
              the kern_vm window. entry count: {}, dump: {dump}",
@@ -1034,9 +1034,9 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestE
 ///     `Ptr` carries `cast_annotation: Some("sdt_alloc")`.
 ///
 ///   - `payload` is rendered via `chase_sdt_data_payload` against
-///     the discovered allocator's `payload_btf_type_id`. The
+///     the discovered allocator's `target_type_id`. The
 ///     bridge does not directly fire on this path, but the dump's
-///     `sdt_alloc_meta.payload_btf_type_id` (which the bridge
+///     `sdt_alloc_meta.target_type_id` (which the bridge
 ///     consumes to populate its index) MUST be the same id, so a
 ///     correctly-rendered `payload` proves the upstream allocator
 ///     metadata is wired.
@@ -1310,7 +1310,7 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
         anyhow::bail!(
             "no scx_task_map entry surfaced a Struct(type_name=\"ktstr_arena_ctx\") \
              payload -- `chase_sdt_data_payload` returned None for every \
-             entry, sdt_alloc_meta.payload_btf_type_id was unresolved, or \
+             entry, sdt_alloc_meta.target_type_id was unresolved, or \
              every captured arena pointer fell outside the kern_vm window. \
              Without a rendered payload the bridge index has no payload \
              type id to publish, so the surface-struct bridge would also \

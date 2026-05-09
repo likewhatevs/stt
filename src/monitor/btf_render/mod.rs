@@ -1490,7 +1490,7 @@ pub use super::cast_analysis::CastHit;
 pub struct ArenaResolveHit {
     /// BTF type id (in the entry BTF's id space) of the payload
     /// struct the chase should render against. Resolved from the
-    /// allocator slot's `payload_btf_type_id` populated by the
+    /// allocator slot's `target_type_id` populated by the
     /// sdt_alloc pre-pass.
     pub target_type_id: u32,
     /// Byte count the chase must skip past the chased address

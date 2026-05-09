@@ -290,18 +290,16 @@ impl LazyCastMap {
 /// analyzer in parallel — the thundering-herd anti-pattern.
 type CastCacheEntry = Arc<OnceLock<Option<Arc<CastAnalysisOutput>>>>;
 
-/// Process-wide cache: scheduler binary content hash → shared
-/// [`OnceLock`]-gated analysis result. Two builders that resolve
-/// to the same scheduler binary content (even via different paths,
-/// hardlinks, or `cp -p` overwrites that preserve mtime) share one
-/// cache entry, so the analyzer runs at most once per distinct
-/// binary content per process. Held under a `Mutex` only for the
-/// hash-lookup-and-insert step; the analyzer itself runs while no
-/// lock is held — so a slow analysis does not block a sibling
-/// lookup for a different binary.
-fn cast_cache() -> &'static Mutex<HashMap<[u8; 32], CastCacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<[u8; 32], CastCacheEntry>>> = OnceLock::new();
+fn cast_cache() -> &'static Mutex<HashMap<u64, CastCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, CastCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ahash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = ahash::RandomState::with_seeds(0, 0, 0, 0).build_hasher();
+    hasher.write(bytes);
+    hasher.finish()
 }
 
 /// Process-wide content-hash-cached entry point.
@@ -343,8 +341,6 @@ fn cast_cache() -> &'static Mutex<HashMap<[u8; 32], CastCacheEntry>> {
 /// Otherwise the analyzed `Arc<CastAnalysisOutput>` shared with
 /// every prior caller for the same binary content.
 pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<CastAnalysisOutput>> {
-    use sha2::Digest;
-
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -358,22 +354,14 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
         }
     };
     let hash_t0 = std::time::Instant::now();
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(&bytes);
-    let hash: [u8; 32] = hasher.finalize().into();
+    let hash = ahash_bytes(&bytes);
     tracing::debug!(
         elapsed_us = hash_t0.elapsed().as_micros() as u64,
         len = bytes.len(),
+        hash = format_args!("{hash:016x}"),
         "cast_analysis: scheduler binary content hash finished"
     );
 
-    // Acquire the entry under the cache lock, then drop the lock
-    // before running the analyzer. The entry is an
-    // `Arc<OnceLock<Option<Arc<CastAnalysisOutput>>>>`; concurrent
-    // callers for the same hash share the same `OnceLock` and
-    // serialise on its `get_or_init` rather than the cache lock.
-    // Concurrent callers for different hashes never block on each
-    // other.
     let entry: CastCacheEntry = {
         let mut cache = cast_cache().lock().unwrap();
         cache
@@ -383,6 +371,25 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
     };
     entry
         .get_or_init(|| {
+            // Disk cache probe: if a prior process already analyzed
+            // this binary, load the result without re-running the
+            // instruction walker. BTFs are reparsed from the binary
+            // bytes (Btf is not serializable).
+            let btfs = parse_btfs_from_bytes(&bytes);
+            if let Some((cast_map, fwd_index)) = persist::try_load(hash, btfs.len()) {
+                tracing::debug!("cast_analysis: disk cache hit");
+                let out = CastAnalysisOutput {
+                    cast_map: Arc::new(cast_map),
+                    btfs,
+                    fwd_index,
+                };
+                return if out.cast_map.is_empty() && out.fwd_index.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(out))
+                };
+            }
+
             let analyze_t0 = std::time::Instant::now();
             let out = build_cast_analysis_from_bytes(&bytes);
             tracing::debug!(
@@ -392,6 +399,7 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
                 fwd_index = out.fwd_index.len(),
                 "cast_analysis: on-demand analysis finished"
             );
+            persist::try_save(hash, &out.cast_map, &out.fwd_index, out.btfs.len());
             if out.cast_map.is_empty() && out.fwd_index.is_empty() {
                 None
             } else {
@@ -534,6 +542,33 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
         btfs,
         fwd_index,
     }
+}
+
+fn parse_btfs_from_bytes(bytes: &[u8]) -> Vec<Arc<Btf>> {
+    let outer = match goblin::elf::Elf::parse(bytes) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let bpf_objs_section = match find_section(&outer, ".bpf.objs") {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    let mut btfs = Vec::new();
+    for inner in iter_embedded_bpf_objects(&outer, bytes, bpf_objs_section) {
+        let elf = match goblin::elf::Elf::parse(inner) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let btf_bytes =
+            match find_section(&elf, ".BTF").and_then(|i| section_data(&elf, inner, i)) {
+                Some(b) => b,
+                None => continue,
+            };
+        if let Ok(btf) = Btf::from_bytes(btf_bytes) {
+            btfs.push(Arc::new(btf));
+        }
+    }
+    btfs
 }
 
 /// Walk every parsed BTF and collect a `name -> FwdIndexEntry`
@@ -1687,6 +1722,8 @@ fn section_data<'a>(
     file_bytes.get(start..end)
 }
 
+
+mod persist;
 
 #[cfg(test)]
 mod tests;
