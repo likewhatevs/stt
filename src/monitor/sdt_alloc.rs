@@ -1167,4 +1167,610 @@ mod tests {
             "error must name the missing struct so the dump pipeline can log a useful diagnostic: '{msg}'"
         );
     }
+
+    // -- from_btf error paths ----------------------------------------
+    //
+    // The four error paths in [`SdtAllocOffsets::from_btf`] each
+    // surface a distinct diagnostic:
+    //
+    //   1. `scx_allocator` missing → `"struct scx_allocator unavailable"`
+    //      (covered by `sdt_alloc_offsets_from_vmlinux_btf_returns_err`)
+    //   2. `sdt_pool` missing      → `"struct sdt_pool unavailable for member offsets"`
+    //   3. `sdt_desc` missing      → `"struct sdt_desc unavailable for member offsets"`
+    //   4. `sdt_chunk` missing     → `"struct sdt_chunk not found"`
+    //
+    // The fifth code path — `sdt_data` as `BTF_KIND_FWD` — must
+    // succeed (lavd and similar schedulers emit `sdt_data` as a
+    // forward declaration; the walker hardcodes 8 from
+    // [`SIZEOF_SDT_ID`] when the body is absent).
+    //
+    // The tests below build minimal synthetic BTF blobs (mirroring
+    // the per-test-module pattern in
+    // `cast_analysis::tests::build_btf` and
+    // `btf_render::tests::cast_build_btf` — pared down here to only
+    // the kinds `from_btf` consults: BTF_KIND_INT, BTF_KIND_STRUCT,
+    // BTF_KIND_FWD) and parse them via `Btf::from_bytes`. Synthetic
+    // BTF makes the four error paths reachable deterministically
+    // without requiring a real scheduler program BTF on disk.
+    //
+    // The constants and wire format mirror linux uapi `btf.h` and
+    // `Documentation/bpf/btf.rst`. The `info` u32 layout: `kind`
+    // in bits 24..29, `vlen` in low 16 bits, `kind_flag` in bit 31.
+
+    const SDTA_BTF_MAGIC: u16 = 0xEB9F;
+    const SDTA_BTF_VERSION: u8 = 1;
+    const SDTA_BTF_HEADER_LEN: u32 = 24;
+    const SDTA_BTF_KIND_INT: u32 = 1;
+    const SDTA_BTF_KIND_STRUCT: u32 = 4;
+    /// `BTF_KIND_FWD = 7`. Forward declaration. Carries a name but
+    /// no body; `kind_flag` selects struct (0) vs union (1) per
+    /// `btf-rs::Fwd::is_struct` / `is_union`.
+    const SDTA_BTF_KIND_FWD: u32 = 7;
+
+    /// One member of a synthetic `BTF_KIND_STRUCT`. The wire format
+    /// stores `bit_offset` (member offset in BITS, not bytes); the
+    /// test helper converts from `byte_offset` for readability.
+    #[derive(Clone, Copy)]
+    struct SdtaSynMember {
+        name_off: u32,
+        type_id: u32,
+        byte_offset: u32,
+    }
+
+    /// One synthetic BTF type. The pared-down kind set (`Int`,
+    /// `Struct`, `Fwd`) is exactly what `from_btf` needs to traverse:
+    /// member offsets come from `Struct`s, the `sdt_data` Fwd path
+    /// exercises the [`SIZEOF_SDT_ID`] fallback, and `Int` provides
+    /// terminal type ids the struct members can reference.
+    enum SdtaSynType {
+        /// `BTF_KIND_INT`. `encoding=0` is plain unsigned (the form
+        /// `u64` / `u32` resolve to in libbpf-emitted BTF).
+        Int {
+            name_off: u32,
+            size: u32,
+            encoding: u32,
+            offset: u32,
+            bits: u32,
+        },
+        /// `BTF_KIND_STRUCT` with `kind_flag=0` — non-bitfield
+        /// members. `from_btf` only consumes byte-aligned member
+        /// offsets via [`member_byte_offset`], so the simpler
+        /// `kind_flag=0` form suffices.
+        Struct {
+            name_off: u32,
+            size: u32,
+            members: Vec<SdtaSynMember>,
+        },
+        /// `BTF_KIND_FWD` (struct flavour, `kind_flag=0`). Used by
+        /// the `sdt_data` Fwd-fallback test — the only path
+        /// `from_btf` accepts a Fwd on, since the header size is
+        /// kernel-source-fixed at `SIZEOF_SDT_ID = 8`.
+        Fwd {
+            name_off: u32,
+        },
+    }
+
+    /// Append a NUL-terminated string to the BTF strings buffer and
+    /// return its byte offset. Same shape as
+    /// `cast_analysis::tests::push_name`, kept private to this test
+    /// module to avoid coupling between fixtures.
+    fn sdta_push_name(s: &mut Vec<u8>, name: &str) -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    }
+
+    /// Build a minimal BTF byte blob from a list of synthetic types
+    /// and a string section.
+    ///
+    /// Header layout matches `cast_analysis::tests::build_btf`:
+    /// 24-byte header (magic + version + flags + hdr_len + type_off
+    /// + type_len + str_off + str_len) followed by the type section
+    /// then the string section. Type ids start at 1 (id 0 is Void)
+    /// and increase in `types` order.
+    fn sdta_build_btf(types: &[SdtaSynType], strings: &[u8]) -> Vec<u8> {
+        let mut type_section: Vec<u8> = Vec::new();
+        for ty in types {
+            match ty {
+                SdtaSynType::Int {
+                    name_off,
+                    size,
+                    encoding,
+                    offset,
+                    bits,
+                } => {
+                    type_section.extend_from_slice(&name_off.to_le_bytes());
+                    let info = (SDTA_BTF_KIND_INT << 24) & 0x1f00_0000;
+                    type_section.extend_from_slice(&info.to_le_bytes());
+                    type_section.extend_from_slice(&size.to_le_bytes());
+                    let int_data =
+                        (*encoding << 24) | ((*offset & 0xff) << 16) | (*bits & 0xff);
+                    type_section.extend_from_slice(&int_data.to_le_bytes());
+                }
+                SdtaSynType::Struct {
+                    name_off,
+                    size,
+                    members,
+                } => {
+                    type_section.extend_from_slice(&name_off.to_le_bytes());
+                    let vlen = members.len() as u32;
+                    let info =
+                        ((SDTA_BTF_KIND_STRUCT << 24) & 0x1f00_0000) | (vlen & 0xffff);
+                    type_section.extend_from_slice(&info.to_le_bytes());
+                    type_section.extend_from_slice(&size.to_le_bytes());
+                    for m in members {
+                        type_section.extend_from_slice(&m.name_off.to_le_bytes());
+                        type_section.extend_from_slice(&m.type_id.to_le_bytes());
+                        // Non-bitfield struct: bit_offset = byte * 8.
+                        let bit_off = m.byte_offset * 8;
+                        type_section.extend_from_slice(&bit_off.to_le_bytes());
+                    }
+                }
+                SdtaSynType::Fwd { name_off } => {
+                    type_section.extend_from_slice(&name_off.to_le_bytes());
+                    // BTF_KIND_FWD: vlen=0, kind_flag=0 (struct
+                    // flavour). size_type field is unused but is
+                    // still 4 bytes wide on the wire — emit 0.
+                    let info = (SDTA_BTF_KIND_FWD << 24) & 0x1f00_0000;
+                    type_section.extend_from_slice(&info.to_le_bytes());
+                    type_section.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        }
+
+        let type_len = type_section.len() as u32;
+        let str_len = strings.len() as u32;
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&SDTA_BTF_MAGIC.to_le_bytes());
+        blob.push(SDTA_BTF_VERSION);
+        blob.push(0); // flags
+        blob.extend_from_slice(&SDTA_BTF_HEADER_LEN.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes()); // type_off
+        blob.extend_from_slice(&type_len.to_le_bytes());
+        blob.extend_from_slice(&type_len.to_le_bytes()); // str_off = type_len
+        blob.extend_from_slice(&str_len.to_le_bytes());
+        blob.extend_from_slice(&type_section);
+        blob.extend_from_slice(strings);
+        blob
+    }
+
+    /// Set of names every from_btf-error-path test needs in its
+    /// string section. Shared so each test's setup stays focused on
+    /// the type list, not the string table mechanics.
+    ///
+    /// Returns `(strings, name_offsets)` where `name_offsets` is a
+    /// struct of byte offsets keyed by name.
+    fn sdta_strings_for_from_btf() -> (Vec<u8>, SdtaNames) {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = sdta_push_name(&mut strings, "u64");
+        let n_scx_allocator = sdta_push_name(&mut strings, "scx_allocator");
+        let n_sdt_pool = sdta_push_name(&mut strings, "sdt_pool");
+        let n_sdt_desc = sdta_push_name(&mut strings, "sdt_desc");
+        let n_sdt_chunk = sdta_push_name(&mut strings, "sdt_chunk");
+        let n_sdt_data = sdta_push_name(&mut strings, "sdt_data");
+        let n_pool = sdta_push_name(&mut strings, "pool");
+        let n_root = sdta_push_name(&mut strings, "root");
+        let n_elem_size = sdta_push_name(&mut strings, "elem_size");
+        let n_allocated = sdta_push_name(&mut strings, "allocated");
+        let n_nr_free = sdta_push_name(&mut strings, "nr_free");
+        let n_chunk = sdta_push_name(&mut strings, "chunk");
+        let n_descs = sdta_push_name(&mut strings, "descs");
+        (
+            strings,
+            SdtaNames {
+                n_u64,
+                n_scx_allocator,
+                n_sdt_pool,
+                n_sdt_desc,
+                n_sdt_chunk,
+                n_sdt_data,
+                n_pool,
+                n_root,
+                n_elem_size,
+                n_allocated,
+                n_nr_free,
+                n_chunk,
+                n_descs,
+            },
+        )
+    }
+
+    /// Byte offsets within the string section for the names every
+    /// from_btf-error-path test references. Bundled into a struct so
+    /// each test's local state stays tidy and so the order of `let`
+    /// bindings matches across tests (preventing accidental skews
+    /// between tests that all reference the same name table).
+    struct SdtaNames {
+        n_u64: u32,
+        n_scx_allocator: u32,
+        n_sdt_pool: u32,
+        n_sdt_desc: u32,
+        n_sdt_chunk: u32,
+        n_sdt_data: u32,
+        n_pool: u32,
+        n_root: u32,
+        n_elem_size: u32,
+        n_allocated: u32,
+        n_nr_free: u32,
+        n_chunk: u32,
+        n_descs: u32,
+    }
+
+    /// Build the minimal `scx_allocator` struct every from_btf path
+    /// must traverse before reaching the inner-struct lookups. Two
+    /// members `pool` and `root`, both typed as `u64` (type_id=1)
+    /// since `from_btf` only reads each member's byte offset, not
+    /// its type. `pool` at offset 0, `root` at offset 8, total size
+    /// 16 — matches the kernel's `struct scx_allocator { struct
+    /// sdt_pool pool; sdt_desc_t *root; }` member ORDER (the actual
+    /// kernel `pool` is itself a struct, but the synthetic version
+    /// only needs a name + offset for [`member_byte_offset`] to
+    /// succeed).
+    fn sdta_allocator_struct(names: &SdtaNames) -> SdtaSynType {
+        SdtaSynType::Struct {
+            name_off: names.n_scx_allocator,
+            size: 16,
+            members: vec![
+                SdtaSynMember {
+                    name_off: names.n_pool,
+                    type_id: 1,
+                    byte_offset: 0,
+                },
+                SdtaSynMember {
+                    name_off: names.n_root,
+                    type_id: 1,
+                    byte_offset: 8,
+                },
+            ],
+        }
+    }
+
+    /// Test 1: `scx_allocator` is present but `sdt_pool` is missing
+    /// from the BTF entirely. `from_btf` must surface the
+    /// `"sdt_pool unavailable for member offsets"` context — the
+    /// distinct diagnostic that lets the dump pipeline distinguish
+    /// "no scheduler links sdt_alloc" (test
+    /// `sdt_alloc_offsets_from_vmlinux_btf_returns_err`) from
+    /// "scheduler links sdt_alloc but the BTF stripped sdt_pool".
+    #[test]
+    fn sdt_alloc_offsets_missing_sdt_pool_distinct_error() {
+        let (strings, names) = sdta_strings_for_from_btf();
+        let types = vec![
+            // id=1: u64 plain unsigned. Used as the type for every
+            // member of the synthetic structs (see
+            // `sdta_allocator_struct`'s comment).
+            SdtaSynType::Int {
+                name_off: names.n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id=2: scx_allocator (full struct).
+            sdta_allocator_struct(&names),
+            // id=3: sdt_desc (full struct, present so we don't
+            // accidentally match its error path instead).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_desc,
+                size: 24,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: names.n_allocated,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: names.n_nr_free,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                    SdtaSynMember {
+                        name_off: names.n_chunk,
+                        type_id: 1,
+                        byte_offset: 16,
+                    },
+                ],
+            },
+            // id=4: sdt_chunk (full struct).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_chunk,
+                size: 8,
+                members: vec![SdtaSynMember {
+                    name_off: names.n_descs,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            // id=5: sdt_data (Fwd, the form `from_btf` accepts).
+            SdtaSynType::Fwd {
+                name_off: names.n_sdt_data,
+            },
+            // sdt_pool is intentionally OMITTED — this is the path
+            // under test.
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+        let err = SdtAllocOffsets::from_btf(&btf)
+            .expect_err("missing sdt_pool must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sdt_pool"),
+            "error must name the missing struct: '{msg}'"
+        );
+        assert!(
+            msg.contains("unavailable for member offsets"),
+            "error must carry the sdt_pool-specific context distinguishing this from sdt_chunk's 'not found' wording: '{msg}'"
+        );
+        // The diagnostic must NOT name unrelated structs — the
+        // error path is sdt_pool-specific. A regression that
+        // reordered the require_full_struct calls would surface
+        // `sdt_desc` in the message instead.
+        assert!(
+            !msg.contains("sdt_desc"),
+            "missing-sdt_pool error must not reference sdt_desc: '{msg}'"
+        );
+        assert!(
+            !msg.contains("sdt_chunk"),
+            "missing-sdt_pool error must not reference sdt_chunk: '{msg}'"
+        );
+    }
+
+    /// Test 2: `scx_allocator` and `sdt_pool` are present but
+    /// `sdt_desc` is missing from the BTF. The error must reach
+    /// `from_btf`'s `sdt_desc` lookup specifically — surfacing the
+    /// `"sdt_desc unavailable for member offsets"` context — and
+    /// not collapse onto an earlier failure.
+    #[test]
+    fn sdt_alloc_offsets_missing_sdt_desc_distinct_error() {
+        let (strings, names) = sdta_strings_for_from_btf();
+        let types = vec![
+            // id=1: u64 plain unsigned.
+            SdtaSynType::Int {
+                name_off: names.n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id=2: scx_allocator (full struct).
+            sdta_allocator_struct(&names),
+            // id=3: sdt_pool (full struct, present).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_pool,
+                size: 32,
+                members: vec![SdtaSynMember {
+                    name_off: names.n_elem_size,
+                    type_id: 1,
+                    byte_offset: 16,
+                }],
+            },
+            // id=4: sdt_chunk (full struct, present so we reach
+            // sdt_desc before sdt_chunk).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_chunk,
+                size: 8,
+                members: vec![SdtaSynMember {
+                    name_off: names.n_descs,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            // id=5: sdt_data (Fwd).
+            SdtaSynType::Fwd {
+                name_off: names.n_sdt_data,
+            },
+            // sdt_desc is intentionally OMITTED.
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+        let err = SdtAllocOffsets::from_btf(&btf)
+            .expect_err("missing sdt_desc must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sdt_desc"),
+            "error must name the missing struct: '{msg}'"
+        );
+        assert!(
+            msg.contains("unavailable for member offsets"),
+            "error must carry the sdt_desc-specific context distinguishing this from sdt_chunk's 'not found' wording: '{msg}'"
+        );
+        // sdt_pool must NOT appear — sdt_pool resolved successfully
+        // before from_btf reached the sdt_desc lookup. A leak
+        // would mean require_full_struct's context is misordered.
+        assert!(
+            !msg.contains("sdt_pool"),
+            "missing-sdt_desc error must not reference sdt_pool: '{msg}'"
+        );
+        assert!(
+            !msg.contains("sdt_chunk"),
+            "missing-sdt_desc error must not reference sdt_chunk: '{msg}'"
+        );
+    }
+
+    /// Test 3: `scx_allocator`, `sdt_pool`, `sdt_desc` all present
+    /// but `sdt_chunk` is missing. The error must surface the
+    /// distinct `"sdt_chunk not found"` context — sdt_chunk goes
+    /// through [`find_struct_or_fwd`] (not `require_full_struct`),
+    /// so its diagnostic wording differs from sdt_pool / sdt_desc.
+    #[test]
+    fn sdt_alloc_offsets_missing_sdt_chunk_distinct_error() {
+        let (strings, names) = sdta_strings_for_from_btf();
+        let types = vec![
+            // id=1: u64 plain unsigned.
+            SdtaSynType::Int {
+                name_off: names.n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id=2: scx_allocator (full struct).
+            sdta_allocator_struct(&names),
+            // id=3: sdt_pool (full struct).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_pool,
+                size: 32,
+                members: vec![SdtaSynMember {
+                    name_off: names.n_elem_size,
+                    type_id: 1,
+                    byte_offset: 16,
+                }],
+            },
+            // id=4: sdt_desc (full struct, present so sdt_chunk is
+            // the failing lookup).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_desc,
+                size: 24,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: names.n_allocated,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: names.n_nr_free,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                    SdtaSynMember {
+                        name_off: names.n_chunk,
+                        type_id: 1,
+                        byte_offset: 16,
+                    },
+                ],
+            },
+            // id=5: sdt_data (Fwd).
+            SdtaSynType::Fwd {
+                name_off: names.n_sdt_data,
+            },
+            // sdt_chunk is intentionally OMITTED.
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+        let err = SdtAllocOffsets::from_btf(&btf)
+            .expect_err("missing sdt_chunk must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sdt_chunk"),
+            "error must name the missing struct: '{msg}'"
+        );
+        // sdt_chunk uses `find_struct_or_fwd` with the context
+        // `"btf: struct sdt_chunk not found"`. The inner anyhow
+        // error from `with_context` always carries `"type 'X' not
+        // found"`, so a contains-"not found" check alone is also
+        // satisfied by the sdt_pool / sdt_desc paths via their
+        // inner context. The distinguishing OUTER-context check is
+        // the absence of `"unavailable for member offsets"` — that
+        // wording is sdt_pool / sdt_desc-specific.
+        assert!(
+            msg.contains("not found"),
+            "sdt_chunk error must carry the find_struct_or_fwd 'not found' wording: '{msg}'"
+        );
+        assert!(
+            !msg.contains("unavailable for member offsets"),
+            "sdt_chunk uses find_struct_or_fwd, NOT require_full_struct — the 'unavailable for member offsets' phrase is sdt_pool / sdt_desc-specific and must not appear: '{msg}'"
+        );
+        assert!(
+            !msg.contains("sdt_pool"),
+            "missing-sdt_chunk error must not reference sdt_pool: '{msg}'"
+        );
+        assert!(
+            !msg.contains("sdt_desc"),
+            "missing-sdt_chunk error must not reference sdt_desc: '{msg}'"
+        );
+    }
+
+    /// Test 4: every required type present and `sdt_data` emitted
+    /// as a `BTF_KIND_FWD` forward declaration. `from_btf` must
+    /// succeed and `data_header_size` must equal
+    /// [`SIZEOF_SDT_ID`] = 8 — the kernel-header-fixed size of the
+    /// `union sdt_id` header (the only non-flex-array member in
+    /// `struct sdt_data`). This is the lavd-style scheduler path:
+    /// the program never accesses `sdt_data` members directly so
+    /// libbpf strips the body to a Fwd, and the walker covers
+    /// liveness via the per-level `allocated[]` bitmap rather than
+    /// the slot's own header content.
+    #[test]
+    fn sdt_alloc_offsets_sdt_data_fwd_uses_sizeof_sdt_id() {
+        let (strings, names) = sdta_strings_for_from_btf();
+        let types = vec![
+            // id=1: u64 plain unsigned.
+            SdtaSynType::Int {
+                name_off: names.n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id=2: scx_allocator (full struct).
+            sdta_allocator_struct(&names),
+            // id=3: sdt_pool (full struct).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_pool,
+                size: 32,
+                members: vec![SdtaSynMember {
+                    name_off: names.n_elem_size,
+                    type_id: 1,
+                    byte_offset: 16,
+                }],
+            },
+            // id=4: sdt_desc (full struct).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_desc,
+                size: 24,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: names.n_allocated,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: names.n_nr_free,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                    SdtaSynMember {
+                        name_off: names.n_chunk,
+                        type_id: 1,
+                        byte_offset: 16,
+                    },
+                ],
+            },
+            // id=5: sdt_chunk (full struct with `descs` member at
+            // offset 0 — matches the kernel layout's union at
+            // offset 0).
+            SdtaSynType::Struct {
+                name_off: names.n_sdt_chunk,
+                size: 8,
+                members: vec![SdtaSynMember {
+                    name_off: names.n_descs,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            // id=6: sdt_data (Fwd) — the path under test. The
+            // hardcoded fallback to SIZEOF_SDT_ID must fire.
+            SdtaSynType::Fwd {
+                name_off: names.n_sdt_data,
+            },
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+        let offsets = SdtAllocOffsets::from_btf(&btf)
+            .expect("sdt_data Fwd must NOT cause from_btf to fail — Fwd is the lavd-style path");
+        assert_eq!(
+            offsets.data_header_size, SIZEOF_SDT_ID,
+            "data_header_size for a Fwd sdt_data must fall back to SIZEOF_SDT_ID (=8, the union sdt_id header size that lib/sdt_task_defs.h fixes)"
+        );
+        assert_eq!(
+            offsets.data_header_size, 8,
+            "literal-8 cross-check: the Fwd fallback must equal exactly 8 bytes (kernel-header-fixed)"
+        );
+    }
 }
