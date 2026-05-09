@@ -2528,9 +2528,33 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                 if bit_off % 8 != 0 {
                     continue;
                 }
-                if bit_off / 8 == byte_offset {
-                    let member_type_id = m.get_type_id().ok()?;
+                let member_off = bit_off / 8;
+                let member_type_id = m.get_type_id().ok()?;
+                if member_off == byte_offset {
                     return Some(MemberAt::Struct { member_type_id });
+                }
+                if member_off < byte_offset {
+                    if let Some(terminal) =
+                        super::btf_render::peel_modifiers(btf, member_type_id)
+                    {
+                        if let Type::Array(arr) = &terminal {
+                            let elem_tid = arr.get_type_id().ok()?;
+                            let elem_size =
+                                super::btf_render::type_size(btf, &{
+                                    super::btf_render::peel_modifiers(btf, elem_tid)?
+                                })? as u32;
+                            if elem_size > 0 {
+                                let arr_len = arr.len() as u32;
+                                let arr_byte_size = elem_size * arr_len;
+                                let rel = byte_offset - member_off;
+                                if rel < arr_byte_size && rel % elem_size == 0 {
+                                    return Some(MemberAt::Struct {
+                                        member_type_id: elem_tid,
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
             None
