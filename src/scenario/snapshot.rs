@@ -2185,6 +2185,7 @@ mod tests {
                             }],
                         })),
                         deref_skipped_reason: None,
+                        cast_annotation: None,
                     },
                 },
             ],

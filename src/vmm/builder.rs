@@ -850,7 +850,7 @@ impl KtstrVmBuilder {
         // for the full pipeline.
         let cast_map = self.scheduler_binary.as_deref().and_then(|p| {
             let m = super::cast_analysis_load::build_cast_map_from_scheduler(p);
-            (!m.is_empty()).then_some(m)
+            (!m.is_empty()).then(|| std::sync::Arc::new(m))
         });
 
         Ok(KtstrVm {

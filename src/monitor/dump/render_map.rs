@@ -284,18 +284,14 @@ impl MemReader for AccessorMemReader<'_> {
 
     fn cast_lookup(&self, parent_type_id: u32, member_byte_offset: u32) -> Option<CastHit> {
         // CastMap key is `(source_btf_type_id, field_byte_offset)`,
-        // value is `(target_btf_type_id, AddrSpace)` — see
+        // value is [`CastHit`] — see
         // [`super::super::cast_analysis::CastMap`]. The cast analyzer
         // already keys on the underlying *struct* type id (see
-        // `cast_analysis::resolve_to_struct_id`), matching the form
+        // `bpf_map::resolve_to_struct_id`), matching the form
         // [`super::super::btf_render::render_struct`] threads down
         // as `parent_type_id` after [`super::super::btf_render::peel_modifiers_with_id`].
         let map = self.cast_map?;
-        let &(target_type_id, addr_space) = map.get(&(parent_type_id, member_byte_offset))?;
-        Some(CastHit {
-            target_type_id,
-            addr_space,
-        })
+        map.get(&(parent_type_id, member_byte_offset)).copied()
     }
 }
 
@@ -525,43 +521,18 @@ pub(super) fn render_key_optional(
     }
 }
 
-/// Maximum number of BTF modifier hops [`peel_modifiers`] will
-/// traverse before giving up. Real-world chains rarely exceed 2-3
-/// (e.g. `typedef -> const -> base`); 32 is a generous safety bound
-/// against pathological / cyclic BTF that would otherwise spin a
-/// freeze-path loop.
-const MODIFIER_PEEL_LIMIT: usize = 32;
-
 /// Peel BTF modifier types (`Typedef`, `Const`, `Volatile`,
-/// `Restrict`, `TypeTag`) from `start`, returning the first
-/// non-modifier `Type` reached or `None` on resolve failure / cycle
-/// limit. Centralizes the modifier-peel loop the three sdt_data
-/// lookups (value type, member type, pointee type) all share.
-///
-/// The five kinds it unwraps are the complete modifier set the
-/// kernel's BPF pipeline emits for global-variable types — see the
-/// matching list in [`super::is_scx_allocator_type`] and
-/// `btf_offsets::resolve_member_composite`.
+/// `Restrict`, `TypeTag`, `DeclTag`) from `start`, returning the
+/// first non-modifier `Type` reached or `None` on resolve failure /
+/// cycle limit. Thin wrapper over the canonical
+/// [`super::super::btf_render::peel_modifiers_from_type`] so the
+/// modifier-peel loop has one implementation across the dump
+/// pipeline. The renderer's helper applies the same hop cap as the
+/// previous local copy did and recognises the same modifier kinds
+/// plus `DeclTag` (which the previous local list missed but the
+/// kernel BPF pipeline does emit for global-variable types).
 fn peel_modifiers(btf: &Btf, start: btf_rs::Type) -> Option<btf_rs::Type> {
-    use btf_rs::Type;
-    let mut t = start;
-    for _ in 0..MODIFIER_PEEL_LIMIT {
-        match t {
-            Type::Typedef(_)
-            | Type::Const(_)
-            | Type::Volatile(_)
-            | Type::Restrict(_)
-            | Type::TypeTag(_) => {
-                let inner = t.as_btf_type()?;
-                t = btf.resolve_chained_type(inner).ok()?;
-            }
-            _ => return Some(t),
-        }
-    }
-    // Hit the hop limit without resolving to a non-modifier. Treat as
-    // unresolved — caller falls through to the same `None`-driven
-    // degradation it uses for resolve failures.
-    None
+    super::super::btf_render::peel_modifiers_from_type(btf, start)
 }
 
 /// Locate the byte offset of a `struct sdt_data __arena *` member
@@ -701,24 +672,12 @@ fn resolve_struct_ops_payload_type_id(btf: &Btf, wrapper_type_id: u32) -> Option
         return Some(match inner {
             Type::Struct(_) | Type::Union(_) | Type::Int(_) | Type::Enum(_) | Type::Enum64(_) => {
                 // Walk modifiers forward until we land on a non-
-                // modifier; report that id. Mirrors peel_modifiers
-                // but returns the id rather than the type.
-                let mut id = raw_id;
-                let mut t = btf.resolve_type_by_id(id).ok()?;
-                for _ in 0..MODIFIER_PEEL_LIMIT {
-                    match t {
-                        Type::Typedef(_)
-                        | Type::Const(_)
-                        | Type::Volatile(_)
-                        | Type::Restrict(_)
-                        | Type::TypeTag(_) => {
-                            id = t.as_btf_type()?.get_type_id().ok()?;
-                            t = btf.resolve_type_by_id(id).ok()?;
-                        }
-                        _ => break,
-                    }
-                }
-                id
+                // modifier; report the peeled id. Reuses the
+                // canonical helper in btf_render so this caller
+                // shares the renderer's modifier-set definition
+                // (Typedef / Const / Volatile / Restrict / TypeTag
+                // / DeclTag) and hop cap.
+                super::super::btf_render::peel_modifiers_with_id(btf, raw_id)?.1
             }
             _ => return None,
         });
@@ -1365,6 +1324,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
                     value: owner_kva,
                     deref: None,
                     deref_skipped_reason: None,
+                    cast_annotation: None,
                 });
                 // Value side renders through BTF when available and
                 // falls back to hex when the value type id isn't

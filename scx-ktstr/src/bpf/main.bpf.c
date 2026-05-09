@@ -23,24 +23,45 @@ UEI_DEFINE(uei);
  * payload is reached from userspace via `scx_task_data(p)` (see
  * `lib/sdt_task.bpf.c::scx_task_data`).
  *
- * The struct is laid out so the failure-dump renderer can recognize a
- * captured page in the arena snapshot:
- *   - `magic` carries `KTSTR_ARENA_MAGIC`, an 8-byte recognizable
- *     constant the host-side BTF Datasec walker looks for to confirm
- *     a page belongs to this scheduler.
- *   - `counter` carries `KTSTR_TASK_COUNTER`, a small u32 set
- *     unconditionally on every alloc so the renderer sees a non-zero
- *     value in the captured page contents.
- *   - `_pad` keeps the struct 16-byte aligned to match
- *     `SDT_TASK_MIN_ELEM_PER_ALLOC`'s round-up assumption in
- *     `lib/sdt_alloc.bpf.c::scx_alloc_init` (data_size is rounded
- *     up to 8 there; 16-byte alignment removes any pool-fragmentation
- *     question for downstream readers).
+ * Struct layout exercises the host-side BPF cast analysis pipeline
+ * (`src/monitor/cast_analysis.rs`) end-to-end. The analyzer parses
+ * scx-ktstr's `.bpf.objs` ELF blob at VM-builder time and produces a
+ * `CastMap` keyed on `(struct_btf_id, field_byte_offset) → (target_btf_id,
+ * AddrSpace)`. The dump renderer then promotes flagged `u64` fields into
+ * typed-pointer renders that chase through `read_arena` (AddrSpace::Arena)
+ * or `read_kva` (AddrSpace::Kernel).
+ *
+ * Field roles (offsets are visible to the host analyzer via the BPF
+ * object's BTF):
+ *   - `magic` (offset 0): a u64 sentinel field. Loaded but never
+ *     dereferenced as a pointer base. The analyzer must NOT promote
+ *     this to a typed pointer — the BPF code reads it only to stamp
+ *     a recognizable sentinel into the page, never as a pointer
+ *     base. Verified by the cast E2E test's negative assertion.
+ *   - `counter` (offset 8): a u32 counter. Sub-u64 fields are gated
+ *     out of the cast intercept by the renderer's `int.size() != 8`
+ *     check; this field exists so the size gate is exercised on a
+ *     real captured arena page.
+ *   - `task_kptr` (offset 16): u64 holding a kernel `task_struct *`.
+ *     Written via plain STX from the `task_struct *p` parameter that
+ *     the analyzer typed via the FuncProto seeding path; the STX-side
+ *     detection in `cast_analysis::handle_stx` produces a CastMap entry
+ *     `(ktstr_arena_ctx, 16) -> (task_struct, AddrSpace::Kernel)`. The
+ *     renderer then chases via `MemReader::read_kva` and recurses into
+ *     the task_struct bytes, so the captured field renders as
+ *     `Ptr{value, deref: Some(Struct{type_name: "task_struct", ...})}`
+ *     instead of a raw u64 counter. This is the cross-domain
+ *     "arena-source -> kernel-target" chase the E2E test asserts on.
+ *
+ * The 24-byte size keeps the struct padded to a multiple of 8 (matches
+ * `SDT_TASK_MIN_ELEM_PER_ALLOC`'s round-up in
+ * `lib/sdt_alloc.bpf.c::scx_alloc_init`).
  */
 struct ktstr_arena_ctx {
 	__u64 magic;
 	__u32 counter;
 	__u32 _pad;
+	__u64 task_kptr;
 };
 
 /* Sentinel written into `ktstr_arena_ctx::magic` at every alloc.
@@ -59,6 +80,49 @@ struct ktstr_arena_ctx {
  * `__sync_fetch_and_add` because `ktstr_init_task` is called per
  * task across all CPUs concurrently. */
 __u64 ktstr_alloc_count;
+
+/* Test fixture: BSS-resident struct whose `arena_target` u64 carries
+ * the user-side address of the most recent ktstr_arena_ctx allocation.
+ * Renders inside the dump's `.bss` map and exercises the cast intercept
+ * on the `arena_target` member.
+ *
+ * `ktstr_train_bss_to_arena` (below) loads `arena_target` and
+ * dereferences the resulting u64 as a `struct ktstr_arena_ctx __arena *`,
+ * reading enough fields (`magic` u64@0, `counter` u32@8, `task_kptr`
+ * u64@16) that the host-side cast analyzer
+ * (`src/monitor/cast_analysis.rs::analyze_casts`) can intersect the
+ * observed access pattern against the program BTF and uniquely resolve
+ * the target struct. The result is a `CastMap` entry
+ * `(ktstr_bss_arena_holder, 0) -> (ktstr_arena_ctx, AddrSpace::Arena)`.
+ *
+ * Field roles:
+ *   - `arena_target` (offset 0): u64 holding the arena VA. Loaded as
+ *     a typed pointer base inside the helper so the analyzer's LDX
+ *     path produces a `LoadedU64Field` register state. The observed
+ *     access pattern on the loaded value (`magic` + `counter` +
+ *     `task_kptr` reads, plus the addr_space_cast that the `__arena`
+ *     attribute lowers to) trains the analyzer to flag this offset
+ *     as a `(ktstr_arena_ctx, AddrSpace::Arena)` cast.
+ *   - `bss_plain_counter` (offset 8): u64 counter. Loaded but never
+ *     used as a pointer base. The analyzer must NOT promote it; the
+ *     E2E test asserts it renders as plain Uint as a negative control
+ *     (mirrors the `magic`/`counter` negative assertions on the
+ *     arena-side fixture).
+ *
+ * Volatile keeps the writes that publish the arena VA from being
+ * optimized away — even though the helper is `__noinline`, the global
+ * write in `ktstr_init_task` happens against a non-tracked register
+ * base, and a non-volatile field can be elided by the compiler when
+ * it observes no in-program reader. .bss-resident (no initializer)
+ * so the dump's BTF Datasec walker surfaces the struct under the same
+ * `.bss` map as the existing scheduler globals.
+ */
+struct ktstr_bss_arena_holder {
+	__u64 arena_target;
+	__u64 bss_plain_counter;
+};
+
+volatile struct ktstr_bss_arena_holder ktstr_bss_arena_holder;
 
 /* When non-zero, ktstr_dispatch stops moving tasks from the shared DSQ,
  * causing a deliberate stall that triggers the scx watchdog. */
@@ -226,6 +290,129 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init)
 	return scx_task_init(sizeof(struct ktstr_arena_ctx));
 }
 
+/*
+ * Helper that stamps the task_struct kernel address into a u64 field
+ * of the per-task arena context. Defined as a static BPF-to-BPF helper
+ * (not inlined) so the host-side cast analyzer
+ * (`src/monitor/cast_analysis.rs::analyze_casts`) can seed both
+ * parameters as typed kernel pointers at function entry via the
+ * `.BTF.ext` `func_info` table:
+ *   - R1 ← `Pointer{ktstr_arena_ctx}` (the FuncProto's first param peels
+ *     `__arena *` -> `Ptr` -> `Struct(ktstr_arena_ctx)`).
+ *   - R2 ← `Pointer{task_struct}` (the FuncProto's second param peels
+ *     `*` -> `Ptr` -> `Struct(task_struct)`).
+ * The body's only meaningful instruction is the STX of R2 into
+ * `*(R1 + offsetof(task_kptr))`, which `handle_stx` records as the
+ * cast finding `(ktstr_arena_ctx, 16) -> (task_struct, AddrSpace::Kernel)`.
+ *
+ * `static __noinline` keeps the helper as a real BPF-to-BPF call
+ * with its own `.BTF.ext` `func_info` entry — the analyzer only
+ * seeds parameters at function entries reported by `.BTF.ext`, so
+ * an inlined version would lose the seeding context and the STX
+ * would happen against an Unknown base register (`taskc` returned
+ * by `scx_task_alloc` is not typed by the analyzer because the
+ * analyzer does not currently model BPF-to-BPF return types from
+ * non-kfunc helpers).
+ */
+static __noinline
+int ktstr_stash_task_kptr(struct ktstr_arena_ctx __arena *taskc,
+			  struct task_struct *p)
+{
+	if (!taskc)
+		return -EINVAL;
+	taskc->task_kptr = (u64)p;
+	return 0;
+}
+
+/*
+ * BSS→arena cast trainer. Loads `holder->arena_target` (a u64 in .bss)
+ * and dereferences the resulting value as a `struct ktstr_arena_ctx
+ * __arena *`. Static BPF-to-BPF helper so the host-side cast analyzer
+ * (`src/monitor/cast_analysis.rs::analyze_casts`) seeds R1 with
+ * `Pointer{ktstr_bss_arena_holder}` at function entry via the
+ * `.BTF.ext` `func_info` table.
+ *
+ * What the analyzer sees on this body:
+ *   - LDX r2, [r1 + 0]      → `LoadedU64Field { source: ktstr_bss_arena_holder, offset: 0 }`
+ *   - addr_space_cast       → propagates state, marks (ktstr_bss_arena_holder, 0)
+ *                              as `arena_confirmed`
+ *   - LDX r3, [r2 + 0]  (8) → records access {0, 8} under
+ *                              (ktstr_bss_arena_holder, 0)
+ *   - LDX r4, [r2 + 8]  (4) → records access {8, 4}
+ *   - LDX r5, [r2 + 16] (8) → records access {16, 8}
+ *
+ * After the forward walk, `Analyzer::finalize` intersects the recorded
+ * `(offset, size)` pattern against every BTF struct in scx-ktstr's
+ * program BTF. The pattern {(0,8), (8,4), (16,8)} matches exactly
+ * one struct: `ktstr_arena_ctx` (other 24-byte structs in the BTF do
+ * not have this field-width layout). The resulting `CastMap` entry is
+ * `(ktstr_bss_arena_holder, 0) -> (ktstr_arena_ctx, AddrSpace::Arena)`.
+ *
+ * The body publishes its computed value back into a sibling BSS
+ * counter so the BPF compiler keeps every load and the address-space
+ * cast as observable side effects — without an externally-visible
+ * effect, LLVM's interprocedural pass would have collapsed the
+ * function into a constant return at the call site, dropping the
+ * `func_info` entry the analyzer relies on. The
+ * `__attribute__((used))` annotation pins the symbol even if a
+ * future caller is dropped.
+ *
+ * The verifier needs the addr_space_cast (forced by the `__arena`
+ * attribute) so the JIT inserts the kernel-VM translation; without
+ * it, the dereference would attempt to read a user-virtual address
+ * from a non-arena context and the verifier would reject the
+ * program.
+ *
+ * `static __noinline __attribute__((used))` keeps the helper as a
+ * real BPF-to-BPF call with its own `.BTF.ext` `func_info` entry —
+ * the analyzer only seeds parameters at function entries that
+ * `.BTF.ext` reports, so an inlined version would collapse the
+ * parameter into the caller's frame and the analyzer would lose
+ * the typed-parent context.
+ */
+static __noinline __attribute__((used))
+int ktstr_train_bss_to_arena(struct ktstr_bss_arena_holder *holder)
+{
+	struct ktstr_arena_ctx __arena *p;
+	__u64 raw;
+	__u64 acc = 0;
+
+	if (!holder)
+		return -EINVAL;
+	raw = holder->arena_target;
+	if (!raw)
+		return -ENOENT;
+	/* The cast-through-(unsigned long) is the idiom the lavd
+	 * scheduler uses (see scx/scheds/rust/scx_lavd's `taskc =
+	 * (task_ctx __arena *)(unsigned long)cpuc->cached_taskc_raw`
+	 * pattern). LLVM lowers the conversion to a
+	 * `BPF_ADDR_SPACE_CAST` instruction, which the analyzer's
+	 * arena-confirmed path records. */
+	p = (struct ktstr_arena_ctx __arena *)(unsigned long)raw;
+	if (!p)
+		return -EINVAL;
+	/* Read three discriminating fields so the analyzer's shape
+	 * intersection ({(0,8), (8,4), (16,8)}) uniquely resolves
+	 * `ktstr_arena_ctx` against the program BTF. Accumulate every
+	 * load into `acc` so LLVM cannot elide reads it considers
+	 * unused — a comparison-only pattern in an earlier draft was
+	 * hoisted out by the optimizer because the compares decide
+	 * the return value, not any externally-visible effect. */
+	acc ^= p->magic;
+	acc ^= (__u64)p->counter;
+	acc ^= p->task_kptr;
+	/* Publish through the sibling BSS counter so LLVM cannot
+	 * collapse the helper's body into a tail-call ABI placeholder.
+	 * `holder` is typed `Pointer{ktstr_bss_arena_holder}` per
+	 * FuncProto seeding, so this STX has both a typed base
+	 * register and a non-typed (integer) source — `handle_stx`
+	 * does NOT record a kptr finding here (the source isn't a
+	 * `Pointer{T}`), so the store is purely a code-keep-alive
+	 * effect. */
+	holder->bss_plain_counter += acc & 1;
+	return 0;
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init_task, struct task_struct *p,
 			     struct scx_init_task_args *args)
 {
@@ -247,6 +434,41 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init_task, struct task_struct *p,
 	taskc->magic = KTSTR_ARENA_MAGIC;
 	taskc->counter = KTSTR_TASK_COUNTER;
 	taskc->_pad = 0;
+
+	/* Stash the task_struct kernel pointer in the task_kptr u64 field.
+	 * The store happens inside the helper so the host-side cast analyzer
+	 * sees a typed STX through typed parameter registers, producing an
+	 * AddrSpace::Kernel cast finding the renderer chases at dump time.
+	 * Failing the helper does not abort init_task — the field stays
+	 * zero, which the renderer surfaces as a null pointer. */
+	(void)ktstr_stash_task_kptr(taskc, p);
+
+	/* Publish the arena VA into the BSS-resident holder so the
+	 * trainer below has a concrete pointer to dereference, AND so
+	 * the dump-time renderer reads a valid arena VA from
+	 * `ktstr_bss_arena_holder.arena_target` and chases through the
+	 * cast intercept. Cast through (unsigned long) so the verifier
+	 * lowers to a kernel→arena address-space conversion that
+	 * extracts the user-side VA without keeping the `__arena`
+	 * tag on the result; storing into a plain `volatile u64` field
+	 * cannot accept the qualified pointer otherwise.
+	 *
+	 * The store goes through `BPF_LD_IMM64 r6, .bss_map_value_fd;
+	 * STX [r6 + 0] = r_taskc_as_u64`. The analyzer's r6 is Unknown
+	 * because BPF_LD_IMM64 of a map value clears RegState; the STX
+	 * therefore records nothing on the .bss side. The cast detection
+	 * runs through the LDX path inside `ktstr_train_bss_to_arena`,
+	 * not this STX. */
+	ktstr_bss_arena_holder.arena_target = (__u64)(unsigned long)taskc;
+	__sync_fetch_and_add(&ktstr_bss_arena_holder.bss_plain_counter, 1);
+
+	/* Run the BSS→arena trainer with the freshly-stamped arena VA.
+	 * The helper's body teaches the analyzer to recognize the
+	 * `arena_target` u64 as a `ktstr_arena_ctx __arena *` cast.
+	 * Failing the helper does not abort init_task — the trainer is
+	 * a static analysis affordance, not a load-bearing scheduler
+	 * operation. */
+	(void)ktstr_train_bss_to_arena((struct ktstr_bss_arena_holder *)&ktstr_bss_arena_holder);
 
 	__sync_fetch_and_add(&ktstr_alloc_count, 1);
 	return 0;
@@ -336,8 +558,8 @@ void BPF_STRUCT_OPS(ktstr_dump_task, struct scx_dump_ctx *dctx,
 		scx_bpf_dump("  ktstr task: <no arena ctx>\n");
 		return;
 	}
-	scx_bpf_dump("  ktstr task: magic=0x%llx counter=%u\n",
-		     taskc->magic, taskc->counter);
+	scx_bpf_dump("  ktstr task: magic=0x%llx counter=%u task_kptr=0x%llx\n",
+		     taskc->magic, taskc->counter, taskc->task_kptr);
 }
 
 SCX_OPS_DEFINE(ktstr_ops,

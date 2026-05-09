@@ -1,3 +1,4 @@
+use super::super::cast_analysis::AddrSpace;
 use super::*;
 
 /// Build a Btf instance using the project's standard vmlinux
@@ -186,6 +187,7 @@ fn display_ptr_is_lowercase_hex() {
                 value: 0xffff_8000_1234_5678,
                 deref: None,
                 deref_skipped_reason: None,
+                cast_annotation: None,
             }
         ),
         "0xffff800012345678"
@@ -197,6 +199,7 @@ fn display_ptr_is_lowercase_hex() {
                 value: 0,
                 deref: None,
                 deref_skipped_reason: None,
+                cast_annotation: None,
             }
         ),
         "0x0"
@@ -1522,11 +1525,13 @@ fn is_zero_ptr() {
         value: 0,
         deref: None,
         deref_skipped_reason: None,
+        cast_annotation: None,
     }));
     assert!(!is_zero(&RenderedValue::Ptr {
         value: 0xffff_8000_dead_beef,
         deref: None,
         deref_skipped_reason: None,
+        cast_annotation: None,
     }));
     // A pointer with a deref but value=0 is still zero per the
     // is_zero contract — only `value` matters.
@@ -1534,6 +1539,7 @@ fn is_zero_ptr() {
         value: 0,
         deref: Some(Box::new(RenderedValue::Uint { bits: 32, value: 5 })),
         deref_skipped_reason: None,
+        cast_annotation: None,
     }));
 }
 
@@ -1582,6 +1588,7 @@ fn is_inline_scalar_accepts_scalars() {
         value: 0,
         deref: None,
         deref_skipped_reason: None,
+        cast_annotation: None,
     }));
     assert!(is_inline_scalar(&RenderedValue::Bytes { hex: "00".into() }));
     assert!(is_inline_scalar(&RenderedValue::Unsupported {
@@ -1625,6 +1632,7 @@ fn display_ptr_with_scalar_deref_uses_arrow() {
             value: 42,
         })),
         deref_skipped_reason: None,
+        cast_annotation: None,
     };
     let out = format!("{v}");
     assert!(
@@ -1643,6 +1651,7 @@ fn display_ptr_with_cpulist_deref_renders_inline() {
         value: 0xffff_8888_aaaa_bbbb,
         deref: Some(Box::new(RenderedValue::CpuList { cpus: "0-3".into() })),
         deref_skipped_reason: None,
+        cast_annotation: None,
     };
     assert_eq!(format!("{v}"), "0xffff8888aaaabbbb → cpus={0-3}");
 }
@@ -1663,6 +1672,7 @@ fn display_ptr_with_struct_deref_indents_correctly() {
         value: 0xdead_beef,
         deref: Some(Box::new(inner)),
         deref_skipped_reason: None,
+        cast_annotation: None,
     };
     let out = format!("{v}");
     assert!(out.contains("0xdeadbeef → inner{"));
@@ -1677,6 +1687,7 @@ fn display_ptr_without_deref_no_arrow() {
         value: 0xff,
         deref: None,
         deref_skipped_reason: None,
+        cast_annotation: None,
     };
     let out = format!("{v}");
     assert!(
@@ -1700,6 +1711,7 @@ fn display_ptr_with_skip_reason_surfaces_inline() {
         deref_skipped_reason: Some(
             "arena read failed (cross-page boundary or unmapped page)".to_string(),
         ),
+        cast_annotation: None,
     };
     let out = format!("{v}");
     assert!(
@@ -1936,11 +1948,13 @@ fn array_block_all_zero_collapses() {
                 value: 0,
                 deref: None,
                 deref_skipped_reason: None,
+                cast_annotation: None,
             },
             RenderedValue::Ptr {
                 value: 0,
                 deref: None,
                 deref_skipped_reason: None,
+                cast_annotation: None,
             },
         ],
     };
@@ -2440,11 +2454,17 @@ fn ptr_cycle_visited_set_does_not_leak_across_calls() {
 // keeps these tests independent of vmlinux availability and pins
 // the exact intercept gate without any real kernel BTF noise.
 
-const CAST_BTF_MAGIC: u16 = 0xeB9F;
+const CAST_BTF_MAGIC: u16 = 0xEB9F;
 const CAST_BTF_VERSION: u8 = 1;
 const CAST_BTF_HEADER_LEN: u32 = 24;
 const CAST_BTF_KIND_INT: u32 = 1;
 const CAST_BTF_KIND_STRUCT: u32 = 4;
+/// `BTF_KIND_TYPEDEF` per `btf-rs::obj::resolve` — kind 8 maps to
+/// `Type::Typedef`. Used by the modifier-chain integration test.
+const CAST_BTF_KIND_TYPEDEF: u32 = 8;
+/// `BTF_KIND_CONST` per `btf-rs::obj::resolve` — kind 10 maps to
+/// `Type::Const`. Used by the modifier-chain integration test.
+const CAST_BTF_KIND_CONST: u32 = 10;
 
 /// Build a minimal BTF blob containing `types` (id=1..) and a
 /// string-section payload `strings` (must start with `\0`). The
@@ -2486,6 +2506,27 @@ fn cast_build_btf(types: &[CastSynType], strings: &[u8]) -> Vec<u8> {
                     let bit_off = m.byte_offset * 8;
                     type_section.extend_from_slice(&bit_off.to_le_bytes());
                 }
+            }
+            CastSynType::Typedef { name_off, type_id } => {
+                // BTF_KIND_TYPEDEF wire layout: name_off (4) + info (4)
+                // + size_type (4) where size_type holds the wrapped
+                // type id. Per `cbtf::btf_type::kind`, the kind is
+                // bits 24..29 of `info`; vlen is 0 for Typedef.
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let info = (CAST_BTF_KIND_TYPEDEF << 24) & 0x1f00_0000;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&type_id.to_le_bytes());
+            }
+            CastSynType::Const { type_id } => {
+                // BTF_KIND_CONST wire layout: name_off (4, always 0) +
+                // info (4) + size_type (4, the wrapped type id). Per
+                // the BTF spec, Const types are anonymous so name_off
+                // is unused.
+                let name_off: u32 = 0;
+                type_section.extend_from_slice(&name_off.to_le_bytes());
+                let info = (CAST_BTF_KIND_CONST << 24) & 0x1f00_0000;
+                type_section.extend_from_slice(&info.to_le_bytes());
+                type_section.extend_from_slice(&type_id.to_le_bytes());
             }
         }
     }
@@ -2532,6 +2573,19 @@ enum CastSynType {
         size: u32,
         members: Vec<CastSynMember>,
     },
+    /// `BTF_KIND_TYPEDEF` (kind=8). Wraps another type id with a
+    /// name. The renderer's [`peel_modifiers_with_id`] peels through
+    /// it; the analyzer's [`super::super::bpf_map::resolve_to_struct_id`]
+    /// peels through it too. Used by the modifier-chain integration
+    /// test to verify both peel paths agree on the underlying
+    /// struct id the [`CastMap`] keys on.
+    Typedef { name_off: u32, type_id: u32 },
+    /// `BTF_KIND_CONST` (kind=10). Anonymous wrapper around another
+    /// type id. Same renderer / analyzer peel treatment as Typedef.
+    /// `name_off` is always 0 per the BTF spec (Const types are
+    /// anonymous), but the field is still emitted for wire-format
+    /// completeness.
+    Const { type_id: u32 },
 }
 
 /// Helper: build a string section + name offsets for the names
@@ -2653,29 +2707,38 @@ fn cast_btf_t_with_u32() -> (Vec<u8>, u32, u32) {
     (cast_build_btf(&types, &strings), 3, 4)
 }
 
-/// Stub `MemReader` for cast-intercept tests. Returns a fixed
-/// [`CastHit`] for any `cast_lookup` call (the test fixtures fix
-/// the parent id and offset that will be queried, so universal
-/// match is sufficient and avoids hand-keying the same id+offset
-/// pair into every test). `arena_bytes_at` and `kva_bytes_at`
-/// drive the address-space dispatch; tests that don't exercise
-/// reads leave the maps empty.
+/// Stub `MemReader` for cast-intercept tests. Two cast-lookup
+/// modes:
+///
+/// - `cast_map = Some(map)` — looks up
+///   `(parent_type_id, member_byte_offset)` in a real
+///   [`super::super::cast_analysis::CastMap`] (typically produced by
+///   [`super::super::cast_analysis::analyze_casts`]) and returns
+///   the matching [`CastHit`]. The integration tests use this mode
+///   to wire actual analyzer output into the renderer.
+/// - `cast_map = None` — returns the fixed `hit` (or `None` when
+///   `hit` is `None`) for every query. The unit tests for the
+///   intercept gate use this mode because they only need the
+///   intercept to fire or not fire on a single (parent, offset)
+///   pair.
+///
+/// `arena_bytes_at` and `kva_bytes_at` drive the address-space
+/// dispatch; tests that don't exercise reads leave the maps empty.
+#[derive(Default)]
 struct CastStubReader {
+    /// Fixed [`CastHit`] returned by `cast_lookup` when `cast_map`
+    /// is `None`. Universal-match avoids hand-keying the same
+    /// (id, offset) pair into every gate-focused test.
     hit: Option<CastHit>,
+    /// Real cast map consulted when `Some`. The
+    /// `(parent_type_id, member_byte_offset)` lookup mirrors
+    /// `AccessorMemReader::cast_lookup` in `dump/render_map.rs`
+    /// (the production path), so the integration tests cover the
+    /// same shape.
+    cast_map: Option<super::super::cast_analysis::CastMap>,
     arena_window: Option<(u64, u64)>,
     arena_bytes_at: std::collections::HashMap<u64, Vec<u8>>,
     kva_bytes_at: std::collections::HashMap<u64, Vec<u8>>,
-}
-
-impl Default for CastStubReader {
-    fn default() -> Self {
-        Self {
-            hit: None,
-            arena_window: None,
-            arena_bytes_at: std::collections::HashMap::new(),
-            kva_bytes_at: std::collections::HashMap::new(),
-        }
-    }
 }
 
 impl MemReader for CastStubReader {
@@ -2699,7 +2762,16 @@ impl MemReader for CastStubReader {
         }
         Some(bytes[..len].to_vec())
     }
-    fn cast_lookup(&self, _parent_type_id: u32, _member_byte_offset: u32) -> Option<CastHit> {
+    fn cast_lookup(&self, parent_type_id: u32, member_byte_offset: u32) -> Option<CastHit> {
+        // CastMap mode: look up (parent, offset) in the analyzer's
+        // output. Mirrors the production `AccessorMemReader::cast_lookup`
+        // so the integration tests cover the same key/value shape.
+        if let Some(map) = &self.cast_map {
+            return map.get(&(parent_type_id, member_byte_offset)).copied();
+        }
+        // Fixed-hit mode (default): return the canned hit
+        // regardless of (parent, offset). Used by gate-focused
+        // unit tests above.
         self.hit
     }
 }
@@ -2728,11 +2800,16 @@ fn cast_intercept_u64_renders_as_ptr_with_chase() {
 
     let mut arena_bytes = std::collections::HashMap::new();
     arena_bytes.insert(TARGET_ADDR, inner_bytes);
-    let reader = CastStubReader {
-        hit: Some(CastHit {
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
-        }),
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
         arena_window: Some((ARENA_LO, ARENA_HI)),
         arena_bytes_at: arena_bytes,
         ..Default::default()
@@ -2753,6 +2830,7 @@ fn cast_intercept_u64_renders_as_ptr_with_chase() {
         value,
         ref deref,
         ref deref_skipped_reason,
+        ..
     } = members[0].value
     else {
         panic!(
@@ -2824,6 +2902,7 @@ fn cast_intercept_null_value_no_crash() {
         value,
         ref deref,
         ref deref_skipped_reason,
+        ..
     } = members[0].value
     else {
         panic!(
@@ -2951,6 +3030,8 @@ fn cast_chase_cycle_detection() {
     };
 
     let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    // (outer_bytes is little-endian per the renderer's wire format
+    // assumption; SELF_ADDR.to_le_bytes() above produces those.)
     let RenderedValue::Struct { ref members, .. } = v else {
         panic!("expected outer Struct render, got {v:?}");
     };
@@ -2960,6 +3041,7 @@ fn cast_chase_cycle_detection() {
         value: outer_value,
         deref: ref outer_deref,
         deref_skipped_reason: ref outer_reason,
+        ..
     } = members[0].value
     else {
         panic!(
@@ -2987,6 +3069,7 @@ fn cast_chase_cycle_detection() {
         value: inner_value,
         deref: ref inner_deref,
         deref_skipped_reason: ref inner_reason,
+        ..
     } = inner_members[0].value
     else {
         panic!(
@@ -3047,6 +3130,7 @@ fn cast_chase_kernel_plausibility_rejects_freed_slab() {
         value,
         ref deref,
         ref deref_skipped_reason,
+        ..
     } = members[0].value
     else {
         panic!(
@@ -3066,4 +3150,2091 @@ fn cast_chase_kernel_plausibility_rejects_freed_slab() {
         reason.contains("plausibility"),
         "skip reason must mention plausibility, got: {reason}"
     );
+}
+
+// ---- Cast pipeline integration ---------------------------------
+//
+// The tests above stub `cast_lookup` with a fixed [`CastHit`]. The
+// integration tests below run real
+// [`super::super::cast_analysis::analyze_casts`] over a synthetic
+// BPF program, feed the resulting [`super::super::cast_analysis::CastMap`]
+// into [`CastStubReader::cast_map`], and render a struct against
+// the analyzer's actual output. The point: verify the
+// `(parent_type_id, member_byte_offset)` keys the analyzer emits
+// match the keys [`render_member`]'s cast intercept queries via
+// [`MemReader::cast_lookup`]. A drift between analyzer and
+// renderer (e.g. analyzer keys on a typedef-wrapped surface id,
+// renderer queries with the peeled struct id) would surface as a
+// missed intercept here even though both halves work in
+// isolation.
+//
+// The fixtures use the same [`cast_build_btf`] /
+// [`CastSynType`] machinery the gate-focused tests above use,
+// extended with `Typedef` and `Const` for the modifier-chain case.
+// BPF instruction encoding goes through [`BpfInsn::new`]; opcode
+// constants come from `libbpf_rs::libbpf_sys` (the same source
+// the analyzer's own private constants use, so the test
+// instruction stream stays in lock-step with the analyzer's
+// decode tables).
+
+use super::super::cast_analysis::{BpfInsn, CastMap, InitialReg, analyze_casts};
+
+/// `BPF_LDX | BPF_DW | BPF_MEM` in the [`BpfInsn::code`] byte. The
+/// arena-cast LDX shape the analyzer's `handle_ldx` matches: load
+/// 8 bytes through a typed pointer base. Constants pulled from
+/// `libbpf_rs::libbpf_sys` so the test encoding stays in lock-step
+/// with the analyzer's own decode tables.
+fn cast_ldx_dw_mem_code() -> u8 {
+    use libbpf_rs::libbpf_sys as bs;
+    (bs::BPF_LDX | bs::BPF_DW | bs::BPF_MEM) as u8
+}
+
+/// `BPF_JMP | BPF_EXIT` in the [`BpfInsn::code`] byte. Terminator
+/// for synthetic programs.
+fn cast_exit_code() -> u8 {
+    use libbpf_rs::libbpf_sys as bs;
+    (bs::BPF_JMP | bs::BPF_EXIT) as u8
+}
+
+/// One-shot helper: emit `r{dst} = *(u64 *)(r{src} + off)` as a
+/// single [`BpfInsn`] for cast-integration tests.
+fn cast_ldx_dw(dst: u8, src: u8, off: i16) -> BpfInsn {
+    BpfInsn::new(cast_ldx_dw_mem_code(), dst, src, off, 0)
+}
+
+/// One-shot helper: emit `exit` as a single [`BpfInsn`].
+fn cast_exit() -> BpfInsn {
+    BpfInsn::new(cast_exit_code(), 0, 0, 0, 0)
+}
+
+/// Build a BTF blob shaped to drive [`analyze_casts`] to a unique
+/// (T, 8) → (Q, Arena) finding when run against the canonical
+/// `r2 = T.f; r3 = *r2` pair. Layout:
+///
+///   id=1: u64 (size 8, plain unsigned)
+///   id=2: struct T { u64 f @ offset 8 }, size 16
+///   id=3: struct Q { u64 x @ offset 0 }, size 8
+///
+/// T's u64 lives at offset 8 (not 0), so the access pattern
+/// `(offset=0, size=8)` from `*r2` only matches Q in the layout
+/// index — the analyzer's source-removal step doesn't fire (T is
+/// not in the candidate set), so the single-candidate condition
+/// emits the entry.
+fn cast_btf_t_at_offset_8_q_at_offset_0() -> (Vec<u8>, u32, u32) {
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let types = vec![
+        // id 1: u64 plain unsigned.
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct T { u64 f @ 8 }, size 16. Offset 8 keeps T
+        // out of the (offset=0, size=8) layout-index bucket, so the
+        // analyzer's intersection collapses to {Q} cleanly.
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 16,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 8,
+            }],
+        },
+        // id 3: struct Q { u64 x @ 0 }, size 8.
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    (cast_build_btf(&types, &strings), 2, 3)
+}
+
+/// First true integration test: real [`analyze_casts`] output drives
+/// the renderer's cast intercept end-to-end. Verifies that the
+/// `(parent_type_id, member_byte_offset)` keys the analyzer emits
+/// match the keys [`render_member`] queries via
+/// [`MemReader::cast_lookup`], and that the renderer chases the
+/// recovered target through [`render_cast_pointer`] to produce a
+/// `Ptr` with a populated `deref`.
+///
+/// A drift between analyzer key format and renderer query format
+/// would surface here as a missed intercept (the u64 field
+/// rendered as `Uint` instead of `Ptr`), even though both halves
+/// work in isolation.
+#[test]
+fn cast_pipeline_analyzer_output_drives_renderer_intercept() {
+    let (blob, t_id, q_id) = cast_btf_t_at_offset_8_q_at_offset_0();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // BPF program:
+    //   r2 = *(u64 *)(r1 + 8)   ; load T.f → r2 = LoadedU64Field{T, 8}
+    //   r3 = *(u64 *)(r2 + 0)   ; deref @0 records access (0, 8) under (T, 8)
+    //   exit
+    let insns = vec![cast_ldx_dw(2, 1, 8), cast_ldx_dw(3, 2, 0), cast_exit()];
+    let cast_map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 1,
+            struct_type_id: t_id,
+        }],
+        &[],
+        &[],
+    );
+    // Analyzer must produce exactly one finding: (T, 8) → (Q, Arena).
+    assert_eq!(
+        cast_map.get(&(t_id, 8)),
+        Some(&CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        }),
+        "analyzer must emit (T, 8) → (Q, Arena); got: {cast_map:?}"
+    );
+
+    // Render T's bytes (16 bytes: 8 padding + arena address at
+    // offset 8) with the analyzer's CastMap as the lookup source.
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let mut outer_bytes = vec![0u8; 16];
+    outer_bytes[8..16].copy_from_slice(&TARGET_ADDR.to_le_bytes());
+    let inner_bytes = 0x42u64.to_le_bytes().to_vec();
+
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, inner_bytes);
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct {
+        type_name,
+        ref members,
+    } = v
+    else {
+        panic!("expected outer Struct render, got {v:?}");
+    };
+    assert_eq!(type_name.as_deref(), Some("T"));
+    assert_eq!(members.len(), 1, "T has a single u64 member at offset 8");
+    assert_eq!(members[0].name, "f");
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "(T, 8) cast hit must produce Ptr (not Uint); got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, TARGET_ADDR, "Ptr value must be the loaded u64");
+    assert!(
+        deref_skipped_reason.is_none(),
+        "successful chase must carry no skip reason; got {deref_skipped_reason:?}"
+    );
+    let inner = deref
+        .as_deref()
+        .expect("chase succeeded → deref must be Some");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = *inner
+    else {
+        panic!("deref payload must be the rendered Q struct, got {inner:?}");
+    };
+    assert_eq!(
+        inner_name.as_deref(),
+        Some("Q"),
+        "deref payload must carry Q's name"
+    );
+    assert_eq!(inner_members.len(), 1);
+    assert_eq!(inner_members[0].name, "x");
+    let RenderedValue::Uint { bits, value } = inner_members[0].value else {
+        panic!("Q.x must render as Uint, got {:?}", inner_members[0].value);
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, 0x42);
+}
+
+/// Modifier-chain integration: render a `Typedef → Const → Struct(T)`
+/// surface type. The renderer's [`peel_modifiers_with_id`] must
+/// peel both wrappers and emit `parent_type_id = T_id` (the
+/// underlying struct) so [`MemReader::cast_lookup`] queries with
+/// the same id the analyzer keyed on. Catches the fragile coupling
+/// where a future change to one peel path (renderer or analyzer)
+/// drifts away from the other.
+#[test]
+fn cast_pipeline_modifier_chain_renderer_peels_to_analyzer_struct_id() {
+    // Layout extends `cast_btf_t_at_offset_8_q_at_offset_0` with two
+    // modifier wrappers: id=4 = Const(T), id=5 = Typedef(Const(T)).
+    // The analyzer still keys on T_id=2 (struct id) because both
+    // `bpf_map::resolve_to_struct_id` (used by InitialReg seeding)
+    // and `peel_modifiers_with_id` (used by render_struct) collapse
+    // the wrapper chain.
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    // Add a typedef name distinct from the existing strings so the
+    // wrapper carries an identifiable name on the wire (the
+    // renderer doesn't surface it because peel collapses the
+    // wrapper, but the BTF blob round-trips correctly).
+    let mut strings = strings;
+    let n_typedef = push(&mut strings, "T_alias");
+    let types = vec![
+        // id 1..3 mirror cast_btf_t_at_offset_8_q_at_offset_0.
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 16,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 8,
+            }],
+        },
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 4: const(T) — wraps T_id=2.
+        CastSynType::Const { type_id: 2 },
+        // id 5: typedef T_alias = const(T) — wraps id 4. Render via
+        // this id; peel_modifiers_with_id collapses 5→4→2.
+        CastSynType::Typedef {
+            name_off: n_typedef,
+            type_id: 4,
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+    let typedef_id: u32 = 5;
+
+    // Analyzer is run against the SAME BTF; the wrappers are inert
+    // for analyze_casts (they're not Struct/Union, so the layout
+    // index skips them). InitialReg seeds with the typedef wrapper
+    // to verify the analyzer's `resolve_to_struct_id` peels through
+    // the same chain the renderer does.
+    let insns = vec![cast_ldx_dw(2, 1, 8), cast_ldx_dw(3, 2, 0), cast_exit()];
+    let cast_map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 1,
+            struct_type_id: typedef_id,
+        }],
+        &[],
+        &[],
+    );
+    assert_eq!(
+        cast_map.get(&(t_id, 8)),
+        Some(&CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena
+        }),
+        "analyzer must peel typedef→const→struct and key on T_id={t_id}; got: {cast_map:?}"
+    );
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let mut outer_bytes = vec![0u8; 16];
+    outer_bytes[8..16].copy_from_slice(&TARGET_ADDR.to_le_bytes());
+    let inner_bytes = 0x99u64.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, inner_bytes);
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    // Render via the typedef id — the renderer's peel must produce
+    // parent_type_id=T_id so the cast lookup hits.
+    let v = render_value_with_mem(&btf, typedef_id, &outer_bytes, &reader);
+    let RenderedValue::Struct {
+        type_name,
+        ref members,
+    } = v
+    else {
+        panic!("expected Struct render after peel, got {v:?}");
+    };
+    assert_eq!(
+        type_name.as_deref(),
+        Some("T"),
+        "renderer must collapse typedef/const wrappers to underlying T name"
+    );
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "modifier-chain peel must reach the cast intercept; got {:?}. \
+             A failure here means the renderer's peel diverges from the \
+             analyzer's — the integration is broken.",
+            members[0].value
+        );
+    };
+    assert_eq!(value, TARGET_ADDR);
+    assert!(deref_skipped_reason.is_none());
+    let inner = deref.as_deref().expect("chase deref Some");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        ..
+    } = *inner
+    else {
+        panic!("deref payload must be Q struct, got {inner:?}");
+    };
+    assert_eq!(inner_name.as_deref(), Some("Q"));
+}
+
+/// Multi-field integration: a struct with three u64 fields where
+/// only two are flagged by the analyzer must render the flagged
+/// fields as `Ptr` and the third as `Uint`. The point: per-member
+/// cast lookup is independent — a hit on one offset must not
+/// promote unrelated u64 fields.
+#[test]
+fn cast_pipeline_multi_field_only_flagged_offsets_render_as_ptr() {
+    // Layout: T has u64 fields at offsets 0, 8, 16. Q is a generic
+    // 8-byte target (u64 @ 0).
+    //   id=1: u64
+    //   id=2: struct T { u64 f0 @ 0; u64 f1 @ 8; u64 f2 @ 16 }, size 24
+    //   id=3: struct Q { u64 x @ 0 }, size 8
+    let (strings, n_int, n_t, n_q, _n_f, n_x) = cast_strings_for_t_q();
+    // Add three field names distinct from `f`/`x`.
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let mut strings = strings;
+    let n_f0 = push(&mut strings, "f0");
+    let n_f1 = push(&mut strings, "f1");
+    let n_f2 = push(&mut strings, "f2");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 24,
+            members: vec![
+                CastSynMember {
+                    name_off: n_f0,
+                    type_id: 1,
+                    byte_offset: 0,
+                },
+                CastSynMember {
+                    name_off: n_f1,
+                    type_id: 1,
+                    byte_offset: 8,
+                },
+                CastSynMember {
+                    name_off: n_f2,
+                    type_id: 1,
+                    byte_offset: 16,
+                },
+            ],
+        },
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+
+    // Build a CastMap by hand with entries for offsets 0 and 8
+    // ONLY (NOT 16). This mirrors a partial-coverage analyzer
+    // result: some u64 fields recovered, others missed (false
+    // negatives are the safe direction for the analyzer).
+    let mut cast_map: CastMap = std::collections::BTreeMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    cast_map.insert(
+        (t_id, 8),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+
+    // Outer T bytes: arena addresses at offsets 0 and 8, plain
+    // u64 counter at offset 16. The renderer must NOT chase the
+    // counter even though it could be misinterpreted as an arena
+    // address (it falls in the arena window for stress purposes).
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const ADDR_F0: u64 = 0x10_0000_1000;
+    const ADDR_F1: u64 = 0x10_0000_2000;
+    const COUNTER_F2: u64 = 0x10_0000_3000;
+    let mut outer_bytes = vec![0u8; 24];
+    outer_bytes[0..8].copy_from_slice(&ADDR_F0.to_le_bytes());
+    outer_bytes[8..16].copy_from_slice(&ADDR_F1.to_le_bytes());
+    outer_bytes[16..24].copy_from_slice(&COUNTER_F2.to_le_bytes());
+
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(ADDR_F0, 0xAAu64.to_le_bytes().to_vec());
+    arena_bytes.insert(ADDR_F1, 0xBBu64.to_le_bytes().to_vec());
+    // Note: deliberately NO entry at COUNTER_F2 — even if the
+    // intercept were buggy and fired for f2, the chase would
+    // surface a `read_arena returned None` skip reason rather
+    // than a deref payload. The test's primary check is that f2
+    // renders as Uint (no intercept attempted).
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected outer Struct render, got {v:?}");
+    };
+    assert_eq!(members.len(), 3, "T has three u64 members");
+    assert_eq!(members[0].name, "f0");
+    assert_eq!(members[1].name, "f1");
+    assert_eq!(members[2].name, "f2");
+
+    // f0 (cast hit at offset 0): Ptr with deref Some.
+    let RenderedValue::Ptr {
+        value: f0_value,
+        ref deref,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "f0 (offset 0) must render as Ptr (cast map hit); got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(f0_value, ADDR_F0);
+    assert!(deref.is_some(), "f0 chase must succeed (deref Some)");
+
+    // f1 (cast hit at offset 8): Ptr with deref Some.
+    let RenderedValue::Ptr {
+        value: f1_value,
+        ref deref,
+        ..
+    } = members[1].value
+    else {
+        panic!(
+            "f1 (offset 8) must render as Ptr (cast map hit); got {:?}",
+            members[1].value
+        );
+    };
+    assert_eq!(f1_value, ADDR_F1);
+    assert!(deref.is_some(), "f1 chase must succeed (deref Some)");
+
+    // f2 (NO cast entry at offset 16): plain Uint counter.
+    let RenderedValue::Uint {
+        bits: f2_bits,
+        value: f2_value,
+    } = members[2].value
+    else {
+        panic!(
+            "f2 (offset 16) must render as Uint (no cast map entry); \
+             got {:?}. A failure here means a hit on one offset is \
+             contaminating unrelated offsets in the same struct.",
+            members[2].value
+        );
+    };
+    assert_eq!(f2_bits, 64);
+    assert_eq!(f2_value, COUNTER_F2);
+}
+
+/// Empty-CastMap integration: a [`CastMap`] with no entries (the
+/// no-cast case for a scheduler whose program contains zero
+/// recovered casts) must leave every u64 field rendering as a
+/// plain `Uint`. Verifies the lookup miss path through the real
+/// `BTreeMap::get` returns `None` exactly as the trait-default
+/// `cast_lookup` does, so deploying an empty analyzer result is
+/// behaviorally indistinguishable from no analyzer at all.
+#[test]
+fn cast_pipeline_empty_cast_map_renders_uint() {
+    let (blob, t_id, _q_id) = cast_btf_t_at_offset_8_q_at_offset_0();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // Empty CastMap. cast_lookup must return None for every query.
+    let cast_map: CastMap = std::collections::BTreeMap::new();
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        ..Default::default()
+    };
+
+    // T has u64 at offset 8; render with a counter-shaped value
+    // there. With no cast entries, the field must render as a
+    // plain Uint regardless of the value's numeric range.
+    let mut outer_bytes = vec![0u8; 16];
+    outer_bytes[8..16].copy_from_slice(&0xCAFE_F00Du64.to_le_bytes());
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Uint { bits, value } = members[0].value else {
+        panic!(
+            "empty cast map must leave u64 as Uint; got {:?}. A \
+             failure here means an empty BTreeMap is being treated \
+             as 'wildcard hit' instead of 'no hits' — a regression \
+             that would promote every u64 to a phantom pointer.",
+            members[0].value
+        );
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, 0xCAFE_F00D);
+}
+
+/// Wrong-struct integration: a [`CastMap`] entry keyed on a
+/// struct id DIFFERENT from the one being rendered must NOT
+/// fire. The renderer queries `cast_lookup` with the parent
+/// struct's id; an entry for an unrelated struct (even at the
+/// same byte offset, with the same target type) is a miss.
+/// Catches the regression where the lookup ignored
+/// `parent_type_id` and matched on offset alone.
+#[test]
+fn cast_pipeline_wrong_struct_id_does_not_intercept() {
+    // Layout: two distinct structs with identical shape (u64 @ 0).
+    // The CastMap entry is keyed on U; the test renders T. The
+    // intercept must NOT fire on T even though T's offset-0 u64
+    // is structurally identical to U's.
+    //   id=1: u64
+    //   id=2: struct T { u64 f @ 0 }, size 8
+    //   id=3: struct Q { u64 x @ 0 }, size 8 (cast target)
+    //   id=4: struct U { u64 g @ 0 }, size 8 (the "wrong" parent)
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let mut strings = strings;
+    let n_u = push(&mut strings, "U");
+    let n_g = push(&mut strings, "g");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: T { u64 f @ 0 }
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: Q { u64 x @ 0 } (cast target — present so the
+        // CastMap entry references a real id, even though the
+        // intercept must not fire for this test).
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 4: U { u64 g @ 0 } — the unrelated parent the cast
+        // map is keyed on.
+        CastSynType::Struct {
+            name_off: n_u,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_g,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+    let u_id: u32 = 4;
+
+    // CastMap entry keyed on (U, 0) — NOT T. Rendering T must
+    // miss the lookup.
+    let mut cast_map: CastMap = std::collections::BTreeMap::new();
+    cast_map.insert(
+        (u_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+
+    // Reader is configured with an arena window and bytes for the
+    // value, so a buggy renderer that ignored parent_type_id and
+    // intercepted anyway would chase successfully — surfacing the
+    // bug as a Ptr render. The correct renderer treats the field
+    // as Uint.
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const VAL: u64 = 0x10_0000_1000;
+    let outer_bytes = VAL.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(VAL, 0x77u64.to_le_bytes().to_vec());
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Uint { bits, value } = members[0].value else {
+        panic!(
+            "(T, 0) must miss the (U, 0) cast entry → render as \
+             Uint; got {:?}. A failure here means cast_lookup is \
+             ignoring parent_type_id, which would promote every \
+             u64 at the entry's offset across every struct in the \
+             scheduler.",
+            members[0].value
+        );
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, VAL);
+}
+
+// ---- render_cast_pointer arena-window check --------------------
+//
+// `render_cast_pointer`'s [`AddrSpace::Arena`] arm at
+// `mod.rs:2590-2598` requires `mem.is_arena_addr(value)` to accept
+// `value`; an out-of-window value short-circuits with
+// `deref_skipped_reason = Some("arena cast value 0x{value:x} outside
+// arena window")` and `deref: None`. The check fires after
+// [`chase_gate`] (so non-zero, non-cycle, non-depth-cap values reach
+// it) and before [`chase_arena_pointer`] (so a missing arena window
+// produces a labelled skip rather than an opaque
+// `read_arena returned None`). These tests pin every distinct
+// `deref_skipped_reason` plus the success path.
+
+/// Arena cast hit whose value falls OUTSIDE the configured arena
+/// window: production at `mod.rs:2650` falls through to the kernel
+/// arm via runtime address-space detection. With no kva entry
+/// configured, `read_kva` returns None and the renderer surfaces
+/// `Ptr{ deref: None, deref_skipped_reason: Some("kernel read_kva
+/// failed at 0x...") }` with `cast_annotation: Some("cast→kernel")`.
+/// Pins the runtime fallthrough — a regression that re-introduced
+/// an early "outside arena window" skip would block legitimate
+/// kernel chases whenever the analyzer's `AddrSpace` tag drifted.
+#[test]
+fn cast_chase_arena_hint_with_non_arena_value_falls_through_to_kernel_arm() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    // Value below the arena window; `is_arena_addr` returns false,
+    // dispatching to the kernel arm. No kva entry → `read_kva`
+    // fails, surfacing as a labelled skip with cast→kernel
+    // annotation.
+    const OUT_OF_WINDOW: u64 = 0x0F_FFFF_FFFF;
+    let outer_bytes = OUT_OF_WINDOW.to_le_bytes().to_vec();
+    let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        ..Default::default()
+    };
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ref cast_annotation,
+    } = members[0].value
+    else {
+        panic!("must surface as Ptr; got {:?}", members[0].value);
+    };
+    assert_eq!(value, OUT_OF_WINDOW);
+    assert!(deref.is_none());
+    let reason = deref_skipped_reason.as_deref().expect("skip reason");
+    // Runtime fallthrough → kernel arm; read_kva has no entry, so
+    // the kernel-read-failed reason fires. The reason includes the
+    // "(cast analysis may have flagged a non-pointer field)" suffix
+    // because the original hint was Arena, indicating the analyzer
+    // may have mis-tagged the slot.
+    assert!(
+        reason.contains("read_kva failed"),
+        "skip reason must mention 'read_kva failed' (kernel arm); got: {reason}"
+    );
+    assert!(
+        reason.contains("cast analysis may have flagged"),
+        "Arena→kernel runtime dispatch must annotate suffix; got: {reason}"
+    );
+    // cast_annotation reflects the runtime decision (kernel), not
+    // the analyzer's hint (Arena).
+    assert_eq!(
+        cast_annotation.as_deref(),
+        Some("cast→kernel"),
+        "runtime kernel dispatch must produce cast→kernel annotation"
+    );
+}
+
+// ---- render_cast_pointer kernel-arm skip-reason paths ----------
+//
+// The kernel arm at `mod.rs:2616-2691` walks four pre-read gates:
+// (1) target type peels, (2) `type_size` returns Some, (3) size != 0,
+// (4) `read_kva` returns bytes. Each failure surfaces a distinctly
+// worded `deref_skipped_reason`. A regression that collapsed two
+// gates into one — or skipped a gate entirely — would produce a
+// chase against an unresolved or zero-sized target, with the
+// rendered output silently degrading to garbage. These tests pin
+// each reason string so every failure path stays distinguishable.
+
+/// Kernel cast target whose `target_type_id` does not resolve to any
+/// type in the BTF — `peel_modifiers` returns `None`. The renderer
+/// surfaces `Ptr{ deref: None, deref_skipped_reason: Some("kernel
+/// cast target type id N unresolvable") }` from `mod.rs:2616-2627`.
+/// Without this guard, a corrupt or stale CastMap entry pointing at
+/// a freed type id would propagate `None` further down and surface
+/// as the same "kernel read_kva failed" reason that genuine read
+/// failures use — collapsing two distinct failure modes into one.
+#[test]
+fn cast_chase_kernel_target_type_id_unresolvable() {
+    let (blob, t_id, _q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // Use an id beyond every type emitted by `cast_btf_t_and_q` (it
+    // produces ids 1..=3, so 9999 is safely out of range and
+    // `btf.resolve_type_by_id` errors → peel_modifiers → None).
+    const UNRESOLVABLE: u32 = 9999;
+    const KVA: u64 = 0xffff_8000_0000_1000;
+    let outer_bytes = KVA.to_le_bytes().to_vec();
+    let reader = CastStubReader {
+        hit: Some(CastHit {
+            target_type_id: UNRESOLVABLE,
+            addr_space: AddrSpace::Kernel,
+        }),
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "unresolvable target must still surface as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, KVA);
+    assert!(
+        deref.is_none(),
+        "unresolvable target must not produce a deref payload"
+    );
+    let reason = deref_skipped_reason
+        .as_deref()
+        .expect("peel_modifiers failure must populate skip reason");
+    assert!(
+        reason.contains("unresolvable"),
+        "skip reason must mention 'unresolvable'; got: {reason}"
+    );
+    assert!(
+        reason.contains(&UNRESOLVABLE.to_string()),
+        "skip reason must include the offending type id; got: {reason}"
+    );
+}
+
+/// Kernel cast target whose BTF size is 0 (a struct with `size_type
+/// = 0` — represents an incomplete forward declaration the BPF
+/// compiler emitted without a definition). The renderer surfaces
+/// `Ptr{ deref: None, deref_skipped_reason: Some("...BTF size is 0
+/// (incomplete type)") }` from `mod.rs:2640-2651`. This guard
+/// prevents a zero-byte `read_kva` from succeeding spuriously and
+/// rendering an empty struct as if the chase had landed.
+#[test]
+fn cast_chase_kernel_target_btf_size_zero() {
+    // Build a BTF blob where the cast target is a zero-sized
+    // struct. Layout:
+    //   id=1: u64
+    //   id=2: struct T { u64 f @ 0 }, size 8
+    //   id=3: struct Q {}, size 0  (the zero-sized cast target)
+    //
+    // T_id=2, Q_id=3. The kernel arm's `if btf_size == 0` check at
+    // `mod.rs:2640-2651` is the gate we are exercising; `type_size`
+    // returns `Some(0)` for a zero-sized Struct so the prior guard
+    // (None case) does not fire.
+    let (strings, n_int, n_t, n_q, n_f, _n_x) = cast_strings_for_t_q();
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // Q with size 0 and no members: the BTF wire format permits
+        // it (vlen=0, size_type=0), and `type_size` returns Some(0).
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 0,
+            members: vec![],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+
+    const KVA: u64 = 0xffff_8000_0000_1000;
+    let outer_bytes = KVA.to_le_bytes().to_vec();
+    let reader = CastStubReader {
+        hit: Some(CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Kernel,
+        }),
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "zero-sized target must still surface as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, KVA);
+    assert!(deref.is_none());
+    let reason = deref_skipped_reason
+        .as_deref()
+        .expect("zero-sized target must populate skip reason");
+    assert!(
+        reason.contains("BTF size is 0"),
+        "skip reason must say 'BTF size is 0'; got: {reason}"
+    );
+    assert!(
+        reason.contains("incomplete type"),
+        "skip reason must mention 'incomplete type'; got: {reason}"
+    );
+}
+
+/// Kernel cast hit where `read_kva` returns `None` (the page is
+/// unmapped or the page-table walk failed). The renderer surfaces
+/// `Ptr{ deref: None, deref_skipped_reason: Some("kernel read_kva
+/// failed at 0x... (unmapped page or no PTE); needed N bytes") }`
+/// from `mod.rs:2668-2691`. Without this gate, a `None` from
+/// `read_kva` would propagate to the unwrap downstream and either
+/// crash or render whatever default the inner type produces from
+/// zero bytes — both worse than the labelled skip.
+#[test]
+fn cast_chase_kernel_read_kva_failure() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // Q is an 8-byte struct (size=8), so `read_size` will be 8.
+    // Reader carries NO `kva_bytes_at` entries, so `read_kva` returns
+    // `None` for every address — the failure path under test.
+    const KVA: u64 = 0xffff_8000_0000_2000;
+    let outer_bytes = KVA.to_le_bytes().to_vec();
+    let reader = CastStubReader {
+        hit: Some(CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Kernel,
+        }),
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "read_kva failure must still surface as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, KVA);
+    assert!(
+        deref.is_none(),
+        "read_kva failure must not produce a deref payload"
+    );
+    let reason = deref_skipped_reason
+        .as_deref()
+        .expect("read_kva failure must populate skip reason");
+    assert!(
+        reason.contains("read_kva failed"),
+        "skip reason must say 'read_kva failed'; got: {reason}"
+    );
+    assert!(
+        reason.contains(&format!("0x{KVA:x}")),
+        "skip reason must include the failing address in hex; got: {reason}"
+    );
+    assert!(
+        reason.contains("needed"),
+        "skip reason must include the requested byte count; got: {reason}"
+    );
+}
+
+/// Kernel cast hit where the requested size exceeds the bytes
+/// remaining in the current 4 KiB page. `read_size = btf_size
+/// .min(POINTER_CHASE_CAP).min(page_remaining)` at `mod.rs:2666`
+/// caps the read at the page edge so `read_kva` never crosses an
+/// allocation boundary; the resulting `truncated_at_cap` flag wraps
+/// the inner render in `RenderedValue::Truncated{needed: btf_size,
+/// had: page_remaining, partial: ...}` at `mod.rs:2732-2745`. This
+/// test pins the page-edge clipping AND the Truncated wrapper.
+#[test]
+fn cast_chase_kernel_page_edge_truncation() {
+    // Build a target with size > page_remaining. Q's size is set to
+    // 100 bytes (a single u64 at offset 0 plus 92 bytes of trailing
+    // padding, recorded only in `size_type`). The kernel value KVA
+    // = page_base + 4080 leaves 16 bytes in the current page
+    // (4096 - (4080 % 4096) = 16). So:
+    //   btf_size       = 100
+    //   page_remaining = 16
+    //   POINTER_CHASE_CAP = 4096
+    //   read_size      = min(100, 4096, 16) = 16
+    //   truncated_at_cap = (100 > 16) = true
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // Q size=100, single u64 member at offset 0. The struct's
+        // declared size is what `type_size` reports — not the sum
+        // of member sizes. Tail bytes 8..100 are unaccounted for in
+        // BTF members, modelling a struct with padding or members
+        // the test doesn't care about.
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 100,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+
+    // KVA leaves exactly 16 bytes remaining in the page.
+    const KVA: u64 = 0xffff_8000_0000_0ff0;
+    let outer_bytes = KVA.to_le_bytes().to_vec();
+    // Provide 16 bytes at KVA so `read_kva(KVA, 16)` succeeds. First
+    // 8 bytes carry Q.x = 0xCAFE (low value, top byte is 0x00 — the
+    // plausibility gate at `mod.rs:2702-2717` accepts it).
+    let mut target_bytes = vec![0u8; 16];
+    target_bytes[0..8].copy_from_slice(&0xCAFEu64.to_le_bytes());
+    let mut kva_bytes = std::collections::HashMap::new();
+    kva_bytes.insert(KVA, target_bytes);
+    // Use cast_map mode so only the outer T.f → Q intercept fires;
+    // Q.x at (q_id, 0) has no entry, so the inner u64 surfaces as
+    // a plain Uint render rather than recursing into another chase.
+    let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Kernel,
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        kva_bytes_at: kva_bytes,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "page-edge clipped chase must still surface as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, KVA);
+    assert!(
+        deref_skipped_reason.is_none(),
+        "successful (clipped) read must carry no skip reason; got {deref_skipped_reason:?}"
+    );
+    let inner = deref
+        .as_deref()
+        .expect("read succeeded → deref must be Some");
+    // Outer wrap: Truncated{needed: 100, had: 16, partial: ...}.
+    let RenderedValue::Truncated {
+        needed,
+        had,
+        ref partial,
+    } = *inner
+    else {
+        panic!("btf_size > read_size must wrap deref payload in Truncated; got {inner:?}");
+    };
+    assert_eq!(needed, 100, "Truncated.needed must be the BTF size");
+    assert_eq!(
+        had, 16,
+        "Truncated.had must be the page-edge-clipped read size"
+    );
+    // Partial render: the inner Struct{Q} also wraps as Truncated
+    // because 16 bytes < Q.size=100, with its own partial: Struct.
+    // Walk through both wrappers to reach Q's members.
+    let inner_struct = match &**partial {
+        RenderedValue::Struct { .. } => partial.as_ref(),
+        RenderedValue::Truncated {
+            partial: deeper, ..
+        } => deeper.as_ref(),
+        other => panic!(
+            "partial render must reach a Q struct (possibly via inner Truncated); got {other:?}"
+        ),
+    };
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = *inner_struct
+    else {
+        panic!("expected inner Struct render, got {inner_struct:?}");
+    };
+    assert_eq!(
+        inner_name.as_deref(),
+        Some("Q"),
+        "inner struct must carry Q's name"
+    );
+    assert_eq!(inner_members.len(), 1);
+    assert_eq!(inner_members[0].name, "x");
+    let RenderedValue::Uint { bits, value } = inner_members[0].value else {
+        panic!("Q.x must render as Uint, got {:?}", inner_members[0].value);
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, 0xCAFE, "first 8 bytes of clipped read must decode");
+}
+
+/// Kernel cast hit whose `read_kva` returns plausible bytes (top
+/// byte != 0xff) and whose target peels + sizes correctly: the
+/// chase succeeds and the rendered struct's members are surfaced
+/// in the `deref` payload. Complement to
+/// [`cast_chase_kernel_plausibility_rejects_freed_slab`] — same
+/// path but the plausibility gate ALLOWS the read instead of
+/// rejecting it. Without this test, a regression that flipped the
+/// plausibility gate's polarity (`if first_qword >> 56 != 0xff`
+/// rejects, instead of accepts) would only show up as a missing
+/// deref on every kernel chase, with no test catching the inversion.
+#[test]
+fn cast_chase_kernel_successful_chase_top_byte_non_ff() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // KVA in the kernel direct-map range; the value passed to the
+    // plausibility gate is the FIRST QWORD OF target_bytes (Q.x's
+    // value), not KVA itself. Choose target bytes whose first qword
+    // top byte is 0x00 (a plain counter) so the gate at
+    // `mod.rs:2702-2717` accepts.
+    const KVA: u64 = 0xffff_8000_dead_b000;
+    let outer_bytes = KVA.to_le_bytes().to_vec();
+    // Q is 8 bytes (the existing fixture). Provide exactly 8 bytes
+    // at KVA whose first qword is a low counter value (0x42).
+    let inner_bytes: Vec<u8> = 0x42u64.to_le_bytes().to_vec();
+    let mut kva_bytes = std::collections::HashMap::new();
+    kva_bytes.insert(KVA, inner_bytes);
+    // Use cast_map mode so only the outer T.f → Q intercept fires;
+    // Q.x at (q_id, 0) has no entry, so the inner u64 surfaces as
+    // a plain Uint render rather than recursing into another chase.
+    let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Kernel,
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        kva_bytes_at: kva_bytes,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "kernel chase must surface as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, KVA);
+    assert!(
+        deref_skipped_reason.is_none(),
+        "successful chase carries no skip reason; got {deref_skipped_reason:?}"
+    );
+    let inner = deref
+        .as_deref()
+        .expect("plausibility-allowed chase → deref must be Some");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = *inner
+    else {
+        panic!("deref payload must be the rendered Q struct; got {inner:?}");
+    };
+    assert_eq!(
+        inner_name.as_deref(),
+        Some("Q"),
+        "deref payload must carry Q's name"
+    );
+    assert_eq!(inner_members.len(), 1);
+    assert_eq!(inner_members[0].name, "x");
+    let RenderedValue::Uint { bits, value } = inner_members[0].value else {
+        panic!("Q.x must render as Uint, got {:?}", inner_members[0].value);
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, 0x42, "Q.x must reflect the bytes read_kva returned");
+}
+
+// ---- POINTER_CHASE_CAP and parent-byte-boundary edge cases -----
+//
+// These tests pin the cap-and-boundary behavior that protects the
+// renderer from unbounded reads (POINTER_CHASE_CAP) and from
+// out-of-range slicing (parent_bytes boundary). Both produce
+// `RenderedValue::Truncated` wrappers when the rendered subtree is
+// partial, so the consumer can tell the rendered output is
+// incomplete.
+
+/// Arena cast target whose BTF size exceeds [`POINTER_CHASE_CAP`]
+/// (4096 bytes). [`chase_arena_pointer`] at `mod.rs:2481-2482` clamps
+/// the read to 4096 bytes and sets `truncated_at_cap = true`, then
+/// wraps the rendered struct in `RenderedValue::Truncated{needed:
+/// btf_size, had: 4096, partial: ...}` at `mod.rs:2512-2521`. Without
+/// the cap, an analyzer that emits a 1 MiB struct would force the
+/// renderer to allocate (and read) a megabyte from the arena snapshot
+/// for a single failure dump — pulling the dump through
+/// O(num_recovered_pointers * pointee_size) memory pressure.
+#[test]
+fn cast_chase_arena_pointee_exceeds_cap_wraps_in_truncated() {
+    // Q is sized 5000 (above POINTER_CHASE_CAP=4096) so the cap
+    // clamps the read. Single u64 member at offset 0 covers the
+    // first 8 bytes; the remaining 4992 bytes are unaccounted-for
+    // padding in the BTF wire format.
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 5000,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    // Provide exactly 4096 bytes (POINTER_CHASE_CAP) at TARGET_ADDR
+    // so `read_arena(TARGET_ADDR, 4096)` succeeds. Bytes 0..8 carry
+    // Q.x = 0x77.
+    let mut target_bytes = vec![0u8; 4096];
+    target_bytes[0..8].copy_from_slice(&0x77u64.to_le_bytes());
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, target_bytes);
+    // Use cast_map mode (NOT the universal `hit` field) so only the
+    // outer T.f → Q intercept fires; Q.x at (q_id, 0) has no entry,
+    // so the inner u64 falls through to the plain Uint render and
+    // doesn't recurse into a phantom kernel chase.
+    let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "cap-clamped chase must still surface as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, TARGET_ADDR);
+    assert!(
+        deref_skipped_reason.is_none(),
+        "cap-clamped read is a SUCCESS; no skip reason expected; got {deref_skipped_reason:?}"
+    );
+    let inner = deref
+        .as_deref()
+        .expect("read succeeded → deref must be Some");
+    // Outer wrap: Truncated{needed: 5000, had: 4096, partial: ...}.
+    let RenderedValue::Truncated {
+        needed,
+        had,
+        ref partial,
+    } = *inner
+    else {
+        panic!("btf_size > POINTER_CHASE_CAP must wrap deref in Truncated; got {inner:?}");
+    };
+    assert_eq!(needed, 5000, "Truncated.needed must be Q's BTF size");
+    assert_eq!(
+        had, 4096,
+        "Truncated.had must equal POINTER_CHASE_CAP (4096)"
+    );
+    // `render_struct` itself emitted a Truncated wrapper because
+    // 4096 < Q.size=5000; walk through it to reach the inner Struct.
+    let inner_struct = match &**partial {
+        RenderedValue::Struct { .. } => partial.as_ref(),
+        RenderedValue::Truncated {
+            partial: deeper, ..
+        } => deeper.as_ref(),
+        other => panic!(
+            "partial render must reach a Q struct (possibly via inner Truncated); got {other:?}"
+        ),
+    };
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = *inner_struct
+    else {
+        panic!("expected inner Struct render, got {inner_struct:?}");
+    };
+    assert_eq!(inner_name.as_deref(), Some("Q"));
+    let RenderedValue::Uint { bits, value } = inner_members[0].value else {
+        panic!("Q.x must render as Uint, got {:?}", inner_members[0].value);
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(
+        value, 0x77,
+        "first 8 bytes of cap-clamped read must decode correctly"
+    );
+}
+
+/// Cast intercept on a u64 member where `byte_off + 8 >
+/// parent_bytes.len()` — the closure at `mod.rs:2314-2317` returns
+/// `None`, the intercept does not fire, and execution falls through
+/// to the existing partial-decode path at `mod.rs:2330-2355` which
+/// emits a `RenderedValue::Truncated` wrapping whatever the inner
+/// renderer salvaged. Without this guard, the intercept would slice
+/// `parent_bytes[byte_off..byte_off+8]` past the slice's end and
+/// either crash or read uninitialized memory off the end of the
+/// allocation — a critical bug given the renderer runs over
+/// guest-supplied bytes the analyzer already corrupted somewhere.
+#[test]
+fn cast_intercept_u64_at_parent_bytes_boundary_falls_through() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // T's u64 member is at offset 0 with size 8 — the full member
+    // needs 8 bytes. Provide only 4 bytes so `byte_off + 8 = 8 > 4
+    // = parent_bytes.len()` and the intercept short-circuits. The
+    // configured cast hit + arena window + bytes are all set up so
+    // a buggy intercept that ignored the boundary check would
+    // produce a Ptr render — a successful test confirms only Truncated.
+    let outer_bytes = vec![0xCA, 0xFE, 0xBA, 0xBE];
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(0xBEBA_FECAu64, vec![0u8; 8]);
+    let reader = CastStubReader {
+        hit: Some(CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        }),
+        arena_window: Some((0, u64::MAX)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    // The outer T struct is 8 bytes but only 4 were supplied, so
+    // `render_struct` wraps in `Truncated{needed:8, had:4, partial:
+    // Struct{T}}`. The intercept's boundary guard at
+    // `mod.rs:2314-2317` short-circuits when `byte_off + 8 >
+    // parent_bytes.len()`, so T.f also surfaces as a per-member
+    // `Truncated`, NOT a `Ptr`.
+    let outer_struct = match &v {
+        RenderedValue::Struct { .. } => &v,
+        RenderedValue::Truncated { partial, .. } => partial.as_ref(),
+        other => panic!("expected Struct or Truncated{{Struct}}; got {other:?}"),
+    };
+    let RenderedValue::Struct { ref members, .. } = *outer_struct else {
+        panic!("expected Struct under outer Truncated; got {outer_struct:?}");
+    };
+    match &members[0].value {
+        RenderedValue::Truncated { needed, had, .. } => {
+            assert_eq!(*needed, 8, "u64 needs 8 bytes");
+            assert_eq!(*had, 4, "supplied bytes for member is 4");
+        }
+        RenderedValue::Ptr { .. } => panic!(
+            "boundary fall-through must NOT produce Ptr — intercept's \
+             boundary guard at mod.rs:2314-2317 short-circuits; got {:?}",
+            members[0].value
+        ),
+        other => panic!("boundary fall-through must produce Truncated; got {other:?}"),
+    }
+}
+
+// ---- Int-encoding gate paths -----------------------------------
+//
+// The intercept's `int.size() != 8 || int.is_signed() ||
+// int.is_bool() || int.is_char()` gate at `mod.rs:2309-2311`
+// rejects every non-plain-unsigned-u64 member regardless of the
+// reader's `cast_lookup` hit. The size-mismatch case
+// (`cast_intercept_non_u64_field_not_intercepted`) is already
+// covered above; these tests cover the encoding flags. BPF stores
+// recovered typed pointers in plain-unsigned u64 slots only; a
+// `_Bool`, `char`, or signed 8-byte field is structurally not the
+// analyzer's output shape and must NOT be intercepted.
+
+/// Cast intercept on a `_Bool`-encoded 8-byte field with a fixed
+/// hit returned by `cast_lookup`: the intercept's gate at
+/// `mod.rs:2309-2311` rejects (int.is_bool() == true) before
+/// `cast_lookup` is consulted, and the renderer falls through to
+/// the normal Int render — `RenderedValue::Bool{value}` (an 8-byte
+/// _Bool encodes as is_bool() at the BTF level; render_int
+/// produces Bool when is_bool()).
+#[test]
+fn cast_intercept_bool_field_not_intercepted() {
+    // Build T with a single 8-byte _Bool member at offset 0.
+    // Encoding = BTF_INT_BOOL (= 4); size = 8; bits = 64. The Q
+    // type is included so the cast hit can reference a real id, but
+    // the gate rejects before the hit is consulted.
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let types = vec![
+        // id 1: 8-byte _Bool. encoding=4 = BTF_INT_BOOL.
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 4,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct T { _Bool f @ 0 }, size 8.
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: struct Q { _Bool x @ 0 }, size 8 (cast target;
+        // unused since the gate rejects first, but a valid id).
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+
+    // Outer T bytes: a non-zero _Bool value (0x01). Reader returns
+    // Some(hit) for any (parent, offset) — the bool gate must
+    // reject before this is consulted.
+    let outer_bytes = 1u64.to_le_bytes().to_vec();
+    let reader = CastStubReader {
+        hit: Some(CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        }),
+        arena_window: Some((0, u64::MAX)),
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    // The bool gate must reject the intercept. Render path produces
+    // Bool — the cast intercept must NOT have fired.
+    match &members[0].value {
+        RenderedValue::Bool { value } => {
+            assert!(*value, "bool value 0x01 must render as true");
+        }
+        RenderedValue::Ptr { .. } => panic!(
+            "_Bool field must NOT be intercepted (int.is_bool() gate at \
+             mod.rs:2309 rejects); got {:?}",
+            members[0].value
+        ),
+        other => panic!("_Bool field must render as Bool; got {other:?}"),
+    }
+}
+
+/// Cast intercept on a SIGNED 8-byte int member with a fixed hit:
+/// the intercept's gate at `mod.rs:2309-2311` rejects
+/// (int.is_signed() == true) before `cast_lookup` is consulted, and
+/// the renderer falls through to the normal Int render —
+/// `RenderedValue::Int{bits: 64, value: <signed value>}`. Signed
+/// 8-byte ints in BPF programs are typically counters / deltas, not
+/// recovered pointers; the gate keeps the analyzer-emitted hits
+/// from contaminating a counter slot.
+#[test]
+fn cast_intercept_signed_8byte_int_not_intercepted() {
+    // Build T with a single 8-byte SIGNED int member at offset 0.
+    // Encoding = BTF_INT_SIGNED (= 1); size = 8; bits = 64.
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let types = vec![
+        // id 1: 8-byte signed int. encoding=1 = BTF_INT_SIGNED.
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 1,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: struct Q with the same signed-int field. Cast target
+        // is unused since the gate rejects first.
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+
+    // Outer bytes: signed -1 (all-ones u64). Without the gate, the
+    // reader would interpret 0xFFFFFFFFFFFFFFFF as a pointer value
+    // — the gate must reject the intercept.
+    let outer_bytes = (-1i64).to_le_bytes().to_vec();
+    let reader = CastStubReader {
+        hit: Some(CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        }),
+        arena_window: Some((0, u64::MAX)),
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    match &members[0].value {
+        RenderedValue::Int { bits, value } => {
+            assert_eq!(
+                *bits, 64,
+                "signed int must render at its declared 64-bit width"
+            );
+            assert_eq!(*value, -1, "signed -1 must round-trip as Int{{value: -1}}");
+        }
+        RenderedValue::Ptr { .. } => panic!(
+            "signed 8-byte int must NOT be intercepted (int.is_signed() \
+             gate at mod.rs:2309 rejects); got {:?}",
+            members[0].value
+        ),
+        other => panic!("signed 8-byte int must render as Int; got {other:?}"),
+    }
+}
+
+// ---- parent_type_id == None path -------------------------------
+//
+// `render_member`'s `parent_type_id` parameter is `Option<u32>` at
+// `mod.rs:2243`. Through the public entry points
+// (`render_value_with_mem` → `render_value_inner` → `render_struct`
+// at `mod.rs:2106`) it is always `Some(parent_type_id)`. The `None`
+// case is reachable only by calling `render_member` directly. The
+// intercept's first line — `let parent = parent_type_id?;` at
+// `mod.rs:2304` — short-circuits when `None`, leaving the closure's
+// `cast_intercept` as `None` and the renderer falling through to
+// the unmodified path. This test pins the no-crash, no-intercept
+// behavior.
+
+/// Direct call to `render_member` with `parent_type_id = None` must
+/// short-circuit the cast intercept (`mod.rs:2304`) and produce the
+/// same render as the no-cast case — for a u64 field, that is
+/// `RenderedValue::Uint{bits: 64, value}`. Establishes the contract
+/// for any future entry point that bypasses `render_struct` (e.g.
+/// rendering a stand-alone member from a synthesized layout): such
+/// callers must explicitly opt in to the cast intercept by passing
+/// the parent struct id, never silently inheriting it.
+#[test]
+fn cast_intercept_parent_type_id_none_does_not_crash() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // Resolve T's first member directly so we can hand it to
+    // render_member without going through render_struct (which
+    // always passes Some(parent_type_id)).
+    let Type::Struct(t_struct) = btf.resolve_type_by_id(t_id).expect("T resolves") else {
+        panic!("T_id resolves to non-Struct type");
+    };
+    let m = t_struct.members.first().expect("T has one member");
+
+    // Configure the reader so a buggy renderer that ignored the
+    // None short-circuit and called cast_lookup anyway WOULD chase
+    // the value. The correct render must produce Uint regardless.
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, 0xAAu64.to_le_bytes().to_vec());
+    let reader = CastStubReader {
+        hit: Some(CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        }),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    // Direct call to render_member with parent_type_id = None.
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let v = render_member(
+        &btf,
+        m,
+        None,
+        &outer_bytes,
+        0,
+        Some(&reader as &dyn MemReader),
+        &mut visited,
+    );
+
+    // None short-circuit MUST keep the intercept off; the u64
+    // renders as Uint with the loaded value.
+    let RenderedValue::Uint { bits, value } = v else {
+        panic!(
+            "parent_type_id=None must short-circuit the intercept and \
+             render as Uint; got {v:?}. A failure here means \
+             render_member's `let parent = parent_type_id?` guard at \
+             mod.rs:2304 was bypassed."
+        );
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, TARGET_ADDR);
+}
+
+// ---- Recursive cast chase + modifier-chain unit test -----------
+//
+// A cast target whose own struct contains a u64 field flagged by
+// the cast analyzer drives the renderer into a recursive chase:
+// the outer chase produces a `Ptr{ deref: Some(Struct{ ... }) }`,
+// and the inner Struct's u64 field surfaces as another nested
+// `Ptr{ deref: Some(Struct{ ... }) }`. The visited set carries the
+// outer address through the recursion so genuine cycles still
+// surface as `[cycle]` (covered by `cast_chase_cycle_detection`).
+// This test pins the non-cycle recursive case where two distinct
+// addresses chain.
+//
+// The modifier-chain unit test renders a `Typedef -> Const ->
+// Struct(T)` surface type via `cast_map`-mode lookup keyed on
+// `T_id` directly. The renderer's `peel_modifiers_with_id` MUST
+// produce the underlying `T_id` so `cast_lookup(T_id, 0)` hits.
+// This is a focused unit-only sibling of
+// `cast_pipeline_modifier_chain_renderer_peels_to_analyzer_struct_id`
+// (which also runs the analyzer); the pure-renderer test isolates
+// the peel behavior so a regression in one half (renderer or
+// analyzer) is distinguishable from a regression in the other.
+
+/// Target struct whose body itself contains a cast-flagged u64
+/// field. The renderer's recursion must:
+///   - chase the outer Ptr (T.f → Q struct at TARGET_ADDR),
+///   - render Q.x as a NESTED Ptr (cast hit at (Q, 0)),
+///   - chase Q.x → R struct at TARGET_ADDR_2 → R.y = Uint(0xBB).
+///
+/// Both deref payloads must be present (deref: Some) and neither
+/// should carry a skip reason.
+#[test]
+fn cast_chase_recursive_target_with_inner_cast_field() {
+    // Build a 4-type BTF: u64, T (8 bytes, u64 @ 0), Q (8 bytes,
+    // u64 @ 0), R (8 bytes, u64 @ 0). The CastMap entries are:
+    //   (T_id, 0) → (Q_id, Arena)
+    //   (Q_id, 0) → (R_id, Arena)
+    // R has no flagged member, so the recursion terminates.
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let mut strings = strings;
+    let n_r = push(&mut strings, "R");
+    let n_y = push(&mut strings, "y");
+    let types = vec![
+        // id 1: u64
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: T { u64 f @ 0 }
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: Q { u64 x @ 0 }
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 4: R { u64 y @ 0 }
+        CastSynType::Struct {
+            name_off: n_r,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_y,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+    let r_id: u32 = 4;
+
+    let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    cast_map.insert(
+        (q_id, 0),
+        CastHit {
+            target_type_id: r_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    const TARGET_ADDR_2: u64 = 0x10_0000_2000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    // Q at TARGET_ADDR: Q.x = TARGET_ADDR_2 (the inner cast value).
+    let q_bytes: Vec<u8> = TARGET_ADDR_2.to_le_bytes().to_vec();
+    // R at TARGET_ADDR_2: R.y = 0xBB (terminal value).
+    let r_bytes: Vec<u8> = 0xBBu64.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, q_bytes);
+    arena_bytes.insert(TARGET_ADDR_2, r_bytes);
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected outer Struct render, got {v:?}");
+    };
+    // Outer T.f: Ptr → Q.
+    let RenderedValue::Ptr {
+        value: outer_value,
+        deref: ref outer_deref,
+        deref_skipped_reason: ref outer_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "outer cast intercept must surface as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(outer_value, TARGET_ADDR);
+    assert!(
+        outer_reason.is_none(),
+        "outer chase must succeed; got {outer_reason:?}"
+    );
+    let q_inner = outer_deref
+        .as_deref()
+        .expect("outer deref Some (chase succeeded)");
+    let RenderedValue::Struct {
+        type_name: ref q_name,
+        members: ref q_members,
+    } = *q_inner
+    else {
+        panic!("outer deref must be Q struct; got {q_inner:?}");
+    };
+    assert_eq!(q_name.as_deref(), Some("Q"));
+    assert_eq!(q_members.len(), 1);
+    assert_eq!(q_members[0].name, "x");
+    // Inner Q.x: nested Ptr → R (the cast intercept fires
+    // recursively because the renderer recurses with parent_type_id
+    // = Q_id, and the CastMap has (Q, 0) → (R, Arena)).
+    let RenderedValue::Ptr {
+        value: inner_value,
+        deref: ref inner_deref,
+        deref_skipped_reason: ref inner_reason,
+        ..
+    } = q_members[0].value
+    else {
+        panic!(
+            "inner Q.x must surface as Ptr (recursive cast hit); got {:?}. \
+             A failure here means the renderer didn't pass Q_id as \
+             parent_type_id when recursing through the deref payload.",
+            q_members[0].value
+        );
+    };
+    assert_eq!(inner_value, TARGET_ADDR_2);
+    assert!(
+        inner_reason.is_none(),
+        "inner chase must succeed; got {inner_reason:?}"
+    );
+    let r_inner = inner_deref
+        .as_deref()
+        .expect("inner deref Some (chase succeeded)");
+    let RenderedValue::Struct {
+        type_name: ref r_name,
+        members: ref r_members,
+    } = *r_inner
+    else {
+        panic!("inner deref must be R struct; got {r_inner:?}");
+    };
+    assert_eq!(r_name.as_deref(), Some("R"));
+    assert_eq!(r_members.len(), 1);
+    assert_eq!(r_members[0].name, "y");
+    // Terminal R.y: plain Uint (no cast entry at (R, 0)).
+    let RenderedValue::Uint { bits, value } = r_members[0].value else {
+        panic!(
+            "R.y must terminate as Uint (no recursive cast entry at (R,0)); \
+             got {:?}",
+            r_members[0].value
+        );
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, 0xBB);
+}
+
+/// Modifier-chain unit case: the parent type is rendered via a
+/// `Typedef -> Const -> Struct(T)` chain, and the CastMap is keyed
+/// on `(T_id, 0)` directly. The renderer's
+/// `peel_modifiers_with_id` MUST collapse the wrapper chain to
+/// `T_id` before threading it into `render_struct` as
+/// `parent_type_id`; the cast intercept then queries
+/// `cast_lookup(T_id, 0)` and hits. Pure-renderer test —
+/// complementary to
+/// `cast_pipeline_modifier_chain_renderer_peels_to_analyzer_struct_id`
+/// which couples the analyzer in. Without this isolated test, a
+/// regression in just the renderer's peel would only surface
+/// indirectly through the integration test (where it'd be
+/// indistinguishable from an analyzer regression).
+#[test]
+fn cast_intercept_modifier_chain_parent_uses_post_peel_id() {
+    // Layout:
+    //   id=1: u64
+    //   id=2: T { u64 f @ 0 }
+    //   id=3: Q { u64 x @ 0 } (cast target)
+    //   id=4: const(T) — wraps id=2
+    //   id=5: typedef T_alias = const(T) — wraps id=4
+    let (strings, n_int, n_t, n_q, n_f, n_x) = cast_strings_for_t_q();
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let mut strings = strings;
+    let n_typedef = push(&mut strings, "T_alias");
+    let types = vec![
+        CastSynType::Int {
+            name_off: n_int,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        CastSynType::Struct {
+            name_off: n_q,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        CastSynType::Const { type_id: 2 },
+        CastSynType::Typedef {
+            name_off: n_typedef,
+            type_id: 4,
+        },
+    ];
+    let blob = cast_build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    let t_id: u32 = 2;
+    let q_id: u32 = 3;
+    let typedef_id: u32 = 5;
+
+    // CastMap keyed on the POST-PEEL id (T_id, 0). If the renderer
+    // forwarded the typedef_id (or any non-peeled id) as
+    // parent_type_id, this lookup would miss and the field would
+    // render as Uint — failing the assertion below.
+    let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, 0x55u64.to_le_bytes().to_vec());
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        ..Default::default()
+    };
+
+    // Render via the typedef wrapper id; the renderer's peel must
+    // produce parent_type_id=T_id (the post-peel struct id) so the
+    // cast lookup hits.
+    let v = render_value_with_mem(&btf, typedef_id, &outer_bytes, &reader);
+    let RenderedValue::Struct {
+        type_name,
+        ref members,
+    } = v
+    else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    assert_eq!(
+        type_name.as_deref(),
+        Some("T"),
+        "renderer must collapse modifier wrappers to underlying T name"
+    );
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "modifier-chain rendering must reach the cast intercept (peel \
+             must produce T_id as parent_type_id); got {:?}. A failure here \
+             means peel_modifiers_with_id forwarded the typedef wrapper id \
+             instead of the post-peel struct id at mod.rs:2828.",
+            members[0].value
+        );
+    };
+    assert_eq!(value, TARGET_ADDR);
+    assert!(deref_skipped_reason.is_none());
+    let inner = deref.as_deref().expect("chase deref Some");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = *inner
+    else {
+        panic!("deref payload must be Q struct, got {inner:?}");
+    };
+    assert_eq!(inner_name.as_deref(), Some("Q"));
+    let RenderedValue::Uint { bits, value } = inner_members[0].value else {
+        panic!("Q.x must render as Uint, got {:?}", inner_members[0].value);
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, 0x55);
 }

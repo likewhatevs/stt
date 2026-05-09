@@ -20,7 +20,7 @@ pub mod bpf_prog;
 pub mod bpf_syscall;
 pub mod btf_offsets;
 pub mod btf_render;
-pub mod cast_analysis;
+pub(crate) mod cast_analysis;
 pub mod debug_capture;
 pub mod dmesg_scx;
 pub mod dump;

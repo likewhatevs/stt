@@ -1073,13 +1073,14 @@ impl KtstrVm {
         let freeze_coord_num_nodes = self.topology.num_numa_nodes();
         // BPF cast-analysis output produced once at builder time
         // from the scheduler binary's embedded `.bpf.objs` ELF.
-        // Cloned into the coord closure so the dump-state call site
-        // can hand a borrowed reference to
-        // [`crate::monitor::dump::DumpContext::cast_map`]. The
-        // builder collapses an empty map (no scheduler, parse
-        // failure, no findings) to `None` so the borrow site needs
-        // no extra emptiness check.
-        let freeze_coord_cast_map: Option<crate::monitor::cast_analysis::CastMap> =
+        // Wrapped in `Arc` and cloned into the coord closure so the
+        // dump-state call site can hand a borrowed reference to
+        // [`crate::monitor::dump::DumpContext::cast_map`] without
+        // round-tripping the BTreeMap through `Clone` on every
+        // freeze. The builder collapses an empty map (no scheduler,
+        // parse failure, no findings) to `None` so the borrow site
+        // needs no extra emptiness check.
+        let freeze_coord_cast_map: Option<Arc<crate::monitor::cast_analysis::CastMap>> =
             self.cast_map.clone();
         let freeze_coord_on_demand_in_flight = on_demand_in_flight.clone();
         let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
@@ -4077,7 +4078,9 @@ impl KtstrVm {
                                         // hardware lacks counters).
                                         perf_capture: (*freeze_coord_perf_capture).as_ref(),
                                         deadline: capture_deadline,
-                                        cast_map: freeze_coord_cast_map.as_ref(),
+                                        cast_map: freeze_coord_cast_map
+                                            .as_ref()
+                                            .map(|a| a.as_ref()),
                                     },
                                 );
                                 tracing::debug!(

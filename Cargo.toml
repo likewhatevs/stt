@@ -332,6 +332,9 @@ name = "ktstr_sched_tests"
 name = "failure_dump_e2e"
 
 [[test]]
+name = "cast_analysis_e2e"
+
+[[test]]
 name = "scenario_coverage"
 
 [[test]]

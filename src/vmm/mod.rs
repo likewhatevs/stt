@@ -425,7 +425,7 @@ pub struct KtstrVm {
     /// instruction-stream parse failure, analyzer returned an
     /// empty map). All paths render every `u64` as a plain
     /// unsigned counter — the pre-integration default.
-    pub(crate) cast_map: Option<crate::monitor::cast_analysis::CastMap>,
+    pub(crate) cast_map: Option<std::sync::Arc<crate::monitor::cast_analysis::CastMap>>,
 }
 
 struct RunLocks {
