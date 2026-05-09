@@ -2074,6 +2074,138 @@ fn mem_reader_default_impls_skip_arena() {
     assert!(r.read_arena(0x1234, 8).is_none());
 }
 
+// -- AccessorMemReader cast_lookup --------------------------------
+//
+// `AccessorMemReader::cast_lookup` (render_map.rs) consults its
+// `cast_map` field: `Some(map)` returns
+// `map.get(&(parent_type_id, member_byte_offset)).copied()`,
+// `None` returns `None`. The struct itself is private to
+// render_map.rs, so these tests use a stand-in `StubReader` that
+// mirrors the production method body verbatim — same convention
+// as the surrounding AccessorMemReader-shape tests
+// (`accessor_mem_reader_no_snapshot_rejects_all_addrs` and the
+// rest in this section).
+
+/// `cast_lookup` with a populated [`CastMap`] returns the matching
+/// [`CastHit`] when the `(parent_type_id, member_byte_offset)` key
+/// is present, and `None` when it is not. Mirrors the production
+/// `AccessorMemReader::cast_lookup` body line-for-line so a
+/// regression in either trips this test.
+#[test]
+fn accessor_mem_reader_cast_lookup_with_populated_map() {
+    use super::super::btf_render::CastHit;
+    use super::super::cast_analysis::{AddrSpace, CastMap};
+
+    // Production cast_lookup body (render_map.rs):
+    //   let map = self.cast_map?;
+    //   map.get(&(parent_type_id, member_byte_offset)).copied()
+    struct StubReader<'a> {
+        cast_map: Option<&'a CastMap>,
+    }
+    impl super::super::btf_render::MemReader for StubReader<'_> {
+        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn cast_lookup(&self, parent_type_id: u32, member_byte_offset: u32) -> Option<CastHit> {
+            let map = self.cast_map?;
+            map.get(&(parent_type_id, member_byte_offset)).copied()
+        }
+    }
+
+    // Build a CastMap with two entries: one Arena, one Kernel.
+    // Parent ids and member offsets are arbitrary u32s — the
+    // map's role is opaque key/value storage and the lookup is
+    // a plain BTreeMap::get.
+    let mut map = CastMap::new();
+    map.insert(
+        (42, 8),
+        CastHit {
+            target_type_id: 99,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    map.insert(
+        (42, 16),
+        CastHit {
+            target_type_id: 100,
+            addr_space: AddrSpace::Kernel,
+        },
+    );
+
+    let r = StubReader {
+        cast_map: Some(&map),
+    };
+
+    // Hit on (42, 8): returns the Arena CastHit.
+    let hit_arena = r
+        .cast_lookup(42, 8)
+        .expect("populated map must return CastHit for present key");
+    assert_eq!(
+        hit_arena.target_type_id, 99,
+        "target_type_id must match the inserted value",
+    );
+    assert!(
+        matches!(hit_arena.addr_space, AddrSpace::Arena),
+        "addr_space hint must round-trip through cast_lookup",
+    );
+
+    // Hit on (42, 16): returns the Kernel CastHit.
+    let hit_kernel = r
+        .cast_lookup(42, 16)
+        .expect("populated map must return CastHit for present key");
+    assert_eq!(hit_kernel.target_type_id, 100);
+    assert!(
+        matches!(hit_kernel.addr_space, AddrSpace::Kernel),
+        "second entry's addr_space must round-trip distinctly from the first",
+    );
+
+    // Miss on a non-present key: returns None.
+    assert!(
+        r.cast_lookup(42, 24).is_none(),
+        "key not in map must produce None (no fallback to nearby offsets)",
+    );
+    assert!(
+        r.cast_lookup(99, 8).is_none(),
+        "different parent_type_id must produce None even with same offset",
+    );
+}
+
+/// `cast_lookup` with `cast_map = None` returns `None` for every
+/// query. The `?` operator on the Option short-circuits before the
+/// BTreeMap lookup. Production code path: when the dump pass runs
+/// without a cast analysis (no scheduler binary supplied), every
+/// `u64` field renders as a plain counter — no typed-pointer
+/// promotion fires.
+#[test]
+fn accessor_mem_reader_cast_lookup_with_none_map() {
+    use super::super::cast_analysis::CastMap;
+
+    struct StubReader<'a> {
+        cast_map: Option<&'a CastMap>,
+    }
+    impl super::super::btf_render::MemReader for StubReader<'_> {
+        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn cast_lookup(
+            &self,
+            parent_type_id: u32,
+            member_byte_offset: u32,
+        ) -> Option<super::super::btf_render::CastHit> {
+            let map = self.cast_map?;
+            map.get(&(parent_type_id, member_byte_offset)).copied()
+        }
+    }
+
+    let r = StubReader { cast_map: None };
+
+    // Every query returns None — the `?` on `self.cast_map` fires
+    // before any map lookup happens.
+    assert!(r.cast_lookup(0, 0).is_none());
+    assert!(r.cast_lookup(42, 8).is_none());
+    assert!(r.cast_lookup(u32::MAX, u32::MAX).is_none());
+}
+
 // -- ArenaSnapshot.user_vm_start serde + Display ------------------
 //
 // The new field is preserved across serde encode/decode and

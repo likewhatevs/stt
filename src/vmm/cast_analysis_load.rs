@@ -32,12 +32,17 @@
 //!
 //! # Error policy
 //!
-//! Any failure (path missing, ELF parse, missing `.bpf.objs`, missing
-//! `.BTF`, malformed `.BTF.ext`, BTF parse failure) returns an empty
-//! [`CastMap`] after a `warn!` log line. The dump path is best-effort —
-//! a missing cast map silently disables typed-pointer promotion in the
-//! renderer (every `u64` field renders as a plain counter, the
-//! pre-integration default).
+//! Any failure returns an empty [`CastMap`]. The log level depends on
+//! the failure kind: scheduler-binary read errors, outer ELF parse
+//! failures, missing `.bpf.objs`, inner ELF parse failures, and
+//! malformed `.BTF` log at `warn!` (these indicate a likely bug in
+//! the scheduler build); a missing `.BTF` section and an inner ELF
+//! with no executable BPF program sections log at `debug!` (these
+//! shapes are valid for non-scx binaries that ship a `.bpf.objs` for
+//! unrelated reasons). The dump path is best-effort — a missing
+//! cast map silently disables typed-pointer promotion in the renderer
+//! (every `u64` field renders as a plain counter, the pre-integration
+//! default).
 //!
 //! No libbpf calls, no kernel BPF interaction, no CAP_BPF needed — this
 //! runs purely on the on-disk binary bytes.
@@ -182,10 +187,23 @@ pub(crate) fn build_cast_map_from_scheduler(path: &std::path::Path) -> CastMap {
         casts = merged.len(),
         "cast_analysis: analyze_casts pipeline finished"
     );
-    tracing::info!(
-        casts = merged.len(),
-        "cast_analysis: recovered typed pointers from scheduler"
-    );
+    // Demote to debug! when no casts were recovered: a clean
+    // analyze on a scheduler with no typed pointers is a normal
+    // outcome, not an event the operator needs to see at info!
+    // (which would surface as a startup line on every test run).
+    // Non-empty results stay at info! so the operator sees the
+    // recovery count when it matters.
+    if merged.is_empty() {
+        tracing::debug!(
+            casts = 0,
+            "cast_analysis: recovered 0 typed pointers from scheduler"
+        );
+    } else {
+        tracing::info!(
+            casts = merged.len(),
+            "cast_analysis: recovered typed pointers from scheduler"
+        );
+    }
     merged
 }
 
@@ -381,7 +399,7 @@ fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
     // `src_reg = BPF_PSEUDO_KFUNC_CALL = 2` + `imm = btf_id`, so
     // every pre-relocation kfunc call is invisible to it. Patching
     // mirrors what libbpf does at load time
-    // (`tools/lib/bpf/libbpf.c:6420` RELO_EXTERN_CALL handler):
+    // (`bpf_object__relocate_data`'s `RELO_EXTERN_CALL` arm):
     // walk the ELF relocation entries that target each program text
     // section, resolve the symbol name to a `BTF_KIND_FUNC` of
     // extern linkage in the program's own BTF, then rewrite both
@@ -431,9 +449,12 @@ fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
 /// the section. Either way, the section's name keys the BTF
 /// lookup that finds the matching `BTF_KIND_DATASEC` id.
 ///
-/// `base_offset` resolution mirrors libbpf's relocation logic:
-/// the LD_IMM64's pre-relocation `imm` field carries the per-
-/// variable byte offset within the section (clang emits this for
+/// `base_offset` resolution mirrors libbpf's relocation logic.
+/// For SHT_REL (the BPF convention — clang emits SHT_REL, not
+/// SHT_RELA, for BPF object files), `r_addend` is absent; the
+/// offset comes from `LD_IMM64 insn.imm + sym.st_value`. The
+/// LD_IMM64's pre-relocation `imm` field carries the per-variable
+/// byte offset within the section (clang emits this for
 /// `STT_SECTION` symbols). For `STT_OBJECT` symbols clang emits
 /// `imm == 0` and the offset comes from `sym.st_value` (the
 /// object symbol's address within its section). The function
@@ -620,7 +641,8 @@ fn find_datasec_btf_id(btf: &Btf, name: &str) -> Option<u32> {
 /// resolves the symbol's BTF id (the program's own
 /// `BTF_KIND_FUNC` whose name matches the symbol) to the kernel's
 /// kfunc BTF id, then rewrites `src_reg` to `BPF_PSEUDO_KFUNC_CALL =
-/// 2` and `imm` to the resolved id (`tools/lib/bpf/libbpf.c:6420`).
+/// 2` and `imm` to the resolved id (libbpf
+/// `bpf_object__relocate_data`'s `RELO_EXTERN_CALL` arm).
 ///
 /// The cast analyzer never runs at kernel-load time — it operates
 /// purely on the on-disk binary. So this function performs the same
@@ -757,10 +779,10 @@ fn patch_kfunc_calls(
             let Some(sym) = elf.syms.get(reloc.r_sym) else {
                 continue;
             };
-            // Match libbpf's `sym_is_extern` (libbpf.c:4042): the
-            // symbol must be an undefined NOTYPE with global or
-            // weak binding. Anything else is a subprog, a static
-            // helper, or a data symbol; not a kfunc.
+            // Match libbpf's `sym_is_extern`: the symbol must be
+            // an undefined NOTYPE with global or weak binding.
+            // Anything else is a subprog, a static helper, or a
+            // data symbol; not a kfunc.
             const STT_NOTYPE: u8 = goblin::elf::sym::STT_NOTYPE;
             const STB_GLOBAL: u8 = goblin::elf::sym::STB_GLOBAL;
             const STB_WEAK: u8 = goblin::elf::sym::STB_WEAK;
@@ -783,7 +805,7 @@ fn patch_kfunc_calls(
             };
             // Look up the symbol name in the program BTF. We want
             // a `BTF_KIND_FUNC` with extern linkage (mirroring
-            // libbpf's `find_extern_btf_id` at libbpf.c:4068). The
+            // libbpf's `find_extern_btf_id`). The
             // helper returns every id sharing this name; we accept
             // only Func/extern. A name that resolves to multiple
             // distinct Func ids (impossible in well-formed BPF BTF
@@ -808,9 +830,9 @@ fn patch_kfunc_calls(
 /// linkage is extern. Returns `None` if the name does not resolve
 /// in the BTF or if the only matching id is not a Func / not extern.
 ///
-/// Mirrors libbpf's `find_extern_btf_id` (libbpf.c:4068) restricted
-/// to FUNC kinds — the cast analyzer only consumes FUNCs (it does
-/// not type-recover ksym data variables, just kfunc returns).
+/// Mirrors libbpf's `find_extern_btf_id` restricted to FUNC kinds
+/// — the cast analyzer only consumes FUNCs (it does not type-
+/// recover ksym data variables, just kfunc returns).
 fn find_extern_func_btf_id(btf: &Btf, name: &str) -> Option<u32> {
     let ids = btf.resolve_ids_by_name(name).ok()?;
     for id in ids {
@@ -3251,5 +3273,576 @@ mod tests {
         assert_eq!(find_extern_func_btf_id(&btf, "foo"), None);
         // Name not in BTF returns None.
         assert_eq!(find_extern_func_btf_id(&btf, "absent"), None);
+    }
+
+    // ----- build_datasec_pointers tests ------------------------------
+    //
+    // The eight gates inside `build_datasec_pointers` reject malformed
+    // input and surface only well-formed `DatasecPointer` annotations
+    // for `R_BPF_64_64` relocations whose target instruction is a
+    // `BPF_LD_IMM64` referencing a `BTF_KIND_DATASEC` section. The
+    // tests below construct one `(elf, btf, section_bases)` tuple per
+    // gate, run [`build_datasec_pointers`], and assert the gate fired
+    // (empty result) or did not fire (one result with the expected
+    // fields).
+
+    /// Encode `BPF_LD_IMM64` first-slot wire bytes:
+    /// `code=0x18`, `dst_reg=0`, `src_reg=0`, `off=0`, `imm`.
+    /// libbpf-style pre-relocation: the LD_IMM64 second slot
+    /// (also 8 bytes, all zero except trailing imm-high) is appended
+    /// separately by callers — only the first slot opcode matters
+    /// for the `build_datasec_pointers` gate.
+    fn ld_imm64_first_slot_bytes(imm: i32) -> [u8; 8] {
+        // `BPF_LD | BPF_DW | BPF_IMM` = 0x18 in linux uapi `bpf.h`.
+        let mut out = [0u8; 8];
+        out[0] = 0x18;
+        out[1] = 0; // regs byte: dst=0, src=0
+        out[2..4].copy_from_slice(&0i16.to_le_bytes());
+        out[4..8].copy_from_slice(&imm.to_le_bytes());
+        out
+    }
+
+    /// `BPF_LD_IMM64` second slot — 8 bytes with the imm-high field
+    /// cleared. Production paths use this slot for the high 32 bits
+    /// of a 64-bit immediate; the test only needs a non-call slot
+    /// the patcher will skip.
+    fn ld_imm64_second_slot_bytes() -> [u8; 8] {
+        [0u8; 8]
+    }
+
+    /// Append a single `BTF_KIND_DATASEC` type to `types`. Each
+    /// datasec entry is `name_off(4) info(4) size(4)` (12 bytes,
+    /// the standard btf_type header) plus N * 12 bytes for each
+    /// VarSecinfo (`type(4) offset(4) size(4)`). `vsi_entries` is a
+    /// slice of `(type_id, offset, size)` triples — empty list is
+    /// allowed (vlen=0), giving a name-only datasec.
+    fn append_btf_datasec(
+        types: &mut Vec<u8>,
+        name_off: u32,
+        section_size: u32,
+        vsi_entries: &[(u32, u32, u32)],
+    ) {
+        // BTF_KIND_DATASEC = 15. info packs `(kind << 24) | vlen`.
+        const BTF_KIND_DATASEC: u32 = 15;
+        let vlen = vsi_entries.len() as u32;
+        let info = ((BTF_KIND_DATASEC << 24) & 0x1f00_0000) | (vlen & 0xffff);
+        types.extend_from_slice(&name_off.to_le_bytes());
+        types.extend_from_slice(&info.to_le_bytes());
+        // size_or_type field carries the section's total byte size
+        // for DATASEC (matches kernel `btf_type::size_or_type` union
+        // when `kind == BTF_KIND_DATASEC`).
+        types.extend_from_slice(&section_size.to_le_bytes());
+        for (type_id, offset, size) in vsi_entries {
+            types.extend_from_slice(&type_id.to_le_bytes());
+            types.extend_from_slice(&offset.to_le_bytes());
+            types.extend_from_slice(&size.to_le_bytes());
+        }
+    }
+
+    /// Build a minimal `.BTF` blob containing one `BTF_KIND_DATASEC`
+    /// named `sec_name` plus one `BTF_KIND_INT u64` (id=1). Returns
+    /// the byte blob and the datasec id (always 2). The integer is
+    /// the underlying type for any VarSecinfo entries the caller adds.
+    fn build_datasec_btf_blob(sec_name: &str) -> (Vec<u8>, u32) {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = strings.len() as u32;
+        strings.extend_from_slice(b"u64");
+        strings.push(0);
+        let n_sec = strings.len() as u32;
+        strings.extend_from_slice(sec_name.as_bytes());
+        strings.push(0);
+
+        let mut types: Vec<u8> = Vec::new();
+        // id 1: BTF_KIND_INT u64 size=8 bits=64 (encoding=0).
+        types.extend_from_slice(&kfunc_btf_type_header(n_u64, 1, 0, 8));
+        let int_data: u32 = 64;
+        types.extend_from_slice(&int_data.to_le_bytes());
+        // id 2: BTF_KIND_DATASEC named `sec_name`, no VSI entries.
+        // `build_datasec_pointers` only resolves the section name
+        // to a datasec id; it does NOT walk the VSI list (that's
+        // the analyzer's job during STX/LDX). An empty VSI list is
+        // acceptable for these gate-focused tests.
+        append_btf_datasec(&mut types, n_sec, 32, &[]);
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&0xEB9F_u16.to_le_bytes());
+        blob.push(1);
+        blob.push(0);
+        blob.extend_from_slice(&24u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&types);
+        blob.extend_from_slice(&strings);
+        (blob, 2)
+    }
+
+    /// Construct the standard scaffold the `build_datasec_pointers`
+    /// gate tests share: an inner ELF with a `.bss`-named PROGBITS
+    /// section (the "datasec target"), a `.text` section with one
+    /// LD_IMM64 + EXIT, a `.symtab` + `.strtab`, and an `SHT_REL`
+    /// section relocating `.text`. Returns `(blob, btf_blob,
+    /// text_concat, section_bases)` ready for [`build_datasec_pointers`].
+    ///
+    /// `r_type` selects the relocation type byte (1 = R_BPF_64_64);
+    /// `r_offset` selects which `.text` slot the reloc lands on
+    /// (must be 0 for the LD_IMM64 first slot); `sym_st_value`,
+    /// `sym_st_shndx`, and `sym_st_type_bind` parameterize the
+    /// referenced symbol; `imm_value` is the LD_IMM64 first-slot
+    /// `imm` field. `sec_name_in_btf` controls whether the BTF
+    /// datasec's name matches the ELF section name.
+    #[allow(clippy::too_many_arguments)]
+    fn build_datasec_test_scaffold(
+        bss_name: &'static str,
+        sec_name_in_btf: &str,
+        r_type: u32,
+        r_offset: u64,
+        sym_st_value: u64,
+        sym_st_shndx: u16,
+        sym_st_type_bind: u8,
+        imm_value: i32,
+    ) -> (Vec<u8>, Vec<u8>, Vec<BpfInsn>, HashMap<u32, usize>) {
+        // BTF blob: one datasec whose name is `sec_name_in_btf`.
+        let (btf_blob, _ds_id) = build_datasec_btf_blob(sec_name_in_btf);
+
+        // ELF strtab: just the symbol name (we use a single named
+        // symbol pointing into `.bss`).
+        let mut strtab: Vec<u8> = vec![0];
+        let n_sym = strtab.len() as u32;
+        strtab.extend_from_slice(b"global_var");
+        strtab.push(0);
+
+        // Symtab: shdr[0] is the always-null sentinel; shdr[1] is
+        // the variable symbol. `st_info` packs (bind, type) per
+        // ELF64. The caller controls both via `sym_st_type_bind`.
+        let mut symtab: Vec<u8> = Vec::new();
+        symtab.extend_from_slice(&elf64_sym(0, 0, 0, 0, 0));
+        symtab.extend_from_slice(&elf64_sym(
+            n_sym,
+            sym_st_type_bind,
+            sym_st_shndx,
+            sym_st_value,
+            0,
+        ));
+
+        // Text section: one LD_IMM64 + an EXIT slot. The LD_IMM64
+        // uses two 8-byte slots; we encode a third slot for EXIT
+        // so the section byte size is 24 — matching what the BPF
+        // loader sees for a real LD_IMM64 followed by an exit.
+        let mut text: Vec<u8> = Vec::new();
+        text.extend_from_slice(&ld_imm64_first_slot_bytes(imm_value));
+        text.extend_from_slice(&ld_imm64_second_slot_bytes());
+        text.extend_from_slice(&kfunc_exit_bytes());
+
+        // SHT_REL entry: `r_offset = r_offset` (caller-controlled),
+        // `r_sym = 1` (our named symbol), `r_type = r_type`.
+        let rel_data: Vec<u8> = elf64_rel(r_offset, 1, r_type).to_vec();
+
+        // ELF layout (caller-controlled section names so tests can
+        // exercise the "unknown section name" gate). Section
+        // indices: 1 = `.bss`-named (`bss_name`); 2 = `.text`;
+        // 3 = `.strtab`; 4 = `.symtab`; 5 = `.rel.text`; 6 = `.BTF`.
+        let blob = build_elf64(
+            vec![
+                SecSpec::new(bss_name, sh::SHT_PROGBITS).data(vec![0u8; 32]),
+                SecSpec::new(".text", sh::SHT_PROGBITS)
+                    .flags(sh::SHF_EXECINSTR.into())
+                    .data(text),
+                SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
+                SecSpec::new(".symtab", sh::SHT_SYMTAB)
+                    .data(symtab)
+                    .link(3)
+                    .entsize(24),
+                SecSpec::new(".rel.text", sh::SHT_REL)
+                    .data(rel_data)
+                    .link(4)
+                    .info(2) // info = target section idx (.text)
+                    .entsize(16),
+                SecSpec::new(".BTF", sh::SHT_PROGBITS).data(btf_blob.clone()),
+            ],
+            h::EM_BPF,
+            h::ET_REL,
+        );
+
+        // Decoded text — three 8-byte instructions:
+        //   slot 0: LD_IMM64 first half (the reloc target)
+        //   slot 1: LD_IMM64 second half (zeros)
+        //   slot 2: EXIT
+        let text_concat: Vec<BpfInsn> = vec![
+            BpfInsn::from_le_bytes(ld_imm64_first_slot_bytes(imm_value)),
+            BpfInsn::from_le_bytes(ld_imm64_second_slot_bytes()),
+            BpfInsn::from_le_bytes(kfunc_exit_bytes()),
+        ];
+
+        // section_bases: only the .text section (idx 2 here). The
+        // base index is 0 because the test object only has one text
+        // section, so its instructions start at concat-idx 0.
+        let mut section_bases: HashMap<u32, usize> = HashMap::new();
+        section_bases.insert(2, 0);
+
+        (blob, btf_blob, text_concat, section_bases)
+    }
+
+    /// Gate 1 (R_BPF_64_64 type): a relocation whose `r_type` is
+    /// not `R_BPF_64_64` (= 1) is silently dropped — the function
+    /// produces no `DatasecPointer` even though every other gate
+    /// would pass.
+    #[test]
+    fn build_datasec_pointers_rejects_non_r_bpf_64_64() {
+        let (blob, btf_blob, text_concat, section_bases) = build_datasec_test_scaffold(
+            ".bss",
+            ".bss",
+            10, // r_type != R_BPF_64_64 (= 1)
+            0,
+            0,
+            1, // st_shndx = .bss (idx 1)
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            0,
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+        let out = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+        assert!(out.is_empty(), "non-R_BPF_64_64 reloc must be skipped");
+    }
+
+    /// Gate 2 (`r_offset` alignment): a relocation whose `r_offset`
+    /// is not a multiple of 8 cannot reference an LD_IMM64
+    /// instruction (BPF instructions are 8-byte aligned). The
+    /// alignment gate fires before any other check.
+    #[test]
+    fn build_datasec_pointers_rejects_non_multiple_of_8_offset() {
+        let (blob, btf_blob, text_concat, section_bases) = build_datasec_test_scaffold(
+            ".bss",
+            ".bss",
+            1,
+            4, // r_offset = 4 (not a multiple of 8)
+            0,
+            1,
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            0,
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+        let out = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+        assert!(
+            out.is_empty(),
+            "r_offset=4 (not multiple of 8) must be rejected"
+        );
+    }
+
+    /// Gate 3 (`r_offset` past section end): a relocation whose
+    /// `r_offset >= section_byte_size` cannot possibly land on a
+    /// real instruction. The bounds gate fires.
+    #[test]
+    fn build_datasec_pointers_rejects_offset_past_section_size() {
+        // Text section size = 24 bytes (3 BPF instructions). An
+        // r_offset of 100 is far past the end and must be rejected.
+        let (blob, btf_blob, text_concat, section_bases) = build_datasec_test_scaffold(
+            ".bss",
+            ".bss",
+            1,
+            100, // r_offset >= section_byte_size (= 24)
+            0,
+            1,
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            0,
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+        let out = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+        assert!(
+            out.is_empty(),
+            "r_offset past section size must be rejected"
+        );
+    }
+
+    /// Gate 4 (instruction opcode): a relocation that lands on an
+    /// instruction whose `code` byte is not `BPF_LD_IMM64` (= 0x18)
+    /// is silently dropped. The renderer relies on the LD_IMM64
+    /// arm to apply datasec annotations; a reloc on an EXIT or
+    /// LDX would mis-route the analyzer state.
+    #[test]
+    fn build_datasec_pointers_rejects_non_ld_imm64_opcode() {
+        // r_offset = 16 → instruction index 2 (the EXIT slot, not
+        // an LD_IMM64). The opcode-byte gate fires.
+        let (blob, btf_blob, text_concat, section_bases) = build_datasec_test_scaffold(
+            ".bss",
+            ".bss",
+            1,
+            16, // EXIT slot, not LD_IMM64
+            0,
+            1,
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            0,
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+        let out = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+        assert!(
+            out.is_empty(),
+            "reloc on non-LD_IMM64 opcode must be rejected"
+        );
+    }
+
+    /// Gate 5 (symbol section binding): symbols with `st_shndx`
+    /// set to `SHN_UNDEF` (0), `SHN_ABS` (0xFFF1), or `SHN_COMMON`
+    /// (0xFFF2) are not bound to a real section index; the
+    /// function rejects all three.
+    #[test]
+    fn build_datasec_pointers_rejects_special_section_index_symbols() {
+        for shndx in [0u16, 0xFFF1, 0xFFF2] {
+            let (blob, btf_blob, text_concat, section_bases) = build_datasec_test_scaffold(
+                ".bss",
+                ".bss",
+                1,
+                0,
+                0,
+                shndx,
+                st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+                0,
+            );
+            let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+            let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+            let out = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+            assert!(
+                out.is_empty(),
+                "symbol with st_shndx={shndx:#x} must be rejected"
+            );
+        }
+    }
+
+    /// Gate 6 (BTF datasec lookup): a section name that resolves
+    /// in the ELF but does NOT exist as a `BTF_KIND_DATASEC` in the
+    /// program BTF is rejected. Even if the section name is well-
+    /// formed (`.bss`), without a matching BTF datasec the
+    /// annotation cannot be emitted — the analyzer would have no
+    /// VarSecinfo entries to walk.
+    #[test]
+    fn build_datasec_pointers_rejects_section_not_in_btf() {
+        // ELF section name = `.bss`, BTF datasec name = `.rodata`.
+        // The BTF lookup at the section name `.bss` finds no
+        // matching datasec → drop.
+        let (blob, btf_blob, text_concat, section_bases) = build_datasec_test_scaffold(
+            ".bss",
+            ".rodata", // BTF datasec name mismatches ELF section name
+            1,
+            0,
+            0,
+            1,
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            0,
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+        let out = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+        assert!(
+            out.is_empty(),
+            "section name not in BTF as DATASEC must be rejected"
+        );
+    }
+
+    /// Gate 7 (`sym.st_value` overflow): if `sym.st_value`
+    /// exceeds `u32::MAX`, the offset cannot be represented in the
+    /// `base_offset: u32` field of [`DatasecPointer`]. The gate
+    /// rejects.
+    #[test]
+    fn build_datasec_pointers_rejects_st_value_past_u32_max() {
+        let (blob, btf_blob, text_concat, section_bases) = build_datasec_test_scaffold(
+            ".bss",
+            ".bss",
+            1,
+            0,
+            (u32::MAX as u64) + 1, // st_value > u32::MAX
+            1,
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            0,
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+        let out = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+        assert!(out.is_empty(), "sym.st_value > u32::MAX must be rejected");
+    }
+
+    /// Gate 8 (happy path): every gate passes, the function emits
+    /// exactly one [`DatasecPointer`] with the expected
+    /// `insn_offset`, `datasec_type_id`, and `base_offset`.
+    /// The `base_offset` is the sum of `insn.imm` and
+    /// `sym.st_value`, mirroring the libbpf convention for
+    /// `STT_OBJECT` symbols carrying the per-variable offset in
+    /// `st_value` and `STT_SECTION` symbols using `imm`.
+    #[test]
+    fn build_datasec_pointers_happy_path_emits_pointer() {
+        // `imm = 16`, `st_value = 0`: STT_SECTION-style
+        // pre-relocation form where the byte offset of the
+        // referenced global is encoded in the LD_IMM64 imm field.
+        let (blob, btf_blob, text_concat, section_bases) = build_datasec_test_scaffold(
+            ".bss",
+            ".bss",
+            1, // R_BPF_64_64
+            0, // r_offset = 0 (LD_IMM64 first slot)
+            0, // st_value = 0
+            1, // st_shndx = .bss (idx 1)
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            16, // LD_IMM64 imm = 16 (offset within .bss)
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+        let out = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+        assert_eq!(out.len(), 1, "all gates pass → exactly one entry");
+        assert_eq!(out[0].insn_offset, 0, "PC = base + r_offset/8 = 0");
+        assert_eq!(
+            out[0].datasec_type_id, 2,
+            "datasec id is 2 (per build_datasec_btf_blob)"
+        );
+        assert_eq!(
+            out[0].base_offset, 16,
+            "base_offset = imm (16) + st_value (0) = 16"
+        );
+    }
+
+    /// `find_datasec_btf_id` filters its results to
+    /// `BTF_KIND_DATASEC` only — a name shared by a `BTF_KIND_VAR`
+    /// or `BTF_KIND_INT` does not match. Mirrors the kind-filter
+    /// invariant in [`find_extern_func_btf_id_filters_to_func_kind`]
+    /// for the kfunc helper.
+    #[test]
+    fn find_datasec_btf_id_filters_to_datasec_kind() {
+        // Build a BTF with three types named `.bss`:
+        //   id 1: BTF_KIND_INT named ".bss" (size=4, bits=32)
+        //   id 2: BTF_KIND_VAR named ".bss" (linkage=1)
+        //   id 3: BTF_KIND_DATASEC named ".bss" (size=8)
+        // The lookup must return id 3 — not id 1 (Int) or id 2
+        // (Var) — even though all three share the same name.
+        let mut strings: Vec<u8> = vec![0];
+        let n_bss = strings.len() as u32;
+        strings.extend_from_slice(b".bss");
+        strings.push(0);
+
+        let mut types: Vec<u8> = Vec::new();
+        // id 1: INT
+        types.extend_from_slice(&kfunc_btf_type_header(n_bss, 1, 0, 4));
+        let int_data: u32 = 32;
+        types.extend_from_slice(&int_data.to_le_bytes());
+        // id 2: VAR (kind=14, vlen=0). size_or_type = wrapped int id (1).
+        types.extend_from_slice(&kfunc_btf_type_header(n_bss, 14, 0, 1));
+        let var_linkage: u32 = 1; // global
+        types.extend_from_slice(&var_linkage.to_le_bytes());
+        // id 3: DATASEC (kind=15, vlen=0). size_or_type = section
+        // byte size (8).
+        append_btf_datasec(&mut types, n_bss, 8, &[]);
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&0xEB9F_u16.to_le_bytes());
+        blob.push(1);
+        blob.push(0);
+        blob.extend_from_slice(&24u32.to_le_bytes());
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&types);
+        blob.extend_from_slice(&strings);
+
+        let btf = Btf::from_bytes(&blob).expect("parse btf");
+        // The datasec is id 3; the helper must filter past Int (1)
+        // and Var (2) to return it.
+        assert_eq!(
+            find_datasec_btf_id(&btf, ".bss"),
+            Some(3),
+            "kind filter must skip past Int/Var to the Datasec",
+        );
+        // A name not present in the BTF returns None.
+        assert_eq!(find_datasec_btf_id(&btf, ".rodata"), None);
+    }
+
+    /// `patch_kfunc_calls` already-relocated gate: a call whose
+    /// `src_reg == BPF_PSEUDO_KFUNC_CALL` (= 2) and `imm == 42`
+    /// has already been rewritten by some prior relocation pass
+    /// (e.g. an scheduler binary that captures a post-load BPF
+    /// object). The patcher must NOT overwrite the kernel BTF id
+    /// already in `imm` — doing so would replace a kernel id with
+    /// a program-BTF id, sending the analyzer to the wrong BTF
+    /// universe. Both `src_reg` and `imm` survive unmodified.
+    #[test]
+    fn patch_kfunc_calls_skips_already_relocated_src_reg() {
+        let kf_name = "bpf_task_acquire";
+        let (btf_blob, _expected_func_id, _t_id) = build_kfunc_btf_blob(kf_name);
+        let btf = Btf::from_bytes(&btf_blob).expect("parse btf");
+
+        let mut strtab: Vec<u8> = vec![0];
+        let kf_str_off = strtab.len() as u32;
+        strtab.extend_from_slice(kf_name.as_bytes());
+        strtab.push(0);
+
+        let mut symtab: Vec<u8> = Vec::new();
+        symtab.extend_from_slice(&elf64_sym(0, 0, 0, 0, 0));
+        symtab.extend_from_slice(&elf64_sym(
+            kf_str_off,
+            st_info(syms::STB_GLOBAL, syms::STT_NOTYPE),
+            0,
+            0,
+            0,
+        ));
+
+        // Already-relocated kfunc call:
+        //   code = 0x85 (BPF_JMP | BPF_CALL)
+        //   dst = 0, src = BPF_PSEUDO_KFUNC_CALL (= 2)
+        //   off = 0, imm = 42 (some kernel BTF id)
+        // The packed regs byte: dst=0 (low 4) | src=2 (high 4) = 0x20.
+        let already_relocated_call: [u8; 8] = [0x85, 0x20, 0x00, 0x00, 42, 0x00, 0x00, 0x00];
+
+        let mut text: Vec<u8> = Vec::new();
+        text.extend_from_slice(&already_relocated_call);
+        text.extend_from_slice(&kfunc_exit_bytes());
+        let rel_data: Vec<u8> = elf64_rel(0, 1, 10).to_vec();
+
+        let blob = build_elf64(
+            vec![
+                SecSpec::new(".text", sh::SHT_PROGBITS)
+                    .flags(sh::SHF_EXECINSTR.into())
+                    .data(text),
+                SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
+                SecSpec::new(".symtab", sh::SHT_SYMTAB)
+                    .data(symtab)
+                    .link(2)
+                    .entsize(24),
+                SecSpec::new(".rel.text", sh::SHT_REL)
+                    .data(rel_data)
+                    .link(3)
+                    .info(1)
+                    .entsize(16),
+                SecSpec::new(".BTF", sh::SHT_PROGBITS).data(btf_blob),
+            ],
+            h::EM_BPF,
+            h::ET_REL,
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let mut text_concat: Vec<BpfInsn> = vec![
+            BpfInsn::from_le_bytes(already_relocated_call),
+            BpfInsn::from_le_bytes(kfunc_exit_bytes()),
+        ];
+        let mut section_bases: HashMap<u32, usize> = HashMap::new();
+        section_bases.insert(1, 0);
+
+        // Sanity: pre-call state matches the already-relocated form.
+        assert_eq!(text_concat[0].code, 0x85);
+        assert_eq!(text_concat[0].src_reg(), BPF_PSEUDO_KFUNC_CALL);
+        assert_eq!(text_concat[0].imm, 42);
+
+        patch_kfunc_calls(&mut text_concat, &btf, &elf, &section_bases);
+
+        // Both fields must survive unmodified — the imm gate
+        // (`imm != -1`) fires before any BTF lookup, preserving
+        // the kernel id intact.
+        assert_eq!(
+            text_concat[0].src_reg(),
+            BPF_PSEUDO_KFUNC_CALL,
+            "src_reg must survive unmodified",
+        );
+        assert_eq!(
+            text_concat[0].imm, 42,
+            "imm must survive unmodified — kernel BTF id preserved",
+        );
     }
 }

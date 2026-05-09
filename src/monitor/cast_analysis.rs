@@ -155,7 +155,13 @@ impl BpfInsn {
     /// Construct an instruction with explicit fields. `dst` and `src`
     /// are 0..=15 register indices (the analyzer rejects 11..=15 at
     /// decode time per `step()`).
-    #[allow(dead_code)]
+    ///
+    /// Test-only: production decode uses
+    /// [`BpfInsn::from_le_bytes`]; tests construct fixtures directly
+    /// to exercise specific opcode/register combinations without a
+    /// round-trip through the wire encoder. Gated `#[cfg(test)]` so
+    /// release builds do not carry an unused constructor.
+    #[cfg(test)]
     pub const fn new(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> Self {
         Self {
             code,
@@ -276,10 +282,13 @@ pub(crate) struct FuncEntry {
 /// `bpf.h` `BPF_PSEUDO_MAP_VALUE = 2` for the kernel-side encoding.
 ///
 /// `base_offset` is the byte offset of the referenced global within
-/// the datasec, recovered from the relocation entry's `r_addend`
-/// (for RELA) or the LD_IMM64 first-slot `imm` (for REL).
+/// the datasec. For SHT_REL (the BPF convention — clang emits
+/// SHT_REL, not SHT_RELA, for BPF object files), `r_addend` is
+/// absent; the offset comes from `LD_IMM64 insn.imm +
+/// sym.st_value` and the host-side loader populates `base_offset`
+/// from those fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DatasecPointer {
+pub(crate) struct DatasecPointer {
     /// Instruction index of the `BPF_LD_IMM64` to annotate.
     pub insn_offset: usize,
     /// BTF id of the `BTF_KIND_DATASEC` type for the referenced
@@ -307,6 +316,22 @@ pub enum AddrSpace {
     /// virtual address (slab / vmalloc / per-cpu). Recovered by
     /// tracking STX of a typed `Pointer{T}` register.
     Kernel,
+}
+
+impl std::fmt::Display for AddrSpace {
+    /// Renders as the lowercase address-space tag the renderer
+    /// composes into [`crate::monitor::btf_render::RenderedValue::Ptr::cast_annotation`]
+    /// (e.g. `"cast→arena"`, `"cast→kernel"`). Keeps the textual
+    /// representation in one place so a new variant cannot drift
+    /// between the analyzer enum and the operator-visible
+    /// annotation.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            AddrSpace::Arena => "arena",
+            AddrSpace::Kernel => "kernel",
+        };
+        f.write_str(s)
+    }
 }
 
 /// One recovered cast finding, returned by
@@ -854,19 +879,21 @@ impl<'a> Analyzer<'a> {
                             },
                         );
                         self.note_type_id(datasec_type_id);
-                    } else if insn.src_reg() == BPF_PSEUDO_MAP_VALUE {
-                        // Post-relocation bytecode with no caller
-                        // annotation: we cannot recover the
-                        // datasec id from the map_fd alone (the
-                        // mapping lives in the loader's `.maps`
-                        // parser). Drop dst — false negative is
-                        // the safe direction.
-                        self.set_reg(dst, RegState::Unknown);
                     } else {
-                        // Plain LD_IMM64 (literal constant, map_fd,
-                        // BTF id, …): the destination receives a
-                        // 64-bit immediate, never a typed kernel
-                        // pointer the renderer needs to chase.
+                        // Every other LD_IMM64 shape collapses to
+                        // Unknown for the destination register:
+                        //   - `src_reg == BPF_PSEUDO_MAP_VALUE`
+                        //     without a caller annotation: post-
+                        //     relocation bytecode whose map_fd
+                        //     alone does not identify a datasec
+                        //     (the mapping lives in the loader's
+                        //     `.maps` parser). Drop dst — false
+                        //     negative is the safe direction.
+                        //   - plain LD_IMM64 (literal constant,
+                        //     map_fd, BTF id, …): the destination
+                        //     receives a 64-bit immediate, never
+                        //     a typed kernel pointer the renderer
+                        //     needs to chase.
                         self.set_reg(dst, RegState::Unknown);
                     }
                     *skip_next = true;
@@ -1959,14 +1986,6 @@ pub(crate) const BPF_PSEUDO_KFUNC_CALL: u8 = bs::BPF_PSEUDO_KFUNC_CALL as u8;
 /// from post-relocation forms — by the time it runs every kfunc
 /// call carries its BTF id.
 pub(crate) const BPF_PSEUDO_CALL: u8 = bs::BPF_PSEUDO_CALL as u8;
-
-/// `BPF_LD_IMM64` with `src_reg == BPF_PSEUDO_MAP_VALUE` denotes a
-/// load-immediate of an address into a global section (`.bss` /
-/// `.data` / `.rodata`). The first slot's `imm` is the map fd at
-/// pre-load time; libbpf rewrites it to the variable's byte offset
-/// at relocation time. See linux uapi `bpf.h`. Defined as a `u8`
-/// since [`BpfInsn::src_reg`] returns `u8`.
-pub(crate) const BPF_PSEUDO_MAP_VALUE: u8 = bs::BPF_PSEUDO_MAP_VALUE as u8;
 
 #[cfg(test)]
 mod tests {
@@ -7535,12 +7554,6 @@ mod tests {
     /// - id 7: Func("bpf_task_acquire") -> id 6
     fn btf_bss_with_kptr() -> (Vec<u8>, u32, u32, u32, u32) {
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_t = push_name(&mut strings, "task_struct");
         let n_x = push_name(&mut strings, "x");
@@ -7701,12 +7714,6 @@ mod tests {
         // Var "kptr_b"(5), Datasec(6, [(4,0,8), (5,16,8)]),
         // FuncProto(7), Func(8).
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_t = push_name(&mut strings, "task_struct");
         let n_x = push_name(&mut strings, "x");
@@ -8034,12 +8041,6 @@ mod tests {
     fn func_entry_multiple_at_same_pc_last_wins() {
         let slot_off: u32 = 16;
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_t = push_name(&mut strings, "T");
         let n_p = push_name(&mut strings, "P");
@@ -8171,12 +8172,6 @@ mod tests {
     #[test]
     fn func_entry_pc0_no_params_clears_initial_regs() {
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_t = push_name(&mut strings, "T");
         let n_q = push_name(&mut strings, "Q");
@@ -8268,12 +8263,6 @@ mod tests {
     fn func_entry_pc_gt_0_reseeds_mid_stream() {
         let slot_off: u32 = 16;
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_t = push_name(&mut strings, "T");
         let n_p = push_name(&mut strings, "P");
@@ -8398,12 +8387,6 @@ mod tests {
     #[test]
     fn initial_reg_duplicate_seeds_last_wins() {
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_s1 = push_name(&mut strings, "S1");
         let n_s2 = push_name(&mut strings, "S2");
@@ -8587,12 +8570,6 @@ mod tests {
     fn many_func_entries_each_seeds() {
         const N: usize = 100;
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_p = push_name(&mut strings, "P");
         let n_arg_t = push_name(&mut strings, "task");
@@ -8708,12 +8685,6 @@ mod tests {
     fn many_struct_types_unique_match_resolves() {
         const N_FILLER: usize = 499;
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u32 = push_name(&mut strings, "u32");
         let n_u64 = push_name(&mut strings, "u64");
         let n_t = push_name(&mut strings, "T");
@@ -8824,12 +8795,6 @@ mod tests {
     fn deep_modifier_chain_resolves_to_u64() {
         const CHAIN_LEN: usize = 30;
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_t = push_name(&mut strings, "T");
         let n_q = push_name(&mut strings, "Q");
@@ -8913,12 +8878,6 @@ mod tests {
     fn maximum_stack_slots_all_recorded() {
         const N: usize = 64;
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let n_p = push_name(&mut strings, "P");
         let mut t_names = Vec::with_capacity(N);
@@ -9035,12 +8994,6 @@ mod tests {
     fn many_field_struct_records_two_distinct_casts() {
         const N: u32 = 100;
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u8 = push_name(&mut strings, "u8");
         let n_u32 = push_name(&mut strings, "u32");
         let n_u64 = push_name(&mut strings, "u64");
@@ -9164,12 +9117,6 @@ mod tests {
     fn many_cast_patterns_in_one_program() {
         const N: u32 = 20;
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u8 = push_name(&mut strings, "u8");
         let n_u64 = push_name(&mut strings, "u64");
         let n_t = push_name(&mut strings, "T");
@@ -9267,12 +9214,6 @@ mod tests {
     #[test]
     fn empty_btf_no_panic() {
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u64 = push_name(&mut strings, "u64");
         let types = vec![SynType::Int {
             name_off: n_u64,
@@ -9309,12 +9250,6 @@ mod tests {
     #[test]
     fn btf_only_ints_no_panic() {
         let mut strings: Vec<u8> = vec![0];
-        let push_name = |s: &mut Vec<u8>, name: &str| {
-            let off = s.len() as u32;
-            s.extend_from_slice(name.as_bytes());
-            s.push(0);
-            off
-        };
         let n_u8 = push_name(&mut strings, "u8");
         let n_u16 = push_name(&mut strings, "u16");
         let n_u32 = push_name(&mut strings, "u32");

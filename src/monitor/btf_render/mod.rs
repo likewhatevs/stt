@@ -2128,6 +2128,56 @@ fn render_struct(
     }
 }
 
+/// Shared BPF cast intercept gate for [`render_member`] and
+/// [`render_datasec`]. Caller passes the (parent_id, byte_off) key
+/// the cast analyzer would have seen. Returns `Some(rendered)` when
+/// every gate aligns and the field is a cast-recovered typed
+/// pointer; `None` otherwise (caller falls through to its standard
+/// render path).
+///
+/// `field_bytes` must be the parent_bytes / section_bytes slice
+/// from `byte_off` onward (i.e. the slice already advanced to the
+/// field's start). The helper reads the first 8 bytes; a slice
+/// shorter than 8 bytes falls through to `None`.
+///
+/// Gates (in order):
+/// - `mem` is `Some` (no chase is possible without a [`MemReader`]).
+/// - `peeled` peels to a plain unsigned 8-byte [`Type::Int`] — BPF
+///   stores typed pointers in `u64` slots; signed, `_Bool`, `char`,
+///   and sub-u64 widths are not the cast analyzer's output shape.
+/// - `byte_off` fits in `u32` (datasec / struct offsets exceed
+///   `u32::MAX` only in malformed BTF; the analyzer keys offsets as
+///   `u32`).
+/// - [`MemReader::cast_lookup`] returns a hit for
+///   `(parent_type_id, byte_off)` (default `None` keeps every
+///   reader correct without an explicit override).
+/// - `field_bytes` is at least 8 bytes long (a truncated field
+///   falls through to the existing partial-decode path so the
+///   consumer still sees whatever survived).
+fn try_cast_intercept(
+    btf: &Btf,
+    cast_key: (u32, usize),
+    peeled: &Type,
+    field_bytes: &[u8],
+    depth: u32,
+    mem: Option<&dyn MemReader>,
+    visited: &mut HashSet<u64>,
+) -> Option<RenderedValue> {
+    let (parent_type_id, byte_off) = cast_key;
+    let reader = mem?;
+    let Type::Int(int) = peeled else {
+        return None;
+    };
+    if int.size() != 8 || int.is_signed() || int.is_bool() || int.is_char() {
+        return None;
+    }
+    let off_u32 = u32::try_from(byte_off).ok()?;
+    let hit = reader.cast_lookup(parent_type_id, off_u32)?;
+    let head = field_bytes.get(..8)?;
+    let value = u64::from_le_bytes(head.try_into().ok()?);
+    Some(render_cast_pointer(btf, hit, value, depth, reader, visited))
+}
+
 /// Render a `BTF_KIND_DATASEC` (e.g. `.bss`, `.data`, `.rodata`) by
 /// walking its `VarSecinfo` entries and rendering each variable into
 /// the slice of section bytes its `offset()` and `size()` describe.
@@ -2220,34 +2270,20 @@ fn render_datasec(
         // address-space reader. Mirrors the gate in
         // [`render_member`] for struct members, but keyed on the
         // datasec id + variable offset (the cast analyzer's
-        // `(parent, off)` pair for a BSS / data global).
-        //
-        // Every gate must align: a [`MemReader`] is plumbed (no
-        // chase is possible without one), the variable's
-        // underlying type peels to a plain unsigned 8-byte Int
-        // (BPF stores typed pointers in `u64` slots), the
-        // section bytes cover the full 8-byte slot at
-        // `var_info.offset()`, and `cast_lookup` returns a hit
-        // for `(parent_type_id, offset)`. Any failure falls
-        // through to the standard `render_value_inner` path.
-        let cast_intercept: Option<RenderedValue> = (|| {
-            let reader = mem?;
-            let inner_ty = peel_modifiers(btf, inner_id)?;
-            let Type::Int(int) = &inner_ty else {
-                return None;
-            };
-            if int.size() != 8 || int.is_signed() || int.is_bool() || int.is_char() {
-                return None;
-            }
-            let off_u32 = u32::try_from(offset).ok()?;
-            let hit = reader.cast_lookup(parent_type_id, off_u32)?;
-            let end = offset.checked_add(8)?;
-            if end > bytes.len() {
-                return None;
-            }
-            let value = u64::from_le_bytes(bytes[offset..end].try_into().ok()?);
-            Some(render_cast_pointer(btf, hit, value, depth, reader, visited))
-        })();
+        // `(parent, off)` pair for a BSS / data global). Shared
+        // gating logic lives in [`try_cast_intercept`].
+        let cast_intercept = peel_modifiers(btf, inner_id).and_then(|inner_ty| {
+            let field_bytes = bytes.get(offset..).unwrap_or_default();
+            try_cast_intercept(
+                btf,
+                (parent_type_id, offset),
+                &inner_ty,
+                field_bytes,
+                depth,
+                mem,
+                visited,
+            )
+        });
         if let Some(rv) = cast_intercept {
             members.push(RenderedMember {
                 name: var_name,
@@ -2331,45 +2367,22 @@ fn render_member(
     // BPF cast intercept: a `u64` member that the cast analyzer
     // recovered as a typed pointer is rendered as `Ptr` with the
     // recovered target chased through the appropriate address-space
-    // reader. The intercept fires only when every gate aligns:
-    //   - the parent's BTF id is known (we are inside a struct that
-    //     [`render_struct`] dispatched, not a standalone Int render),
-    //   - a [`MemReader`] is plumbed (no chase is possible without
-    //     one; the no-mem path falls through to a plain Uint),
-    //   - the member peels to a plain unsigned 8-byte Int (BPF stores
-    //     typed pointers in `u64` slots — `_Bool`, `char`, signed
-    //     ints, and sub-u64 widths are not the cast analyzer's
-    //     output shape and skip this path),
-    //   - the reader's [`MemReader::cast_lookup`] returns a hit for
-    //     `(parent, byte_off)` (default `None` keeps every existing
-    //     reader correct without an explicit override),
-    //   - the parent_bytes slice covers the full 8-byte field at
-    //     `byte_off` (a truncated member falls through to the
-    //     existing partial-decode path so the consumer still sees
-    //     whatever survived).
-    //
-    // Any gate failing leaves `cast_intercept` as `None` and the
-    // renderer takes the unmodified path below — this preserves the
-    // prior u64-as-counter rendering for fields the analyzer did
-    // not flag.
-    let cast_intercept: Option<RenderedValue> = (|| {
-        let parent = parent_type_id?;
-        let reader = mem?;
-        let Type::Int(int) = &member_ty else {
-            return None;
-        };
-        if int.size() != 8 || int.is_signed() || int.is_bool() || int.is_char() {
-            return None;
-        }
-        let off_u32 = u32::try_from(byte_off).ok()?;
-        let hit = reader.cast_lookup(parent, off_u32)?;
-        let end = byte_off.checked_add(8)?;
-        if end > parent_bytes.len() {
-            return None;
-        }
-        let value = u64::from_le_bytes(parent_bytes[byte_off..end].try_into().ok()?);
-        Some(render_cast_pointer(btf, hit, value, depth, reader, visited))
-    })();
+    // reader. Shared gating logic lives in [`try_cast_intercept`];
+    // the additional `parent_type_id?` here ensures we are inside a
+    // struct that [`render_struct`] dispatched (a standalone Int
+    // render carries no parent and skips the intercept).
+    let cast_intercept = parent_type_id.and_then(|parent| {
+        let field_bytes = parent_bytes.get(byte_off..).unwrap_or_default();
+        try_cast_intercept(
+            btf,
+            (parent, byte_off),
+            &member_ty,
+            field_bytes,
+            depth,
+            mem,
+            visited,
+        )
+    });
     if let Some(rv) = cast_intercept {
         return rv;
     }
@@ -2577,6 +2590,33 @@ fn chase_arena_pointer(
     (Some(payload), None)
 }
 
+/// Build a [`RenderedValue::Ptr`] for a cast-recovered pointer with
+/// uniform field assembly.
+///
+/// Every site in [`render_cast_pointer`] that emits a `Ptr` shares
+/// the same four-field shape (`value`, optional `deref`, optional
+/// `deref_skipped_reason`, optional `cast_annotation`). The helper
+/// encodes the canonical annotation — `format!("cast→{addr_space}")`
+/// using the [`AddrSpace`] [`Display`] impl — so adding a new
+/// address-space variant cannot drift between the analyzer enum and
+/// the operator-visible tag. `addr_space` here is the address space
+/// the renderer ACTUALLY chased through (runtime decision), not the
+/// analyzer's hint, so the annotation reflects the path the chase
+/// took.
+fn cast_ptr(
+    value: u64,
+    deref: Option<Box<RenderedValue>>,
+    reason: Option<String>,
+    addr_space: super::cast_analysis::AddrSpace,
+) -> RenderedValue {
+    RenderedValue::Ptr {
+        value,
+        deref,
+        deref_skipped_reason: reason,
+        cast_annotation: Some(format!("cast→{addr_space}")),
+    }
+}
+
 /// Render a cast-recovered typed pointer.
 ///
 /// Builds [`RenderedValue::Ptr`] mirroring the [`Type::Ptr`] arm's
@@ -2625,20 +2665,11 @@ fn render_cast_pointer(
     // the "no chase attempted" path (`deref` + reason both
     // `None`); a cycle records the `cycle → 0x{value:x}` reason.
     // Only [`ChaseGate::Proceed`] enters the per-arm read+recurse
-    // logic below. The cast_annotation reflects the analyzer's
-    // hint even when no chase fires — operators still see the
+    // logic below. The cast_annotation on the no-chase path
+    // reflects the analyzer's hint so operators still see the
     // pointer was a cast finding rather than a BTF-typed pointer.
-    let hint_annotation = match hit.addr_space {
-        super::cast_analysis::AddrSpace::Arena => "cast→arena",
-        super::cast_analysis::AddrSpace::Kernel => "cast→kernel",
-    };
     if let ChaseGate::Skip { reason } = chase_gate(value, depth, visited) {
-        return RenderedValue::Ptr {
-            value,
-            deref: None,
-            deref_skipped_reason: reason,
-            cast_annotation: Some(hint_annotation.to_string()),
-        };
+        return cast_ptr(value, None, reason, hit.addr_space);
     }
     // Runtime address-space detection: if the value falls in the
     // arena window, chase through `read_arena` (frozen-snapshot
@@ -2650,12 +2681,7 @@ fn render_cast_pointer(
     if mem.is_arena_addr(value) {
         let (deref, reason) =
             chase_arena_pointer(btf, hit.target_type_id, value, mem, depth, visited);
-        return RenderedValue::Ptr {
-            value,
-            deref,
-            deref_skipped_reason: reason,
-            cast_annotation: Some("cast→arena".to_string()),
-        };
+        return cast_ptr(value, deref, reason, super::cast_analysis::AddrSpace::Arena);
     }
     // Kernel-arm chase: out-of-arena value, read through the
     // page-table walker. Resolve target type id to a Type so
@@ -2664,37 +2690,37 @@ fn render_cast_pointer(
     // resolved through the same BTF — but the fallthrough emits a
     // labelled skip rather than panicking.
     let Some(target_ty) = peel_modifiers(btf, hit.target_type_id) else {
-        return RenderedValue::Ptr {
+        return cast_ptr(
             value,
-            deref: None,
-            deref_skipped_reason: Some(format!(
+            None,
+            Some(format!(
                 "kernel cast target type id {} unresolvable",
                 hit.target_type_id
             )),
-            cast_annotation: Some("cast→kernel".to_string()),
-        };
+            super::cast_analysis::AddrSpace::Kernel,
+        );
     };
     let Some(btf_size) = type_size(btf, &target_ty) else {
-        return RenderedValue::Ptr {
+        return cast_ptr(
             value,
-            deref: None,
-            deref_skipped_reason: Some(format!(
+            None,
+            Some(format!(
                 "kernel cast target type id {} has unresolvable size",
                 hit.target_type_id
             )),
-            cast_annotation: Some("cast→kernel".to_string()),
-        };
+            super::cast_analysis::AddrSpace::Kernel,
+        );
     };
     if btf_size == 0 {
-        return RenderedValue::Ptr {
+        return cast_ptr(
             value,
-            deref: None,
-            deref_skipped_reason: Some(format!(
+            None,
+            Some(format!(
                 "kernel cast target type id {} BTF size is 0 (incomplete type)",
                 hit.target_type_id
             )),
-            cast_annotation: Some("cast→kernel".to_string()),
-        };
+            super::cast_analysis::AddrSpace::Kernel,
+        );
     }
     // Kernel reads honour [`POINTER_CHASE_CAP`] and also cap at
     // the remaining bytes in the current 4 KiB page so `read_kva`
@@ -2717,23 +2743,23 @@ fn render_cast_pointer(
         // kernel read failed — surface both pieces of evidence so
         // the operator can correlate the analyzer hint with the
         // actual chase outcome. If the analyzer hinted Arena but
-        // the value was outside the arena window, this is the
-        // structural mismatch fix #29 calls out: the analyzer may
-        // have flagged a non-pointer field.
+        // the value was outside the arena window, this is a
+        // structural mismatch: the analyzer may have flagged a
+        // non-pointer field.
         let suffix = if matches!(hit.addr_space, super::cast_analysis::AddrSpace::Arena) {
             " (cast analysis may have flagged a non-pointer field)"
         } else {
             ""
         };
-        return RenderedValue::Ptr {
+        return cast_ptr(
             value,
-            deref: None,
-            deref_skipped_reason: Some(format!(
+            None,
+            Some(format!(
                 "kernel read_kva failed at 0x{value:x} \
                  (unmapped page or no PTE); needed {read_size} bytes{suffix}"
             )),
-            cast_annotation: Some("cast→kernel".to_string()),
-        };
+            super::cast_analysis::AddrSpace::Kernel,
+        );
     };
     // Plausibility gate: a freed slab object's first qword is
     // often a freelist next pointer, which on x86_64 / aarch64
@@ -2748,16 +2774,16 @@ fn render_cast_pointer(
     if target_bytes.len() >= 8 {
         let first_qword = u64::from_le_bytes(target_bytes[..8].try_into().unwrap());
         if first_qword >> 56 == 0xff {
-            return RenderedValue::Ptr {
+            return cast_ptr(
                 value,
-                deref: None,
-                deref_skipped_reason: Some(format!(
+                None,
+                Some(format!(
                     "kernel cast plausibility gate rejected: first qword \
                      top byte is 0xff at 0x{value:x} (likely freed slab \
                      object freelist pointer)"
                 )),
-                cast_annotation: Some("cast→kernel".to_string()),
-            };
+                super::cast_analysis::AddrSpace::Kernel,
+            );
         }
     }
     // Cycle protection mirrors the `Type::Ptr` arm: mark the
@@ -2788,12 +2814,12 @@ fn render_cast_pointer(
     } else {
         Box::new(inner)
     };
-    RenderedValue::Ptr {
+    cast_ptr(
         value,
-        deref: Some(deref_payload),
-        deref_skipped_reason: None,
-        cast_annotation: Some("cast→kernel".to_string()),
-    }
+        Some(deref_payload),
+        None,
+        super::cast_analysis::AddrSpace::Kernel,
+    )
 }
 
 fn render_bitfield(

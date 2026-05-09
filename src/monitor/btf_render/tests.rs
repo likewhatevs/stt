@@ -2955,15 +2955,16 @@ fn cast_intercept_non_u64_field_not_intercepted() {
     assert_eq!(value, 0xCAFE);
 }
 
-/// Default `MemReader::cast_lookup` returns `None`; the cast
-/// intercept short-circuits and the renderer takes the
-/// pre-existing path. A u64 member surfaces as `Uint{ bits: 64,
-/// value }` — same as before the cast intercept landed. A
-/// regression that fired the intercept for None-returning
-/// readers would surface here as a Ptr render, breaking every
-/// reader that doesn't override `cast_lookup`.
+/// `MemReader::cast_lookup` returns `None` for every
+/// `(parent, off)`; the cast intercept short-circuits on the
+/// `cast_lookup` gate and the renderer takes the pre-existing
+/// path. A u64 member surfaces as `Uint{ bits: 64, value }` —
+/// same as before the cast intercept landed. A regression that
+/// fired the intercept for None-returning readers would surface
+/// here as a Ptr render, breaking every reader that doesn't
+/// override `cast_lookup`.
 #[test]
-fn cast_intercept_no_cast_map_renders_uint() {
+fn cast_intercept_no_hit_renders_uint() {
     let (blob, t_id, _q_id) = cast_btf_t_and_q();
     let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
 
@@ -3149,6 +3150,130 @@ fn cast_chase_kernel_plausibility_rejects_freed_slab() {
     assert!(
         reason.contains("plausibility"),
         "skip reason must mention plausibility, got: {reason}"
+    );
+}
+
+/// Runtime dispatch wins over the analyzer's address-space hint:
+/// a `CastHit` whose `addr_space` is `Kernel` but whose value
+/// falls inside the arena window must still chase via the arena
+/// reader (not `read_kva`), and the `cast_annotation` must
+/// reflect the path actually taken (`"cast→arena"`).
+///
+/// Per [`render_cast_pointer`]'s comment block (mod.rs ~2591):
+/// "Address-space dispatch is RUNTIME-driven: `is_arena_addr` is
+/// consulted on the actual pointer value to decide whether to
+/// chase via `read_arena` (in-window) or `read_kva` (out-of-window).
+/// The `CastHit::addr_space` tag from the analyzer is treated as
+/// a hint only — runtime evidence from the pointer value is
+/// authoritative." This test pins that contract: a Kernel-hinted
+/// hit with an arena-window value goes through the arena path.
+#[test]
+fn cast_intercept_kernel_hint_arena_value_dispatches_to_arena_reader() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // Configure: arena window covers [ARENA_LO, ARENA_HI); the
+    // pointer value (TARGET_ADDR) falls inside that window even
+    // though the analyzer's hint says Kernel. The arena reader
+    // has bytes for TARGET_ADDR; the kva reader is intentionally
+    // empty so a wrongly-routed kernel chase would surface as a
+    // skip reason rather than a successful chase.
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let inner_bytes = 0x42u64.to_le_bytes().to_vec();
+
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, inner_bytes);
+    // CastMap mode (key-specific) so the inner Q.x render
+    // does NOT re-trigger the cast intercept on a (Q, 0) lookup —
+    // only the outer (T, 0) key has an entry. The hit-on-every-
+    // query mode would chase Q.x through the kernel path because
+    // 0x42 is not in the arena window, surfacing a spurious
+    // failure that has nothing to do with the runtime-vs-hint
+    // dispatch this test pins.
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: q_id,
+            // Kernel hint — but value is an arena address. Runtime
+            // detection is_arena_addr(value) returns true → arena
+            // reader fires regardless of the hint.
+            addr_space: AddrSpace::Kernel,
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        // kva_bytes_at is intentionally empty — read_kva would
+        // return None for any address. If runtime dispatch ever
+        // routed a Kernel-hinted but in-arena value through the
+        // kernel path, this test would surface a skip reason.
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected outer Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ref cast_annotation,
+    } = members[0].value
+    else {
+        panic!(
+            "Kernel-hint + arena-value cast must surface as Ptr, got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, TARGET_ADDR, "Ptr value is the loaded u64");
+    assert!(
+        deref_skipped_reason.is_none(),
+        "arena dispatch chose the arena reader → no skip reason; got {deref_skipped_reason:?}",
+    );
+    let inner = deref
+        .as_deref()
+        .expect("arena reader returned Some bytes → deref payload populated");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = *inner
+    else {
+        panic!(
+            "deref payload must be the rendered Q struct (proves arena chase, \
+             not kernel chase, did the read), got {inner:?}",
+        );
+    };
+    assert_eq!(
+        inner_name.as_deref(),
+        Some("Q"),
+        "inner deref carries Q's name → render_value_inner(target_type_id) succeeded",
+    );
+    assert_eq!(inner_members.len(), 1, "Q has one u64 member");
+    let RenderedValue::Uint { bits, value } = inner_members[0].value else {
+        panic!(
+            "Q.x must render as Uint (was rendered through arena reader bytes), got {:?}",
+            inner_members[0].value
+        );
+    };
+    assert_eq!(bits, 64);
+    assert_eq!(value, 0x42, "arena reader returned 0x42 at TARGET_ADDR");
+    // The annotation must reflect the path actually taken (arena),
+    // not the analyzer's hint (Kernel). A regression that emitted
+    // "cast→kernel" here would mean the renderer fell back to the
+    // kernel arm but somehow succeeded, which is impossible without
+    // canned kva bytes — but the annotation pins the dispatch
+    // outcome explicitly so the contract isn't merely inferred.
+    assert_eq!(
+        cast_annotation.as_deref(),
+        Some("cast→arena"),
+        "runtime dispatch chose arena → annotation is cast→arena, NOT cast→kernel; \
+         got {cast_annotation:?}",
     );
 }
 
