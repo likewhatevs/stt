@@ -2206,6 +2206,222 @@ fn accessor_mem_reader_cast_lookup_with_none_map() {
     assert!(r.cast_lookup(u32::MAX, u32::MAX).is_none());
 }
 
+// -- AccessorMemReader resolve_arena_type -------------------------
+//
+// `AccessorMemReader::resolve_arena_type` (render_map.rs) gates on
+// `is_arena_addr` (snapshot's [user_vm_start, user_vm_start + 4 GiB)),
+// masks the chased address with `0xFFFF_FFFF`, and looks up the result
+// in the per-pass [`ArenaTypeIndex`]. The struct itself is private to
+// render_map.rs, so the tests use a stand-in `StubReader` that
+// mirrors the production method body verbatim — same convention as
+// the surrounding `accessor_mem_reader_*` tests above.
+
+/// `resolve_arena_type` masks the chased address with
+/// `0xFFFF_FFFF` and looks up the result in the per-pass index.
+/// Two different 64-bit addresses sharing the same low-32-bit
+/// window resolve to the SAME bridge entry — pinning the masking
+/// step that bridges the production
+/// `walk_sdt_allocator -> emit_leaf` low-32 keys against the
+/// renderer's full-64-bit chase values.
+#[test]
+fn accessor_mem_reader_resolve_arena_type_masks_low_32() {
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::ArenaTypeIndex;
+
+    // Production resolve_arena_type body (render_map.rs):
+    //   let index = self.arena_type_index?;
+    //   if !self.is_arena_addr(addr) { return None; }
+    //   let key = (addr & 0xFFFF_FFFF) as u32;
+    //   index.get(&key).copied()
+    struct StubReader<'a> {
+        arena_snapshot: Option<&'a ArenaSnapshot>,
+        arena_type_index: Option<&'a ArenaTypeIndex>,
+    }
+    impl super::super::btf_render::MemReader for StubReader<'_> {
+        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn is_arena_addr(&self, addr: u64) -> bool {
+            let Some(snap) = self.arena_snapshot else {
+                return false;
+            };
+            if snap.user_vm_start == 0 {
+                return false;
+            }
+            let Some(end) = snap.user_vm_start.checked_add(1 << 32) else {
+                return false;
+            };
+            addr >= snap.user_vm_start && addr < end
+        }
+        fn resolve_arena_type(&self, addr: u64) -> Option<u32> {
+            let index = self.arena_type_index?;
+            if !self.is_arena_addr(addr) {
+                return None;
+            }
+            let key = (addr & 0xFFFF_FFFF) as u32;
+            index.get(&key).copied()
+        }
+    }
+
+    // Snapshot: arena window covering [0x10_0000_0000,
+    // 0x11_0000_0000). Two payload-start keys (low 32 bits) seeded
+    // into the index.
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut index = ArenaTypeIndex::new();
+    index.insert(0x0000_1008, 7); // payload start at slot @ 0x1000 + 8
+    index.insert(0x0000_2008, 11);
+
+    let r = StubReader {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    // Full 64-bit address that masks to 0x0000_1008 hits id=7.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1008),
+        Some(7),
+        "in-window address with matching low-32 must resolve",
+    );
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_2008),
+        Some(11),
+        "second seeded entry must resolve to its distinct id",
+    );
+    // In-window address whose low 32 bits are NOT in the index:
+    // returns None.
+    assert!(
+        r.resolve_arena_type(0x10_0000_3000).is_none(),
+        "in-window address absent from the index must return None",
+    );
+}
+
+/// `resolve_arena_type` returns `None` for an address that lies
+/// OUTSIDE the arena window, even when the index contains an entry
+/// matching the address's low 32 bits. The is_arena_addr gate
+/// fires first; without it a stale index entry could surface for
+/// any 64-bit value whose low 32 bits collide with a captured
+/// payload-start by happenstance.
+#[test]
+fn accessor_mem_reader_resolve_arena_type_rejects_out_of_window() {
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::ArenaTypeIndex;
+
+    struct StubReader<'a> {
+        arena_snapshot: Option<&'a ArenaSnapshot>,
+        arena_type_index: Option<&'a ArenaTypeIndex>,
+    }
+    impl super::super::btf_render::MemReader for StubReader<'_> {
+        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn is_arena_addr(&self, addr: u64) -> bool {
+            let Some(snap) = self.arena_snapshot else {
+                return false;
+            };
+            if snap.user_vm_start == 0 {
+                return false;
+            }
+            let Some(end) = snap.user_vm_start.checked_add(1 << 32) else {
+                return false;
+            };
+            addr >= snap.user_vm_start && addr < end
+        }
+        fn resolve_arena_type(&self, addr: u64) -> Option<u32> {
+            let index = self.arena_type_index?;
+            if !self.is_arena_addr(addr) {
+                return None;
+            }
+            let key = (addr & 0xFFFF_FFFF) as u32;
+            index.get(&key).copied()
+        }
+    }
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut index = ArenaTypeIndex::new();
+    index.insert(0x0000_1008, 7);
+
+    let r = StubReader {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    // Below the window: matches the index's low-32 key but
+    // `is_arena_addr` gate rejects.
+    assert!(
+        r.resolve_arena_type(0x0F_0000_1008).is_none(),
+        "below-window address with colliding low-32 must NOT resolve",
+    );
+    // Above the window: same gate.
+    assert!(
+        r.resolve_arena_type(0x12_0000_1008).is_none(),
+        "above-window address with colliding low-32 must NOT resolve",
+    );
+}
+
+/// `resolve_arena_type` returns `None` when the index is absent
+/// (`arena_type_index = None`): the `?` short-circuit fires before
+/// the gate. Production path: a scheduler that does not link
+/// sdt_alloc leaves the index empty; the renderer falls back to
+/// the trait default's "no bridge" behaviour.
+#[test]
+fn accessor_mem_reader_resolve_arena_type_none_index_short_circuits() {
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::ArenaTypeIndex;
+
+    struct StubReader<'a> {
+        arena_snapshot: Option<&'a ArenaSnapshot>,
+        arena_type_index: Option<&'a ArenaTypeIndex>,
+    }
+    impl super::super::btf_render::MemReader for StubReader<'_> {
+        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
+            None
+        }
+        fn is_arena_addr(&self, addr: u64) -> bool {
+            let Some(snap) = self.arena_snapshot else {
+                return false;
+            };
+            if snap.user_vm_start == 0 {
+                return false;
+            }
+            let Some(end) = snap.user_vm_start.checked_add(1 << 32) else {
+                return false;
+            };
+            addr >= snap.user_vm_start && addr < end
+        }
+        fn resolve_arena_type(&self, addr: u64) -> Option<u32> {
+            let index = self.arena_type_index?;
+            if !self.is_arena_addr(addr) {
+                return None;
+            }
+            let key = (addr & 0xFFFF_FFFF) as u32;
+            index.get(&key).copied()
+        }
+    }
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let r = StubReader {
+        arena_snapshot: Some(&snap),
+        arena_type_index: None,
+    };
+
+    // Even an in-window address returns None when the index is
+    // absent — the `?` operator on `self.arena_type_index` fires
+    // before the gate runs.
+    assert!(
+        r.resolve_arena_type(0x10_0000_1008).is_none(),
+        "None index must short-circuit before is_arena_addr gate",
+    );
+}
+
 // -- ArenaSnapshot.user_vm_start serde + Display ------------------
 //
 // The new field is preserved across serde encode/decode and
@@ -4168,6 +4384,7 @@ fn render_map_struct_ops_no_offsets_returns_error() {
         arena_page_index: &arena_page_index,
         sdt_alloc_metas: &sdt_alloc_metas,
         cast_map: None,
+        arena_type_index: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered
@@ -4233,6 +4450,7 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
         arena_page_index: &arena_page_index,
         sdt_alloc_metas: &sdt_alloc_metas,
         cast_map: None,
+        arena_type_index: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered

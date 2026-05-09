@@ -2412,6 +2412,47 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // its own payload type instead of forcing the renderer to give
     // up.
     let mut sdt_alloc_metas: Vec<crate::monitor::dump::render_map::SdtAllocMeta> = Vec::new();
+    // `payload_start_low32 → payload_btf_type_id` lookup
+    // populated as each allocator walk completes.
+    // [`MemReader::resolve_arena_type`] consults this to recover
+    // the real payload struct id for chased arena pointers whose
+    // declared pointee is a `BTF_KIND_FWD` (typical for `struct
+    // sdt_data __arena *` fields where the body lives in a
+    // separate library BTF). Built incrementally inside the walk
+    // loop so the per-allocator snapshot moves into
+    // `report.sdt_allocations` after each iteration without a
+    // clone.
+    //
+    // [`crate::monitor::sdt_alloc::TreeWalker::emit_leaf`]
+    // populates each [`SdtAllocEntry::user_addr`] as
+    // `data_ptr & 0xFFFF_FFFF` — the slot-START address windowed
+    // to the low 32 bits. The bridge does NOT key on slot-start
+    // because the production trigger is post-header pointers:
+    // `scx_task_data(p)` (`lib/sdt_task.bpf.c`) returns
+    // `data->payload`, and lavd caches that exact value in
+    // `cached_taskc_raw`. Every chase the renderer issues for a
+    // typed field whose value comes from those helpers carries
+    // the payload start (slot start + header_size), not the slot
+    // start. Adding `data_header_size` here (8 bytes —
+    // `sizeof(union sdt_id)`) shifts the key from slot-start to
+    // payload-start so the renderer's
+    // [`MemReader::resolve_arena_type`] override — which masks the
+    // chased value with `0xFFFF_FFFF` — finds a match.
+    //
+    // `checked_add` guards against a `user_addr + header_size`
+    // sum overflowing `u32::MAX`: the additive end of the windowed
+    // payload start. The mask in [`emit_leaf`] keeps `user_addr`
+    // within `u32::MAX`, but a slot at the very top of the window
+    // could push the post-header start past it; saturate by
+    // skipping those slots rather than wrapping into a
+    // low-numbered key that would alias a different slot. Duplicates
+    // (two slots reporting the same payload start, indicating a
+    // stale snapshot from a freed allocation racing with the
+    // freeze) keep the FIRST entry; this matches the
+    // [`build_arena_page_index`] policy on duplicate user_addr
+    // pages and emits a `tracing::debug!` line so an operator
+    // diagnosing a wrong-render can spot the collision.
+    let mut arena_type_index = crate::monitor::dump::render_map::ArenaTypeIndex::new();
     if !deadline_exceeded(&mut truncated_at_us)
         && let Some((bss_bytes, btf_kva)) = sched_bss_bytes
         && arena_kern_vm_start != 0
@@ -2422,6 +2463,18 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         // arena pointer embedded in a per-task / per-cgroup
         // sdt_alloc payload chases into typed contents instead
         // of opaque hex.
+        //
+        // The arena type index is intentionally `None` on this
+        // pre-pass reader: the walk produces the entries the
+        // index is built from, so the index does not yet exist
+        // when the leaf payload renders run. A nested `__arena
+        // *` pointer inside a payload that targets a separate
+        // allocator slot whose payload type is forward-declared
+        // in the program BTF degrades to the existing chase
+        // behaviour during the pre-pass; the index is wired
+        // into the per-map renders below where the typical
+        // bridge call site lives (TASK_STORAGE / HASH maps
+        // holding `struct sdt_data __arena *` entry pointers).
         let sdt_mem = accessor.mem_reader(
             shared_arena_snapshot.as_ref().map(|(_, snap)| snap),
             &arena_page_index,
@@ -2435,6 +2488,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // the dump, instead of degrading to plain counters
             // for fields the analyzer recovered.
             cast_map,
+            None,
         );
         // Locate every sdt_alloc allocator instance declared in
         // `.bss`. The Datasec walk gives us each variable's name and
@@ -2486,22 +2540,58 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 var_name.clone(),
                 &sdt_mem,
             );
-            // Accumulate every allocator with a typed payload. The
+            // Accumulate every allocator with a typed payload AND
+            // append its live slots to the bridge index. The
             // per-map selector (`select_sdt_alloc_meta`) picks the
             // right one by matching `var_name` (the .bss symbol —
             // e.g. `scx_task_allocator`) against each rendered map's
             // name (e.g. `scx_task_map`). Schedulers that declare
             // multiple typed allocators no longer lose payload
             // expansion — each map renders against the matching
-            // allocator's payload type.
+            // allocator's payload type. Only allocators with a
+            // resolved payload type id contribute to the bridge
+            // index — without a typed payload there is no useful
+            // BTF id to surface to the renderer, and the index
+            // would just point every chase at 0 (which the bridge
+            // gate filters as "no payload type").
             if choice.btf_type_id != 0 {
                 sdt_alloc_metas.push(crate::monitor::dump::render_map::SdtAllocMeta {
-                    allocator_name: var_name,
+                    allocator_name: var_name.clone(),
                     elem_size,
                     header_size: sdt_offsets.data_header_size,
                     payload_btf_type_id: choice.btf_type_id,
                     kern_vm_start: arena_kern_vm_start,
                 });
+                if let Ok(header_low32) = u32::try_from(sdt_offsets.data_header_size) {
+                    for entry in &snap.entries {
+                        // user_addr comes back as a `u64` whose top
+                        // 32 bits are zero (per
+                        // `walk_sdt_allocator`'s mask in
+                        // `emit_leaf`). The narrowing cast
+                        // preserves the meaningful low half; the
+                        // assertion is encoded in the source
+                        // comment for the masking site rather than
+                        // re-checked here.
+                        let user_addr_low32 = entry.user_addr as u32;
+                        let Some(payload_start) = user_addr_low32.checked_add(header_low32) else {
+                            continue;
+                        };
+                        match arena_type_index.entry(payload_start) {
+                            std::collections::btree_map::Entry::Vacant(v) => {
+                                v.insert(choice.btf_type_id);
+                            }
+                            std::collections::btree_map::Entry::Occupied(o) => {
+                                tracing::debug!(
+                                    payload_start = format_args!("{:#x}", payload_start),
+                                    first_btf_type_id = *o.get(),
+                                    duplicate_btf_type_id = choice.btf_type_id,
+                                    allocator = %var_name,
+                                    "sdt_alloc bridge has duplicate payload_start; keeping first entry",
+                                );
+                            }
+                        }
+                    }
+                }
             }
             // Surface only allocators with a non-empty result OR a
             // diagnostic elem_size; an all-zero snapshot from a
@@ -2511,9 +2601,15 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             }
         }
     }
+    let arena_type_index_ref = if arena_type_index.is_empty() {
+        None
+    } else {
+        Some(&arena_type_index)
+    };
     tracing::debug!(
         elapsed_us = sdt_alloc_t0.elapsed().as_micros() as u64,
         allocations = report.sdt_allocations.len(),
+        index_entries = arena_type_index.len(),
         "dump_state phase: sdt_alloc"
     );
 
@@ -2614,6 +2710,19 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // `None` keeps every `u64` rendered as a plain
                 // unsigned counter (the trait default).
                 cast_map,
+                // Built from the sdt_alloc pre-pass above:
+                // `payload_start → payload_btf_type_id` for
+                // every live allocator slot. Lets the renderer
+                // recover a `BTF_KIND_FWD` pointee's real
+                // struct id via [`MemReader::resolve_arena_type`]
+                // — a `struct sdt_data __arena *` field whose
+                // pointee body lives in the sdt_alloc library's
+                // BTF still chases as the typed per-task /
+                // per-cgroup struct, instead of skipping with
+                // "forward declaration; body not in this BTF".
+                // `None` when no allocator with a typed payload
+                // was discovered.
+                arena_type_index: arena_type_index_ref,
             },
             &info,
         );
