@@ -2540,6 +2540,11 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                 let member_off = bit_off / 8;
                 let member_type_id = m.get_type_id().ok()?;
                 if member_off == byte_offset {
+                    if let Some(terminal) = super::btf_render::peel_modifiers(btf, member_type_id)
+                        && matches!(terminal, Type::Struct(_) | Type::Union(_))
+                    {
+                        return struct_member_at(btf, member_type_id, 0);
+                    }
                     return Some(MemberAt::Struct {
                         member_type_id,
                         resolved_parent_type_id: parent_type_id,

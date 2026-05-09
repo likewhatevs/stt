@@ -9471,3 +9471,173 @@ fn struct_member_at_resolves_array_element_offset() {
          {map:?}"
     );
 }
+
+#[test]
+fn stx_nested_struct_arena_finding_keys_on_inner() {
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = push_name(&mut strings, "u64");
+    let n_inner = push_name(&mut strings, "Inner");
+    let n_cgx = push_name(&mut strings, "cgx_raw");
+    let n_llcx = push_name(&mut strings, "llcx_raw");
+    let n_outer = push_name(&mut strings, "Outer");
+    let n_inner_field = push_name(&mut strings, "inner");
+    let types = vec![
+        SynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        SynType::Struct {
+            name_off: n_inner,
+            size: 16,
+            members: vec![
+                SynMember {
+                    name_off: n_cgx,
+                    type_id: 1,
+                    byte_offset: 0,
+                },
+                SynMember {
+                    name_off: n_llcx,
+                    type_id: 1,
+                    byte_offset: 8,
+                },
+            ],
+        },
+        SynType::Struct {
+            name_off: n_outer,
+            size: 16,
+            members: vec![SynMember {
+                name_off: n_inner_field,
+                type_id: 2,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    let inner_id: u32 = 2;
+    let outer_id: u32 = 3;
+    let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+    let insns = vec![
+        pseudo_call,
+        stx(BPF_SIZE_DW, 6, 0, 0),
+        mov_x(7, 0),
+        stx(BPF_SIZE_DW, 6, 7, 8),
+        exit(),
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 6,
+            struct_type_id: outer_id,
+        }],
+        &[],
+        &[],
+        &[SubprogReturn { insn_offset: 0 }],
+    );
+    assert_eq!(
+        map.get(&(inner_id, 0)),
+        Some(&CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        }),
+        "nested struct STX must key on (Inner, 0) not (Outer, 0): {map:?}"
+    );
+    assert_eq!(
+        map.get(&(inner_id, 8)),
+        Some(&CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        }),
+        "nested struct STX must key on (Inner, 8) not (Outer, 8): {map:?}"
+    );
+    assert!(
+        !map.contains_key(&(outer_id, 0)),
+        "outer struct id must NOT appear as key: {map:?}"
+    );
+    assert!(
+        !map.contains_key(&(outer_id, 8)),
+        "outer struct id must NOT appear as key: {map:?}"
+    );
+}
+
+#[test]
+fn ldx_nested_struct_loads_inner_key() {
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = push_name(&mut strings, "u64");
+    let n_inner = push_name(&mut strings, "Inner");
+    let n_field = push_name(&mut strings, "ptr_field");
+    let n_outer = push_name(&mut strings, "Outer");
+    let n_embed = push_name(&mut strings, "embed");
+    let n_target = push_name(&mut strings, "Target");
+    let n_x = push_name(&mut strings, "x");
+    let types = vec![
+        SynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        SynType::Struct {
+            name_off: n_inner,
+            size: 16,
+            members: vec![SynMember {
+                name_off: n_field,
+                type_id: 1,
+                byte_offset: 8,
+            }],
+        },
+        SynType::Struct {
+            name_off: n_outer,
+            size: 16,
+            members: vec![SynMember {
+                name_off: n_embed,
+                type_id: 2,
+                byte_offset: 0,
+            }],
+        },
+        SynType::Struct {
+            name_off: n_target,
+            size: 8,
+            members: vec![SynMember {
+                name_off: n_x,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob = build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    let inner_id: u32 = 2;
+    let outer_id: u32 = 3;
+    let insns = vec![
+        ldx(BPF_SIZE_DW, 2, 1, 8),
+        addr_space_cast(2, 2, 1),
+        ldx(BPF_SIZE_DW, 3, 2, 0),
+        exit(),
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 1,
+            struct_type_id: outer_id,
+        }],
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        map.contains_key(&(inner_id, 8)),
+        "nested LDX + deref must key on (Inner={inner_id}, 8) \
+         not (Outer={outer_id}, 8): {map:?}"
+    );
+    assert!(
+        !map.contains_key(&(outer_id, 8)),
+        "outer id must NOT appear as key for nested member: {map:?}"
+    );
+}
