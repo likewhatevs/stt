@@ -2717,7 +2717,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                     choice.target_type_id,
                     sdt_offsets.data_header_size,
                     elem_size,
-                    &snap.entries,
+                    &snap.all_slot_addrs,
                 );
             }
             // Surface only allocators with a non-empty result OR a

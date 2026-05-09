@@ -389,6 +389,8 @@ pub struct SdtAllocatorSnapshot {
     /// fallback paths without re-deriving the heuristic.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub payload_type_reason: String,
+    #[serde(skip)]
+    pub all_slot_addrs: Vec<u64>,
 }
 
 impl std::fmt::Display for SdtAllocatorSnapshot {
@@ -475,6 +477,7 @@ pub fn walk_sdt_allocator(
         elem_size: 0,
         target_type_id,
         payload_type_reason: payload_type_reason.into(),
+        all_slot_addrs: Vec::new(),
     };
 
     // Read pool.elem_size from the in-bss allocator image. This is
@@ -690,10 +693,6 @@ impl<'a> TreeWalker<'a> {
     /// early return that abandons descent into a non-trivial subtree
     /// — translate failures, out-of-range `nr_free`, NULL `chunk`.
     fn descend(&mut self, desc_ptr: u64, level: usize) {
-        if self.out.entries.len() >= MAX_SDT_ALLOC_ENTRIES {
-            self.out.truncated = true;
-            return;
-        }
         if level >= SDT_TASK_LEVELS {
             return;
         }
@@ -732,10 +731,6 @@ impl<'a> TreeWalker<'a> {
         for (word_idx, &word_value) in allocated.iter().enumerate() {
             let mut word = word_value;
             while word != 0 {
-                if self.out.entries.len() >= MAX_SDT_ALLOC_ENTRIES {
-                    self.out.truncated = true;
-                    return;
-                }
                 let bit = word.trailing_zeros() as usize;
                 word &= word - 1;
                 let pos = word_idx * 64 + bit;
@@ -772,6 +767,11 @@ impl<'a> TreeWalker<'a> {
 
     /// Emit one leaf allocation: read tid + payload, BTF-render.
     fn emit_leaf(&mut self, data_ptr: u64) {
+        self.out.all_slot_addrs.push(data_ptr & 0xFFFF_FFFF);
+        if self.out.entries.len() >= MAX_SDT_ALLOC_ENTRIES {
+            self.out.truncated = true;
+            return;
+        }
         let Some(data_pa) = self.translate_arena_ptr(data_ptr) else {
             self.out.skipped_subtrees = self.out.skipped_subtrees.saturating_add(1);
             return;
@@ -917,6 +917,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 42,
             payload_type_reason: String::new(),
+        all_slot_addrs: Vec::new(),
         };
         let json = serde_json::to_string(&snap).expect("serialize");
         let parsed: SdtAllocatorSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -939,6 +940,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 0,
             payload_type_reason: String::new(),
+        all_slot_addrs: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"truncated\":true"));
@@ -954,6 +956,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 0,
             payload_type_reason: "no candidate of size 16".into(),
+        all_slot_addrs: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"payload_type_reason\":\"no candidate of size 16\""));
@@ -1025,6 +1028,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 42,
             payload_type_reason: String::new(),
+        all_slot_addrs: Vec::new(),
         };
         let out = format!("{snap}");
         assert!(
@@ -1050,6 +1054,7 @@ mod tests {
             elem_size: 24,
             target_type_id: 0,
             payload_type_reason: "no candidate of size 16".into(),
+        all_slot_addrs: Vec::new(),
         };
         let out = format!("{snap}");
         assert!(out.contains("(truncated)"), "missing truncated: {out}");

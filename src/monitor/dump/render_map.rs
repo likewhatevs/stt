@@ -293,16 +293,14 @@ pub(super) fn build_arena_page_index(
 /// bitmap-then-data ordering), so distinct slots cannot have
 /// overlapping `[start, start + elem_size)` ranges — dedup-on-
 /// exact-key is sufficient.
-pub(super) fn append_arena_type_index_for_allocator<'a, I>(
+pub(super) fn append_arena_type_index_for_allocator(
     index: &mut ArenaTypeIndex,
     allocator_name: &str,
     target_type_id: u32,
     header_size: usize,
     elem_size: u64,
-    entries: I,
-) where
-    I: IntoIterator<Item = &'a super::super::sdt_alloc::SdtAllocEntry>,
-{
+    slot_addrs: &[u64],
+) {
     if target_type_id == 0 {
         return;
     }
@@ -317,13 +315,8 @@ pub(super) fn append_arena_type_index_for_allocator<'a, I>(
         header_size: header_low32,
         target_type_id,
     };
-    for entry in entries {
-        // `user_addr` is the slot-start address already masked to
-        // the low 32 bits by `walk_sdt_allocator`'s `emit_leaf`.
-        // The narrowing cast preserves the meaningful low half;
-        // the assertion is encoded in the source comment for the
-        // masking site.
-        let slot_start = entry.user_addr as u32;
+    for &addr in slot_addrs {
+        let slot_start = addr as u32;
         match index.entry(slot_start) {
             std::collections::btree_map::Entry::Vacant(v) => {
                 v.insert(info);

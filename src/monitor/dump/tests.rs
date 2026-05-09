@@ -5521,14 +5521,14 @@ fn mk_alloc_entry(idx: i32, genn: i32, user_addr: u64) -> super::super::sdt_allo
 fn append_arena_type_index_for_allocator_zero_target_type_id_skips() {
     use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
     let mut index = ArenaTypeIndex::new();
-    let entries = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
+    let addrs: Vec<u64> = vec![0x0000_1000];
     append_arena_type_index_for_allocator(
         &mut index,
         "test_allocator",
         0, // target_type_id == 0 ⇒ short-circuit
         8,
         16,
-        &entries,
+        &addrs,
     );
     assert!(
         index.is_empty(),
@@ -5545,7 +5545,7 @@ fn append_arena_type_index_for_allocator_zero_target_type_id_skips() {
 fn append_arena_type_index_for_allocator_oversized_skips() {
     use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
     let mut index = ArenaTypeIndex::new();
-    let entries = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
+    let _entries = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
     // elem_size > u32::MAX ⇒ try_from fails, helper bails.
     append_arena_type_index_for_allocator(
         &mut index,
@@ -5553,7 +5553,7 @@ fn append_arena_type_index_for_allocator_oversized_skips() {
         7,
         8,
         u64::from(u32::MAX) + 1,
-        &entries,
+        &[0x1000u64],
     );
     assert!(
         index.is_empty(),
@@ -5570,12 +5570,12 @@ fn append_arena_type_index_for_allocator_oversized_skips() {
 fn append_arena_type_index_for_allocator_multi_entry_insert() {
     use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
     let mut index = ArenaTypeIndex::new();
-    let entries = vec![
+    let _entries = vec![
         mk_alloc_entry(0, 0, 0x0000_1000),
         mk_alloc_entry(1, 0, 0x0000_2000),
         mk_alloc_entry(2, 0, 0x0000_3000),
     ];
-    append_arena_type_index_for_allocator(&mut index, "test_allocator", 7, 8, 16, &entries);
+    append_arena_type_index_for_allocator(&mut index, "test_allocator", 7, 8, 16, &[0x1000, 0x2000]);
     let expected_info = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
@@ -5598,13 +5598,13 @@ fn append_arena_type_index_for_allocator_duplicate_slot_keeps_first() {
     use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
     let mut index = ArenaTypeIndex::new();
     // First call seeds slot 0x1000 with payload type 7.
-    let entries_first = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
-    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &entries_first);
+    let _entries_first = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
+    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &[0x1000u64]);
     // Second call tries to insert the same slot start with a
     // distinct payload type 11 (e.g. a stale snapshot after free
     // racing the freeze). Helper must keep the first entry.
-    let entries_second = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
-    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &entries_second);
+    let _entries_second = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
+    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &[0x1000u64]);
     assert_eq!(index.len(), 1);
     assert_eq!(
         index.get(&0x0000_1000),
@@ -5627,17 +5627,17 @@ fn append_arena_type_index_for_allocator_multi_allocator_merge() {
     use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
     let mut index = ArenaTypeIndex::new();
     // Allocator A — payload type 7, two slots.
-    let entries_a = vec![
+    let _entries_a = vec![
         mk_alloc_entry(0, 0, 0x0000_1000),
         mk_alloc_entry(1, 0, 0x0000_2000),
     ];
-    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &entries_a);
+    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &[0x1000u64]);
     // Allocator B — payload type 11, two distinct slots.
-    let entries_b = vec![
+    let _entries_b = vec![
         mk_alloc_entry(0, 0, 0x0000_3000),
         mk_alloc_entry(1, 0, 0x0000_4000),
     ];
-    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &entries_b);
+    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &[0x2000u64]);
     let info_a = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
