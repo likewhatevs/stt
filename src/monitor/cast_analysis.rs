@@ -86,11 +86,25 @@
 //! kfunc's FuncProto return type peels to `Ptr -> Struct`, R0 is set
 //! to `Pointer{struct_type_id}` after the standard R0..R5 clobber.
 //!
+//! Plain-helper return values: at every `BPF_CALL` whose `src_reg ==
+//! 0` (the helper-call form per linux uapi `bpf.h`) AND
+//! `imm == BPF_FUNC_map_lookup_elem`, R1's pre-clobber state is
+//! consulted. If R1 was [`RegState::DatasecPointer`] into a
+//! `BTF_KIND_DATASEC` named `.maps` and the targeted map's BTF
+//! declaration carries a `value` member whose type peels to
+//! `Ptr -> Struct/Union`, R0 is typed `Pointer{value_struct_id}`
+//! after the clobber. Other helper ids leave R0 Unknown — the
+//! analyzer keeps a strict per-helper allowlist (currently length 1)
+//! to bound false-positive risk. Maps whose value type is a primitive
+//! (e.g. stat counters declared `__type(value, u64)`) drop because
+//! `Ptr -> u64` does not peel to a Struct/Union.
+//!
 //! Branches are handled conservatively: on every jump-target PC the
 //! pre-pass identifies, register state AND stack-slot state are reset
 //! before processing that PC. This drops casts that span branch joins
 //! (false negative, acceptable). Function calls clobber `r0..=r5` per
-//! the BPF ABI; kfunc return typing happens after the clobber.
+//! the BPF ABI; kfunc and helper return typing happen after the
+//! clobber.
 //!
 //! # Public surface
 //!
@@ -104,6 +118,32 @@
 //!   parameters / known typed values returned from helpers.
 //! - [`FuncEntry`]: function-entry PC + BTF FuncProto id for
 //!   automatic R1..R5 seeding from the proto's parameters.
+//! - [`SubprogReturn`]: `BPF_PSEUDO_CALL` PC whose resolved subprog
+//!   name matches the arena-allocator allowlist; seeds R0 to
+//!   [`RegState::ArenaU64FromAlloc`] after the standard R0..=R5
+//!   clobber so allocator-return values flow into the STX-flow
+//!   arena cast detection path.
+//! - [`DatasecPointer`]: caller-supplied annotation pairing a
+//!   `BPF_LD_IMM64` PC with its target `BTF_KIND_DATASEC` plus the
+//!   byte offset of the referenced global within that section, so
+//!   the `BPF_LD_IMM64` arm can set the destination register to
+//!   [`RegState::DatasecPointer`] and downstream STX/LDX through
+//!   the register fire kptr / arena cast findings against the
+//!   datasec's variable layout.
+//!
+//! # F1 mitigation: arena_confirmed evidence required
+//!
+//! On aarch64 the 4 GiB arena window catches any 33-bit value as
+//! "in arena", so a slot that just happens to hold a 33-bit-shaped
+//! counter could be mis-rendered as an arena pointer. Every Arena
+//! cast emit therefore requires direct evidence the slot held an
+//! arena VA at runtime: either (a) an observed
+//! [`BPF_ADDR_SPACE_CAST`] (`ALU64 | MOV | X` with `off=1, imm=1`)
+//! on a value loaded from the slot, or (b) an observed STX of an
+//! [`RegState::ArenaU64FromAlloc`] value into the slot. Slots with
+//! shape-inference evidence ALONE are dropped — the operator can
+//! re-enable them by adding either form of direct evidence in the
+//! scheduler source.
 //!
 //! The module does not mutate the BTF object and does not call into
 //! libbpf or the kernel — it operates purely on the instruction slice
@@ -263,6 +303,33 @@ pub(crate) struct FuncEntry {
     pub func_proto_id: u32,
 }
 
+/// Caller-supplied annotation that flags a `BPF_PSEUDO_CALL` to an
+/// in-tree subprog whose return value is a u64 carrying an arena
+/// virtual address.
+///
+/// scx schedulers stash arena pointers in `u64` slots after calling
+/// helpers like `scx_static_alloc()` / `scx_alloc_internal()` that
+/// return a u64 (NOT a typed pointer). BTF declares the destination
+/// field as `u64`, so neither the renderer's [`btf_rs::Type::Ptr`] arm
+/// nor the cast analyzer's [`Type::Int`] LDX-shape inference fires —
+/// the field looks like a counter. The host-side loader walks
+/// [`BPF_PSEUDO_CALL`] sites whose resolved subprog name matches the
+/// allocator allowlist and emits one [`SubprogReturn`] per call site.
+/// The analyzer applies the annotation at the PC immediately AFTER the
+/// call (the BPF ABI clobbers R0..=R5 at the call boundary; this seeds
+/// R0 to [`RegState::ArenaU64FromAlloc`] AFTER the clobber so the next
+/// move/spill/store of R0 carries the tag forward).
+///
+/// `insn_offset` is the call PC (not PC+1); the analyzer applies the
+/// seed inside its [`BPF_OP_CALL`] arm after the standard register
+/// clobber, mirroring how [`Self::handle_kfunc_call`] types R0 from
+/// the kfunc's FuncProto return type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubprogReturn {
+    /// Instruction index of the `BPF_PSEUDO_CALL` site.
+    pub insn_offset: usize,
+}
+
 /// Caller-supplied annotation that ties a `BPF_LD_IMM64` instruction
 /// to its target `BTF_KIND_DATASEC` plus the byte offset of the
 /// referenced global within that section.
@@ -319,12 +386,17 @@ pub enum AddrSpace {
 }
 
 impl std::fmt::Display for AddrSpace {
-    /// Renders as the lowercase address-space tag the renderer
-    /// composes into [`crate::monitor::btf_render::RenderedValue::Ptr::cast_annotation`]
-    /// (e.g. `"cast→arena"`, `"cast→kernel"`). Keeps the textual
-    /// representation in one place so a new variant cannot drift
-    /// between the analyzer enum and the operator-visible
-    /// annotation.
+    /// Renders as the lowercase address-space tag (`"arena"` /
+    /// `"kernel"`) for free-form formatting (error messages, log
+    /// lines). The renderer side bypasses `Display` and uses an
+    /// exhaustive `match` over the variant set in
+    /// `crate::monitor::btf_render::cast_annotation_for` to hand
+    /// back static `&'static str` annotations
+    /// (`"cast→arena"`, `"cast→arena (sdt_alloc)"`, `"cast→kernel"`,
+    /// `"cast→kernel (sdt_alloc)"`) — so the operator-visible
+    /// `cast_annotation` field is allocation-free per chase. A
+    /// new `AddrSpace` variant added here must also add a row in
+    /// `cast_annotation_for`'s match; the compiler enforces it.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             AddrSpace::Arena => "arena",
@@ -428,6 +500,25 @@ enum RegState {
         datasec_type_id: u32,
         base_offset: u32,
     },
+    /// Register holds a `u64` value the analyzer believes is an arena
+    /// virtual address — either because it came directly from an
+    /// allocator-return seed at a [`SubprogReturn::insn_offset`], OR
+    /// because it was loaded from a slot the analyzer previously
+    /// tagged as Arena via the STX-flow path (alias-set tracking).
+    ///
+    /// Distinct from [`Self::LoadedU64Field`]: that variant tracks a
+    /// generic u64 whose downstream LDX accesses constrain shape
+    /// inference. This variant has stronger evidence (the value came
+    /// from an allowlisted allocator OR an already-arena-tagged
+    /// field), so the STX of this state into a `u64` field of a
+    /// typed `Pointer{P}` parent records `(P, off)` as an Arena cast
+    /// finding directly — no shape inference required.
+    ///
+    /// No payload fields: the source slot identity (parent struct +
+    /// field offset) is derived at the STX site from the destination
+    /// register's `Pointer{P}` state and the store's offset, not
+    /// carried in the value register's state.
+    ArenaU64FromAlloc,
 }
 
 /// Observed `(offset, size_bytes)` access through a `LoadedU64Field`
@@ -446,17 +537,34 @@ struct Access {
 /// instruction at that PC executes. `datasec_pointers` annotates
 /// `BPF_LD_IMM64` PCs that resolve (after libbpf relocation) to a
 /// `BPF_PSEUDO_MAP_VALUE` reference into a `.bss` / `.data` /
-/// `.rodata` global section — see [`DatasecPointer`].
+/// `.rodata` global section — see [`DatasecPointer`]. `subprog_returns`
+/// annotates `BPF_PSEUDO_CALL` sites whose resolved subprog name
+/// matches the arena-allocator allowlist (e.g. `scx_static_alloc_internal`,
+/// `scx_alloc_internal`, `bpf_arena_alloc_pages`); after the standard
+/// R0..=R5 clobber the analyzer seeds R0 to
+/// [`RegState::ArenaU64FromAlloc`] so the value flows into STX-side
+/// arena cast detection. See [`SubprogReturn`].
 ///
-/// `initial_regs`, `func_entries`, and `datasec_pointers` compose:
-/// seeds apply once at PC 0, function-entry reseeding applies at
-/// every matching `insn_offset`, and datasec annotations apply at
-/// every matching `BPF_LD_IMM64` PC. Reseeding clears ALL registers
-/// (R0..R10) and drops every stack slot (subprog entry semantics:
-/// the callee's frame is fresh, and stale R6..R9 from linearly-
-/// preceding unrelated functions must not leak). R1..R5 are then
-/// re-seeded from the FuncProto's parameter types where they
-/// resolve to struct pointers.
+/// `initial_regs`, `func_entries`, `datasec_pointers`, and
+/// `subprog_returns` compose: seeds apply once at PC 0, function-entry
+/// reseeding applies at every matching `insn_offset`, datasec
+/// annotations apply at every matching `BPF_LD_IMM64` PC, and
+/// allocator-return seeds apply at every matching `BPF_PSEUDO_CALL`
+/// PC. Reseeding clears ALL registers (R0..R10) and drops every stack
+/// slot (subprog entry semantics: the callee's frame is fresh, and
+/// stale R6..R9 from linearly-preceding unrelated functions must not
+/// leak). R1..R5 are then re-seeded from the FuncProto's parameter
+/// types where they resolve to struct pointers.
+///
+/// The plain-helper return arm in [`Analyzer::step`] does not consume
+/// caller-supplied annotations — it derives R0's typing from the
+/// analyzer's pre-clobber view of R1 (which the existing datasec
+/// annotation pipeline already populates with
+/// [`RegState::DatasecPointer`] when the LD_IMM64 of R1 targets the
+/// `.maps` BTF datasec). No new caller-side annotation list is
+/// needed: a `bpf_map_lookup_elem` call site whose R1 is sourced
+/// from a `.maps` LD_IMM64 already has all the evidence the arm
+/// requires by the time the call is processed.
 ///
 /// The analysis ignores any [`BpfInsn`] it cannot decode (unknown
 /// opcode, malformed encoding) — those manifest as false negatives,
@@ -468,11 +576,18 @@ pub fn analyze_casts(
     initial_regs: &[InitialReg],
     func_entries: &[FuncEntry],
     datasec_pointers: &[DatasecPointer],
+    subprog_returns: &[SubprogReturn],
 ) -> CastMap {
     let mut analyzer = Analyzer::new(btf);
     analyzer.seed(initial_regs);
     let targets = jump_targets(insns);
-    analyzer.run(insns, &targets, func_entries, datasec_pointers);
+    analyzer.run(
+        insns,
+        &targets,
+        func_entries,
+        datasec_pointers,
+        subprog_returns,
+    );
     analyzer.finalize()
 }
 
@@ -498,20 +613,66 @@ struct Analyzer<'a> {
     stack_slots: BTreeMap<i16, RegState>,
     /// Fields confirmed as arena pointers by a `BPF_ADDR_SPACE_CAST`
     /// instruction (code=0xBF, off=1, imm=1). Keyed by
-    /// `(source_struct_id, field_byte_offset)`. Participates in
-    /// conflict detection only; does NOT emit standalone entries.
-    /// The shape-inference path (`patterns`) and the kptr STX path
-    /// (`kptr_findings`) are the only producers of map entries —
-    /// arena_confirmed merely vetoes a kptr finding when the same
-    /// slot was also observed as the source of an arena cast (the
-    /// slot cannot simultaneously hold an arena VA and a kernel
-    /// VA).
+    /// `(source_struct_id, field_byte_offset)`.
+    ///
+    /// Two roles:
+    /// 1. Veto a kptr finding when the same slot was also observed as
+    ///    the source of an arena cast (the slot cannot simultaneously
+    ///    hold an arena VA and a kernel VA — the conflict drop set
+    ///    in [`Self::finalize`] uses this).
+    /// 2. Gate the shape-inference path: an entry in
+    ///    [`Self::patterns`] alone is not enough evidence to emit an
+    ///    Arena cast hit (the LDX-shape inference can match
+    ///    coincidentally on schedulers whose program BTF carries
+    ///    same-shape unrelated structs). `arena_confirmed` is the
+    ///    direct evidence that the value held in the slot was an
+    ///    arena pointer — required for the shape-inference emit per
+    ///    the F1 hostile-input mitigation. The new STX-flow path
+    ///    (see [`Self::arena_stx_findings`]) carries its own evidence
+    ///    (allocator-return → field) and emits independently.
     arena_confirmed: BTreeSet<(u32, u32)>,
+    /// Fields where an [`RegState::ArenaU64FromAlloc`] register was
+    /// stored into a `u64` slot of a typed `Pointer{P}` (or
+    /// `DatasecPointer`) parent. Keyed by
+    /// `(parent_struct_id, field_byte_offset)`.
+    ///
+    /// Direct evidence the slot holds an arena VA: the value came
+    /// from an allocator return (e.g. `scx_static_alloc()`) or
+    /// propagated from another already-arena-tagged slot. Conflicting
+    /// cross-path observations (a typed `Pointer{T}` STX into the same
+    /// slot, indicating a kernel kptr write) are detected by
+    /// [`Self::finalize`]'s conflict-drop set, which cross-references
+    /// `arena_stx_findings` keys against `kptr_findings` keys and
+    /// rejects the slot from BOTH sides — false positive is
+    /// unacceptable, false negative is the safe direction. Within
+    /// `arena_stx_findings` itself, all current insertions resolve
+    /// to [`ArenaStxEntry::Pending`] (see the enum doc for the
+    /// `Conflicting` variant's defensive role).
+    arena_stx_findings: BTreeMap<(u32, u32), ArenaStxEntry>,
     /// Largest type id touched while resolving sources (struct
     /// pointer types and u64-field source structs). Used to bound
     /// the matcher's id walk below
     /// [`super::sdt_alloc::MAX_BTF_ID_PROBE`].
     max_seen_type_id: u32,
+    /// Count of [`SubprogReturn`] / kfunc-allowlist allocator-seed
+    /// applications during the forward walk. Incremented every
+    /// time the analyzer sets R0 to [`RegState::ArenaU64FromAlloc`]
+    /// from either:
+    /// - a caller-supplied [`SubprogReturn`] match in the
+    ///   `BPF_OP_CALL` arm, OR
+    /// - the `ARENA_ALLOC_KFUNC_NAMES` allowlist match in
+    ///   [`Self::handle_kfunc_call`].
+    ///
+    /// Used by [`Self::finalize`] to gate the F4 mitigation warn
+    /// (`allocator helpers may need __always_inline`): the warn
+    /// must only fire when allocator call sites WERE seen but
+    /// produced NO `arena_stx_findings`, which is the actual
+    /// "non-inlined helper" signature. Firing when
+    /// `arena_stx_findings` is non-empty but `arena_confirmed` is
+    /// empty (the prior gate) was too broad — that condition
+    /// matches the normal STX-flow path where the allocator IS
+    /// inlined and its R0 reaches a STX into a typed slot.
+    alloc_seeds_applied: u32,
 }
 
 /// Kptr finding state: a single `(parent, offset)` slot may be
@@ -520,10 +681,78 @@ struct Analyzer<'a> {
 /// can drop it.
 #[derive(Debug, Clone, Copy)]
 enum KptrEntry {
-    /// Single observed target type id.
+    /// Single observed target type id. Always non-zero in practice —
+    /// `Pointer{T}` source registers carry a real BTF type id and the
+    /// `Pointer{T}` STX path is the only insertion site for this
+    /// variant. (The arena-STX path uses the sibling
+    /// [`ArenaStxEntry`] enum, not this one, so a stale "0 means
+    /// deferred resolve" reading does not apply here.)
     Single(u32),
     /// Two or more disjoint target ids observed; drop the slot.
     Conflicting,
+}
+
+/// Arena STX finding state for [`Analyzer::arena_stx_findings`]. A
+/// single `(parent, offset)` slot may be written by an
+/// [`RegState::ArenaU64FromAlloc`] STX (records `Pending`) and, in
+/// principle, also by a typed-pointer kptr STX (which records into
+/// the sibling [`Analyzer::kptr_findings`], not here).
+///
+/// The variant set is deliberately distinct from [`KptrEntry`]: the
+/// arena STX path has no per-finding payload (the renderer's
+/// [`super::btf_render::MemReader::resolve_arena_type`] bridge
+/// recovers the actual payload BTF type id at chase time), so reusing
+/// `KptrEntry::Single(0)` as a "deferred resolve pending" sentinel
+/// would conflate two different concepts at the type level. A
+/// dedicated enum makes "this slot saw an arena STX" a single
+/// variant ([`Self::Pending`]) and keeps `KptrEntry::Single(0)`'s
+/// meaning unambiguous in the kptr path.
+///
+/// `Conflicting` is preserved for symmetry with [`KptrEntry`] and as
+/// a defensive landing pad: today the only insertion path for
+/// `arena_stx_findings` is the `StxValueKind::Arena` arm of
+/// [`Analyzer::handle_stx`], which only ever inserts
+/// [`Self::Pending`]. The arena-STX dedup arm in `handle_stx`
+/// therefore matches `Some(Self::Pending)` exhaustively as a no-op
+/// and treats `Some(Self::Conflicting)` as `unreachable!()`. If a
+/// future code path adds a way to record disagreement on the same
+/// slot from the arena side, it can use this variant; finalize's
+/// filter will drop it identically to today.
+#[derive(Debug, Clone, Copy)]
+enum ArenaStxEntry {
+    /// Allocator-tagged value observed at the slot. The renderer's
+    /// [`super::btf_render::MemReader::resolve_arena_type`] bridge
+    /// supplies the actual payload BTF type id at chase time — the
+    /// analyzer emits `target_type_id == 0` from finalize and the
+    /// bridge fills in the real id.
+    Pending,
+    /// Two or more disagreeing observations — drop the slot.
+    /// Unreachable through today's insertion paths but kept for
+    /// symmetry with [`KptrEntry::Conflicting`] and as a defensive
+    /// terminal so finalize's filter survives a future enrichment
+    /// of the arena-STX path. `#[allow(dead_code)]` because no
+    /// current insertion site constructs the variant; the
+    /// `unreachable!()` in [`Analyzer::handle_stx`]'s arena dedup
+    /// arm and the defensive filter in [`Analyzer::finalize`] both
+    /// reference it as a pattern only. Removing the variant would
+    /// drop the documented design margin and force a churn of the
+    /// match shape if a future enrichment ever needs it.
+    #[allow(dead_code)]
+    Conflicting,
+}
+
+/// Discriminator for the value-side state at a STX site that passed
+/// the BTF u64 gate. Used by [`Analyzer::handle_stx`] to dispatch the
+/// kptr vs arena finding paths from one match arm rather than
+/// re-pattern-matching [`RegState`] inside the recording logic.
+#[derive(Debug, Clone, Copy)]
+enum StxValueKind {
+    /// Source register held [`RegState::Pointer`]: record into
+    /// [`Analyzer::kptr_findings`].
+    Kptr { target: u32 },
+    /// Source register held [`RegState::ArenaU64FromAlloc`]: record
+    /// into [`Analyzer::arena_stx_findings`].
+    Arena,
 }
 
 impl<'a> Analyzer<'a> {
@@ -535,7 +764,9 @@ impl<'a> Analyzer<'a> {
             kptr_findings: BTreeMap::new(),
             stack_slots: BTreeMap::new(),
             arena_confirmed: BTreeSet::new(),
+            arena_stx_findings: BTreeMap::new(),
             max_seen_type_id: 0,
+            alloc_seeds_applied: 0,
         }
     }
 
@@ -658,6 +889,7 @@ impl<'a> Analyzer<'a> {
         jump_targets: &BTreeSet<usize>,
         func_entries: &[FuncEntry],
         datasec_pointers: &[DatasecPointer],
+        subprog_returns: &[SubprogReturn],
     ) {
         // BPF_LD_IMM64 is a two-insn pseudo-instruction. The decoder
         // skips its second slot via this flag.
@@ -694,6 +926,17 @@ impl<'a> Analyzer<'a> {
             std::collections::HashMap::with_capacity(datasec_pointers.len());
         for dp in datasec_pointers {
             datasec_by_pc.insert(dp.insn_offset, (dp.datasec_type_id, dp.base_offset));
+        }
+
+        // Pre-build the subprog-return seed set so the `BPF_OP_CALL`
+        // arm can decide whether to seed R0 to
+        // [`RegState::ArenaU64FromAlloc`] in O(1). Duplicates collapse
+        // (calling the same allocator at the same PC twice would be
+        // physically impossible — one PC is one instruction).
+        let mut subprog_returns_by_pc: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(subprog_returns.len());
+        for sr in subprog_returns {
+            subprog_returns_by_pc.insert(sr.insn_offset);
         }
 
         for (pc, insn) in insns.iter().enumerate() {
@@ -733,7 +976,16 @@ impl<'a> Analyzer<'a> {
             // and falls through to the default Unknown when None.
             let datasec_hit = datasec_by_pc.get(&pc).copied();
 
-            self.step(*insn, &mut skip_next, datasec_hit);
+            // Allocator-return seed: the `BPF_OP_CALL` arm consults
+            // this flag and, AFTER the standard R0..=R5 clobber, sets
+            // R0 to [`RegState::ArenaU64FromAlloc`] when the PC
+            // matches a [`SubprogReturn::insn_offset`]. The subsequent
+            // STX of R0 (or any propagated copy) into a typed `u64`
+            // field of a `Pointer{P}` parent records `(P, off)` as an
+            // Arena cast finding.
+            let alloc_seed = subprog_returns_by_pc.contains(&pc);
+
+            self.step(*insn, &mut skip_next, datasec_hit, alloc_seed);
 
             // Dead-code disambiguation barrier: after an EXIT or
             // unconditional JA/gotol, the NEXT linear PC is
@@ -758,7 +1010,13 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn step(&mut self, insn: BpfInsn, skip_next: &mut bool, datasec_hit: Option<(u32, u32)>) {
+    fn step(
+        &mut self,
+        insn: BpfInsn,
+        skip_next: &mut bool,
+        datasec_hit: Option<(u32, u32)>,
+        alloc_seed: bool,
+    ) {
         let class = insn.code & 0x07;
         let dst = insn.dst_reg() as usize;
         let src = insn.src_reg() as usize;
@@ -985,21 +1243,103 @@ impl<'a> Analyzer<'a> {
                 if op == BPF_OP_CALL {
                     // BPF_CALL clobbers r0..=r5 per the BPF ABI:
                     // r1..r5 are call args (consumed), r0 carries
-                    // the return value. Clobber first; for kfunc
-                    // calls (src_reg == BPF_PSEUDO_KFUNC_CALL) the
-                    // imm field carries the kernel BTF id of the
-                    // kfunc — if its FuncProto return type peels
-                    // through Ptr to a Struct/Union, set r0 to a
-                    // typed pointer. Helper calls and BPF-to-BPF
-                    // calls fall through with r0 left Unknown
-                    // (false negative, acceptable: we do not have
-                    // a typed-helper-return table).
+                    // the return value. Save R1 BEFORE the clobber
+                    // so the helper-return arm below can resolve
+                    // the map descriptor argument for
+                    // `bpf_map_lookup_elem`. Once R0..R5 are
+                    // cleared, R1's pre-call state is gone — only
+                    // the saved snapshot survives across the
+                    // clobber boundary.
+                    let pre_call_r1 = self.regs[1];
                     for r in 0..=5 {
                         self.set_reg(r, RegState::Unknown);
                     }
                     let pseudo = insn.src_reg();
                     if pseudo == BPF_PSEUDO_KFUNC_CALL {
+                        // kfunc calls (src_reg == BPF_PSEUDO_KFUNC_CALL):
+                        // the imm field carries the kernel BTF id of
+                        // the kfunc — if its FuncProto return type
+                        // peels through Ptr to a Struct/Union, set r0
+                        // to a typed pointer. Mutually exclusive with
+                        // the plain-helper arm below: kfuncs use a
+                        // distinct pseudo selector (see linux uapi
+                        // `bpf.h`: `BPF_PSEUDO_KFUNC_CALL = 2`).
                         self.handle_kfunc_call(insn.imm);
+                    } else if pseudo == 0 && insn.imm == BPF_FUNC_MAP_LOOKUP_ELEM {
+                        // Plain-helper arm. `pseudo == 0` is the
+                        // helper-call form (linux uapi `bpf.h`:
+                        // `BPF_PSEUDO_CALL = 1` is BPF-to-BPF;
+                        // `BPF_PSEUDO_KFUNC_CALL = 2` is kfunc; the
+                        // verifier treats `src_reg == 0` as a kernel
+                        // helper-id call). `imm` is the helper id
+                        // (`BPF_FUNC_*`); the analyzer types R0 only
+                        // for `bpf_map_lookup_elem` (helper id 1) —
+                        // no other helper has a pointer-to-struct
+                        // return shape we can resolve from the BPF
+                        // program BTF alone. The map descriptor lives
+                        // in R1 at the call site (per
+                        // `bpf_map_lookup_elem_proto::arg1_type =
+                        // ARG_CONST_MAP_PTR` in linux
+                        // `kernel/bpf/helpers.c`); the saved
+                        // pre-clobber state above carries the
+                        // analyzer's pre-call view.
+                        //
+                        // Only fires when the saved R1 is a
+                        // [`RegState::DatasecPointer`] into a
+                        // `BTF_KIND_DATASEC` named `.maps` (the libbpf
+                        // user-space BTF map declaration section),
+                        // and the map's BTF def carries a `value`
+                        // member whose type peels to `Ptr -> Struct/
+                        // Union`. Stat-counter maps (`__type(value,
+                        // u64)`) drop here — their value type is not
+                        // a struct so [`map_value_struct_id`]
+                        // returns None. False-negative is the safe
+                        // direction.
+                        if let RegState::DatasecPointer {
+                            datasec_type_id,
+                            base_offset,
+                        } = pre_call_r1
+                            && let Some(sid) = map_value_struct_id(
+                                self.btf,
+                                datasec_type_id,
+                                base_offset,
+                            )
+                        {
+                            self.regs[0] = RegState::Pointer {
+                                struct_type_id: sid,
+                            };
+                            self.note_type_id(sid);
+                        }
+                    }
+                    // Allocator-return seed: caller-supplied annotation
+                    // identified this `BPF_PSEUDO_CALL` PC as a call to
+                    // an arena-allocator subprog (see [`SubprogReturn`]).
+                    // After the standard R0..=R5 clobber, type R0 as
+                    // [`RegState::ArenaU64FromAlloc`] so the next
+                    // STX of R0 (or its propagation through MOV /
+                    // stack spill / LDX of an already-arena-tagged
+                    // slot) records `(parent, off)` as an Arena cast
+                    // finding via [`Self::handle_stx`]. The seed is
+                    // applied AFTER the clobber so a same-PC kfunc-
+                    // call seed (which sets R0 to a typed `Pointer{T}`)
+                    // wins on the rare programs where both annotations
+                    // resolve to the same call site — kfunc returns
+                    // are stronger evidence than the allocator
+                    // allowlist.
+                    if alloc_seed && matches!(self.regs[0], RegState::Unknown) {
+                        self.regs[0] = RegState::ArenaU64FromAlloc;
+                        // F4 telemetry: bump the seed-applied
+                        // counter so [`Self::finalize`] can
+                        // distinguish "we saw allocator call
+                        // sites but no slot got tagged" (the
+                        // non-inlined-helper signature) from
+                        // "no allocator was ever called". A
+                        // saturating add keeps the count bounded
+                        // for pathological inputs that loop a
+                        // call site (the verifier rejects such
+                        // programs but the analyzer must not
+                        // panic on them).
+                        self.alloc_seeds_applied = self.alloc_seeds_applied.saturating_add(1);
                     }
                 }
                 // EXIT, JA, conditional jumps: no state change at
@@ -1125,13 +1465,49 @@ impl<'a> Analyzer<'a> {
                     // Plain u64 field -- THIS is the cast target.
                     (Some(8), Some(Type::Int(int))) => {
                         if int.size() == 8 && !int.is_signed() && !int.is_bool() && !int.is_char() {
-                            self.set_reg(
-                                dst,
+                            // Alias-set tracking: when LDX reads from
+                            // a `(parent, off)` slot the analyzer
+                            // previously tagged via the STX-flow
+                            // arena path (see
+                            // [`Self::arena_stx_findings`]), the
+                            // loaded value is itself an arena VA. Set
+                            // the destination state to
+                            // [`RegState::ArenaU64FromAlloc`] so the
+                            // tag propagates through subsequent
+                            // moves / spills / stores. Falls through
+                            // to the generic `LoadedU64Field` shape
+                            // when the slot has not been arena-tagged
+                            // yet — the first STX that tags the slot
+                            // populates the index, after which later
+                            // LDXs through the same slot inherit.
+                            //
+                            // Using [`BTreeMap::contains_key`]
+                            // without inspecting the
+                            // [`ArenaStxEntry`] variant is
+                            // intentional: any entry — `Pending`
+                            // or (today unreachable) `Conflicting`
+                            // — proves the slot saw an arena STX
+                            // somewhere in the program, which is
+                            // the only signal alias-tracking
+                            // needs. A future `Conflicting` would
+                            // still be arena-shaped (the conflict
+                            // would be across paths that all wrote
+                            // an arena pointer); finalize would
+                            // drop the slot from the cast map but
+                            // the LDX value loaded out of it is
+                            // still an arena VA.
+                            let dst_state = if self
+                                .arena_stx_findings
+                                .contains_key(&(parent_btf_id, canonical_field_off))
+                            {
+                                RegState::ArenaU64FromAlloc
+                            } else {
                                 RegState::LoadedU64Field {
                                     source_struct_id: parent_btf_id,
                                     field_offset: canonical_field_off,
-                                },
-                            );
+                                }
+                            };
+                            self.set_reg(dst, dst_state);
                             self.note_type_id(parent_btf_id);
                             self.patterns
                                 .entry((parent_btf_id, canonical_field_off))
@@ -1180,6 +1556,17 @@ impl<'a> Analyzer<'a> {
                 }
                 self.set_reg(dst, RegState::Unknown);
             }
+            RegState::ArenaU64FromAlloc => {
+                // LDX through an arena pointer reads payload bytes
+                // out of an allocator slot. The slot identity is
+                // already recorded in
+                // [`Self::arena_stx_findings`] via the STX path; the
+                // pointer's destination (parent, off) is what
+                // matters, not the arbitrary dereference offset.
+                // Drop dst to Unknown — we do not run shape inference
+                // on dereferences through arena-tagged pointers.
+                self.set_reg(dst, RegState::Unknown);
+            }
             RegState::Unknown => {
                 // Loading through an untyped base never produces a
                 // tracked register (we don't speculate the source
@@ -1195,7 +1582,7 @@ impl<'a> Analyzer<'a> {
 
     /// `STX [r_dst_base + off] = r_src_value`.
     ///
-    /// Two roles:
+    /// Three roles:
     /// 1. Stack spill — `dst == r10`: save src's RegState in
     ///    `stack_slots[off]`. Sub-DW or non-negative-off stores
     ///    invalidate the slot.
@@ -1206,6 +1593,16 @@ impl<'a> Analyzer<'a> {
     ///    in the kptr map. The BTF gate prevents writing to a
     ///    pre-typed Ptr field (the kernel-driver case where BTF
     ///    already knows the target).
+    /// 3. Arena STX finding — when the base is typed
+    ///    `Pointer{P}` / `DatasecPointer` and the value register
+    ///    is [`RegState::ArenaU64FromAlloc`] (allocator-return
+    ///    seed or alias-tracked from a previously-arena-tagged
+    ///    slot), and the BTF declares the field at the store
+    ///    offset as a plain `u64`, record `(P, off)` in
+    ///    [`Self::arena_stx_findings`]. The slot now holds an
+    ///    arena pointer, even though BTF declared it `u64` — the
+    ///    renderer's [`MemReader::resolve_arena_type`] bridge
+    ///    resolves the payload type at chase time.
     fn handle_stx(&mut self, dst: usize, src: usize, size: u8, off: i16) {
         // Bounds: BPF reg indices are 0..=10. The decoded fields are
         // 4-bit (0..=15) so a malformed instruction stream could put
@@ -1262,11 +1659,17 @@ impl<'a> Analyzer<'a> {
             } => (datasec_type_id, base_offset),
             _ => return,
         };
-        let RegState::Pointer {
-            struct_type_id: target_struct_id,
-        } = self.regs[src]
-        else {
-            return;
+        // Two value-side variants reach the cast-finding paths:
+        // `Pointer{T}` (kernel kptr STX into a u64 field) and
+        // `ArenaU64FromAlloc` (arena pointer from allocator return,
+        // or alias-tracked from a previously-arena-tagged slot).
+        // Anything else carries no signal.
+        let value_state = match self.regs[src] {
+            RegState::Pointer {
+                struct_type_id: tid,
+            } => StxValueKind::Kptr { target: tid },
+            RegState::ArenaU64FromAlloc => StxValueKind::Arena,
+            _ => return,
         };
         let Some(insn_off) = field_byte_offset(off as i32) else {
             return;
@@ -1280,7 +1683,7 @@ impl<'a> Analyzer<'a> {
         };
         // BTF gate: the destination field at this offset must be a
         // plain `u64`. A typed Ptr field is the BTF-already-typed
-        // case the renderer handles natively; recording a kptr
+        // case the renderer handles natively; recording a cast
         // there would duplicate work. A non-u64 field (sub-u64
         // int, struct, array) is not a pointer slot at all — the
         // store is undefined behavior we drop conservatively.
@@ -1295,28 +1698,16 @@ impl<'a> Analyzer<'a> {
         if int.size() != 8 || int.is_signed() || int.is_bool() || int.is_char() {
             return;
         }
-        // Self-store is almost always a structural error (the
-        // analyzer concluded `parent == target` because of
-        // ambiguous pointer aliasing); reject to keep the false-
-        // positive bar high. The Datasec parent path cannot
-        // self-store: a datasec id is never the target struct id
-        // of a kptr (kptrs target slab structs like task_struct),
-        // so this gate fires only on the Pointer{struct} case in
-        // practice. The unconditional check is the simplest safe
-        // form.
-        if parent_btf_id == target_struct_id {
-            return;
-        }
         // The Datasec path stores the variable's start offset
         // (matching `MemberAt::Datasec::var_byte_offset`) as the
         // canonical key, NOT the queried offset. For a plain u64
         // global the two are equal; for a struct global the
-        // queried offset can land mid-struct but the kptr finding
+        // queried offset can land mid-struct but the cast finding
         // is keyed on the variable's start so the renderer's
         // `(parent, member_offset)` lookup matches the variable
         // boundary. Lookups through the BSS-DATASEC parent then
-        // surface the per-variable kptr just like a struct member
-        // would.
+        // surface the per-variable kptr / arena finding just like
+        // a struct member would.
         let canonical_field_off = match member {
             MemberAt::Struct { .. } => field_off,
             MemberAt::Datasec {
@@ -1324,21 +1715,95 @@ impl<'a> Analyzer<'a> {
             } => var_byte_offset,
         };
         self.note_type_id(parent_btf_id);
-        self.note_type_id(target_struct_id);
         let key = (parent_btf_id, canonical_field_off);
-        match self.kptr_findings.get(&key).copied() {
-            None => {
-                self.kptr_findings
-                    .insert(key, KptrEntry::Single(target_struct_id));
+        match value_state {
+            StxValueKind::Kptr { target } => {
+                // Self-store is almost always a structural error
+                // (the analyzer concluded `parent == target`
+                // because of ambiguous pointer aliasing); reject
+                // to keep the false-positive bar high. The Datasec
+                // parent path cannot self-store: a datasec id is
+                // never the target struct id of a kptr (kptrs
+                // target slab structs like task_struct), so this
+                // gate fires only on the `Pointer{struct}` case in
+                // practice. The unconditional check is the
+                // simplest safe form.
+                if parent_btf_id == target {
+                    return;
+                }
+                self.note_type_id(target);
+                match self.kptr_findings.get(&key).copied() {
+                    None => {
+                        self.kptr_findings.insert(key, KptrEntry::Single(target));
+                    }
+                    Some(KptrEntry::Single(prev)) if prev == target => {
+                        // Same target observed again — keep Single.
+                    }
+                    Some(_) => {
+                        // Different target previously observed at
+                        // the same slot, or already collapsed to
+                        // Conflicting. The slot is ambiguous;
+                        // drop it on finalize.
+                        self.kptr_findings.insert(key, KptrEntry::Conflicting);
+                    }
+                }
             }
-            Some(KptrEntry::Single(prev)) if prev == target_struct_id => {
-                // Same target observed again — keep Single.
-            }
-            Some(_) => {
-                // Different target previously observed at the same
-                // slot, or already collapsed to Conflicting. The
-                // slot is ambiguous; drop it on finalize.
-                self.kptr_findings.insert(key, KptrEntry::Conflicting);
+            StxValueKind::Arena => {
+                // Allocator-return / alias-tracked arena pointer
+                // stored into a u64 slot. Record the slot in
+                // [`Self::arena_stx_findings`] so finalize emits
+                // an Arena cast hit. The target type id is
+                // unresolved at analysis time — the renderer's
+                // [`super::btf_render::MemReader::resolve_arena_type`]
+                // bridge supplies the real payload BTF id at chase
+                // time, so the analyzer just records that the slot
+                // saw an arena STX via [`ArenaStxEntry::Pending`].
+                //
+                // Two STX writes to the same slot of the same shape
+                // (arena STX after another arena STX) are not a
+                // conflict — both observations agree the slot
+                // holds an arena pointer. The `Some(Pending)` arm
+                // is the dedup no-op.
+                //
+                // A prior `Pointer{T}` STX into the same slot has
+                // already populated `kptr_findings`; the conflict
+                // detector in [`Self::finalize`] cross-references
+                // both maps and drops the slot from BOTH sides so
+                // the resulting CastMap excludes it. That cross-
+                // path conflict is detected at finalize, NOT here:
+                // `arena_stx_findings` and `kptr_findings` are
+                // disjoint maps and this arm only sees prior arena
+                // STX state.
+                match self.arena_stx_findings.get(&key).copied() {
+                    None => {
+                        self.arena_stx_findings
+                            .insert(key, ArenaStxEntry::Pending);
+                    }
+                    Some(ArenaStxEntry::Pending) => {
+                        // Same arena observation — no-op dedup.
+                    }
+                    Some(ArenaStxEntry::Conflicting) => {
+                        // Unreachable: the only insertion site for
+                        // `arena_stx_findings` is THIS arm, and
+                        // this arm only inserts
+                        // `ArenaStxEntry::Pending`. The
+                        // `Conflicting` variant exists for
+                        // symmetry with [`KptrEntry::Conflicting`]
+                        // and as a defensive landing pad if a
+                        // future code path adds disagreement
+                        // detection inside the arena STX flow.
+                        // Until then, reaching this arm signals a
+                        // logic error in the analyzer's insertion
+                        // discipline; panicking surfaces it
+                        // instead of silently re-inserting and
+                        // masking the bug.
+                        unreachable!(
+                            "arena_stx_findings cannot hold Conflicting: \
+                             only the StxValueKind::Arena arm inserts, \
+                             and it only inserts Pending"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1452,32 +1917,92 @@ impl<'a> Analyzer<'a> {
     /// files typically have `imm = -1` for kfunc calls before
     /// libbpf resolves the kernel BTF id) or a non-kfunc call;
     /// drop silently in both cases.
+    ///
+    /// Two distinct R0 typings happen here:
+    ///
+    /// 1. **Typed-pointer return** (`Ptr -> Struct/Union`): the
+    ///    kfunc returns a typed kernel pointer (e.g.
+    ///    `bpf_task_acquire`, `bpf_cpumask_first`). R0 becomes
+    ///    [`RegState::Pointer`] so the next STX of R0 into a u64
+    ///    slot of a typed parent records a kernel kptr finding.
+    ///
+    /// 2. **Arena-allocator return** (`Ptr -> Void`, allowlisted
+    ///    name): the kfunc allocates arena memory and returns a
+    ///    raw `void *` whose runtime value is an arena VA (e.g.
+    ///    `bpf_arena_alloc_pages`). The Ptr->Void return is
+    ///    structurally indistinguishable from a typed pointer at
+    ///    the BTF level — neither side carries a `__arena`
+    ///    qualifier in the kernel's program-BTF representation —
+    ///    so the disambiguator is the kfunc's name. R0 becomes
+    ///    [`RegState::ArenaU64FromAlloc`] so the next STX of R0
+    ///    into a u64 slot of a typed parent records an arena
+    ///    finding via `arena_stx_findings`. Arms 1 and 2 are
+    ///    mutually exclusive: arm 1 only fires when the return
+    ///    peels to a Struct/Union; arm 2 only fires when the
+    ///    return peels to Void AND the name is on the allowlist.
+    ///    A kfunc whose name is on the allowlist but whose
+    ///    return is NOT Ptr->Void (BTF mismatch — drift between
+    ///    kernel source and analyzer's allowlist) drops to no
+    ///    typing rather than misclassifying R0.
     fn handle_kfunc_call(&mut self, imm: i32) {
         if imm <= 0 {
             return;
         }
         let func_btf_id = imm as u32;
-        let proto = match self.btf.resolve_type_by_id(func_btf_id) {
+        // Resolve the kfunc's FuncProto AND retain a handle on the
+        // `Type::Func` so we can resolve its name for the
+        // allocator-allowlist arm. The two-arm dispatch needs both
+        // pieces of evidence (return-type shape + name), so the
+        // resolution is unified here rather than running twice.
+        let (proto, func_name) = match self.btf.resolve_type_by_id(func_btf_id) {
             Ok(Type::Func(f)) => match f.get_type_id() {
                 Ok(pid) => match self.btf.resolve_type_by_id(pid) {
-                    Ok(Type::FuncProto(fp)) => fp,
+                    Ok(Type::FuncProto(fp)) => {
+                        let name = self.btf.resolve_name(&f).ok();
+                        (fp, name)
+                    }
                     _ => return,
                 },
                 Err(_) => return,
             },
-            Ok(Type::FuncProto(fp)) => fp,
+            Ok(Type::FuncProto(fp)) => (fp, None),
             _ => return,
         };
         let ret_id = proto.return_type_id();
         if ret_id == 0 {
-            // Void return — R0 stays Unknown.
+            // Void return at the FuncProto level (return_type_id
+            // == 0 marks `void` in BTF). R0 stays Unknown — no
+            // arena allocator declares this shape (allocators
+            // return `void *`, not `void`).
             return;
         }
+        // Arm 1: typed-pointer return.
         if let Some(sid) = super::bpf_map::resolve_to_struct_id(self.btf, ret_id) {
             self.regs[0] = RegState::Pointer {
                 struct_type_id: sid,
             };
             self.note_type_id(sid);
+            return;
+        }
+        // Arm 2: arena-allocator return. The allowlist lookup
+        // is gated on `Ptr -> Void` to keep the false-positive
+        // bar high — a same-named kfunc whose return is NOT
+        // Ptr->Void cannot have its R0 typed by this arm. This
+        // protects against name collisions between a future
+        // arena-returning kfunc and an unrelated kfunc that
+        // happens to share a name.
+        if return_peels_to_ptr_void(self.btf, ret_id)
+            && let Some(name) = func_name.as_deref()
+            && ARENA_ALLOC_KFUNC_NAMES.contains(&name)
+        {
+            self.regs[0] = RegState::ArenaU64FromAlloc;
+            // F4 telemetry parity with the SubprogReturn arm:
+            // count this as an applied allocator seed so the
+            // finalize warn distinguishes "allocator was called
+            // but no slot got tagged" from "no allocator was
+            // ever called" identically across kfunc and subprog
+            // paths.
+            self.alloc_seeds_applied = self.alloc_seeds_applied.saturating_add(1);
         }
     }
 
@@ -1506,6 +2031,25 @@ impl<'a> Analyzer<'a> {
             .max_seen_type_id
             .saturating_add(CANDIDATE_SEARCH_SLACK)
             .min(super::sdt_alloc::MAX_BTF_ID_PROBE);
+        // F15 mitigation: warn when the candidate-search slack
+        // capped against the hard ceiling. A scheduler whose largest
+        // touched id is close to MAX_BTF_ID_PROBE means
+        // [`build_layout_index`] cannot probe every type the BTF
+        // exposes — shape-inference candidates above the cap are
+        // invisible. Surface this as a `warn!` so a future BTF that
+        // genuinely exceeds the ceiling shows up rather than silently
+        // missing candidates.
+        if self.max_seen_type_id.saturating_add(CANDIDATE_SEARCH_SLACK)
+            > super::sdt_alloc::MAX_BTF_ID_PROBE
+        {
+            tracing::warn!(
+                max_seen_type_id = self.max_seen_type_id,
+                slack = CANDIDATE_SEARCH_SLACK,
+                cap = super::sdt_alloc::MAX_BTF_ID_PROBE,
+                "cast_analysis: candidate-search slack capped at MAX_BTF_ID_PROBE; \
+                 shape-inference candidates above the cap are invisible"
+            );
+        }
 
         // Pre-build (offset, size) -> { type_id } so each pattern
         // does not re-walk the entire BTF id space. The walk stops
@@ -1514,9 +2058,11 @@ impl<'a> Analyzer<'a> {
         let layout = build_layout_index(self.btf, max_id);
 
         // Arena/kptr conflict drop set: any (source, offset) slot
-        // observed by BOTH the arena LDX path (`self.patterns` —
+        // observed by BOTH an arena path (`self.patterns` —
         // the slot was loaded as a u64 then dereferenced as a
-        // pointer base) AND the kernel STX path (`self.kptr_findings`
+        // pointer base; OR `self.arena_stx_findings` — an
+        // [`RegState::ArenaU64FromAlloc`] value was stored into
+        // the slot) AND the kernel STX path (`self.kptr_findings`
         // — a typed `Pointer{T}` was stored into the slot) is
         // ambiguous. The same byte cannot simultaneously hold an
         // arena VA (deref via arena reader) and a kernel VA (deref
@@ -1535,14 +2081,104 @@ impl<'a> Analyzer<'a> {
             .filter(|(_, accesses)| !accesses.is_empty())
             .map(|(k, _)| *k)
             .chain(self.arena_confirmed.iter().copied())
+            .chain(self.arena_stx_findings.keys().copied())
             .filter(|k| self.kptr_findings.contains_key(k))
             .collect();
 
-        // Arena pointer path: BTF-shape-inferred targets. Tagged as
-        // AddrSpace::Arena because the source u64 field is itself
-        // dereferenced and its target struct is recovered by
-        // intersecting struct shapes across the observed access
-        // pattern.
+        // Track keys already emitted as Arena via the STX-flow path
+        // so the shape-inference loop below can short-circuit a
+        // duplicate emit. Both paths produce
+        // `addr_space: AddrSpace::Arena` for the same slot, but
+        // shape inference may resolve `target_type_id` to a concrete
+        // BTF struct id while the STX-flow path emits `0` (deferred
+        // resolve via `MemReader::resolve_arena_type` bridge). The
+        // shape-inference target is always at least as informative,
+        // so the LATER loop wins by overwriting on the same key.
+        // Recording arena-STX hits first, then letting the shape
+        // loop overwrite when it has a concrete id, gives the best
+        // of both: the bridge fires for slots without shape-derived
+        // ids, and concrete ids take precedence when both fire.
+
+        // Arena STX-flow path: directly observed STX of an
+        // [`RegState::ArenaU64FromAlloc`] value into a u64 slot.
+        // Emit with `target_type_id == 0` — the renderer's
+        // [`MemReader::resolve_arena_type`] bridge resolves the
+        // payload BTF id at chase time from the live arena snapshot
+        // (cross-BTF Fwd resolution). Conflicting slots (also seen
+        // as kptr STX) drop here AND on the kptr side.
+        //
+        // # When the deferred resolve succeeds vs fails at chase
+        // time
+        //
+        // The bridge is backed by
+        // [`super::dump::render_map::ArenaTypeIndex`], which the
+        // sdt_alloc pre-pass populates by walking
+        // [`super::sdt_alloc::SdtAllocatorSnapshot`] for every
+        // **per-instance** allocator (`scx_alloc_internal` and
+        // friends). The bridge therefore RESOLVES at chase time only
+        // when the chased pointer's runtime value falls inside an
+        // sdt_alloc slot's `[slot_start, slot_start + elem_size)`
+        // range AND lands at either the slot start (header_skip ==
+        // header_size) or payload start (header_skip == 0).
+        //
+        // The bridge does NOT cover bump-allocator allocations from
+        // `scx_static_alloc_internal` — that allocator has no
+        // per-allocation header and produces a flat arena region
+        // with no per-slot metadata the pre-pass can index. A slot
+        // whose arena VA was produced by `scx_static_alloc_internal`
+        // and whose target BTF type is unique-shape-inferable at
+        // analysis time will resolve via the shape-inference loop
+        // below (concrete `target_type_id != 0`); a slot whose
+        // shape is ambiguous (multiple BTF structs match the access
+        // pattern) and whose VA is from `scx_static_alloc_internal`
+        // will fall through with `target_type_id == 0` and the
+        // bridge will return `None` at chase time, so the chase
+        // skips with a clear "no entry for 0x{val:x}" reason.
+        // This is the "no invalid data made" contract: ambiguous
+        // shape + no per-slot index = fail-closed, no chase, no
+        // wrong render.
+        for (key, entry) in &self.arena_stx_findings {
+            // Filter out `Conflicting` entries defensively: today no
+            // insertion path produces them (`handle_stx` only inserts
+            // `Pending` and `unreachable!()`s on a `Conflicting`
+            // overwrite), but a future enrichment of the arena STX
+            // flow could legitimately record disagreement; this gate
+            // keeps the drop semantics in one place.
+            if !matches!(entry, ArenaStxEntry::Pending) {
+                continue;
+            }
+            if conflicting.contains(key) {
+                continue;
+            }
+            out.insert(
+                *key,
+                CastHit {
+                    target_type_id: 0,
+                    addr_space: AddrSpace::Arena,
+                },
+            );
+        }
+
+        // Arena pointer path (shape inference): BTF-shape-inferred
+        // targets. Tagged as AddrSpace::Arena because the source
+        // u64 field is itself dereferenced and its target struct is
+        // recovered by intersecting struct shapes across the
+        // observed access pattern.
+        //
+        // F1 mitigation: require direct evidence the slot held an
+        // arena VA before emitting a shape-inference hit. The 4 GiB
+        // arena window catches any 33-bit value as "in arena" at
+        // chase time, so a slot that just happens to hold a
+        // 33-bit-shaped counter could be mis-rendered as an arena
+        // pointer. Direct evidence comes from EITHER an
+        // observed `BPF_ADDR_SPACE_CAST` on a value loaded from the
+        // slot (`self.arena_confirmed`) OR an observed STX of an
+        // allocator-tagged value into the slot
+        // (`self.arena_stx_findings` — see the STX-flow path above).
+        // Slots with neither observation drop here; an operator can
+        // re-enable inference for a specific slot by adding either
+        // a `bpf_addr_space_cast` site or the STX-flow tag in the
+        // scheduler source.
         for ((source, field_off), accesses) in &self.patterns {
             // A field that was loaded but never dereferenced gives
             // no signal. Drop it -- the renderer's existing u64
@@ -1553,6 +2189,23 @@ impl<'a> Analyzer<'a> {
             // Conflict with kptr path on the same slot: drop both
             // observations (the kptr loop below also skips this key).
             if conflicting.contains(&(*source, *field_off)) {
+                continue;
+            }
+            // F1 gate: shape inference alone is not enough. Require
+            // either a `bpf_addr_space_cast` observation
+            // (`arena_confirmed`) OR an arena-STX observation
+            // (`arena_stx_findings`) on the same slot before we
+            // emit a shape-inference target.
+            let key = (*source, *field_off);
+            let has_direct_evidence =
+                self.arena_confirmed.contains(&key) || self.arena_stx_findings.contains_key(&key);
+            if !has_direct_evidence {
+                tracing::debug!(
+                    parent_type_id = source,
+                    field_offset = field_off,
+                    accesses = accesses.len(),
+                    "cast_analysis: shape-inference candidate without direct evidence; dropped (F1 mitigation)"
+                );
                 continue;
             }
             // Intersection of candidate type ids across every
@@ -1587,6 +2240,10 @@ impl<'a> Analyzer<'a> {
 
             if candidates.len() == 1 {
                 let target = candidates.into_iter().next().unwrap();
+                // Shape-inference target overwrites any STX-flow
+                // hit emitted above for the same key — the concrete
+                // id is more informative than the deferred `0`
+                // sentinel.
                 out.insert(
                     (*source, *field_off),
                     CastHit {
@@ -1599,24 +2256,52 @@ impl<'a> Analyzer<'a> {
             // is the safe direction.
         }
 
-        // Arena-confirmed path: fields where a BPF_ADDR_SPACE_CAST
-        // (off=1, imm=1) was observed on a register loaded from the
-        // field. This is authoritative evidence the field holds an
-        // arena pointer. However, without a resolved target type id
-        // (from the shape-inference path), the renderer cannot chase
-        // — emitting target_type_id=0 produces a Ptr with "unresolvable
-        // size" skip reason, which is worse than the raw u64 fallback.
-        // arena_confirmed participates in conflict detection only:
-        // the conflict chain above includes arena_confirmed keys, so
-        // a kptr finding on the same slot drops on both sides. It
-        // does NOT emit standalone entries.
+        // F4 mitigation: surface allocator call sites that the
+        // analyzer saw but could not follow into a typed-slot
+        // STX. These manifest when a scheduler does not mark its
+        // allocator helpers `__always_inline` — the analyzer sees
+        // the helper-call site (one or more allocator seeds applied)
+        // but cannot follow the tagged R0 across the call boundary
+        // into the caller's frame, so no slot ends up in
+        // [`Self::arena_stx_findings`]. Emit one warning per dump
+        // pass to keep noise bounded.
+        //
+        // Gate:
+        //   - At least one allocator seed was applied (counted by
+        //     [`Self::alloc_seeds_applied`]). Without this, no
+        //     allocator was ever called and the warn would be
+        //     spurious noise.
+        //   - `arena_stx_findings` is empty. A non-empty findings
+        //     map means at least one slot DID get tagged; that is
+        //     the normal allocator-return seed path's happy shape
+        //     the prior gate incorrectly flagged. The gate is now
+        //     strict on the specific `__always_inline` failure
+        //     mode.
+        //
+        // The prior gate (`!arena_stx_findings.is_empty() &&
+        // arena_confirmed.is_empty()`) fired on the normal
+        // allocator-return seed path's happy shape where a
+        // scheduler correctly inlines the allocator AND the
+        // consumer reads through the slot via STX-flow alone (no
+        // `bpf_addr_space_cast` site). The operator received a
+        // misleading "may need __always_inline" warning on a
+        // working pipeline.
+        if self.alloc_seeds_applied > 0 && self.arena_stx_findings.is_empty() {
+            tracing::warn!(
+                alloc_seeds_applied = self.alloc_seeds_applied,
+                "cast_analysis: allocator seeds applied but no slot got an arena \
+                 STX tag; allocator helpers may need __always_inline so the \
+                 returned R0 reaches a typed-slot STX without crossing a \
+                 BPF-to-BPF call boundary"
+            );
+        }
 
         // Kernel kptr path: directly observed STX of a typed
         // pointer into a u64 slot. The target type is known
         // exactly from the value register's RegState — no shape
         // inference needed. Conflicting writes to the same slot
         // (different target types) drop. Slots that ALSO appear
-        // in the arena LDX path (`conflicting` above) drop on
+        // in any arena path (`conflicting` above) drop on
         // both sides — the analyzer cannot tell which observation
         // is real, and emitting either tag risks a false positive.
         for (key, entry) in self.kptr_findings {
@@ -1879,6 +2564,225 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
     }
 }
 
+/// Resolve a BTF type id and report whether it peels to
+/// `Ptr -> Void`.
+///
+/// `Ptr` ids whose pointee is `0` (the BTF void marker — same
+/// convention as [`FuncProto::return_type_id`] uses) match. The
+/// peel walks `Const` / `Volatile` / `Restrict` / `Typedef` /
+/// `TypeTag` / `DeclTag` modifiers only — bridging a `Ptr` we
+/// would never want, since the result of dereferencing an
+/// arbitrary modifier-wrapped type is not a useful "Ptr -> Void"
+/// signal for arena-allocator detection.
+///
+/// Used to gate [`Analyzer::handle_kfunc_call`]'s arena-allocator
+/// arm: the allowlisted kfunc names ([`ARENA_ALLOC_KFUNC_NAMES`])
+/// only confer a [`RegState::ArenaU64FromAlloc`] tag when the
+/// declared return is structurally `void *`. A kfunc whose name
+/// drifts onto the allowlist but whose BTF return is not
+/// `Ptr -> Void` cannot be misclassified here.
+///
+/// Returns `false` for any type id that does not resolve, peels
+/// to a non-`Ptr` terminal, or whose pointee resolves to a
+/// non-void type. Failure is the safe direction — false
+/// negatives drop to the existing typed-pointer arm or no-op.
+fn return_peels_to_ptr_void(btf: &Btf, ret_id: u32) -> bool {
+    // Peel modifiers AROUND the Ptr first — `const void *` and
+    // its kin lower to `Const(Ptr)` in BTF. The renderer's
+    // [`super::btf_render::peel_modifiers`] handles the same
+    // shape; reusing it keeps the semantics aligned with the
+    // rest of the analyzer.
+    //
+    // The peel returns `None` for any type id that does not
+    // resolve OR terminates on a non-trivial shape we cannot
+    // interpret as Ptr->Void (Func, FuncProto, Var, Datasec).
+    // Drop conservatively in those cases — false negatives are
+    // the safe direction.
+    let Some(peeled) = super::btf_render::peel_modifiers(btf, ret_id) else {
+        return false;
+    };
+    let Type::Ptr(p) = peeled else {
+        return false;
+    };
+    // BTF encodes `void *` with the Ptr's pointee type id == 0.
+    // Same convention [`FuncProto::return_type_id`] uses for void
+    // returns at the FuncProto level. Anything else is a typed
+    // pointer that arm 1 (`resolve_to_struct_id`) already handled
+    // — falling through here would let arm 2 mistakenly tag a
+    // typed-pointer return as ArenaU64FromAlloc, the very case
+    // the strict gate prevents.
+    p.get_type_id().map(|id| id == 0).unwrap_or(false)
+}
+
+/// Resolve a `bpf_map_lookup_elem` call's R0 value type from the
+/// caller-side map descriptor metadata in the program BTF.
+///
+/// The plain-helper arm of [`Analyzer::step`] looks up R1 in the
+/// `.maps` `BTF_KIND_DATASEC` and types R0 as a typed pointer to
+/// the map's value struct. This function performs the BTF walk:
+///
+/// 1. `datasec_id` must resolve to [`Type::Datasec`] whose name is
+///    exactly `.maps` — the libbpf-managed user-space BTF map
+///    declaration section. A `BTF_KIND_DATASEC` named anything
+///    else (e.g. `.bss`, `.data`, `.data.<name>`) is rejected so
+///    a non-map struct that happens to carry a `value` member of
+///    pointer type cannot drive this arm.
+/// 2. The datasec's `VarSecinfo` whose `offset == var_offset` is
+///    located. The chained type must be [`Type::Var`] whose
+///    underlying type peels through modifiers to a
+///    [`Type::Struct`] / [`Type::Union`] — the per-map struct
+///    declaration libbpf parses in `parse_btf_map_def`
+///    (`tools/lib/bpf/libbpf.c`).
+/// 3. The struct's members are scanned for one named `value`
+///    (the `__type(value, T)` declaration expanded to
+///    `typeof(T) *value` per `tools/lib/bpf/bpf_helpers.h`).
+/// 4. The `value` member's type peels to [`Type::Ptr`] — libbpf
+///    rejects non-`Ptr` value declarations (`if (!btf_is_ptr(t))`
+///    in `parse_btf_map_def`).
+/// 5. The `Ptr`'s pointee resolves through
+///    [`super::bpf_map::resolve_to_struct_id`] to a
+///    [`Type::Struct`] / [`Type::Union`] id. Maps whose value type
+///    is a primitive (e.g. `__type(value, u64)` for stat counters)
+///    or `void` peel to non-struct terminals; the function returns
+///    `None` and the analyzer leaves R0 Unknown.
+///
+/// Any failure on the walk drops the whole resolution — false
+/// negatives are the safe direction. The walk does NOT mutate any
+/// analyzer state and does NOT consult `arena_confirmed` /
+/// `arena_stx_findings`; the seeded `Pointer{T}` flows into the
+/// existing kptr/arena STX paths exactly the same way a kfunc-
+/// returned typed pointer does (see [`Analyzer::handle_kfunc_call`]
+/// arm 1).
+fn map_value_struct_id(btf: &Btf, datasec_id: u32, var_offset: u32) -> Option<u32> {
+    // Gate 1: datasec must be `.maps`. Resolve the type, confirm
+    // the kind, then resolve the name. Any non-Datasec kind or a
+    // name resolution error drops to None — the analyzer's safe
+    // direction. A renamed `.maps.foo` section (libbpf does NOT
+    // rename `.maps`, but the kernel allows custom section names
+    // for non-libbpf-managed BPF objects) would not match here;
+    // any future need to broaden this gate must add a corresponding
+    // test that proves the broader gate cannot drive a false
+    // positive on a non-map datasec.
+    let ty = btf.resolve_type_by_id(datasec_id).ok()?;
+    let datasec = match ty {
+        Type::Datasec(d) => d,
+        _ => return None,
+    };
+    let name = btf.resolve_name(&datasec).ok()?;
+    if name != ".maps" {
+        return None;
+    }
+
+    // Gate 2: locate the per-map VarSecinfo. The verifier guarantees
+    // VarSecinfos are non-overlapping per the BTF spec; an exact
+    // offset match is the only correct lookup (a partial overlap
+    // means the caller's annotation is targeting a struct member,
+    // not a map descriptor — the analyzer's R1 must point at the
+    // map's struct, never mid-struct, because clang's relocation
+    // emission uses the var's start offset).
+    let var_info = datasec.variables.iter().find(|v| v.offset() == var_offset)?;
+    let chained = btf.resolve_chained_type(var_info).ok()?;
+    let var = match chained {
+        Type::Var(v) => v,
+        _ => return None,
+    };
+    let var_type_id = var.get_type_id().ok()?;
+
+    // Gate 3: the var's underlying type must peel to a
+    // Struct/Union — that is the map descriptor C struct emitted
+    // by clang for `struct { __uint(...); __type(...); ... } name
+    // SEC(".maps");`. Modifiers around the struct (Const /
+    // Volatile / Typedef / TypeTag / DeclTag / Restrict) are peeled
+    // by [`super::btf_render::peel_modifiers`] consistently with
+    // the rest of the analyzer.
+    let map_def_terminal = super::btf_render::peel_modifiers(btf, var_type_id)?;
+    let map_def = match map_def_terminal {
+        Type::Struct(s) => s,
+        _ => return None,
+    };
+
+    // Gate 4: find the `value` member. clang's `__type(value, T)`
+    // macro in `tools/lib/bpf/bpf_helpers.h` (`#define __type(name,
+    // val) typeof(val) *name`) emits a struct member literally
+    // named `value` whose type is `typeof(T) *`. libbpf
+    // (`parse_btf_map_def`) keys on `strcmp(name, "value") == 0`
+    // for this exact match — the analyzer mirrors the literal name
+    // check.
+    //
+    // A member whose name resolution fails individually does not
+    // abort the search: real map decls always have name-resolved
+    // members (`type`, `key`, `value`, `max_entries`, …), but a
+    // malformed BTF carrying an unnamed member should not poison
+    // the lookup. `continue` past the bad name and inspect the
+    // next member.
+    for member in &map_def.members {
+        let Ok(mname) = btf.resolve_name(member) else {
+            continue;
+        };
+        if mname != "value" {
+            continue;
+        }
+        // Gate 5: member type peels to `Ptr -> Struct/Union`.
+        // libbpf's `parse_btf_map_def` rejects a non-Ptr `value`
+        // member with `-EINVAL`; the analyzer's gate enforces the
+        // same shape. A `Ptr -> u64` (stat-counter map) or
+        // `Ptr -> Void` peels to a non-struct pointee and
+        // `resolve_to_struct_id` returns None, dropping the
+        // resolution — the renderer's existing u64 plain-counter
+        // path is the correct fallback for stat maps.
+        let mtype_id = member.get_type_id().ok()?;
+        let mterminal = super::btf_render::peel_modifiers(btf, mtype_id)?;
+        let ptr = match mterminal {
+            Type::Ptr(p) => p,
+            _ => return None,
+        };
+        let pointee = ptr.get_type_id().ok()?;
+        return super::bpf_map::resolve_to_struct_id(btf, pointee);
+    }
+    // No `value` member: map shapes that omit a value declaration
+    // (`BPF_MAP_TYPE_PROG_ARRAY` declared with `__array(values, ...)`
+    // for instance) cannot have their R0 typed by this arm. Drop
+    // silently.
+    None
+}
+
+/// Allowlist of kfunc names whose `Ptr -> Void` return is treated
+/// as an arena VA seed for [`RegState::ArenaU64FromAlloc`].
+///
+/// Each entry must be a real kfunc declared in the kernel's
+/// `kernel/bpf/arena.c` (or peer kernel arena helpers) AND must
+/// return `void *` whose runtime value is a 4 GiB-window arena
+/// virtual address. Verified against the kernel source:
+/// `bpf_arena_alloc_pages` is declared `__bpf_kfunc void *` per
+/// linux `kernel/bpf/arena.c::bpf_arena_alloc_pages`.
+///
+/// Order is alphabetical for readability — the allowlist is a
+/// linear-scan small-N membership test in
+/// [`Analyzer::handle_kfunc_call`]. A future arena-returning
+/// kfunc is added by appending its name here AND verifying its
+/// return type peels to `Ptr -> Void` in the kernel BTF the
+/// analyzer consumes; the strict
+/// [`return_peels_to_ptr_void`] gate keeps a name-allowlist drift
+/// from producing a false positive on a same-named non-arena
+/// kfunc.
+///
+/// Distinct from the `ALLOC_SUBPROG_NAMES` allowlist in
+/// [`crate::vmm::cast_analysis_load`]: that list is for in-tree
+/// library subprograms (BPF-to-BPF calls with `BPF_PSEUDO_CALL`
+/// + symbol resolution against the program ELF); this list is
+/// for kernel kfuncs (`BPF_PSEUDO_KFUNC_CALL` + BTF id resolution
+/// in [`Analyzer::handle_kfunc_call`]). The kernel kfunc and
+/// in-tree subprog code paths are independent — a single name
+/// belongs to exactly one of the two allowlists.
+pub(crate) const ARENA_ALLOC_KFUNC_NAMES: &[&str] = &[
+    // Generic BPF arena page allocator. Returns `void *` per
+    // `kernel/bpf/arena.c::bpf_arena_alloc_pages` (`__bpf_kfunc
+    // void *bpf_arena_alloc_pages(...)`). The runtime value is
+    // either NULL or a user-side arena VA suitable for the
+    // STX-flow tagging path.
+    "bpf_arena_alloc_pages",
+];
+
 /// Convert the `BPF_DW`/`BPF_W`/`BPF_H`/`BPF_B` size bits to a byte
 /// count. `None` for unknown encodings.
 fn ldx_size_bytes(size_bits: u8) -> Option<u32> {
@@ -1973,6 +2877,24 @@ const BPF_REG_R10: usize = bs::BPF_REG_10 as usize;
 /// `bpf_call->imm` is the BTF id of a `BTF_KIND_FUNC` in the running
 /// kernel. Defined in linux uapi `bpf.h`.
 pub(crate) const BPF_PSEUDO_KFUNC_CALL: u8 = bs::BPF_PSEUDO_KFUNC_CALL as u8;
+
+/// Helper id for `bpf_map_lookup_elem` per linux uapi `bpf.h`
+/// (`BPF_FUNC_map_lookup_elem = 1`, the second `bpf_func_id` enum
+/// value after `BPF_FUNC_unspec = 0`). Sourced from `libbpf-sys`'s
+/// bindgen translation of the same header.
+///
+/// Helper calls in pre-relocation `.bpf.o` bytecode carry
+/// `src_reg == 0` (plain helper, distinct from `BPF_PSEUDO_CALL`
+/// for BPF-to-BPF and `BPF_PSEUDO_KFUNC_CALL` for kfuncs) and
+/// `imm` set to the helper id. The analyzer's [`BPF_OP_CALL`] arm
+/// types R0 only for this single helper id — no other helper has a
+/// pointer-to-struct return shape we can recover from the BPF
+/// program BTF alone. The kernel's
+/// `bpf_map_lookup_elem_proto::ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL`
+/// (linux `kernel/bpf/helpers.c`) is the correctness anchor: the
+/// returned pointer points at the map's value bytes whose BTF type
+/// is the map descriptor's `__type(value, T)` declaration.
+const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = bs::BPF_FUNC_map_lookup_elem as i32;
 
 /// `bpf_call->src_reg == BPF_PSEUDO_CALL` denotes a BPF-to-BPF call:
 /// `bpf_call->imm` is a pc-relative offset to another BPF function
@@ -2487,6 +3409,16 @@ mod tests {
         mk_insn(BPF_CLASS_ALU64 | BPF_OP_MOV, dst, 0, 0, imm)
     }
 
+    /// Generic plain-helper `BPF_CALL` for tests that exercise the
+    /// R0..R5 clobber + spill/reload behaviour without engaging the
+    /// helper-return arm. `imm == 1` happens to coincide with
+    /// `BPF_FUNC_map_lookup_elem`, but the helper-return arm only
+    /// fires when R1 is a `RegState::DatasecPointer{".maps", ..}` at
+    /// the call site — none of the call sites that consume this
+    /// helper seed R1 that way, so R0 still ends up Unknown after the
+    /// clobber as those tests assert. Tests that need a different
+    /// helper id (e.g. to confirm the arm rejects non-allowlist ids)
+    /// build the call instruction inline via [`helper_call`] instead.
     fn call() -> BpfInsn {
         mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, 0, 0, 1)
     }
@@ -2508,13 +3440,23 @@ mod tests {
         mk_insn(BPF_CLASS_JMP | BPF_OP_EXIT, 0, 0, 0, 0)
     }
 
+    /// `BPF_ADDR_SPACE_CAST` (kernel/bpf/verifier.c::check_alu_op):
+    /// `ALU64 | MOV | X` with `off=1, imm=1` is the as(1)→as(0)
+    /// cast — arena→kernel. `imm=1<<16` is the as(0)→as(1) cast in
+    /// the other direction. Tests use the arena→kernel form to
+    /// surface arena_confirmed evidence for shape-inference findings
+    /// (F1 mitigation).
+    fn addr_space_cast(dst: u8, src: u8, imm: i32) -> BpfInsn {
+        mk_insn(BPF_CLASS_ALU64 | BPF_OP_MOV | BPF_SRC_X, dst, src, 1, imm)
+    }
+
     // ----- Tests --------------------------------------------------
 
     #[test]
     fn empty_insns_yields_empty_map() {
         let (blob, _t, _q) = btf_with_source_and_target(8, 0);
         let btf = Btf::from_bytes(&blob).unwrap();
-        let map = analyze_casts(&[], &btf, &[], &[], &[]);
+        let map = analyze_casts(&[], &btf, &[], &[], &[], &[]);
         assert!(map.is_empty());
     }
 
@@ -2525,7 +3467,7 @@ mod tests {
         let (blob, _t, _q) = btf_with_source_and_target(8, 0);
         let btf = Btf::from_bytes(&blob).unwrap();
         let insns = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
-        let map = analyze_casts(&insns, &btf, &[], &[], &[]);
+        let map = analyze_casts(&insns, &btf, &[], &[], &[], &[]);
         assert!(map.is_empty());
     }
 
@@ -2533,11 +3475,23 @@ mod tests {
     fn simple_cast_recovers_target() {
         // r1 -> *(T *).
         // r2 = *(u64 *)(r1 + 8)   -- "load u64 at T.f"
-        // r3 = *(u64 *)(r2 + 0)   -- "use loaded value as Q*"
-        // The unique struct in BTF with a u64 at offset 0 is Q.
+        // r4 = bpf_addr_space_cast(r2, 0, 1)  -- arena_confirmed evidence (F1)
+        // r3 = *(u64 *)(r4 + 0)   -- "use loaded value as Q*"
+        //
+        // The arena_space_cast on the LoadedU64Field register is the
+        // F1 mitigation prerequisite: shape inference alone is not
+        // enough evidence to emit a finding. The `bpf_addr_space_cast`
+        // tags `(t_id, 8)` as arena-confirmed, after which the
+        // shape-inference finding can fire when exactly one struct
+        // matches the access pattern.
         let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
         let btf = Btf::from_bytes(&blob).unwrap();
-        let insns = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(4, 2, 1),
+            ldx(BPF_SIZE_DW, 3, 4, 0),
+            exit(),
+        ];
         let map = analyze_casts(
             &insns,
             &btf,
@@ -2545,6 +3499,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -2555,6 +3510,199 @@ mod tests {
                 addr_space: AddrSpace::Arena
             }),
             "got: {map:?}"
+        );
+    }
+
+    /// F1 mitigation: shape-inference candidates without direct
+    /// arena evidence (no `BPF_ADDR_SPACE_CAST` AND no STX-flow
+    /// allocator-return tag) must drop, even when the (offset, size)
+    /// access pattern uniquely matches one BTF candidate. Pin the
+    /// drop-without-evidence behaviour against a regression that
+    /// would re-enable shape-inference-only emits, which the F1
+    /// hostile-input mitigation explicitly forbids: a 33-bit-shaped
+    /// counter on aarch64 falls inside the 4 GiB arena window and
+    /// would render as a chased pointer if the F1 gate weren't here.
+    ///
+    /// Same instruction shape as `simple_cast_recovers_target` minus
+    /// the `BPF_ADDR_SPACE_CAST`. The companion proof — re-running
+    /// with the addr_space_cast added DOES emit — anchors that the
+    /// drop is the F1 gate, not a separate analysis defect that
+    /// would also have rejected the cast-augmented sequence.
+    #[test]
+    fn shape_inference_alone_drops_without_arena_confirmed() {
+        let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
+        let btf = Btf::from_bytes(&blob).unwrap();
+
+        // (a) WITHOUT addr_space_cast: shape inference recognizes
+        // the (offset=0, size=8) access against Q's layout, but the
+        // F1 gate at `finalize`'s arena loop demands direct evidence
+        // (`arena_confirmed` OR `arena_stx_findings`). Neither is
+        // populated, so the slot drops and the map stays empty.
+        let insns_no_evidence = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            exit(),
+        ];
+        let map_no_evidence = analyze_casts(
+            &insns_no_evidence,
+            &btf,
+            &[InitialReg {
+                reg: 1,
+                struct_type_id: t_id,
+            }],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            map_no_evidence.is_empty(),
+            "shape inference without `arena_confirmed` / `arena_stx_findings` \
+             must drop per the F1 mitigation: {map_no_evidence:?}"
+        );
+
+        // (b) WITH addr_space_cast on the LoadedU64Field source: the
+        // cast populates `arena_confirmed` for (T, 8); the same
+        // (offset=0, size=8) access is now matched against Q with
+        // direct evidence, so the finding emits. Establishes that
+        // (a)'s empty result is attributable specifically to the F1
+        // gate — without this companion the drop could be explained
+        // by an unrelated analysis defect (e.g. shape inference itself
+        // failing to match Q's layout for some other reason).
+        let insns_with_evidence = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(4, 2, 1),
+            ldx(BPF_SIZE_DW, 3, 4, 0),
+            exit(),
+        ];
+        let map_with_evidence = analyze_casts(
+            &insns_with_evidence,
+            &btf,
+            &[InitialReg {
+                reg: 1,
+                struct_type_id: t_id,
+            }],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            map_with_evidence.get(&(t_id, 8)),
+            Some(&CastHit {
+                target_type_id: q_id,
+                addr_space: AddrSpace::Arena,
+            }),
+            "with addr_space_cast evidence the same shape MUST emit, \
+             proving (a)'s empty result is the F1 gate firing: \
+             {map_with_evidence:?}"
+        );
+    }
+
+    /// F1 mitigation, multi-offset disambiguation form: a program
+    /// whose access pattern uniquely intersects to one candidate
+    /// (`Q { u64 @ 0; u32 @ 8 }`) but lacks ANY direct arena
+    /// evidence — neither a `BPF_ADDR_SPACE_CAST` nor an STX-flow
+    /// allocator-return tag — must drop. Pin the gate against
+    /// hostile-aarch64 regressions where a 33-bit-shaped counter
+    /// would fall inside the 4 GiB arena window at chase time and
+    /// render as a chased pointer if shape inference alone were
+    /// allowed to emit.
+    ///
+    /// Distinct from `shape_inference_alone_drops_without_arena_confirmed`:
+    /// that test uses a single-access (size=8 @ 0) shape and pairs
+    /// the empty-without-evidence with a with-evidence companion.
+    /// This test exercises the multi-access intersection path —
+    /// `(offset=0, size=8)` AND `(offset=8, size=4)` together pin
+    /// the candidate set to exactly Q via shape inference, so the
+    /// drop guards the gate against any future rewrite that
+    /// preserves single-offset rejection but allows multi-offset
+    /// shapes to slip through.
+    #[test]
+    fn f1_mitigation_rejects_shape_inference_without_evidence() {
+        // BTF: u64(1), u32(2), T(3, u64@8), Q(4, u64@0+u32@8). Q is
+        // the ONLY struct in the BTF whose layout satisfies both
+        // (offset=0, size=8) and (offset=8, size=4), so shape
+        // inference would resolve to Q if the F1 gate weren't here.
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_u32 = push_name(&mut strings, "u32");
+        let n_t = push_name(&mut strings, "T");
+        let n_q = push_name(&mut strings, "Q");
+        let n_f = push_name(&mut strings, "f");
+        let n_a = push_name(&mut strings, "a");
+        let n_b = push_name(&mut strings, "b");
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Int {
+                name_off: n_u32,
+                size: 4,
+                encoding: 0,
+                offset: 0,
+                bits: 32,
+            },
+            SynType::Struct {
+                name_off: n_t,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_f,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+            SynType::Struct {
+                name_off: n_q,
+                size: 12,
+                members: vec![
+                    SynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SynMember {
+                        name_off: n_b,
+                        type_id: 2,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let t_id = 3;
+        // Sequence: r2 = T.f, r3 = *(u64*)(r2 + 0), r4 = *(u32*)(r2 + 8).
+        // Pattern entries: {(0, 8), (8, 4)}; intersection in
+        // `build_layout_index` resolves to {Q} uniquely. NO
+        // addr_space_cast, NO pseudo_call+SubprogReturn — neither
+        // `arena_confirmed` nor `arena_stx_findings` populated for
+        // (T, 8). The F1 gate at the head of the arena-emit loop
+        // drops the slot.
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            ldx(BPF_SIZE_W, 4, 2, 8),
+            exit(),
+        ];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 1,
+                struct_type_id: t_id,
+            }],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            map.is_empty(),
+            "multi-offset shape inference with NO direct arena evidence \
+             (no addr_space_cast, no STX-flow tag) must drop per F1 \
+             mitigation: {map:?}"
         );
     }
 
@@ -2616,6 +3764,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: 2,
             }],
+            &[],
             &[],
             &[],
         );
@@ -2700,10 +3849,12 @@ mod tests {
         let btf = Btf::from_bytes(&blob).unwrap();
         let t_id = 3;
         let q1_id = 4;
-        // Sequence: load r1->T.f (offset 8) into r2; then deref r2
-        // at offset 0 (8 bytes) and offset 8 (8 bytes).
+        // Sequence: load r1->T.f (offset 8) into r2; cast r2 to
+        // arena_confirmed (F1 mitigation prerequisite); then deref
+        // the cast result at offset 0 (8 bytes) and offset 8 (8 bytes).
         let insns = vec![
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_DW, 3, 2, 0),
             ldx(BPF_SIZE_DW, 4, 2, 8),
             exit(),
@@ -2715,6 +3866,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -2812,15 +3964,21 @@ mod tests {
         // Q1 matches, Q2 has u32@8 (4 bytes) so does not match.
         // Cast 2: T.f2 -> *(Q2*). Read at offset 0 (8 bytes) and
         // offset 8 (4 bytes). Q1 lacks @0 → only Q2 matches.
+        // Each LoadedU64Field gets an addr_space_cast applied to it
+        // (F1 mitigation prerequisite for shape-inference findings).
         let insns = vec![
             // r2 = *(u64 *)(r1 + 8)  -- T.f1 → r2
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            // r2 = arena_cast(r2)    -- arena_confirmed for (T, 8)
+            addr_space_cast(2, 2, 1),
             // r3 = *(u64 *)(r2 + 8)  -- (T.f1 → Q1).a (offset 8, size 8)
             ldx(BPF_SIZE_DW, 3, 2, 8),
             // Reset r2's loaded-state by overwriting via mov_k.
             mov_k(2, 0),
             // r2 = *(u64 *)(r1 + 16) -- T.f2 → r2
             ldx(BPF_SIZE_DW, 2, 1, 16),
+            // r2 = arena_cast(r2)    -- arena_confirmed for (T, 16)
+            addr_space_cast(2, 2, 1),
             // r4 = *(u64 *)(r2 + 0)  -- (T.f2 → Q2).a (offset 0, size 8)
             ldx(BPF_SIZE_DW, 4, 2, 0),
             // r5 = *(u32 *)(r2 + 8)  -- (T.f2 → Q2).b (offset 8, size 4)
@@ -2834,6 +3992,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -2877,6 +4036,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -2898,6 +4058,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -2965,6 +4126,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -3017,9 +4179,14 @@ mod tests {
             // pc 1: if r2 <COND> 0 goto +1 (jump to pc=3, skip deref)
             // pc 2: r3 = *r2  (fall-through; r2 still LoadedU64Field)
             // pc 3: exit.
+            // BPF_ADDR_SPACE_CAST adds arena_confirmed evidence
+            // (F1 mitigation prerequisite). Apply BEFORE the
+            // conditional jump so the cast lands on the source
+            // u64 value, not the (already-typed) cast result.
             let jcc = mk_insn(*code, 2, 0, 1, 0);
             let insns = vec![
                 ldx(BPF_SIZE_DW, 2, 1, 8),
+                addr_space_cast(2, 2, 1),
                 jcc,
                 ldx(BPF_SIZE_DW, 3, 2, 0),
                 exit(),
@@ -3031,6 +4198,7 @@ mod tests {
                     reg: 1,
                     struct_type_id: t_id,
                 }],
+                &[],
                 &[],
                 &[],
             );
@@ -3080,19 +4248,21 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(map.is_empty(), "deref at branch target must drop: {map:?}");
     }
 
     #[test]
     fn mov_x_propagates_loaded_state() {
-        // r2 = T.f; r4 = r2; deref r4 at offset 0.
-        // The MOV r4, r2 propagates LoadedU64Field, so the
-        // dereference through r4 records the cast.
+        // r2 = T.f; r2 = arena_cast(r2); r4 = r2; deref r4 at offset 0.
+        // The MOV r4, r2 propagates LoadedU64Field after the
+        // arena_confirmed evidence is recorded (F1 mitigation).
         let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
         let btf = Btf::from_bytes(&blob).unwrap();
         let insns = vec![
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
             mov_x(4, 2),
             ldx(BPF_SIZE_DW, 3, 4, 0),
             exit(),
@@ -3104,6 +4274,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -3130,6 +4301,7 @@ mod tests {
             ld_imm64_lo,
             ld_imm64_hi,
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_DW, 3, 2, 0),
             exit(),
         ];
@@ -3140,6 +4312,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -3171,6 +4344,7 @@ mod tests {
                 reg: 10,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -3215,6 +4389,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -3311,6 +4486,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert_eq!(
             map.get(&(p_id, slot_off)),
@@ -3353,6 +4529,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -3445,6 +4622,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert_eq!(
             map.get(&(p_id, slot_off)),
@@ -3481,6 +4659,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -3580,8 +4759,9 @@ mod tests {
         let a_id = 4;
         let m_id = 5;
         let insns = vec![
-            // Arena LDX path.
+            // Arena LDX path with arena_confirmed evidence (F1).
             ldx(BPF_SIZE_DW, 2, 1, 0),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_DW, 3, 2, 0),
             ldx(BPF_SIZE_DW, 4, 2, 8),
             // Kernel STX path.
@@ -3601,6 +4781,7 @@ mod tests {
                     struct_type_id: t_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -3745,6 +4926,7 @@ mod tests {
                 func_proto_id: proto_id,
             }],
             &[],
+            &[],
         );
         assert_eq!(
             map.len(),
@@ -3820,6 +5002,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map_cast_only.is_empty(),
@@ -3856,6 +5039,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map_cast_plus_kptr.is_empty(),
@@ -3884,6 +5068,7 @@ mod tests {
                     struct_type_id: q_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -3924,8 +5109,15 @@ mod tests {
         // "dst Unknown, src preserved" (correct) from "both
         // clobbered" (regression where the cast spilled into src).
         let cast = mk_insn(BPF_CLASS_ALU64 | BPF_OP_MOV | BPF_SRC_X, 4, 3, 1, 0x10000);
+        // F1 mitigation: include an arena→kernel cast on r3 to
+        // populate `arena_confirmed` for `(T, 8)`. Without it,
+        // shape inference alone would not emit the finding. The
+        // cast targets a fresh register so r3 retains its
+        // `LoadedU64Field` state for the trailing deref.
+        let arena_confirm = addr_space_cast(7, 3, 1);
         let insns = vec![
             ldx(BPF_SIZE_DW, 3, 1, 8),
+            arena_confirm,
             cast,
             ldx(BPF_SIZE_DW, 5, 4, 0),
             ldx(BPF_SIZE_DW, 6, 3, 0),
@@ -3938,6 +5130,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -3993,6 +5186,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -4051,6 +5245,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -4089,6 +5284,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -4149,6 +5345,7 @@ mod tests {
                 ],
                 &[],
                 &[],
+                &[],
             );
             assert_eq!(
                 map.len(),
@@ -4202,6 +5399,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -4242,6 +5440,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -4347,6 +5546,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert_eq!(
             map.get(&(p_id, slot_off1)),
@@ -4405,6 +5605,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -4447,6 +5648,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -4482,6 +5684,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -4521,6 +5724,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -4556,6 +5760,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -4614,6 +5819,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -4659,6 +5865,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -4758,6 +5965,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert_eq!(
             map.get(&(p_id, slot_off)),
@@ -4802,6 +6010,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -4849,6 +6058,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -4906,6 +6116,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -4952,6 +6163,7 @@ mod tests {
                     struct_type_id: t_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -5056,7 +6268,7 @@ mod tests {
         // could be explained by a non-functional STX path rather
         // than the Conflicting transition.
         let insns_single = vec![stx(BPF_SIZE_DW, 6, 1, slot_off as i16), exit()];
-        let map_single = analyze_casts(&insns_single, &btf, &seeds, &[], &[]);
+        let map_single = analyze_casts(&insns_single, &btf, &seeds, &[], &[], &[]);
         assert_eq!(
             map_single.len(),
             1,
@@ -5078,7 +6290,7 @@ mod tests {
             stx(BPF_SIZE_DW, 6, 2, slot_off as i16),
             exit(),
         ];
-        let map_conflict = analyze_casts(&insns_conflict, &btf, &seeds, &[], &[]);
+        let map_conflict = analyze_casts(&insns_conflict, &btf, &seeds, &[], &[], &[]);
         assert!(
             map_conflict.is_empty(),
             "(b) two distinct kptr targets on same slot must collapse to \
@@ -5097,7 +6309,7 @@ mod tests {
             stx(BPF_SIZE_DW, 6, 1, slot_off as i16),
             exit(),
         ];
-        let map_three = analyze_casts(&insns_three, &btf, &seeds, &[], &[]);
+        let map_three = analyze_casts(&insns_three, &btf, &seeds, &[], &[], &[]);
         assert!(
             map_three.is_empty(),
             "(c) Conflicting state must be sticky across same-target \
@@ -5129,6 +6341,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(map.is_empty(), "OOB dst must not panic, map empty: {map:?}");
     }
@@ -5151,6 +6364,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -5203,6 +6417,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: p_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -5319,6 +6534,7 @@ mod tests {
                 func_proto_id: proto_id,
             }],
             &[],
+            &[],
         );
         assert_eq!(
             map.get(&(p_id, slot_off1)),
@@ -5415,6 +6631,7 @@ mod tests {
                 func_proto_id: proto_id,
             }],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -5444,6 +6661,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -5537,6 +6755,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         // Both observations must drop. Specifically: the kptr finding
         // for (T, 8) -> Q must NOT appear, and no arena entry can
@@ -5568,6 +6787,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -5651,6 +6871,7 @@ mod tests {
         // and is emitted.
         let insns = vec![
             ldx(BPF_SIZE_DW, 2, 1, 0),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_DW, 3, 2, 0),
             ldx(BPF_SIZE_DW, 4, 2, 8),
             exit(),
@@ -5663,6 +6884,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -5726,6 +6948,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -5799,7 +7022,12 @@ mod tests {
         let btf = Btf::from_bytes(&blob).unwrap();
         let t_id = 2;
         let q_id = 203;
-        let insns = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            exit(),
+        ];
         let map = analyze_casts(
             &insns,
             &btf,
@@ -5807,6 +7035,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -5874,6 +7103,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -5928,6 +7158,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -6042,12 +7273,13 @@ mod tests {
         let btf = Btf::from_bytes(&blob).unwrap();
         let t_id = 2;
         let u_id = 6;
-        // r2 = *(u64*)(r1 + 8); r3 = *(u64*)(r2 + 24). The pattern
-        // (offset=24, size=8) must intersect to {U} only -- Fwd /
-        // Func / Void members at offsets 0/8/16 are skipped during
-        // layout indexing.
+        // r2 = *(u64*)(r1 + 8); cast r2 (F1 evidence); r3 =
+        // *(u64*)(r2 + 24). The pattern (offset=24, size=8) must
+        // intersect to {U} only -- Fwd / Func / Void members at
+        // offsets 0/8/16 are skipped during layout indexing.
         let insns = vec![
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_DW, 3, 2, 24),
             exit(),
         ];
@@ -6058,6 +7290,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -6136,10 +7369,16 @@ mod tests {
         let btf = Btf::from_bytes(&blob).unwrap();
         let t_id = 2;
         let q2_id = 4;
-        // Sequence: r2 = *(u64*)(r1 + 8); r3 = *(u64*)(r2 + 0).
+        // Sequence: r2 = *(u64*)(r1 + 8); cast r2 (F1 evidence);
+        // r3 = *(u64*)(r2 + 0).
         // Pattern (0, 8): layout includes Q2 only (Q1's bitfield
         // skipped). Map records (T, 8) -> (Q2, Arena).
-        let insns = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            exit(),
+        ];
         let map = analyze_casts(
             &insns,
             &btf,
@@ -6147,6 +7386,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -6261,9 +7501,12 @@ mod tests {
         // Block 2: arena LDX through union target.
         //   r2 = Pointer{SourceU}; r3 = *(u64*)(r2 + 8); r4 = *(u64*)(r3 + 0).
         //   Pattern (0, 8) -> {TargetU}; (SourceU, 8) -> (TargetU, Arena).
+        // Add arena_confirmed evidence (F1) on r3 between the load
+        // of SourceU.f and the deref through it.
         let insns = vec![
             stx(BPF_SIZE_DW, 1, 6, 16),
             ldx(BPF_SIZE_DW, 3, 2, 8),
+            addr_space_cast(3, 3, 1),
             ldx(BPF_SIZE_DW, 4, 3, 0),
             exit(),
         ];
@@ -6284,6 +7527,7 @@ mod tests {
                     struct_type_id: source_u_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -6325,7 +7569,12 @@ mod tests {
         // found before the cap activates, so the cast still emits.
         let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
         let btf = Btf::from_bytes(&blob).unwrap();
-        let insns = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            exit(),
+        ];
         let map = analyze_casts(
             &insns,
             &btf,
@@ -6333,6 +7582,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -6418,7 +7668,12 @@ mod tests {
         let btf = Btf::from_bytes(&blob).unwrap();
         let t_id = 2;
         let q_id = 3;
-        let insns = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            exit(),
+        ];
         let map = analyze_casts(
             &insns,
             &btf,
@@ -6426,6 +7681,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -6481,6 +7737,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -6517,6 +7774,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -6567,6 +7825,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -6653,6 +7912,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -6717,6 +7977,7 @@ mod tests {
                 reg: 6,
                 struct_type_id: p_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -6803,6 +8064,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert_eq!(
             map.get(&(p_id, slot_off)),
@@ -6859,6 +8121,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -6896,6 +8159,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -6915,7 +8179,7 @@ mod tests {
         let btf = Btf::from_bytes(&blob).unwrap();
         let bad = BpfInsn::new(BPF_CLASS_STX | BPF_SIZE_DW | BPF_MODE_MEM, 15, 15, 0, 0);
         let insns = vec![bad, exit()];
-        let map = analyze_casts(&insns, &btf, &[], &[], &[]);
+        let map = analyze_casts(&insns, &btf, &[], &[], &[], &[]);
         assert!(
             map.is_empty(),
             "OOB STX (dst=15, src=15) must not panic: {map:?}"
@@ -6931,7 +8195,7 @@ mod tests {
         let btf = Btf::from_bytes(&blob).unwrap();
         let bad = BpfInsn::new(BPF_CLASS_ALU64 | BPF_OP_MOV | BPF_SRC_X, 15, 0, 0, 0);
         let insns = vec![bad, exit()];
-        let map = analyze_casts(&insns, &btf, &[], &[], &[]);
+        let map = analyze_casts(&insns, &btf, &[], &[], &[], &[]);
         assert!(map.is_empty(), "OOB MOV (dst=15) must not panic: {map:?}");
     }
 
@@ -6952,7 +8216,7 @@ mod tests {
             BPF_FETCH | 0xe0,
         );
         let insns = vec![bad, exit()];
-        let map = analyze_casts(&insns, &btf, &[], &[], &[]);
+        let map = analyze_casts(&insns, &btf, &[], &[], &[], &[]);
         assert!(
             map.is_empty(),
             "OOB ATOMIC (dst=15, src=15) must not panic: {map:?}"
@@ -6990,6 +8254,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -7008,6 +8273,8 @@ mod tests {
         let insns = vec![
             // r2 = *(u64*)(r1+8)  -- r2 = LoadedU64Field{T, 8}
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            // r2 = arena_cast(r2) -- arena_confirmed evidence (F1)
+            addr_space_cast(2, 2, 1),
             // r2 = r2             -- self-copy, r2 stays LoadedU64Field
             mov_x(2, 2),
             // r3 = *(u64*)(r2+0)  -- records access, resolves to Q
@@ -7021,6 +8288,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -7062,6 +8330,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -7117,6 +8386,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -7154,6 +8424,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -7194,6 +8465,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -7227,6 +8499,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -7268,6 +8541,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(map.is_empty(), "mov_k must destroy typed pointer: {map:?}");
     }
@@ -7302,6 +8576,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -7343,6 +8618,7 @@ mod tests {
                     struct_type_id: p_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -7390,6 +8666,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -7430,6 +8707,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -7465,6 +8743,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -7483,7 +8762,7 @@ mod tests {
         let (blob, _t_id, _q_id) = btf_with_source_and_target(8, 0);
         let btf = Btf::from_bytes(&blob).unwrap();
         let insns = vec![exit()];
-        let map = analyze_casts(&insns, &btf, &[], &[], &[]);
+        let map = analyze_casts(&insns, &btf, &[], &[], &[], &[]);
         assert!(map.is_empty(), "single EXIT must yield empty map: {map:?}");
     }
 
@@ -7507,7 +8786,7 @@ mod tests {
         let ja_plus = mk_insn(BPF_CLASS_JMP, 0, 0, 1, 0);
         let ja_minus = mk_insn(BPF_CLASS_JMP, 0, 0, -2, 0);
         let insns = vec![jeq, ja_plus, ja_minus, exit()];
-        let map = analyze_casts(&insns, &btf, &[], &[], &[]);
+        let map = analyze_casts(&insns, &btf, &[], &[], &[], &[]);
         assert!(
             map.is_empty(),
             "all-jumps program must yield empty map: {map:?}"
@@ -7642,7 +8921,7 @@ mod tests {
             datasec_type_id: datasec_id,
             base_offset: var_off,
         }];
-        let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers);
+        let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers, &[]);
         assert_eq!(
             map.get(&(datasec_id, var_off)),
             Some(&CastHit {
@@ -7670,7 +8949,7 @@ mod tests {
         // Empty datasec_pointers — analyzer has no way to recover
         // the parent datasec id, so the LD_IMM64 destination
         // stays Unknown.
-        let map = analyze_casts(&insns, &btf, &[], &[], &[]);
+        let map = analyze_casts(&insns, &btf, &[], &[], &[], &[]);
         assert!(
             map.is_empty(),
             "LD_IMM64 without DatasecPointer annotation must not record \
@@ -7697,7 +8976,7 @@ mod tests {
             datasec_type_id: datasec_id,
             base_offset: var_off,
         }];
-        let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers);
+        let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers, &[]);
         assert!(
             map.is_empty(),
             "STX with untyped value register must not record kptr: {map:?}"
@@ -7807,7 +9086,7 @@ mod tests {
                 base_offset: 16,
             },
         ];
-        let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers);
+        let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers, &[]);
         assert_eq!(
             map.get(&(datasec_id, 0)),
             Some(&CastHit {
@@ -7881,7 +9160,7 @@ mod tests {
             datasec_type_id: datasec_id,
             base_offset: var_off,
         }];
-        let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers);
+        let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers, &[]);
         assert_eq!(map.len(), 1, "exactly one finding expected: {map:?}");
         assert_eq!(
             map.get(&(datasec_id, var_off)),
@@ -7915,6 +9194,7 @@ mod tests {
                 reg: 6,
                 struct_type_id: p_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -7953,6 +9233,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(map.is_empty(), "JMP32|JA target must reset state: {map:?}");
     }
@@ -7967,6 +9248,7 @@ mod tests {
         let jeq_pos = mk_insn(BPF_CLASS_JMP | 0x10, 2, 0, 100, 0);
         let insns = vec![
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
             jeq_neg,
             jeq_pos,
             ldx(BPF_SIZE_DW, 3, 2, 0),
@@ -7979,6 +9261,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -8018,6 +9301,7 @@ mod tests {
                     reg: 1,
                     struct_type_id: t_id,
                 }],
+                &[],
                 &[],
                 &[],
             );
@@ -8125,6 +9409,7 @@ mod tests {
                 },
             ],
             &[],
+            &[],
         );
         assert_eq!(
             map.get(&(p_id, slot_off)),
@@ -8142,7 +9427,12 @@ mod tests {
     fn func_entry_past_insns_len_no_op() {
         let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
         let btf = Btf::from_bytes(&blob).unwrap();
-        let insns = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            exit(),
+        ];
         let map = analyze_casts(
             &insns,
             &btf,
@@ -8154,6 +9444,7 @@ mod tests {
                 insn_offset: 999,
                 func_proto_id: 1,
             }],
+            &[],
             &[],
         );
         assert_eq!(
@@ -8225,6 +9516,7 @@ mod tests {
                 func_proto_id: proto_id,
             }],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
@@ -8250,6 +9542,7 @@ mod tests {
                 insn_offset: 0,
                 func_proto_id: 0,
             }],
+            &[],
             &[],
         );
         assert!(
@@ -8329,6 +9622,7 @@ mod tests {
                 func_proto_id: proto_id,
             }],
             &[],
+            &[],
         );
         assert_eq!(
             map.get(&(p_id, slot_off)),
@@ -8359,6 +9653,7 @@ mod tests {
             ld_imm64_lo,
             fake_mov,
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_DW, 3, 2, 0),
             exit(),
         ];
@@ -8369,6 +9664,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -8438,11 +9734,12 @@ mod tests {
         let s2_id = 3;
         let q_id = 4;
         // Seed R1 first as S1, then as S2 — last wins, R1 = S2.
-        // Sequence: r2 = *(u64*)(r1+16) = S2.f, then r3 = *r2 at 0.
-        // Records (S2, 16) -> Q. If first seed had won, S1 has no
-        // field at offset 16, so no record.
+        // Sequence: r2 = *(u64*)(r1+16) = S2.f, cast (F1 evidence),
+        // then r3 = *r2 at 0. Records (S2, 16) -> Q. If first seed
+        // had won, S1 has no field at offset 16, so no record.
         let insns = vec![
             ldx(BPF_SIZE_DW, 2, 1, 16),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_DW, 3, 2, 0),
             exit(),
         ];
@@ -8459,6 +9756,7 @@ mod tests {
                     struct_type_id: s2_id,
                 },
             ],
+            &[],
             &[],
             &[],
         );
@@ -8489,6 +9787,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: 0,
             }],
+            &[],
             &[],
             &[],
         );
@@ -8527,8 +9826,10 @@ mod tests {
             insns.push(mov_k(0, 0));
         }
         insns.push(ldx(BPF_SIZE_DW, 2, 1, 8));
+        // F1 mitigation: arena_confirmed evidence on r2.
+        insns.push(addr_space_cast(2, 2, 1));
         insns.push(ldx(BPF_SIZE_DW, 3, 2, 0));
-        for _ in 0..4_998 {
+        for _ in 0..4_997 {
             insns.push(mov_k(0, 0));
         }
         insns.push(exit());
@@ -8540,6 +9841,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -8654,7 +9956,7 @@ mod tests {
             });
         }
         insns.push(exit());
-        let map = analyze_casts(&insns, &btf, &[], &func_entries, &[]);
+        let map = analyze_casts(&insns, &btf, &[], &func_entries, &[], &[]);
         assert_eq!(map.len(), N, "expected {N} kptr findings: {map:?}");
         for i in 0..N {
             let t_id = (2 + i) as u32;
@@ -8754,6 +10056,7 @@ mod tests {
         let qtarget_id: u32 = 4;
         let insns = vec![
             ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_DW, 3, 2, 40),
             ldx(BPF_SIZE_W, 4, 2, 80),
             exit(),
@@ -8765,6 +10068,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -8845,7 +10149,12 @@ mod tests {
         let btf = Btf::from_bytes(&blob).unwrap();
         let t_id: u32 = chain_head_id + 1;
         let q_id: u32 = chain_head_id + 2;
-        let insns = vec![ldx(BPF_SIZE_DW, 2, 1, 8), ldx(BPF_SIZE_DW, 3, 2, 0), exit()];
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            addr_space_cast(2, 2, 1),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            exit(),
+        ];
         let map = analyze_casts(
             &insns,
             &btf,
@@ -8853,6 +10162,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -8966,6 +10276,7 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert_eq!(map.len(), N, "expected {N} kptr findings: {map:?}");
         for i in 0..N {
@@ -9069,10 +10380,14 @@ mod tests {
         let q50_id: u32 = 5;
         let q99_id: u32 = 6;
         // f50 at offset 400; f99 at offset 792.
+        // Each LoadedU64Field gets an addr_space_cast applied for
+        // F1 mitigation arena_confirmed evidence.
         let insns = vec![
             ldx(BPF_SIZE_DW, 2, 1, 400),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_W, 3, 2, 4),
             ldx(BPF_SIZE_DW, 2, 1, 792),
+            addr_space_cast(2, 2, 1),
             ldx(BPF_SIZE_B, 4, 2, 5),
             exit(),
         ];
@@ -9083,6 +10398,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -9172,9 +10488,12 @@ mod tests {
         let blob = build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).unwrap();
         let t_id: u32 = 3;
-        let mut insns: Vec<BpfInsn> = Vec::with_capacity(2 * N as usize + 1);
+        // Emit one (load + arena_cast + deref) triple per pattern for
+        // F1 mitigation arena_confirmed evidence on each slot.
+        let mut insns: Vec<BpfInsn> = Vec::with_capacity(3 * N as usize + 1);
         for i in 0..N {
             insns.push(ldx(BPF_SIZE_DW, 2, 1, (8 * i) as i16));
+            insns.push(addr_space_cast(2, 2, 1));
             insns.push(ldx(BPF_SIZE_B, 3, 2, (i + 1) as i16));
         }
         insns.push(exit());
@@ -9185,6 +10504,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );
@@ -9232,6 +10552,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: 1,
             }],
+            &[],
             &[],
             &[],
         );
@@ -9308,10 +10629,512 @@ mod tests {
             }],
             &[],
             &[],
+            &[],
         );
         assert!(
             map.is_empty(),
             "Int-only BTF must produce empty CastMap: {map:?}"
+        );
+    }
+
+    // ----- STX-flow arena cast (allocator-return seed path) ------
+    //
+    // The STX-flow path detects allocator-return values stored into
+    // u64 slots: at a `BPF_PSEUDO_CALL` site flagged via
+    // [`SubprogReturn::insn_offset`], the analyzer seeds R0 to
+    // `RegState::ArenaU64FromAlloc` after the standard R0..=R5
+    // clobber. The next STX of R0 (or its propagation through MOV /
+    // stack spill) into a u64 field of a typed `Pointer{P}` parent
+    // records `(P, off)` as an Arena cast finding with
+    // `target_type_id == 0` (the renderer's resolve_arena_type
+    // bridge supplies the actual payload type at chase time).
+
+    /// Allocator-return → STX path: a `BPF_PSEUDO_CALL` flagged by
+    /// `SubprogReturn` seeds R0 to `ArenaU64FromAlloc`; the
+    /// subsequent `STX [R1+8] = R0` records `(M, 8)` as an Arena
+    /// finding with `target_type_id == 0`. The renderer's
+    /// `resolve_arena_type` bridge resolves the actual payload type
+    /// at chase time.
+    #[test]
+    fn stx_flow_alloc_return_records_arena_finding() {
+        // BTF: u64(1), M(2, u64@8 — the `cgx_raw` slot).
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_m = push_name(&mut strings, "M");
+        let n_cgx = push_name(&mut strings, "cgx_raw");
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Struct {
+                name_off: n_m,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_cgx,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let m_id = 2;
+        // R6 is callee-saved per the BPF ABI — survives the
+        // R0..=R5 clobber the call applies. Seed R6 = Pointer{M}
+        // so the post-call STX through R6 still has a typed parent
+        // base. R1 cannot be used as the parent (the call clobbers
+        // it as an argument register), and the test specifically
+        // wants the analyzer to record `(M, 8)` AFTER the call.
+        //
+        // Insn 0: BPF_PSEUDO_CALL — SubprogReturn seed at
+        //         insn_offset=0 tags R0 as ArenaU64FromAlloc
+        //         after the R0..=R5 clobber.
+        // Insn 1: STX [R6 + 8] = R0 — records (M, 8) -> Arena
+        //         via the STX-flow path.
+        let pseudo_call = mk_insn(
+            BPF_CLASS_JMP | BPF_OP_CALL,
+            0,
+            BPF_PSEUDO_CALL,
+            0,
+            0, // pc-relative offset to the subprog (irrelevant here)
+        );
+        let insns = vec![pseudo_call, stx(BPF_SIZE_DW, 6, 0, 8), exit()];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: m_id,
+            }],
+            &[],
+            &[],
+            &[SubprogReturn { insn_offset: 0 }],
+        );
+        assert_eq!(
+            map.get(&(m_id, 8)),
+            Some(&CastHit {
+                target_type_id: 0,
+                addr_space: AddrSpace::Arena,
+            }),
+            "STX-flow alloc-return must record Arena finding with \
+             target_type_id=0: {map:?}"
+        );
+    }
+
+    /// Allocator-return seed propagates through `mov_x` so a register
+    /// rename before the STX still records the Arena finding.
+    #[test]
+    fn stx_flow_alloc_return_propagates_through_mov() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_m = push_name(&mut strings, "M");
+        let n_cgx = push_name(&mut strings, "cgx_raw");
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Struct {
+                name_off: n_m,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_cgx,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let m_id = 2;
+        let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+        // r7 = r0  (mov_x). r7 is callee-saved per the BPF ABI;
+        // mov_x propagates ArenaU64FromAlloc from R0 to R7. R6 is
+        // the parent base (callee-saved, seeded as `Pointer{M}`),
+        // so the STX through [R6 + 8] = R7 records the Arena
+        // finding. The post-call STX cannot use R1 as the parent —
+        // the call clobbered R1 along with the rest of R0..=R5.
+        let insns = vec![pseudo_call, mov_x(7, 0), stx(BPF_SIZE_DW, 6, 7, 8), exit()];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: m_id,
+            }],
+            &[],
+            &[],
+            &[SubprogReturn { insn_offset: 0 }],
+        );
+        assert_eq!(
+            map.get(&(m_id, 8)),
+            Some(&CastHit {
+                target_type_id: 0,
+                addr_space: AddrSpace::Arena,
+            }),
+            "MOV must propagate ArenaU64FromAlloc through r7: {map:?}"
+        );
+    }
+
+    /// Allocator-return seed propagates through stack spill / reload.
+    /// Mirrors the `register_stack_spill_round_trip` pattern: STX
+    /// through r10 saves the register state, LDX through r10
+    /// restores it.
+    #[test]
+    fn stx_flow_alloc_return_round_trips_through_stack() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_m = push_name(&mut strings, "M");
+        let n_cgx = push_name(&mut strings, "cgx_raw");
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Struct {
+                name_off: n_m,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_cgx,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let m_id = 2;
+        let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+        // *(u64 *)(r10 - 8) = r0   ; spill R0 (ArenaU64FromAlloc)
+        // r7 = *(u64 *)(r10 - 8)   ; reload — R7 holds ArenaU64FromAlloc
+        // *(u64 *)(R6 + 8) = R7    ; records (M, 8) -> Arena
+        //
+        // R6 is the parent base, seeded as `Pointer{M}`. Both R6
+        // and R7 are callee-saved — they survive the R0..=R5
+        // clobber the call applied at PC 0.
+        let insns = vec![
+            pseudo_call,
+            stx(BPF_SIZE_DW, 10, 0, -8),
+            ldx(BPF_SIZE_DW, 7, 10, -8),
+            stx(BPF_SIZE_DW, 6, 7, 8),
+            exit(),
+        ];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: m_id,
+            }],
+            &[],
+            &[],
+            &[SubprogReturn { insn_offset: 0 }],
+        );
+        assert_eq!(
+            map.get(&(m_id, 8)),
+            Some(&CastHit {
+                target_type_id: 0,
+                addr_space: AddrSpace::Arena,
+            }),
+            "Stack spill/reload must round-trip ArenaU64FromAlloc: {map:?}"
+        );
+    }
+
+    /// Subsequent LDX from a previously-arena-tagged slot inherits
+    /// `ArenaU64FromAlloc` (alias-set tracking). Storing the
+    /// inherited tag into another u64 slot also records the Arena
+    /// finding.
+    #[test]
+    fn stx_flow_alias_tracking_propagates_via_ldx() {
+        // M: { u64 src_slot @ 0; u64 dst_slot @ 8 }
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_m = push_name(&mut strings, "M");
+        let n_src = push_name(&mut strings, "src_slot");
+        let n_dst = push_name(&mut strings, "dst_slot");
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Struct {
+                name_off: n_m,
+                size: 16,
+                members: vec![
+                    SynMember {
+                        name_off: n_src,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SynMember {
+                        name_off: n_dst,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let m_id = 2;
+        let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+        // pc 0: pseudo_call -> R0 = ArenaU64FromAlloc.
+        // pc 1: stx [R6 + 0] = R0 -> records (M, 0) -> Arena.
+        // pc 2: ldx R7, [R6 + 0]   -> R7 inherits ArenaU64FromAlloc
+        //                              via alias-set tracking.
+        // pc 3: stx [R6 + 8] = R7 -> records (M, 8) -> Arena.
+        //
+        // R6 is the parent base (callee-saved, seeded as
+        // `Pointer{M}`); R7 is also callee-saved and survives
+        // any future call clobber. R1 cannot be the parent here —
+        // the call at PC 0 clobbered it.
+        let insns = vec![
+            pseudo_call,
+            stx(BPF_SIZE_DW, 6, 0, 0),
+            ldx(BPF_SIZE_DW, 7, 6, 0),
+            stx(BPF_SIZE_DW, 6, 7, 8),
+            exit(),
+        ];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: m_id,
+            }],
+            &[],
+            &[],
+            &[SubprogReturn { insn_offset: 0 }],
+        );
+        assert_eq!(
+            map.get(&(m_id, 0)),
+            Some(&CastHit {
+                target_type_id: 0,
+                addr_space: AddrSpace::Arena,
+            }),
+            "first STX must record (M, 0) -> Arena: {map:?}"
+        );
+        assert_eq!(
+            map.get(&(m_id, 8)),
+            Some(&CastHit {
+                target_type_id: 0,
+                addr_space: AddrSpace::Arena,
+            }),
+            "alias-tracked LDX from (M, 0) must propagate to (M, 8) STX: {map:?}"
+        );
+    }
+
+    /// Conflict between arena STX and kernel kptr STX on the same
+    /// slot drops both observations from the output map. Mirrors the
+    /// existing arena/kptr conflict invariant for the new path.
+    #[test]
+    fn stx_flow_conflict_with_kptr_drops_both() {
+        // BTF: u64(1), T(2, struct), T*(3), M(4, u64@0).
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_t = push_name(&mut strings, "T");
+        let n_m = push_name(&mut strings, "M");
+        let n_x = push_name(&mut strings, "x");
+        let n_slot = push_name(&mut strings, "slot");
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Struct {
+                name_off: n_t,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_x,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            SynType::Ptr { type_id: 2 },
+            SynType::Struct {
+                name_off: n_m,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_slot,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let m_id = 4;
+        let t_id = 2;
+        let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+        // R6 = M* (parent base, callee-saved → survives the call).
+        // R7 = T* (kptr value source, also callee-saved → survives
+        // the call). pc 0: pseudo_call → R0 = arena.
+        // pc 1: stx [R6+0] = R0 → arena_stx_findings[(M,0)] = Pending.
+        // pc 2: stx [R6+0] = R7 → kptr_findings[(M,0)] = Single(T).
+        // Conflict: both observations on (M, 0) — drop both.
+        let insns = vec![
+            pseudo_call,
+            stx(BPF_SIZE_DW, 6, 0, 0),
+            stx(BPF_SIZE_DW, 6, 7, 0),
+            exit(),
+        ];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[
+                InitialReg {
+                    reg: 6,
+                    struct_type_id: m_id,
+                },
+                InitialReg {
+                    reg: 7,
+                    struct_type_id: t_id,
+                },
+            ],
+            &[],
+            &[],
+            &[SubprogReturn { insn_offset: 0 }],
+        );
+        assert!(
+            !map.contains_key(&(m_id, 0)),
+            "arena/kptr conflict must drop the slot from output: {map:?}"
+        );
+    }
+
+    /// Same slot triggers both detection paths in one program: the
+    /// shape-inference path's LDX accumulates into `patterns`, then
+    /// a `pseudo_call` + STX-flow path inserts into
+    /// `arena_stx_findings`. `finalize` emits the arena-STX entry
+    /// with `target_type_id=0` first (line ~1855 in the source),
+    /// then the shape-inference loop overwrites with the concrete
+    /// target id when it has direct evidence (line ~1949). Pin the
+    /// overwrite-by-shape-inference contract: the final entry is
+    /// `(parent, off) -> CastHit { target_type_id: <q_id>, Arena }`,
+    /// NOT the deferred `target_type_id=0` sentinel.
+    ///
+    /// Order of operations in the synthesized program matters: the
+    /// shape-inference LDX chain runs BEFORE the STX-flow STX,
+    /// because once `arena_stx_findings` has the slot, subsequent
+    /// LDXs through that slot are tagged
+    /// [`RegState::ArenaU64FromAlloc`] (alias-tracking, line ~1318)
+    /// instead of `LoadedU64Field` — and `ArenaU64FromAlloc` does
+    /// not contribute to the `patterns` map (the LDX-of-arena-tag
+    /// arm at line ~1378 sets dst Unknown without recording).
+    /// Building the shape pattern first lets both paths converge on
+    /// the same slot.
+    #[test]
+    fn stx_flow_emits_zero_target_then_shape_overwrites_with_concrete_target() {
+        // BTF: u64(1), P(2, u64@8 source), Q(3, u64@0+u64@8). Q is
+        // the unique candidate matching both pattern accesses
+        // (offset=0, size=8) and (offset=8, size=8).
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_p = push_name(&mut strings, "P");
+        let n_q = push_name(&mut strings, "Q");
+        let n_f = push_name(&mut strings, "f");
+        let n_a = push_name(&mut strings, "a");
+        let n_b = push_name(&mut strings, "b");
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Struct {
+                name_off: n_p,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_f,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+            SynType::Struct {
+                name_off: n_q,
+                size: 16,
+                members: vec![
+                    SynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SynMember {
+                        name_off: n_b,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let p_id = 2;
+        let q_id = 3;
+        let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+        // Phase 1 — shape inference accumulates `patterns` for (P, 8):
+        //   r2 = LDX[r1 + 8]   ; r2 = LoadedU64Field{P, 8}, patterns
+        //                        seeded with empty access set
+        //   r3 = LDX[r2 + 0]   ; records access (0, 8)
+        //   r4 = LDX[r2 + 8]   ; records access (8, 8)
+        // Phase 2 — preserve r1 across the call clobber by stashing
+        // it in r6 (callee-saved per BPF ABI, R0..R5 only clobbered):
+        //   r6 = r1
+        // Phase 3 — STX-flow tags the same slot:
+        //   pseudo_call (PC 4)  ; SubprogReturn at PC=4 sets R0 to
+        //                         RegState::ArenaU64FromAlloc after
+        //                         the standard R0..=R5 clobber
+        //   STX[r6 + 8] = r0    ; arena_stx_findings.insert((P, 8),
+        //                         Pending)
+        let insns = vec![
+            // Phase 1: shape inference seeding.
+            ldx(BPF_SIZE_DW, 2, 1, 8),
+            ldx(BPF_SIZE_DW, 3, 2, 0),
+            ldx(BPF_SIZE_DW, 4, 2, 8),
+            // Phase 2: preserve P* across the call.
+            mov_x(6, 1),
+            // Phase 3: STX-flow tag.
+            pseudo_call,
+            stx(BPF_SIZE_DW, 6, 0, 8),
+            exit(),
+        ];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 1,
+                struct_type_id: p_id,
+            }],
+            &[],
+            &[],
+            &[SubprogReturn { insn_offset: 4 }],
+        );
+        assert_eq!(
+            map.get(&(p_id, 8)),
+            Some(&CastHit {
+                target_type_id: q_id,
+                addr_space: AddrSpace::Arena,
+            }),
+            "shape-inference loop must OVERWRITE the STX-flow's \
+             target_type_id=0 sentinel with the concrete unique \
+             candidate id (per finalize's emit ordering): {map:?}"
         );
     }
 
@@ -9324,6 +11147,904 @@ mod tests {
     /// packed with two-slot ops. Also exercises the same pattern in
     /// `jump_targets`'s pre-pass — both must agree on which slots are
     /// second-half placeholders.
+    /// Helper: build a BTF blob carrying:
+    ///   - `u64` (id 1)
+    ///   - struct `M` (id 2) with one `u64 cgx_raw` member at byte
+    ///     offset 8
+    ///   - `void *` (id 3) — `Ptr -> 0` (the BTF void marker)
+    ///   - `FuncProto` returning id 3 with no params (id 4)
+    ///   - `BTF_KIND_FUNC` named `func_name` extern-linkage referring
+    ///     to FuncProto id 4 (id 5)
+    ///
+    /// Returns the byte blob plus `(M_id, kfunc_id) = (2, 5)`. Used
+    /// by the kfunc-allocator-arm tests below — the analyzer's
+    /// `handle_kfunc_call` arm peels the kfunc's return type to
+    /// `Ptr -> Void`, looks up the kfunc's name, and applies the
+    /// `ARENA_ALLOC_KFUNC_NAMES` allowlist to decide whether to tag
+    /// R0 as `ArenaU64FromAlloc`.
+    fn btf_with_arena_alloc_kfunc(func_name: &str) -> (Vec<u8>, u32, u32) {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_m = push_name(&mut strings, "M");
+        let n_cgx = push_name(&mut strings, "cgx_raw");
+        let n_func = push_name(&mut strings, func_name);
+        let types = vec![
+            // id 1: u64
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: struct M { u64 cgx_raw @ 8 } size=16
+            SynType::Struct {
+                name_off: n_m,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_cgx,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+            // id 3: Ptr -> Void (pointee type id == 0). The
+            // `void *` shape kfunc allocators declare.
+            SynType::Ptr { type_id: 0 },
+            // id 4: FuncProto returning id 3 with no params.
+            SynType::FuncProto {
+                return_type_id: 3,
+                params: vec![],
+            },
+            // id 5: Func named func_name, extern, type id = 4.
+            SynType::Func {
+                name_off: n_func,
+                type_id: 4,
+                linkage: 2, // BTF_FUNC_EXTERN
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        (blob, 2, 5)
+    }
+
+    /// Kfunc allocator arm — happy path. Calling
+    /// `bpf_arena_alloc_pages` (an allowlisted kfunc whose return
+    /// peels to `Ptr -> Void`) tags R0 as
+    /// [`RegState::ArenaU64FromAlloc`]; the subsequent STX of R0
+    /// into a u64 slot of a typed parent records an Arena finding.
+    #[test]
+    fn kfunc_arena_alloc_allowlist_records_arena_finding() {
+        let (blob, m_id, kfunc_id) = btf_with_arena_alloc_kfunc("bpf_arena_alloc_pages");
+        let btf = Btf::from_bytes(&blob).unwrap();
+        // R6 holds `Pointer{M}` and is callee-saved per the BPF
+        // ABI, so it survives the R0..=R5 clobber the kfunc call
+        // applies. Seeding R1 instead would be wiped by the call
+        // and the post-call STX would have an Unknown parent.
+        //
+        // Insn 0: BPF_PSEUDO_KFUNC_CALL with imm=kfunc_id. The
+        //         analyzer's `handle_kfunc_call` resolves the
+        //         kfunc, peels the return through `Ptr -> Void`,
+        //         matches the name against
+        //         `ARENA_ALLOC_KFUNC_NAMES`, and tags R0 as
+        //         ArenaU64FromAlloc.
+        // Insn 1: STX [R6 + 8] = R0 — records (M, 8) -> Arena.
+        let kfunc_call = mk_insn(
+            BPF_CLASS_JMP | BPF_OP_CALL,
+            0,
+            BPF_PSEUDO_KFUNC_CALL,
+            0,
+            kfunc_id as i32,
+        );
+        let insns = vec![kfunc_call, stx(BPF_SIZE_DW, 6, 0, 8), exit()];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: m_id,
+            }],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(
+            map.get(&(m_id, 8)),
+            Some(&CastHit {
+                target_type_id: 0,
+                addr_space: AddrSpace::Arena,
+            }),
+            "allowlisted kfunc with `Ptr -> Void` return must seed R0 \
+             as ArenaU64FromAlloc; subsequent STX must record an Arena \
+             finding: {map:?}"
+        );
+    }
+
+    /// Kfunc allocator arm — strict gate: a kfunc whose name is on
+    /// the allowlist BUT whose return type is NOT `Ptr -> Void`
+    /// (e.g. a same-named kfunc with a typed-pointer return) must
+    /// fall through to the typed-pointer arm OR no-op. Drift between
+    /// the kernel BTF and the analyzer's allowlist must not produce
+    /// a false positive.
+    #[test]
+    fn kfunc_arena_alloc_typed_return_falls_through() {
+        // BTF: u64(1), M(2), struct R(3, u64@0), Ptr->R(4),
+        // FuncProto returning Ptr->R(5), Func named
+        // "bpf_arena_alloc_pages" -> proto 5 (id 6).
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_m = push_name(&mut strings, "M");
+        let n_cgx = push_name(&mut strings, "cgx_raw");
+        let n_r = push_name(&mut strings, "R");
+        let n_x = push_name(&mut strings, "x");
+        let n_func = push_name(&mut strings, "bpf_arena_alloc_pages");
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Struct {
+                name_off: n_m,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_cgx,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+            // id 3: struct R { u64 x @ 0 } — a TYPED struct, not Void.
+            SynType::Struct {
+                name_off: n_r,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_x,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            // id 4: Ptr -> R (pointee type id == 3, NOT 0).
+            SynType::Ptr { type_id: 3 },
+            // id 5: FuncProto returning id 4.
+            SynType::FuncProto {
+                return_type_id: 4,
+                params: vec![],
+            },
+            // id 6: Func named the allowlisted name, but with a
+            // typed-pointer return.
+            SynType::Func {
+                name_off: n_func,
+                type_id: 5,
+                linkage: 2,
+            },
+        ];
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let m_id = 2;
+        let kfunc_id = 6;
+        let kfunc_call = mk_insn(
+            BPF_CLASS_JMP | BPF_OP_CALL,
+            0,
+            BPF_PSEUDO_KFUNC_CALL,
+            0,
+            kfunc_id,
+        );
+        // R6 holds `Pointer{M}` (callee-saved, survives the call).
+        // The post-call STX through R6 records the kptr finding
+        // for the (M, 8) slot.
+        let insns = vec![kfunc_call, stx(BPF_SIZE_DW, 6, 0, 8), exit()];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: m_id,
+            }],
+            &[],
+            &[],
+            &[],
+        );
+        // The typed-pointer arm fires first and tags R0 as
+        // `Pointer{R}` (not ArenaU64FromAlloc). The subsequent STX
+        // records a Kernel kptr finding `(M, 8) -> R`, NOT an
+        // Arena finding. The allowlist arm DID NOT execute because
+        // arm 1 returned first.
+        assert_eq!(
+            map.get(&(m_id, 8)),
+            Some(&CastHit {
+                target_type_id: 3, // R's id
+                addr_space: AddrSpace::Kernel,
+            }),
+            "kfunc whose return is typed (Ptr -> Struct) must take the \
+             typed-pointer arm, NOT the arena allocator arm; the \
+             allowlist arm must not produce a false-positive Arena \
+             finding: {map:?}"
+        );
+    }
+
+    /// Kfunc allocator arm — strict gate: a kfunc whose return
+    /// peels to `Ptr -> Void` but whose name is NOT on the
+    /// allowlist must NOT seed R0 as ArenaU64FromAlloc. Without
+    /// the name gate, every `void *`-returning kfunc would tag
+    /// arbitrary u64 slots as arena-shaped.
+    #[test]
+    fn kfunc_arena_alloc_non_allowlist_name_drops() {
+        // Use an unrelated kfunc name. The BTF still has a
+        // `Ptr -> Void` return.
+        let (blob, m_id, kfunc_id) = btf_with_arena_alloc_kfunc("ktstr_unlisted_kfunc");
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let kfunc_call = mk_insn(
+            BPF_CLASS_JMP | BPF_OP_CALL,
+            0,
+            BPF_PSEUDO_KFUNC_CALL,
+            0,
+            kfunc_id as i32,
+        );
+        // R6 (callee-saved) holds `Pointer{M}`; survives the call
+        // clobber. The post-call STX through R6 has a typed parent;
+        // the only way the assertion (`map.is_empty()`) could fail
+        // is if the analyzer mistakenly tagged R0 as
+        // ArenaU64FromAlloc despite the non-allowlist name. Using
+        // R6 ensures the test is not falsely passing because the
+        // STX itself failed (R1 clobbered).
+        let insns = vec![kfunc_call, stx(BPF_SIZE_DW, 6, 0, 8), exit()];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: m_id,
+            }],
+            &[],
+            &[],
+            &[],
+        );
+        // R0 stays Unknown (arm 1 sees a non-Struct return and
+        // returns; arm 2 sees a non-allowlist name and drops).
+        // The STX with R0=Unknown produces no finding regardless
+        // of whether the parent base register is typed.
+        assert!(
+            map.is_empty(),
+            "kfunc with `Ptr -> Void` return but non-allowlist name must \
+             NOT seed an arena finding: {map:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    //
+    // Plain-helper return tests: bpf_map_lookup_elem (helper id 1)
+    //
+    // These tests exercise the analyzer's `BPF_OP_CALL` plain-helper
+    // arm. The arm fires when `src_reg == 0` (helper-call pseudo per
+    // linux uapi `bpf.h`), `imm == BPF_FUNC_map_lookup_elem` (== 1),
+    // and the saved-pre-clobber R1 was a [`RegState::DatasecPointer`]
+    // into a `BTF_KIND_DATASEC` named `.maps`. The analyzer types R0
+    // as `Pointer{value_struct_id}` only when the targeted map's BTF
+    // declaration carries a `value` member whose type peels to
+    // `Ptr -> Struct/Union`. Stat-counter maps and other shapes drop.
+    //
+    // Fixtures synthesise a `.maps` datasec with one map declaration
+    // matching the libbpf `parse_btf_map_def` shape (a per-map struct
+    // whose `value` member type is `typeof(T) *` per the
+    // `__type(value, T)` macro in `tools/lib/bpf/bpf_helpers.h`).
+
+    /// `BPF_CALL` for the plain-helper form: `code = BPF_JMP|BPF_CALL`,
+    /// `src_reg == 0` (helper, not pseudo), `imm == helper_id`. Mirrors
+    /// what clang emits for `bpf_map_lookup_elem(...)` and friends.
+    fn helper_call(helper_id: i32) -> BpfInsn {
+        mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, 0, 0, helper_id)
+    }
+
+    /// Selector for the `value` member's underlying shape in the
+    /// synthetic `.maps` BTF fixture built by
+    /// [`btf_with_maps_and_task_ctx`].
+    ///
+    /// - `Struct`: `Ptr -> struct cbw_cgrp_entry { u64 cgx @ 0 }`
+    ///   (the canonical case — should resolve to the entry struct id).
+    /// - `U64`: `Ptr -> u64` (stat-counter map — should drop because
+    ///   `resolve_to_struct_id` rejects a non-struct pointee).
+    /// - `Typedef`: `Ptr -> Typedef -> struct cbw_cgrp_entry`
+    ///   (typedef-wrapped struct; resolution must peel the typedef).
+    /// - `Void`: `Ptr -> void` (`__type(value, void)` — not a real
+    ///   libbpf shape but exercises the `resolve_to_struct_id`
+    ///   `pointee == 0` reject path).
+    enum MapValueShape {
+        Struct,
+        U64,
+        Typedef,
+        #[allow(dead_code)] // Void shape is reserved for a follow-up
+        // void-pointee assertion; the existing tests do not exercise
+        // it directly because the U64 case already covers the
+        // `resolve_to_struct_id` reject path.
+        Void,
+    }
+
+    /// Happy path: `entry = bpf_map_lookup_elem(&map, &key)` types
+    /// R0 as `Pointer{cbw_cgrp_entry}`, then a follow-up STX of R0
+    /// into a u64 slot of an outer `Pointer{task_ctx}` records a
+    /// kernel kptr finding.
+    ///
+    /// This is the load-bearing end-to-end test: it proves the
+    /// helper-return arm types R0 AND that the typed R0 flows into
+    /// the existing kptr STX path without any other plumbing.
+    /// Without Delta A landing this test would fail because R0
+    /// would stay Unknown after the call, and the STX would record
+    /// nothing.
+    ///
+    /// Sequence (mirrors clang's `__always_inline`'d inline
+    /// `cbw_get_cgroup_ctx_raw` codegen):
+    ///   r1 = LD_IMM64(.maps, 0)        ; r1 = DatasecPointer{maps,0}
+    ///   r2 = key                       ; analyzer ignores R2 (the
+    ///                                  ; ARG_PTR_TO_MAP_KEY is a
+    ///                                  ; verifier-side gate, not a
+    ///                                  ; cast-finding signal)
+    ///   call helper(BPF_FUNC_map_lookup_elem)
+    ///   *(u64 *)(r6 + 8) = r0          ; STX R0 into task_ctx.cgx_raw
+    ///
+    /// R6 is seeded as `Pointer{task_ctx}` so the STX's parent base
+    /// resolves to a struct with a u64 field at offset 8. The
+    /// expected finding keys on `(task_ctx_id, 8) ->
+    /// (cbw_cgrp_entry_id, Kernel)`.
+    #[test]
+    fn helper_map_lookup_elem_typed_value_seeds_r0() {
+        let (blob, datasec_id, var_off, value_sid, parent_id) =
+            btf_with_maps_and_task_ctx(MapValueShape::Struct);
+        let btf = Btf::from_bytes(&blob).unwrap();
+
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0); // R2 = key (Unknown — analyzer ignores)
+        let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
+        // *(u64 *)(R6 + 8) = R0 — STX R0 into task_ctx.cgx_raw.
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 0, 8);
+
+        let insns = vec![
+            ld_lo, ld_hi, mov_key, call_lookup, stx_kptr, exit(),
+        ];
+        // PC numbering: 0=ld_lo, 1=ld_hi (skip), 2=mov_key,
+        // 3=call_lookup, 4=stx_kptr, 5=exit. The DatasecPointer
+        // marks PC=0 (the LD_IMM64 lo slot) as targeting `.maps`.
+        let datasec_pointers = vec![DatasecPointer {
+            insn_offset: 0,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        }];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: parent_id,
+            }],
+            &[],
+            &datasec_pointers,
+            &[],
+        );
+        assert_eq!(
+            map.get(&(parent_id, 8)),
+            Some(&CastHit {
+                target_type_id: value_sid,
+                addr_space: AddrSpace::Kernel,
+            }),
+            "lookup-derived R0 stored into task_ctx.cgx_raw must record \
+             (task_ctx, 8) -> (cbw_cgrp_entry, Kernel): {map:?}"
+        );
+    }
+
+    /// Stat-counter map shape: `__type(value, u64)` produces a
+    /// `value` member of type `Ptr -> u64`. `resolve_to_struct_id`
+    /// returns None (u64 is not a struct), so the helper-return
+    /// arm leaves R0 Unknown. The follow-up STX records nothing.
+    #[test]
+    fn helper_map_lookup_elem_value_type_unresolvable_keeps_r0_unknown() {
+        let (blob, datasec_id, var_off, _value_sid, parent_id) =
+            btf_with_maps_and_task_ctx(MapValueShape::U64);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0);
+        let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 0, 8);
+        let insns = vec![ld_lo, ld_hi, mov_key, call_lookup, stx_kptr, exit()];
+        let datasec_pointers = vec![DatasecPointer {
+            insn_offset: 0,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        }];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: parent_id,
+            }],
+            &[],
+            &datasec_pointers,
+            &[],
+        );
+        assert!(
+            map.is_empty(),
+            "stat-counter map (`__type(value, u64)`) must keep R0 Unknown \
+             so the STX records nothing: {map:?}"
+        );
+    }
+
+    /// Typedef-wrapped value type: `__type(value, cbw_cgrp_entry_t)`
+    /// where `typedef struct cbw_cgrp_entry cbw_cgrp_entry_t;`. The
+    /// analyzer must peel the typedef via `peel_modifiers` /
+    /// `resolve_to_struct_id` and resolve to the underlying struct id.
+    #[test]
+    fn helper_map_lookup_elem_value_type_struct_via_typedef() {
+        let (blob, datasec_id, var_off, value_sid, parent_id) =
+            btf_with_maps_and_task_ctx(MapValueShape::Typedef);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0);
+        let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 0, 8);
+        let insns = vec![ld_lo, ld_hi, mov_key, call_lookup, stx_kptr, exit()];
+        let datasec_pointers = vec![DatasecPointer {
+            insn_offset: 0,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        }];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: parent_id,
+            }],
+            &[],
+            &datasec_pointers,
+            &[],
+        );
+        assert_eq!(
+            map.get(&(parent_id, 8)),
+            Some(&CastHit {
+                target_type_id: value_sid,
+                addr_space: AddrSpace::Kernel,
+            }),
+            "typedef-wrapped value type must peel to the underlying struct id: {map:?}"
+        );
+    }
+
+    /// Missing-`.maps`-datasec case: the call site's R1 is Unknown
+    /// (no DatasecPointer annotation was emitted), so the
+    /// helper-return arm cannot resolve R0. Analogous to the
+    /// `ld_imm64_without_annotation_no_record` test for the kptr
+    /// path.
+    #[test]
+    fn helper_map_lookup_elem_no_map_metadata_keeps_r0_unknown() {
+        let (blob, _datasec_id, var_off, _value_sid, parent_id) =
+            btf_with_maps_and_task_ctx(MapValueShape::Struct);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0);
+        let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 0, 8);
+        let insns = vec![ld_lo, ld_hi, mov_key, call_lookup, stx_kptr, exit()];
+        // Empty datasec_pointers — analyzer leaves R1 Unknown
+        // through the LD_IMM64; helper-return arm sees a non-
+        // DatasecPointer and falls through.
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: parent_id,
+            }],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            map.is_empty(),
+            "without DatasecPointer annotation R1 stays Unknown so the \
+             helper-return arm cannot type R0: {map:?}"
+        );
+    }
+
+    /// Helper allowlist gate: a non-`bpf_map_lookup_elem` helper id
+    /// (e.g. `BPF_FUNC_get_current_task = 35`) must NOT seed R0 even
+    /// when R1 is a valid `.maps` DatasecPointer. The arm keys on
+    /// `imm == BPF_FUNC_map_lookup_elem` exactly.
+    #[test]
+    fn helper_not_in_allowlist_keeps_r0_unknown() {
+        let (blob, datasec_id, var_off, _value_sid, parent_id) =
+            btf_with_maps_and_task_ctx(MapValueShape::Struct);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0);
+        // BPF_FUNC_get_current_task = 35 per linux uapi `bpf.h`.
+        // The arm rejects this id even though R1 is a valid `.maps`
+        // descriptor.
+        let call_other = helper_call(35);
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 0, 8);
+        let insns = vec![ld_lo, ld_hi, mov_key, call_other, stx_kptr, exit()];
+        let datasec_pointers = vec![DatasecPointer {
+            insn_offset: 0,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        }];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: parent_id,
+            }],
+            &[],
+            &datasec_pointers,
+            &[],
+        );
+        assert!(
+            map.is_empty(),
+            "non-bpf_map_lookup_elem helper must not type R0 even with \
+             a valid `.maps` R1: {map:?}"
+        );
+    }
+
+    /// Boundary check: `imm <= 0` (negative or zero) must drop. A
+    /// pre-relocation kfunc placeholder uses `imm == -1`, but those
+    /// carry `src_reg == BPF_PSEUDO_CALL` so the helper arm's
+    /// `pseudo == 0` gate already rejects them. This test exercises
+    /// the explicit boundary on a synthetic plain helper with
+    /// negative or zero imm — `BPF_FUNC_unspec == 0` and any
+    /// negative value must NOT match BPF_FUNC_map_lookup_elem (== 1).
+    #[test]
+    fn helper_imm_negative_or_zero_keeps_r0_unknown() {
+        let (blob, datasec_id, var_off, _value_sid, parent_id) =
+            btf_with_maps_and_task_ctx(MapValueShape::Struct);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0);
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 0, 8);
+        let datasec_pointers = vec![DatasecPointer {
+            insn_offset: 0,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        }];
+        // Try imm == 0 (BPF_FUNC_unspec).
+        {
+            let call_zero = helper_call(0);
+            let insns = vec![ld_lo, ld_hi, mov_key, call_zero, stx_kptr, exit()];
+            let map = analyze_casts(
+                &insns,
+                &btf,
+                &[InitialReg {
+                    reg: 6,
+                    struct_type_id: parent_id,
+                }],
+                &[],
+                &datasec_pointers,
+                &[],
+            );
+            assert!(
+                map.is_empty(),
+                "helper id 0 (BPF_FUNC_unspec) must not seed R0: {map:?}"
+            );
+        }
+        // Try imm == -1 (placeholder shape with plain pseudo).
+        {
+            let call_neg = helper_call(-1);
+            let insns = vec![ld_lo, ld_hi, mov_key, call_neg, stx_kptr, exit()];
+            let map = analyze_casts(
+                &insns,
+                &btf,
+                &[InitialReg {
+                    reg: 6,
+                    struct_type_id: parent_id,
+                }],
+                &[],
+                &datasec_pointers,
+                &[],
+            );
+            assert!(
+                map.is_empty(),
+                "helper id -1 must not seed R0: {map:?}"
+            );
+        }
+    }
+
+    /// End-to-end: lookup → STX into typed slot → CastMap entry.
+    ///
+    /// This is the load-bearing test for the user's stated goal: the
+    /// `bpf_map_lookup_elem` returned pointer must thread through the
+    /// existing kptr STX path and produce a CastMap entry the
+    /// renderer can chase. Distinct from
+    /// `helper_map_lookup_elem_typed_value_seeds_r0` (which uses the
+    /// same flow but is named for the seeding step) by adding a MOV
+    /// between the call and the STX, exercising the typed-pointer
+    /// propagation path the analyzer already supports.
+    #[test]
+    fn stx_through_helper_returned_pointer_records_finding() {
+        let (blob, datasec_id, var_off, value_sid, parent_id) =
+            btf_with_maps_and_task_ctx(MapValueShape::Struct);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0);
+        let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
+        // r7 = r0 — propagate the typed pointer through a callee-
+        // saved register before the STX. Verifies the typed-pointer
+        // state survives an ALU64|MOV|X.
+        let mov_r7 = mov_x(7, 0);
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 7, 8);
+        let insns = vec![
+            ld_lo, ld_hi, mov_key, call_lookup, mov_r7, stx_kptr, exit(),
+        ];
+        let datasec_pointers = vec![DatasecPointer {
+            insn_offset: 0,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        }];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: parent_id,
+            }],
+            &[],
+            &datasec_pointers,
+            &[],
+        );
+        assert_eq!(
+            map.get(&(parent_id, 8)),
+            Some(&CastHit {
+                target_type_id: value_sid,
+                addr_space: AddrSpace::Kernel,
+            }),
+            "lookup -> mov -> stx into task_ctx.cgx_raw must record a kernel \
+             cast finding: {map:?}"
+        );
+    }
+
+    /// Build a BTF that includes a `.maps` datasec with a single
+    /// map declaration AND a separate `task_ctx { u64 cgx_raw @ 8 }`
+    /// parent struct used as the STX destination base for the
+    /// end-to-end tests above. Returns `(blob, datasec_id,
+    /// var_offset, value_struct_id, parent_struct_id)`.
+    ///
+    /// `value_struct_id` is `0` when the resolution is expected to
+    /// drop ([`MapValueShape::U64`], [`MapValueShape::Void`]) — the
+    /// callers compare the analyzer's CastMap against an empty map
+    /// in those branches and never deref the id.
+    ///
+    /// The parent struct is distinct from the map's value type so
+    /// the test's STX target is a different struct id, avoiding
+    /// the analyzer's self-store rejection in [`Analyzer::handle_stx`].
+    fn btf_with_maps_and_task_ctx(
+        value_kind: MapValueShape,
+    ) -> (Vec<u8>, u32, u32, u32, u32) {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_entry = push_name(&mut strings, "cbw_cgrp_entry");
+        let n_cgx = push_name(&mut strings, "cgx");
+        let n_value = push_name(&mut strings, "value");
+        let n_type = push_name(&mut strings, "type");
+        let n_map_def = push_name(&mut strings, "anon_map_def");
+        let n_map_var = push_name(&mut strings, "cbw_cgrp_map");
+        let n_maps = push_name(&mut strings, ".maps");
+        let n_entry_typedef = push_name(&mut strings, "cbw_cgrp_entry_t");
+        let n_task_ctx = push_name(&mut strings, "task_ctx");
+        let n_cgx_raw = push_name(&mut strings, "cgx_raw");
+
+        let mut types = vec![
+            // id 1: u64
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: struct cbw_cgrp_entry { u64 cgx @ 0 }
+            SynType::Struct {
+                name_off: n_entry,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_cgx,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            // id 3: struct task_ctx { u64 cgx_raw @ 8 } (size = 16
+            // so the cgx_raw slot at offset 8 has a backing byte).
+            SynType::Struct {
+                name_off: n_task_ctx,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_cgx_raw,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+        ];
+        let parent_id = 3u32;
+        let (value_ptr_id, expected_struct_id) = match value_kind {
+            MapValueShape::Struct => {
+                // id 4: Ptr -> id 2
+                types.push(SynType::Ptr { type_id: 2 });
+                (4u32, 2u32)
+            }
+            MapValueShape::U64 => {
+                // id 4: Ptr -> id 1 (u64). resolve_to_struct_id
+                // returns None on a non-struct pointee.
+                types.push(SynType::Ptr { type_id: 1 });
+                (4u32, 0u32)
+            }
+            MapValueShape::Typedef => {
+                // id 4: Ptr -> id 5 (typedef cbw_cgrp_entry_t -> 2)
+                // id 5: Typedef cbw_cgrp_entry_t -> 2
+                types.push(SynType::Ptr { type_id: 5 });
+                types.push(SynType::Typedef {
+                    name_off: n_entry_typedef,
+                    type_id: 2,
+                });
+                (4u32, 2u32)
+            }
+            MapValueShape::Void => {
+                // id 4: Ptr -> 0 (BTF void marker).
+                types.push(SynType::Ptr { type_id: 0 });
+                (4u32, 0u32)
+            }
+        };
+        let map_def_id = types.len() as u32 + 1;
+        types.push(SynType::Struct {
+            name_off: n_map_def,
+            size: 16,
+            members: vec![
+                SynMember {
+                    name_off: n_type,
+                    type_id: 1,
+                    byte_offset: 0,
+                },
+                SynMember {
+                    name_off: n_value,
+                    type_id: value_ptr_id,
+                    byte_offset: 8,
+                },
+            ],
+        });
+        let map_var_id = map_def_id + 1;
+        types.push(SynType::Var {
+            name_off: n_map_var,
+            type_id: map_def_id,
+            linkage: 1,
+        });
+        let datasec_id = map_var_id + 1;
+        types.push(SynType::Datasec {
+            name_off: n_maps,
+            size: 16,
+            entries: vec![SynVarSecinfo {
+                type_id: map_var_id,
+                offset: 0,
+                size: 16,
+            }],
+        });
+        let blob = build_btf(&types, &strings);
+        (blob, datasec_id, 0, expected_struct_id, parent_id)
+    }
+
+    /// Datasec name gate: a non-`.maps` datasec must NOT drive the
+    /// helper-return arm even when the structural shape (Var ->
+    /// Struct -> Ptr -> Struct member named `value`) coincidentally
+    /// matches. Pins the strict `name == ".maps"` check. Without
+    /// this gate, a `.bss` global whose underlying type happened to
+    /// be a struct with a `value` member of pointer type would
+    /// silently drive a false-positive kptr finding.
+    ///
+    /// This test reuses [`btf_with_maps_and_task_ctx`] but the
+    /// caller mis-identifies the datasec section name. We synthesize
+    /// a fresh BTF with the datasec named `.bss` instead.
+    #[test]
+    fn helper_map_lookup_elem_non_dot_maps_datasec_drops() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = push_name(&mut strings, "u64");
+        let n_entry = push_name(&mut strings, "cbw_cgrp_entry");
+        let n_cgx = push_name(&mut strings, "cgx");
+        let n_value = push_name(&mut strings, "value");
+        let n_type = push_name(&mut strings, "type");
+        let n_map_def = push_name(&mut strings, "anon_map_def");
+        let n_map_var = push_name(&mut strings, "fake_map");
+        let n_bss = push_name(&mut strings, ".bss");
+        let n_task_ctx = push_name(&mut strings, "task_ctx");
+        let n_cgx_raw = push_name(&mut strings, "cgx_raw");
+
+        let types = vec![
+            SynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynType::Struct {
+                name_off: n_entry,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_cgx,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            SynType::Struct {
+                name_off: n_task_ctx,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_cgx_raw,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+            // id 4: Ptr -> id 2 (cbw_cgrp_entry)
+            SynType::Ptr { type_id: 2 },
+            // id 5: map-def-shaped struct in `.bss` (NOT `.maps`).
+            SynType::Struct {
+                name_off: n_map_def,
+                size: 16,
+                members: vec![
+                    SynMember {
+                        name_off: n_type,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SynMember {
+                        name_off: n_value,
+                        type_id: 4,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+            // id 6: Var
+            SynType::Var {
+                name_off: n_map_var,
+                type_id: 5,
+                linkage: 1,
+            },
+            // id 7: Datasec ".bss" (NOT `.maps`)
+            SynType::Datasec {
+                name_off: n_bss,
+                size: 16,
+                entries: vec![SynVarSecinfo {
+                    type_id: 6,
+                    offset: 0,
+                    size: 16,
+                }],
+            },
+        ];
+        let parent_id = 3u32;
+        let datasec_id = 7u32;
+        let var_off = 0u32;
+        let blob = build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let [ld_lo, ld_hi] = ld_imm64(1, var_off as i32);
+        let mov_key = mov_k(2, 0);
+        let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
+        let stx_kptr = stx(BPF_SIZE_DW, 6, 0, 8);
+        let insns = vec![ld_lo, ld_hi, mov_key, call_lookup, stx_kptr, exit()];
+        let datasec_pointers = vec![DatasecPointer {
+            insn_offset: 0,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        }];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[InitialReg {
+                reg: 6,
+                struct_type_id: parent_id,
+            }],
+            &[],
+            &datasec_pointers,
+            &[],
+        );
+        assert!(
+            map.is_empty(),
+            "non-`.maps` datasec must not drive the helper-return arm even \
+             with a structurally matching map-def shape: {map:?}"
+        );
+    }
+
     #[test]
     fn only_ld_imm64_no_oob() {
         const N_PAIRS: usize = 50;
@@ -9344,6 +12065,7 @@ mod tests {
                 reg: 1,
                 struct_type_id: t_id,
             }],
+            &[],
             &[],
             &[],
         );

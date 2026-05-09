@@ -4,6 +4,55 @@
 //! BTF offsets against the running guest kernel.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, RwLock};
+
+/// Process-global cache of vmlinux ELF bytes keyed by canonical path.
+///
+/// `collect_verifier_stats` is called once per failure-dump cycle; in a
+/// nextest test process running many `#[ktstr_test]` cases that boot
+/// fresh VMs against the same kernel, repeating the file read for every
+/// VM costs 50-340 MB of disk I/O on the freeze-coord cleanup critical
+/// path. Caching the bytes once per canonical path collapses every
+/// subsequent VM's read to a hash lookup + `Arc::clone`.
+///
+/// Same-process invariant: vmlinux content is immutable per process.
+/// A user that rebuilds vmlinux must restart the test process for the
+/// new bytes to take effect — same as every other on-disk artifact
+/// the host pre-loads at boot. The cache key is the canonicalized path
+/// so symlinks across cache / source-tree layouts collapse to one
+/// entry. A `canonicalize` failure (EACCES, missing target) skips the
+/// cache and falls through to the direct read.
+static VMLINUX_BYTES_CACHE: OnceLock<RwLock<std::collections::HashMap<PathBuf, Arc<Vec<u8>>>>> =
+    OnceLock::new();
+
+/// Return the cached vmlinux ELF bytes for `path`, populating the cache
+/// on first read.
+///
+/// Returns `None` when `path` is unreadable. The error case is not
+/// cached: a transient EACCES (e.g. a half-written cache entry whose
+/// permissions arrive on the next ms) should not poison the cache for
+/// the rest of the process.
+pub(crate) fn cached_vmlinux_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
+    let canon = std::fs::canonicalize(path).ok().unwrap_or_else(|| path.to_path_buf());
+    let slot = VMLINUX_BYTES_CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
+    {
+        let read = slot.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(bytes) = read.get(&canon) {
+            return Some(Arc::clone(bytes));
+        }
+    }
+    // Read outside the write lock so a slow read doesn't block other
+    // canonical paths' lookups. A racing second reader will pay the
+    // same read once each — acceptable: the bytes are immutable so
+    // both inserts produce the same value.
+    let bytes = std::fs::read(&canon).ok()?;
+    let arc = Arc::new(bytes);
+    let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
+    // `or_insert` consumes `arc` only on the miss path; on the racing-
+    // win-then-lose path the existing entry's `Arc` is returned and
+    // our `arc` is dropped (one wasted file read; the bytes match).
+    Some(Arc::clone(write.entry(canon).or_insert(arc)))
+}
 
 /// Find the vmlinux ELF next to a kernel image path.
 ///
@@ -124,5 +173,39 @@ mod tests {
         assert_eq!(find_vmlinux(&kernel), None);
 
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// First call reads from disk; second call returns a clone of the
+    /// cached `Arc<Vec<u8>>`, proving the cache hit path does not re-
+    /// read. `Arc::ptr_eq` is the load-bearing assertion: the bytes
+    /// would compare equal even from a re-read, but only the cache
+    /// hit returns the same allocation.
+    #[test]
+    fn cached_vmlinux_bytes_hits_on_second_call() {
+        let tmp = std::env::temp_dir().join("ktstr-cached-vmlinux-bytes");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let vmlinux = tmp.join("vmlinux-test-cache");
+        std::fs::write(&vmlinux, b"FAKE_VMLINUX_BYTES").unwrap();
+
+        let first = cached_vmlinux_bytes(&vmlinux).expect("first read populates cache");
+        let second = cached_vmlinux_bytes(&vmlinux).expect("second read hits cache");
+        assert_eq!(first.as_slice(), b"FAKE_VMLINUX_BYTES");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache hit must return the same Arc; got fresh allocations on each call"
+        );
+
+        std::fs::remove_file(&vmlinux).ok();
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Unreadable path returns `None` without populating the cache;
+    /// a subsequent successful path is unaffected.
+    #[test]
+    fn cached_vmlinux_bytes_missing_returns_none() {
+        let nonexistent = std::env::temp_dir().join("ktstr-cached-vmlinux-bytes-missing-xyzzy");
+        // Defensive: ensure the file does not exist from a prior run.
+        std::fs::remove_file(&nonexistent).ok();
+        assert!(cached_vmlinux_bytes(&nonexistent).is_none());
     }
 }

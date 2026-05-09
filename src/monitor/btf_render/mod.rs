@@ -6,7 +6,12 @@
 //! ([`btf_rs::Type::Volatile`], [`btf_rs::Type::Const`],
 //! [`btf_rs::Type::Restrict`], [`btf_rs::Type::Typedef`],
 //! [`btf_rs::Type::TypeTag`], [`btf_rs::Type::DeclTag`]) are peeled
-//! before dispatch.
+//! before dispatch. [`render_value_with_mem`] is the production
+//! entry point that additionally accepts a [`MemReader`] so the
+//! [`btf_rs::Type::Ptr`] arm and the cast-intercept path
+//! (consulting [`MemReader::cast_lookup`]) chase pointers through
+//! arena snapshots, slab/vmalloc reads, the sdt_alloc bridge, and
+//! the cross-BTF Fwd resolution index.
 //!
 //! The renderer is total: any type kind it cannot decode (Func, FuncProto,
 //! Fwd, Void, or a bytes slice shorter than the type's declared size)
@@ -32,6 +37,7 @@
 //! can carry any of those bases (e.g. `enum scx_exit_kind` declared
 //! with negative members).
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
@@ -141,6 +147,17 @@ pub enum RenderedValue {
     /// native BTF resolve. Cast-recovered pointers that cleared
     /// the same bridge extend the annotation to
     /// `"cast→{addr_space} (sdt_alloc)"`.
+    ///
+    /// Storage is [`Cow<'static, str>`] so the renderer's emit
+    /// sites — every value the renderer itself produces is one
+    /// of a five-element closed set
+    /// (`"sdt_alloc"`, `"cast→arena"`, `"cast→kernel"`,
+    /// `"cast→arena (sdt_alloc)"`, `"cast→kernel (sdt_alloc)"`)
+    /// — borrow `&'static str` literals via [`Cow::Borrowed`]
+    /// without per-chase heap allocations. JSON deserialization
+    /// produces [`Cow::Owned`] (serde's [`Cow`] impl forwards
+    /// to `String`'s deserializer), so existing serialized
+    /// snapshots round-trip unchanged.
     Ptr {
         value: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,7 +165,7 @@ pub enum RenderedValue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         deref_skipped_reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        cast_annotation: Option<String>,
+        cast_annotation: Option<Cow<'static, str>>,
     },
     /// Fallback hex dump for types the renderer can decode the size of
     /// but not the structure (e.g. `BTF_KIND_FWD`). Hex is lowercase,
@@ -1443,6 +1460,126 @@ fn write_indent(f: &mut std::fmt::Formatter<'_>, depth: usize) -> std::fmt::Resu
 // import it directly from cast_analysis.
 pub use super::cast_analysis::CastHit;
 
+/// Outcome of [`MemReader::resolve_arena_type`]: the BTF type id the
+/// chase should render against, paired with the byte count the
+/// chase must skip past the chased address before the payload
+/// struct begins.
+///
+/// The production
+/// [`super::dump::render_map::AccessorMemReader::resolve_arena_type`]
+/// emits exactly two `header_skip` shapes — mid-slot pointers
+/// (header-region or mid-payload offsets) return `None`:
+///
+/// - `header_skip == 0` (payload-start chase): the chased address
+///   already lands at the slot's payload start, e.g. the return of
+///   `scx_task_data(p)` cached in `cached_taskc_raw`. The renderer
+///   reads `btf_size` bytes from the chased address and renders
+///   directly against `target_type_id`.
+/// - `header_skip == slot.header_size` (slot-start chase): the
+///   chased address lands at the slot's first byte, e.g. the
+///   `data` field of `scx_task_map_val` storing the raw return of
+///   `sdt_alloc()`. The renderer reads `header_skip + btf_size`
+///   bytes from the chased address and slices off the leading
+///   `header_skip` bytes (the `union sdt_id` header) before
+///   rendering the payload struct against `target_type_id`.
+///
+/// Field name `target_type_id` matches
+/// [`CastHit::target_type_id`]'s precedent so the two
+/// chase-routing return shapes use the same vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ArenaResolveHit {
+    /// BTF type id (in the entry BTF's id space) of the payload
+    /// struct the chase should render against. Resolved from the
+    /// allocator slot's `payload_btf_type_id` populated by the
+    /// sdt_alloc pre-pass.
+    pub target_type_id: u32,
+    /// Byte count the chase must skip past the chased address
+    /// before the payload struct begins. `0` for a payload-start
+    /// chase (the chased address already lands at the payload);
+    /// the slot's `header_size` for a slot-start chase (the chase
+    /// must skip the leading `union sdt_id` header before
+    /// rendering the payload).
+    pub header_skip: usize,
+}
+
+/// Aggregate kind of a `BTF_KIND_FWD` terminal: `struct foo;` vs
+/// `union foo;`. Threaded into [`MemReader::cross_btf_resolve_fwd`]
+/// so the resolver only matches a same-name complete body whose
+/// aggregate kind agrees — a `Fwd` declared as `struct foo` must
+/// NOT resolve to a `union foo` in another BTF (the wire format
+/// permits same-name struct + union declarations, rare but legal).
+/// Mirrors the gate [`peel_modifiers_resolving_fwd`] applies for
+/// in-BTF resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FwdKind {
+    /// `BTF_KIND_FWD` declared as `struct foo;`. Matches the
+    /// `true` branch of [`btf_rs::Fwd::is_struct`].
+    Struct,
+    /// `BTF_KIND_FWD` declared as `union foo;`. Matches the
+    /// `false` branch of [`btf_rs::Fwd::is_struct`].
+    Union,
+}
+
+impl FwdKind {
+    /// Build a [`FwdKind`] from a [`btf_rs::Fwd`]'s aggregate kind
+    /// flag. The two callers
+    /// ([`try_cross_btf_fwd_resolve`] and
+    /// [`peel_modifiers_resolving_fwd`]) reach the flag via
+    /// [`btf_rs::Fwd::is_struct`].
+    pub fn from_is_struct(is_struct: bool) -> Self {
+        if is_struct {
+            FwdKind::Struct
+        } else {
+            FwdKind::Union
+        }
+    }
+}
+
+/// Reference to a complete struct/union definition in a BTF other
+/// than the one the chase entered with. Returned by
+/// [`MemReader::cross_btf_resolve_fwd`] when a `BTF_KIND_FWD`
+/// terminal in the entry BTF resolves to a body in a sibling
+/// object's BTF (the multi-`.bpf.objs` shape: one object declares
+/// `struct foo;` (forward), another defines `struct foo { ... }`
+/// (full body)).
+///
+/// Borrowed: the BTF reference is tied to the [`MemReader`]
+/// implementation's owned BTF storage (typically `Arc<Btf>` retained
+/// across the dump pass). Render code that recurses into `btf`
+/// must thread the same [`MemReader`] through so further chases
+/// from inside the cross-BTF subtree can also resolve cross-BTF
+/// (same-name structs in either direction).
+///
+/// `type_id` is the resolved struct/union type id WITHIN `btf`'s
+/// own id space — distinct from the entry BTF's id space. The
+/// chase code switches the rendering BTF to `btf` for the
+/// recursion against `type_id`.
+///
+/// `Copy + Clone`: a borrowed reference plus a `u32` is bitwise
+/// copyable. The pair lets the chase paths pass the value by
+/// `Copy` rather than by `&` and sidesteps the move-after-borrow
+/// snags in any match that would otherwise consume the hit
+/// twice. [`Debug`] / [`Hash`] / [`Eq`] are blocked by [`Btf`]
+/// in `btf-rs` — it does not derive any of them — so the
+/// minimal `Copy + Clone` set is the most we can offer until
+/// upstream changes.
+#[derive(Copy, Clone)]
+pub struct CrossBtfRef<'a> {
+    /// Sibling BTF that carries the resolved struct/union body.
+    /// Borrowed from the [`MemReader`] implementation's owned BTF
+    /// storage (typically `Arc<Btf>` retained across the dump
+    /// pass) — the renderer must thread the same [`MemReader`]
+    /// through any recursion into this BTF so further chases
+    /// from inside the cross-BTF subtree can also resolve
+    /// cross-BTF.
+    pub btf: &'a Btf,
+    /// Resolved struct/union type id WITHIN [`Self::btf`]'s own
+    /// id space — distinct from the entry BTF's id space. The
+    /// chase code switches the rendering BTF to [`Self::btf`]
+    /// and recurses against this id.
+    pub type_id: u32,
+}
+
 pub trait MemReader {
     fn read_kva(&self, kva: u64, len: usize) -> Option<Vec<u8>>;
     /// Check if an address is in the arena range. Arena pointers
@@ -1508,9 +1645,10 @@ pub trait MemReader {
     fn cast_lookup(&self, _parent_type_id: u32, _member_byte_offset: u32) -> Option<CastHit> {
         None
     }
-    /// Resolve a chased arena pointer value to the BTF type id of the
-    /// payload it points at, when the renderer's BTF-only chase has
-    /// no body for the declared pointee type.
+    /// Resolve a chased arena pointer value to the BTF type id of
+    /// the payload it points at, plus a `header_skip` byte count
+    /// that tells the chase how to land on the payload struct from
+    /// the chased address.
     ///
     /// The intended trigger: a [`Type::Ptr`] (or cast-recovered
     /// pointer) whose declared pointee is a [`Type::Fwd`] whose body
@@ -1522,36 +1660,78 @@ pub trait MemReader {
     /// [`super::sdt_alloc::SdtAllocatorSnapshot`] pre-pass already
     /// resolves the real payload BTF type id via
     /// [`super::sdt_alloc::discover_payload_btf_id`] for every live
-    /// allocator. The dump path threads a per-pass
-    /// `payload_start → payload_btf_type_id` index into the
-    /// renderer's [`MemReader`] so the chase can recover the real
-    /// type id when the BTF-only resolve fails.
+    /// allocator. The dump path threads a per-pass index of every
+    /// live allocator slot into the renderer's [`MemReader`] so the
+    /// chase can recover the real type id and the slot shape when
+    /// the BTF-only resolve fails.
     ///
     /// `addr` is the chased pointer value as it appears in guest
     /// memory (i.e. the same value the renderer just read from a
-    /// `u64` field or a [`Type::Ptr`] field). Implementations must
+    /// `u64` field or a [`Type::Ptr`] field). Implementations
     /// transform it into the index key shape they store. The
-    /// sdt_alloc bridge follows the same low-32-bits masking
-    /// convention used by [`super::sdt_alloc::SdtAllocEntry::user_addr`]
-    /// (which masks the slot's start address with `0xFFFF_FFFF`),
-    /// but the actual key is the masked PAYLOAD start —
-    /// `(user_addr + header_size) & 0xFFFF_FFFF` — not
-    /// `user_addr` itself, because chased pointers from guest
-    /// memory point past the slot header at the payload, not at
-    /// the slot start. The pre-pass adds `header_size` before
-    /// inserting; the [`MemReader`] impl masks the incoming
-    /// `addr` with `0xFFFF_FFFF` before lookup so the windowed
-    /// pointer hits the indexed payload-start key.
+    /// sdt_alloc bridge stores one entry per slot keyed on
+    /// `slot_start & 0xFFFF_FFFF`; the production
+    /// [`super::dump::render_map::AccessorMemReader`] impl uses a
+    /// range lookup to find the slot whose
+    /// `[slot_start, slot_start + elem_size)` range contains the
+    /// chased address.
     ///
-    /// Returns `Some(btf_type_id)` when the address falls inside a
-    /// known sdt_alloc allocator slot's payload region; the renderer
-    /// retries the size resolve with the recovered id and renders
-    /// the chased target. Returns `None` (the default) when the
-    /// reader has no index, the address is outside every known
-    /// allocator's slot range, or the addressed slot has no resolved
-    /// payload type. Default-`None` keeps existing [`MemReader`]
-    /// impls correct without an explicit override.
-    fn resolve_arena_type(&self, _addr: u64) -> Option<u32> {
+    /// Returns `Some(ArenaResolveHit { target_type_id, header_skip })`
+    /// when the address falls inside a known allocator slot at a
+    /// position the renderer can chase:
+    ///
+    /// - **Slot-start pointer** (the chased address equals the slot
+    ///   start, e.g. the `data` field of `scx_task_map_val` storing
+    ///   the raw return of `sdt_alloc()`): `header_skip` is the
+    ///   slot's header size (typically 8 — the size of `union
+    ///   sdt_id`). The renderer reads `header_skip + btf_size`
+    ///   bytes from `addr`, slices off the first `header_skip`
+    ///   bytes (the sdt_id header), and renders the payload struct
+    ///   against `target_type_id`.
+    /// - **Payload-start pointer** (the chased address equals
+    ///   `slot_start + header_size`, e.g. the return of
+    ///   `scx_task_data(p)` cached in `cached_taskc_raw`):
+    ///   `header_skip == 0`. The renderer reads `btf_size` bytes
+    ///   from `addr` and renders directly.
+    ///
+    /// Returns `None` (the default) when the reader has no index,
+    /// the address is outside every known allocator's slot range,
+    /// the addressed slot has no resolved payload type, or the
+    /// chased pointer landed at an interior slot position
+    /// (mid-header or mid-payload) the renderer cannot translate
+    /// into a struct render. Default-`None` keeps existing
+    /// [`MemReader`] impls correct without an explicit override.
+    fn resolve_arena_type(&self, _addr: u64) -> Option<ArenaResolveHit> {
+        None
+    }
+    /// Resolve a `BTF_KIND_FWD` terminal by struct/union name to a
+    /// complete definition in a sibling BTF.
+    ///
+    /// The intended trigger: the renderer's chase paths
+    /// ([`chase_arena_pointer`] and [`render_cast_pointer`]) just
+    /// peeled the chase target through
+    /// [`peel_modifiers_resolving_fwd`] but the local same-BTF
+    /// sibling search came up empty. The terminal is still a
+    /// `Type::Fwd`, so the BTF-only chase would skip with
+    /// "forward declaration; body not in this BTF". This method
+    /// asks the reader whether any sibling BTF (built once per
+    /// scheduler binary by the cast-analysis pre-pass — see
+    /// [`crate::vmm::cast_analysis_load::CastAnalysisOutput::fwd_index`])
+    /// carries a complete body for `name` matching the `kind`
+    /// aggregate kind ([`FwdKind::Struct`] or [`FwdKind::Union`]).
+    ///
+    /// Returning `Some(CrossBtfRef { btf, type_id })` lets the
+    /// chase switch to `btf` and recurse into `type_id` for the
+    /// pointee render. The same [`MemReader`] is threaded into
+    /// the inner recursion so chases originating inside the
+    /// cross-BTF subtree can also bridge — typical for a struct
+    /// whose members are themselves `Fwd` to another BTF.
+    ///
+    /// Returning `None` (the default) preserves the historical
+    /// "forward declaration; body not in this BTF" skip path —
+    /// keeps every existing [`MemReader`] impl correct without
+    /// an explicit override.
+    fn cross_btf_resolve_fwd(&self, _name: &str, _kind: FwdKind) -> Option<CrossBtfRef<'_>> {
         None
     }
 }
@@ -1728,7 +1908,7 @@ fn render_value_inner(
             // recovered chase even on this arm. Set inside
             // [`chase_arena_pointer`]'s outcome and threaded out via
             // the side-channel below.
-            let mut cast_annotation: Option<String> = None;
+            let mut cast_annotation: Option<Cow<'static, str>> = None;
             // [`chase_gate`] applies the null/cycle/depth-cap policy
             // shared with [`render_cast_pointer`]: null and
             // depth-cap take the "no chase attempted" path
@@ -1761,7 +1941,7 @@ fn render_value_inner(
                             deref_skipped_reason = outcome.reason;
                         }
                         if outcome.sdt_alloc_resolved {
-                            cast_annotation = Some("sdt_alloc".to_string());
+                            cast_annotation = Some(Cow::Borrowed("sdt_alloc"));
                         }
                         return outcome.deref;
                     }
@@ -2584,9 +2764,13 @@ fn unsizable_chase_reason(
             // the struct (e.g. `struct sdt_data` in the sdt_alloc
             // library) and the using program only references it
             // via pointer. The chase has no BTF-declared size to
-            // bound the read, so it skips. Body availability would
-            // require a multi-BTF lookup the renderer doesn't
-            // perform today.
+            // bound the read, so it skips when both the
+            // sdt_alloc bridge ([`MemReader::resolve_arena_type`])
+            // and the cross-BTF Fwd resolution index
+            // ([`MemReader::cross_btf_resolve_fwd`]) have already
+            // been consulted and neither produced a hit — i.e.
+            // the body lives in some BTF the renderer cannot
+            // reach with the available indexes.
             let aggregate = if fwd.is_union() { "union" } else { "struct" };
             let name = btf.resolve_name(fwd).ok().filter(|n| !n.is_empty());
             match name {
@@ -2665,20 +2849,58 @@ struct ArenaChaseOutcome {
     sdt_alloc_resolved: bool,
 }
 
+/// Outcome of [`try_sdt_alloc_bridge`]. Distinguishes the no-fire
+/// case from a fire that adopts a recovered payload type id, with
+/// the resolved type, its id, the `header_skip` the caller applies
+/// to its arena read, and the payload's `btf_size` so callers
+/// don't re-resolve any of them.
+///
+/// `target_ty` and `effective_type_id` are the post-peel type and
+/// type id the caller adopts for its render. The bridge resolves
+/// the recovered id through [`peel_modifiers_resolving_fwd`] before
+/// producing this struct so the caller can switch its render
+/// target without re-running the peel.
+///
+/// `header_skip` is the byte count the chase must skip past the
+/// chased address before the payload struct begins. The
+/// [`MemReader::resolve_arena_type`] contract returns this value:
+/// 0 when the chased pointer already lands on payload-start (the
+/// historical behaviour), or the slot's header size when the
+/// chased pointer lands on slot-start (the new path that handles
+/// the raw return of `sdt_alloc()` cached in `data` fields).
+///
+/// `btf_size` is the storage size of the recovered payload type
+/// (post Fwd-resolving peel). `try_sdt_alloc_bridge` already paid
+/// the [`type_size`] resolve to confirm the bridge can fire;
+/// returning the value lets both chase arms reuse it instead of
+/// re-running the same lookup against the same type.
+#[derive(Debug, Clone)]
+struct SdtAllocBridgeFire {
+    target_ty: Type,
+    effective_type_id: u32,
+    header_skip: usize,
+    btf_size: usize,
+}
+
 /// Try the sdt_alloc bridge for a `BTF_KIND_FWD` chase target.
 ///
 /// Both [`chase_arena_pointer`] and [`render_cast_pointer`]'s kernel
 /// arm fall into the same fix-up after the BTF-only Fwd resolve
-/// fails: ask the [`MemReader`] for an arena-type-index entry keyed
-/// on the chased value, peel the recovered id back through
+/// fails: ask the [`MemReader`] for an arena-resolve hit at the
+/// chased value, peel the recovered id back through
 /// [`peel_modifiers_resolving_fwd`], and only adopt it when the
 /// resolved type has a known size. The helper centralises that flow
 /// so both call sites stay in lockstep on the gating policy.
 ///
-/// `target_ty` and `effective_type_id` are mutated in place when the
-/// bridge fires; the returned `bool` is `true` iff the bridge fired
-/// (the caller threads it into
-/// [`RenderedValue::Ptr::cast_annotation`]).
+/// Pure return: the helper produces an [`SdtAllocBridgeFire`] when
+/// the bridge fires (carrying the resolved `target_ty`, the matching
+/// `effective_type_id`, the `header_skip` the caller applies, and
+/// the payload's `btf_size`) or `None` otherwise. The caller
+/// rebinds its own `target_ty` / `effective_type_id` from the
+/// returned struct — no `&mut` plumbing. The `btf_size` field saves
+/// callers from re-running [`type_size`] on the same resolved
+/// type — the helper has already paid that resolve to gate the
+/// bridge fire.
 ///
 /// Preconditions:
 ///   * `target_ty` is whatever [`peel_modifiers_resolving_fwd`]
@@ -2689,19 +2911,392 @@ fn try_sdt_alloc_bridge(
     btf: &Btf,
     mem: &dyn MemReader,
     val: u64,
-    target_ty: &mut Type,
-    effective_type_id: &mut u32,
-) -> bool {
-    if matches!(target_ty, Type::Fwd(_))
-        && let Some(real_id) = mem.resolve_arena_type(val)
-        && let Some((resolved_ty, resolved_id)) = peel_modifiers_resolving_fwd(btf, real_id)
-        && type_size(btf, &resolved_ty).is_some()
-    {
-        *target_ty = resolved_ty;
-        *effective_type_id = resolved_id;
-        return true;
+    target_ty: &Type,
+) -> Option<SdtAllocBridgeFire> {
+    if !matches!(target_ty, Type::Fwd(_)) {
+        return None;
     }
-    false
+    let hit = mem.resolve_arena_type(val)?;
+    let (resolved_ty, resolved_id) = peel_modifiers_resolving_fwd(btf, hit.target_type_id)?;
+    let btf_size = type_size(btf, &resolved_ty)?;
+    Some(SdtAllocBridgeFire {
+        target_ty: resolved_ty,
+        effective_type_id: resolved_id,
+        header_skip: hit.header_skip,
+        btf_size,
+    })
+}
+
+/// Slice past `header_skip` bytes when the sdt_alloc bridge fires.
+///
+/// Returns the byte slice starting at `header_skip` within
+/// `raw_bytes`, or `None` when the read returned fewer bytes than
+/// the header skip needs (page-tail truncation, short read). Both
+/// chase arms — [`chase_arena_pointer`] and [`render_cast_pointer`]
+/// — apply this slice after their per-arm read so the callers
+/// share a single underrun guard.
+fn apply_header_skip(raw_bytes: &[u8], header_skip: usize) -> Option<&[u8]> {
+    raw_bytes.get(header_skip..)
+}
+
+/// [`MemReader`] adapter that suppresses any lookup whose result
+/// is keyed against the entry BTF's id space, while delegating
+/// every other method.
+///
+/// Used by [`chase_arena_pointer`] and [`render_cast_pointer`] when
+/// [`try_cross_btf_fwd_resolve`] succeeds and the chase recursion
+/// switches from the entry BTF to a sibling BTF.
+///
+/// Two methods carry entry-BTF-keyed payloads and MUST be
+/// suppressed when the chase has crossed a BTF boundary:
+///
+/// - [`MemReader::cast_lookup`]: the cast analyzer's
+///   [`super::cast_analysis::CastMap`] keys on `(parent_type_id,
+///   member_byte_offset)` against the entry BTF's id space. Sibling
+///   BTFs re-use the same numeric id space, so a cast hit at
+///   `(entry_id=N, off=K)` would incorrectly fire when the renderer
+///   reaches a sibling BTF's struct that happens to carry id `N`. The
+///   renderer would treat a plain `u64` field in the sibling struct
+///   as a cast-recovered pointer, producing a phantom `Ptr` render
+///   with a "type id unresolvable" skip reason against an id that is
+///   only meaningful in the entry BTF.
+///
+/// - [`MemReader::resolve_arena_type`]: the
+///   [`super::dump::render_map::ArenaTypeIndex`] populates
+///   [`ArenaResolveHit::target_type_id`] with BTF type ids resolved
+///   against the **entry BTF** at index-build time (the sdt_alloc
+///   pre-pass runs against the program BTF, which is the entry BTF
+///   for the chase that initiated the dump). When a cross-BTF chase
+///   recurses into a sibling BTF and encounters another `Type::Fwd`,
+///   [`try_sdt_alloc_bridge`] would call `mem.resolve_arena_type`
+///   and receive an entry-BTF id; passing that id to
+///   [`peel_modifiers_resolving_fwd`]`(sibling_btf, …)` looks up the
+///   wrong id in the sibling BTF's space — silent wrong-render (the
+///   sibling BTF carries a different type at that id) or silent skip
+///   (the sibling BTF lacks the id). The "no invalid data made"
+///   contract requires this to be a hard `None`.
+///
+/// The remaining [`MemReader`] methods (read_kva / read_arena /
+/// is_arena_addr / nr_cpu_ids / cross_btf_resolve_fwd) carry no
+/// entry-BTF id payload — they operate on raw addresses and string
+/// names — so they stay live. Chases originating inside the
+/// cross-BTF subtree still resolve through the same arena snapshot,
+/// kernel page-walker, and cross-BTF Fwd index. The suppression is
+/// narrowly scoped to the two id-keyed lookups.
+struct CrossBtfMemReader<'a> {
+    inner: &'a dyn MemReader,
+}
+
+impl MemReader for CrossBtfMemReader<'_> {
+    fn read_kva(&self, kva: u64, len: usize) -> Option<Vec<u8>> {
+        self.inner.read_kva(kva, len)
+    }
+    fn is_arena_addr(&self, addr: u64) -> bool {
+        self.inner.is_arena_addr(addr)
+    }
+    fn read_arena(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+        self.inner.read_arena(addr, len)
+    }
+    fn nr_cpu_ids(&self) -> u32 {
+        self.inner.nr_cpu_ids()
+    }
+    // cast_lookup intentionally NOT delegated: returns the trait
+    // default `None`. See struct doc for why suppression is correct
+    // when the chase has crossed BTFs.
+    //
+    // resolve_arena_type intentionally NOT delegated either:
+    // [`ArenaResolveHit::target_type_id`] is keyed against the entry
+    // BTF, so a cross-BTF recursion that consulted it would map a
+    // sibling-BTF chase onto an entry-BTF id and silently wrong-render
+    // (or silently skip with a misleading reason). False negative is
+    // the safe direction — the sibling chase can still surface its
+    // pointee via [`MemReader::cross_btf_resolve_fwd`] and the
+    // ordinary [`Type::Ptr`] arm.
+    fn cross_btf_resolve_fwd(&self, name: &str, kind: FwdKind) -> Option<CrossBtfRef<'_>> {
+        self.inner.cross_btf_resolve_fwd(name, kind)
+    }
+}
+
+/// Pre-read state assembled by [`resolve_chase_target`].
+///
+/// Both chase arms — [`chase_arena_pointer`] and
+/// [`render_cast_pointer`]'s kernel arm — share the entire
+/// "resolve target type, fire sdt_alloc bridge, fall back to
+/// cross-BTF Fwd resolve, settle final size" sequence. That
+/// sequence ends right before the per-arm read (`read_arena` vs
+/// `read_kva`) — at which point the renderer holds enough
+/// state to size the read, slice the header, and recurse. This
+/// struct is exactly that "ready to read" snapshot.
+///
+/// `cross_btf_hit` is preserved by value (the type derives
+/// [`Copy`], so threading it through the resolver does not
+/// surface borrow lifetime headaches) so the per-arm post-read
+/// step can build its own [`CrossBtfMemReader`] wrap on the
+/// recursion path.
+struct ResolvedTarget<'a> {
+    /// Type id of the chase target within [`Self::current_btf`]'s
+    /// id space. Threaded into [`render_value_inner`] for the
+    /// recursion.
+    effective_type_id: u32,
+    /// BTF the recursion runs against — the entry BTF when
+    /// cross-BTF stayed dormant, the resolved sibling BTF when
+    /// the cross-BTF Fwd index returned a hit.
+    current_btf: &'a Btf,
+    /// Storage size of the resolved payload. The per-arm read
+    /// budget is `header_skip + btf_size` clamped at the arm's
+    /// cap (4 KiB for arena, 4 KiB AND page-remaining for
+    /// kernel).
+    btf_size: usize,
+    /// Bytes the chase must skip past the chased address before
+    /// the payload struct begins. `0` for a payload-start chase;
+    /// the slot's header size for a slot-start chase the
+    /// sdt_alloc bridge resolved.
+    header_skip: usize,
+    /// `true` when the resolved payload type id came from the
+    /// sdt_alloc bridge ([`MemReader::resolve_arena_type`])
+    /// rather than the cast analyzer's declared
+    /// `target_type_id`. Surfaces through
+    /// [`RenderedValue::Ptr::cast_annotation`] so operators see
+    /// the layout came from the bridge.
+    sdt_alloc_resolved: bool,
+    /// Set when the cross-BTF Fwd index returned a hit (the
+    /// chase target's body lives in a sibling BTF). The
+    /// post-read recursion wraps `mem` in a
+    /// [`CrossBtfMemReader`] in this case so id-keyed lookups
+    /// (cast / arena type) cannot fire against the sibling
+    /// BTF's id space — see [`CrossBtfMemReader`]'s doc for the
+    /// collision rationale.
+    cross_btf_hit: Option<CrossBtfRef<'a>>,
+}
+
+/// Outcome of [`resolve_chase_target`].
+enum ChaseResolve<'a> {
+    /// Pre-read sequence completed; chase is ready to read and
+    /// recurse. The caller plugs [`Self::Ready`]'s state into its
+    /// per-arm reader and post-read gates.
+    Ready(ResolvedTarget<'a>),
+    /// Pre-read sequence skipped the chase. The reason and
+    /// `sdt_alloc_resolved` flag flow into the caller's
+    /// per-arm `Ptr` builder so the no-deref render still
+    /// surfaces the bridge state when it fired before the skip.
+    Skip {
+        reason: String,
+        sdt_alloc_resolved: bool,
+    },
+}
+
+/// Shared pre-read resolver for arena and kernel chase arms.
+///
+/// Encapsulates the steps both [`chase_arena_pointer`] and
+/// [`render_cast_pointer`]'s kernel arm execute identically:
+///
+/// 1. Peel modifiers + resolve [`Type::Fwd`] to a complete
+///    same-name sibling within `btf` via
+///    [`peel_modifiers_resolving_fwd`].
+/// 2. Try the sdt_alloc bridge ([`try_sdt_alloc_bridge`]) when
+///    the post-peel terminal is still [`Type::Fwd`]. A bridge
+///    fire returns the bridge's resolved `target_ty` /
+///    `effective_type_id` plus the slot's `header_skip` and the
+///    payload's `btf_size`; this resolver rebinds the local
+///    target_ty / effective_type_id from the returned struct.
+/// 3. When the bridge stays dormant, try the cross-BTF Fwd
+///    index ([`try_cross_btf_fwd_resolve`]). A hit switches the
+///    rendering BTF to the resolved sibling and adopts its
+///    type id.
+/// 4. Resolve the final `btf_size` against `current_btf` (or
+///    reuse the bridge's `btf_size` when the bridge fired).
+/// 5. Reject `btf_size == 0` payloads (incomplete types whose
+///    BTF size resolves but is zero).
+///
+/// `kind_label` ("arena chase" / "kernel cast") flows into every
+/// skip reason so the caller-visible messages still distinguish
+/// the two arms; the test fixture in
+/// [`super::btf_render::tests`] asserts the prefix on each path.
+///
+/// On the success path, the [`Self::Ready`] payload carries
+/// every value the per-arm read+recurse needs:
+/// [`ResolvedTarget::effective_type_id`],
+/// [`ResolvedTarget::current_btf`], [`ResolvedTarget::btf_size`],
+/// [`ResolvedTarget::header_skip`],
+/// [`ResolvedTarget::sdt_alloc_resolved`], and
+/// [`ResolvedTarget::cross_btf_hit`]. The bridge state is captured
+/// `Some(...)` exactly when the bridge fired; the `cross_btf_hit`
+/// is captured exactly when the cross-BTF index returned a hit
+/// (mutually exclusive with bridge fire).
+fn resolve_chase_target<'a>(
+    btf: &'a Btf,
+    mem: &'a dyn MemReader,
+    val: u64,
+    target_type_id: u32,
+    kind_label: &'static str,
+) -> ChaseResolve<'a> {
+    // Step 1: peel modifiers AND resolve a Fwd terminal to a
+    // complete Struct/Union sibling of the same name when one
+    // is in the BTF. Without the Fwd shortcut, `type_size`
+    // returns `None` for a `Type::Fwd` terminal and the chase
+    // would skip even when the renderer has full layout info
+    // one BTF id away. `effective_type_id` is what the render
+    // recursion uses to resolve members — the resolved
+    // Struct/Union id when a sibling was found, otherwise the
+    // post-peel original id.
+    let Some((mut target_ty, mut effective_type_id)) =
+        peel_modifiers_resolving_fwd(btf, target_type_id)
+    else {
+        return ChaseResolve::Skip {
+            reason: format!("{kind_label} target type id {target_type_id} unresolvable"),
+            sdt_alloc_resolved: false,
+        };
+    };
+    // Step 2: when the post-peel terminal is still `Type::Fwd`,
+    // ask the sdt_alloc bridge whether the chased address falls
+    // inside an allocator slot whose payload type id the
+    // pre-pass resolved. The bridge is pure-return: a fire
+    // produces a fresh target_ty / effective_type_id which we
+    // rebind here, plus the slot's `header_skip` and the
+    // resolved payload's `btf_size`.
+    let bridge = try_sdt_alloc_bridge(btf, mem, val, &target_ty);
+    let (sdt_alloc_resolved, header_skip, bridge_btf_size) = match bridge {
+        Some(f) => {
+            target_ty = f.target_ty;
+            effective_type_id = f.effective_type_id;
+            (true, f.header_skip, Some(f.btf_size))
+        }
+        None => (false, 0usize, None),
+    };
+    // Step 3: when the bridge stayed dormant, try the cross-BTF
+    // Fwd index. A `Type::Fwd` terminal whose complete body
+    // lives in a sibling BTF resolves through the renderer's
+    // cross-BTF index — the typical multi-`.bpf.objs` shape
+    // (one object declares `struct cgx_target;` forward,
+    // another defines the body). When the index returns a hit
+    // we switch the rendering BTF to the resolved sibling and
+    // adopt its type id. The bridge-fired path skips this
+    // probe — its resolved id is in the entry BTF and the
+    // recursion doesn't need to switch.
+    let cross_btf_hit = if bridge_btf_size.is_none() {
+        try_cross_btf_fwd_resolve(mem, btf, &target_ty)
+    } else {
+        None
+    };
+    let current_btf: &Btf = match cross_btf_hit {
+        Some(hit) => {
+            target_ty = match hit.btf.resolve_type_by_id(hit.type_id) {
+                Ok(ty) => ty,
+                Err(_) => {
+                    return ChaseResolve::Skip {
+                        reason: format!(
+                            "{kind_label}: cross-BTF Fwd resolve returned \
+                             type_id {} but the type does not resolve in \
+                             the sibling BTF",
+                            hit.type_id
+                        ),
+                        sdt_alloc_resolved,
+                    };
+                }
+            };
+            effective_type_id = hit.type_id;
+            hit.btf
+        }
+        None => btf,
+    };
+    // Step 4: resolve the final `btf_size`. The bridge fire
+    // already paid this resolve; reuse its value when present.
+    let btf_size = match bridge_btf_size {
+        Some(sz) => sz,
+        None => {
+            let Some(sz) = type_size(current_btf, &target_ty) else {
+                return ChaseResolve::Skip {
+                    reason: unsizable_chase_reason(
+                        current_btf,
+                        kind_label,
+                        target_type_id,
+                        &target_ty,
+                    ),
+                    sdt_alloc_resolved,
+                };
+            };
+            sz
+        }
+    };
+    // Step 5: reject zero-size payloads (incomplete types whose
+    // BTF size resolves but is zero). The `incomplete type`
+    // substring is what the kernel-arm
+    // `cast_chase_kernel_target_btf_size_zero` test asserts.
+    if btf_size == 0 {
+        return ChaseResolve::Skip {
+            reason: format!(
+                "{kind_label} target type id {target_type_id} BTF size is 0 (incomplete type)"
+            ),
+            sdt_alloc_resolved,
+        };
+    }
+    ChaseResolve::Ready(ResolvedTarget {
+        effective_type_id,
+        current_btf,
+        btf_size,
+        header_skip,
+        sdt_alloc_resolved,
+        cross_btf_hit,
+    })
+}
+
+/// Run [`render_value_inner`] against the resolved target and
+/// wrap the result for the chase arm.
+///
+/// The post-read recursion is also identical between
+/// [`chase_arena_pointer`] and [`render_cast_pointer`]: both
+/// insert the chased value into `visited` before recursing,
+/// optionally wrap `mem` in a [`CrossBtfMemReader`] when the
+/// chase crossed a BTF boundary, recurse against
+/// `effective_type_id` in `current_btf`, remove the value from
+/// `visited` after, and box-wrap the rendered value in a
+/// [`RenderedValue::Truncated`] when the read was clipped.
+///
+/// `truncated_at_cap` is the per-arm "the read was clipped"
+/// flag — arena's path uses `total_needed > POINTER_CHASE_CAP`
+/// (the snapshot is single-page-bound), kernel's path uses
+/// `total_needed > read_size` (read_size is bound by both the
+/// global cap AND the page-remaining length).
+fn recurse_into_target(
+    resolved: &ResolvedTarget<'_>,
+    target_bytes: &[u8],
+    val: u64,
+    depth: u32,
+    mem: &dyn MemReader,
+    visited: &mut HashSet<u64>,
+    truncated_at_cap: bool,
+) -> Box<RenderedValue> {
+    visited.insert(val);
+    let cross_btf_wrap = resolved
+        .cross_btf_hit
+        .as_ref()
+        .map(|_| CrossBtfMemReader { inner: mem });
+    let recurse_mem: &dyn MemReader = match &cross_btf_wrap {
+        Some(w) => w,
+        None => mem,
+    };
+    let inner = render_value_inner(
+        resolved.current_btf,
+        resolved.effective_type_id,
+        target_bytes,
+        depth + 1,
+        Some(recurse_mem),
+        visited,
+    );
+    visited.remove(&val);
+    if truncated_at_cap {
+        // Partial render: only the first capped bytes of a
+        // larger struct were read. Wrap so the consumer can
+        // tell the rendered tree is incomplete even though it
+        // looks structurally sound.
+        Box::new(RenderedValue::Truncated {
+            needed: resolved.btf_size,
+            had: target_bytes.len(),
+            partial: Box::new(inner),
+        })
+    } else {
+        Box::new(inner)
+    }
 }
 
 /// Chase an arena pointer and render the target struct.
@@ -2734,57 +3329,92 @@ fn chase_arena_pointer(
     depth: u32,
     visited: &mut HashSet<u64>,
 ) -> ArenaChaseOutcome {
-    // Peel modifiers AND resolve a Fwd terminal to a complete
-    // Struct/Union sibling of the same name when one is in the
-    // BTF. Without the Fwd shortcut, [`type_size`] would return
-    // `None` for a [`Type::Fwd`] terminal and the chase would skip
-    // even when the renderer has full layout info one BTF id away.
-    // `effective_type_id` is what the render recursion below uses
-    // to resolve members — it is the resolved Struct/Union id when
-    // a sibling was found, otherwise the post-peel original id.
-    let Some((mut target_ty, mut effective_type_id)) =
-        peel_modifiers_resolving_fwd(btf, target_type_id)
-    else {
-        return ArenaChaseOutcome {
-            deref: None,
-            reason: Some(format!(
-                "arena chase target type id {target_type_id} unresolvable"
-            )),
-            sdt_alloc_resolved: false,
+    // Special case: `target_type_id == 0` means the cast analyzer's
+    // STX-flow path tagged the slot as Arena WITHOUT a resolved
+    // BTF type id (the deferred-resolve arena cast path —
+    // allocator-return seeds produce findings whose target shape
+    // is determined entirely by the
+    // [`MemReader::resolve_arena_type`] bridge at chase time).
+    // Skip the shared resolver and consult the bridge directly. If
+    // the bridge returns a hit, render against the recovered
+    // payload type id; otherwise skip with a clear reason so the
+    // operator sees why the chase did not land. The deferred path
+    // bypasses the cross-BTF probe — the bridge's resolved id is
+    // in the entry BTF — by synthesising a `ResolvedTarget` with
+    // `cross_btf_hit = None`, which feeds directly into the
+    // post-read recursion.
+    let resolved = if target_type_id == 0 {
+        let Some(hit) = mem.resolve_arena_type(val) else {
+            return ArenaChaseOutcome {
+                deref: None,
+                reason: Some(format!(
+                    "arena chase: cast analyzer's STX-flow path tagged \
+                     slot as Arena (target_type_id=0, deferred resolve), \
+                     but [`MemReader::resolve_arena_type`] had no entry \
+                     for 0x{val:x}; allocator pre-pass may not have \
+                     populated the index for this allocator"
+                )),
+                sdt_alloc_resolved: false,
+            };
         };
+        let Some((resolved_ty, resolved_id)) =
+            peel_modifiers_resolving_fwd(btf, hit.target_type_id)
+        else {
+            return ArenaChaseOutcome {
+                deref: None,
+                reason: Some(format!(
+                    "arena chase: bridge returned target_type_id={} \
+                     but the type does not resolve in the program BTF",
+                    hit.target_type_id
+                )),
+                sdt_alloc_resolved: false,
+            };
+        };
+        let Some(btf_size) = type_size(btf, &resolved_ty) else {
+            return ArenaChaseOutcome {
+                deref: None,
+                reason: Some(unsizable_chase_reason(
+                    btf,
+                    "arena chase",
+                    hit.target_type_id,
+                    &resolved_ty,
+                )),
+                sdt_alloc_resolved: false,
+            };
+        };
+        if btf_size == 0 {
+            return ArenaChaseOutcome {
+                deref: None,
+                reason: Some(format!(
+                    "arena chase target type id {} BTF size is 0 (incomplete type)",
+                    hit.target_type_id
+                )),
+                sdt_alloc_resolved: true,
+            };
+        }
+        ResolvedTarget {
+            effective_type_id: resolved_id,
+            current_btf: btf,
+            btf_size,
+            header_skip: hit.header_skip,
+            sdt_alloc_resolved: true,
+            cross_btf_hit: None,
+        }
+    } else {
+        match resolve_chase_target(btf, mem, val, target_type_id, "arena chase") {
+            ChaseResolve::Ready(r) => r,
+            ChaseResolve::Skip {
+                reason,
+                sdt_alloc_resolved,
+            } => {
+                return ArenaChaseOutcome {
+                    deref: None,
+                    reason: Some(reason),
+                    sdt_alloc_resolved,
+                };
+            }
+        }
     };
-    // If the post-peel terminal is still [`Type::Fwd`], the
-    // BTF-only resolve found no complete same-name sibling — the
-    // body lives in a separate BTF the renderer cannot reach.
-    // [`try_sdt_alloc_bridge`] consults the
-    // [`MemReader::resolve_arena_type`] override the sdt_alloc
-    // pre-pass populates with `slot_payload_start →
-    // payload_btf_type_id` so a forward-declared payload (e.g. a
-    // scheduler that opaquely references the post-header pointer
-    // returned by `scx_task_data()`) renders as the real per-task /
-    // per-cgroup struct instead of skipping with "forward
-    // declaration; body not in this BTF".
-    let sdt_alloc_resolved =
-        try_sdt_alloc_bridge(btf, mem, val, &mut target_ty, &mut effective_type_id);
-    let Some(btf_size) = type_size(btf, &target_ty) else {
-        return ArenaChaseOutcome {
-            deref: None,
-            reason: Some(unsizable_chase_reason(
-                btf,
-                "arena chase",
-                target_type_id,
-                &target_ty,
-            )),
-            sdt_alloc_resolved,
-        };
-    };
-    if btf_size == 0 {
-        return ArenaChaseOutcome {
-            deref: None,
-            reason: Some("pointee BTF size is 0 (incomplete type)".to_string()),
-            sdt_alloc_resolved,
-        };
-    }
     // The single-page (4 KiB) cap ([`POINTER_CHASE_CAP`]) matches
     // the arena page granularity exposed by
     // [`MemReader::read_arena`]: a pointee larger than 4 KiB
@@ -2796,9 +3426,17 @@ fn chase_arena_pointer(
     // [`RenderedValue::Truncated`] wrapper below when btf_size
     // exceeds the cap, so the operator sees the rendered subtree
     // is partial.
-    let read_size = btf_size.min(POINTER_CHASE_CAP);
-    let truncated_at_cap = btf_size > POINTER_CHASE_CAP;
-    let Some(target_bytes) = mem.read_arena(val, read_size) else {
+    //
+    // When the sdt_alloc bridge fired with `header_skip > 0`, the
+    // total bytes the chase needs from `val` are
+    // `header_skip + btf_size`. The cap still applies to the
+    // requested span — slot-start chases of payloads close to the
+    // cap may surface as `Truncated` because the header eats into
+    // the page-bounded read budget.
+    let total_needed = resolved.header_skip.saturating_add(resolved.btf_size);
+    let read_size = total_needed.min(POINTER_CHASE_CAP);
+    let truncated_at_cap = total_needed > POINTER_CHASE_CAP;
+    let Some(raw_bytes) = mem.read_arena(val, read_size) else {
         // [`MemReader::read_arena`] returns `None` when the full
         // requested length cannot be satisfied — most commonly
         // because the read crosses a page boundary in the captured
@@ -2810,42 +3448,78 @@ fn chase_arena_pointer(
                 "arena read failed (cross-page boundary or unmapped \
                  page); needed {read_size} bytes from 0x{val:x}"
             )),
-            sdt_alloc_resolved,
+            sdt_alloc_resolved: resolved.sdt_alloc_resolved,
         };
     };
-    // Mark this address visited BEFORE recursing so any pointer
-    // in the pointee that loops back here is detected as a
-    // cycle. Cleared after the recursion returns (path-based
-    // visited set: a sibling branch that legitimately points to
-    // the same target is not a cycle on its own path).
-    visited.insert(val);
-    let inner = render_value_inner(
-        btf,
-        effective_type_id,
-        &target_bytes,
-        depth + 1,
-        Some(mem),
-        visited,
-    );
-    visited.remove(&val);
-    let payload = if truncated_at_cap {
-        // Partial render: only the first cap bytes of a larger
-        // struct were read. Wrap so the consumer can tell the
-        // rendered tree is incomplete even though it looks
-        // structurally sound.
-        Box::new(RenderedValue::Truncated {
-            needed: btf_size,
-            had: target_bytes.len(),
-            partial: Box::new(inner),
-        })
-    } else {
-        Box::new(inner)
+    // Slot-start bridge fire: skip the header before rendering the
+    // payload struct. `read_arena` is contractually
+    // single-page-bound so the slice never under-runs unless the
+    // page-tail cropped the read; in that pathological case
+    // surface a clear skip reason rather than rendering a
+    // partial-header-stripped buffer.
+    let Some(target_bytes) = apply_header_skip(&raw_bytes, resolved.header_skip) else {
+        return ArenaChaseOutcome {
+            deref: None,
+            reason: Some(format!(
+                "arena read at 0x{val:x} returned {} bytes; \
+                 sdt_alloc bridge needs at least {} for header skip",
+                raw_bytes.len(),
+                resolved.header_skip
+            )),
+            sdt_alloc_resolved: resolved.sdt_alloc_resolved,
+        };
     };
+    let payload = recurse_into_target(
+        &resolved,
+        target_bytes,
+        val,
+        depth,
+        mem,
+        visited,
+        truncated_at_cap,
+    );
     ArenaChaseOutcome {
         deref: Some(payload),
         reason: None,
-        sdt_alloc_resolved,
+        sdt_alloc_resolved: resolved.sdt_alloc_resolved,
     }
+}
+
+/// Try the cross-BTF Fwd resolution bridge for a `BTF_KIND_FWD`
+/// chase target. Returns `Some(CrossBtfRef { btf, type_id })` when
+/// the [`MemReader::cross_btf_resolve_fwd`] override returns a
+/// hit — the renderer's cast-analysis pre-pass populated a name-
+/// keyed index over every embedded `.bpf.objs` BTF and the named
+/// struct/union has a complete body in a sibling object.
+///
+/// `entry_btf` is the BTF the chase entered with — used to
+/// translate the Fwd's name offset to a string the implementation
+/// can key its index against. `target_ty` must be the post-peel
+/// terminal of [`peel_modifiers_resolving_fwd`]; the helper
+/// itself gates on `matches!(target_ty, Type::Fwd(_))` so calling
+/// on a non-Fwd terminal is a no-op and returns `None`. Anonymous
+/// Fwds (empty resolved name) likewise return `None` — the index
+/// keys on non-empty names.
+///
+/// The aggregate-kind match ([`btf_rs::Fwd::is_struct`]) is
+/// preserved end-to-end: a `Fwd` declared as `struct foo` only
+/// resolves to a `struct foo` body in another BTF, never to a
+/// `union foo`. Mirrors the same gate
+/// [`peel_modifiers_resolving_fwd`] applies for in-BTF resolution.
+fn try_cross_btf_fwd_resolve<'a>(
+    mem: &'a dyn MemReader,
+    entry_btf: &Btf,
+    target_ty: &Type,
+) -> Option<CrossBtfRef<'a>> {
+    let Type::Fwd(fwd) = target_ty else {
+        return None;
+    };
+    let kind = FwdKind::from_is_struct(fwd.is_struct());
+    let name = entry_btf.resolve_name(fwd).ok()?;
+    if name.is_empty() {
+        return None;
+    }
+    mem.cross_btf_resolve_fwd(&name, kind)
 }
 
 /// Build a [`RenderedValue::Ptr`] for a cast-recovered pointer with
@@ -2854,13 +3528,16 @@ fn chase_arena_pointer(
 /// Every site in [`render_cast_pointer`] that emits a `Ptr` shares
 /// the same four-field shape (`value`, optional `deref`, optional
 /// `deref_skipped_reason`, optional `cast_annotation`). The helper
-/// encodes the canonical annotation — `format!("cast→{addr_space}")`
-/// using the [`AddrSpace`] [`Display`] impl — so adding a new
-/// address-space variant cannot drift between the analyzer enum and
-/// the operator-visible tag. `addr_space` here is the address space
-/// the renderer ACTUALLY chased through (runtime decision), not the
-/// analyzer's hint, so the annotation reflects the path the chase
-/// took.
+/// resolves the canonical annotation through [`cast_annotation_for`]
+/// — a 4-cell match over [`AddrSpace`] × [`Self::sdt_alloc_resolved`]
+/// returning a `&'static str` — so every annotation the renderer
+/// emits is a borrow into the binary's read-only string pool, not a
+/// per-chase heap allocation. Adding a new address-space variant
+/// surfaces as a non-exhaustive match at compile time, keeping the
+/// analyzer enum and the operator-visible tag in lockstep.
+/// `addr_space` here is the address space the renderer ACTUALLY
+/// chased through (runtime decision), not the analyzer's hint, so
+/// the annotation reflects the path the chase took.
 ///
 /// `sdt_alloc_resolved` extends the annotation to
 /// `cast→{addr_space} (sdt_alloc)` when the chase recovered the
@@ -2876,16 +3553,40 @@ fn cast_ptr(
     addr_space: super::cast_analysis::AddrSpace,
     sdt_alloc_resolved: bool,
 ) -> RenderedValue {
-    let cast_annotation = if sdt_alloc_resolved {
-        Some(format!("cast→{addr_space} (sdt_alloc)"))
-    } else {
-        Some(format!("cast→{addr_space}"))
-    };
     RenderedValue::Ptr {
         value,
         deref,
         deref_skipped_reason: reason,
-        cast_annotation,
+        cast_annotation: Some(Cow::Borrowed(cast_annotation_for(
+            addr_space,
+            sdt_alloc_resolved,
+        ))),
+    }
+}
+
+/// Resolve the canonical cast annotation tag to a `&'static str`.
+///
+/// The `(addr_space, sdt_alloc_resolved)` pair maps to one of four
+/// fixed strings — exhaustively enumerated below so [`AddrSpace`]'s
+/// closed variant set drives an exhaustive match. A new variant
+/// produces a compile error here, forcing the operator-visible tag
+/// to stay in lockstep with the analyzer enum.
+///
+/// The pre-existing [`AddrSpace`] [`Display`] impl is kept for
+/// other call sites (free-form formatting, error messages); the
+/// renderer side bypasses Display because the closed set lets us
+/// hand back static strings instead of allocating a new `String`
+/// per chase.
+fn cast_annotation_for(
+    addr_space: super::cast_analysis::AddrSpace,
+    sdt_alloc_resolved: bool,
+) -> &'static str {
+    use super::cast_analysis::AddrSpace;
+    match (addr_space, sdt_alloc_resolved) {
+        (AddrSpace::Arena, false) => "cast→arena",
+        (AddrSpace::Arena, true) => "cast→arena (sdt_alloc)",
+        (AddrSpace::Kernel, false) => "cast→kernel",
+        (AddrSpace::Kernel, true) => "cast→kernel (sdt_alloc)",
     }
 }
 
@@ -2981,59 +3682,51 @@ fn render_cast_pointer(
     // the BTF lands on the sibling rather than skipping. The
     // arena arm above shares the same shortcut via
     // [`chase_arena_pointer`].
-    let Some((mut target_ty, mut effective_type_id)) =
-        peel_modifiers_resolving_fwd(btf, hit.target_type_id)
-    else {
+    //
+    // Special case: `target_type_id == 0` is the cast analyzer's
+    // STX-flow Arena sentinel (the deferred-resolve arena cast
+    // path emits this when the target is unresolved at analysis
+    // time). The hint was Arena but the runtime value fell
+    // outside the arena window, so we landed here. Without a BTF
+    // id to resolve, the kernel arm cannot size the read; surface
+    // a clear skip reason so the operator sees the analyzer/runtime
+    // mismatch.
+    if hit.target_type_id == 0 {
         return cast_ptr(
             value,
             None,
             Some(format!(
-                "kernel cast target type id {} unresolvable",
-                hit.target_type_id
+                "kernel cast target unresolved (analyzer hinted Arena \
+                 with deferred resolve, but runtime value 0x{value:x} \
+                 fell outside the arena window)"
             )),
             super::cast_analysis::AddrSpace::Kernel,
             false,
         );
-    };
-    // sdt_alloc bridge for the kernel arm: shared with
-    // [`chase_arena_pointer`] via [`try_sdt_alloc_bridge`] so a
-    // [`Type::Fwd`] target whose body is in another BTF still
-    // chases when the [`MemReader::resolve_arena_type`] index has
-    // an entry for `value`. Structurally a no-op for the production
-    // [`super::dump::render_map::AccessorMemReader`] since the
-    // kernel arm only fires when `is_arena_addr(value)` returned
-    // false and the index keys on user-side arena addresses, but
-    // the symmetric wiring covers custom [`MemReader`] impls that
-    // populate the index differently and keeps the two arms'
-    // resolution policy in lockstep.
-    let sdt_alloc_resolved =
-        try_sdt_alloc_bridge(btf, mem, value, &mut target_ty, &mut effective_type_id);
-    let Some(btf_size) = type_size(btf, &target_ty) else {
-        return cast_ptr(
-            value,
-            None,
-            Some(unsizable_chase_reason(
-                btf,
-                "kernel cast",
-                hit.target_type_id,
-                &target_ty,
-            )),
-            super::cast_analysis::AddrSpace::Kernel,
-            sdt_alloc_resolved,
-        );
-    };
-    if btf_size == 0 {
-        return cast_ptr(
-            value,
-            None,
-            Some(format!(
-                "kernel cast target type id {} BTF size is 0 (incomplete type)",
-                hit.target_type_id
-            )),
-            super::cast_analysis::AddrSpace::Kernel,
-            sdt_alloc_resolved,
-        );
     }
+    // Pre-read sequence shared with [`chase_arena_pointer`]: peel +
+    // Fwd-resolve target, try sdt_alloc bridge, fall back to
+    // cross-BTF Fwd index, settle final btf_size, reject zero-size
+    // payloads. Returns a [`ResolvedTarget`] ready for the per-arm
+    // `read_kva`, or a skip reason that flows into the `cast_ptr`
+    // builder so the no-deref render still surfaces the bridge
+    // state when it fired before the skip.
+    let resolved =
+        match resolve_chase_target(btf, mem, value, hit.target_type_id, "kernel cast") {
+            ChaseResolve::Ready(r) => r,
+            ChaseResolve::Skip {
+                reason,
+                sdt_alloc_resolved,
+            } => {
+                return cast_ptr(
+                    value,
+                    None,
+                    Some(reason),
+                    super::cast_analysis::AddrSpace::Kernel,
+                    sdt_alloc_resolved,
+                );
+            }
+        };
     // Kernel reads honour [`POINTER_CHASE_CAP`] and also cap at
     // the remaining bytes in the current 4 KiB page so `read_kva`
     // cannot accidentally cross a page boundary into an unrelated
@@ -3042,15 +3735,22 @@ fn render_cast_pointer(
     // straddles a page boundary may have its tail in a freed or
     // unrelated page — bounding the read at the page edge keeps
     // the dump from leaking adjacent slab content.
+    //
+    // When the sdt_alloc bridge fired with `header_skip > 0`,
+    // the total bytes the chase needs from `value` are
+    // `header_skip + btf_size` — the header bytes are skipped
+    // before the payload starts. The page-bounded cap still
+    // applies to the requested span.
     const PAGE_SIZE: u64 = 4096;
     // PAGE_SIZE - (value % PAGE_SIZE) bytes remain in the current
     // 4 KiB page from `value` onward. usize fits the result
     // because PAGE_SIZE is 4096 (well below usize::MAX) and the
     // modulo result is in [0, PAGE_SIZE).
     let page_remaining = (PAGE_SIZE - (value % PAGE_SIZE)) as usize;
-    let read_size = btf_size.min(POINTER_CHASE_CAP).min(page_remaining);
-    let truncated_at_cap = btf_size > read_size;
-    let Some(target_bytes) = mem.read_kva(value, read_size) else {
+    let total_needed = resolved.header_skip.saturating_add(resolved.btf_size);
+    let read_size = total_needed.min(POINTER_CHASE_CAP).min(page_remaining);
+    let truncated_at_cap = total_needed > read_size;
+    let Some(raw_bytes) = mem.read_kva(value, read_size) else {
         // The runtime check rejected the arena window AND the
         // kernel read failed — surface both pieces of evidence so
         // the operator can correlate the analyzer hint with the
@@ -3071,7 +3771,26 @@ fn render_cast_pointer(
                  (unmapped page or no PTE); needed {read_size} bytes{suffix}"
             )),
             super::cast_analysis::AddrSpace::Kernel,
-            sdt_alloc_resolved,
+            resolved.sdt_alloc_resolved,
+        );
+    };
+    // Slot-start bridge fire on the kernel arm: skip the header
+    // before the plausibility gate and the recursion. Refuse to
+    // proceed when the read returned fewer bytes than the header
+    // skip needs — surfaces the page-tail truncation as a clear
+    // skip reason rather than rendering a corrupted slice.
+    let Some(target_bytes) = apply_header_skip(&raw_bytes, resolved.header_skip) else {
+        return cast_ptr(
+            value,
+            None,
+            Some(format!(
+                "kernel read_kva at 0x{value:x} returned {} bytes; \
+                 sdt_alloc bridge needs at least {} for header skip",
+                raw_bytes.len(),
+                resolved.header_skip
+            )),
+            super::cast_analysis::AddrSpace::Kernel,
+            resolved.sdt_alloc_resolved,
         );
     };
     // Plausibility gate: a freed slab object's first qword is
@@ -3083,7 +3802,8 @@ fn render_cast_pointer(
     // kptr chase in the `Type::Ptr` arm. Arena reads are exempt
     // (the arena helper above does not apply this gate) — arena
     // pages are caller-controlled allocations whose first bytes
-    // are not used for slab freelist metadata.
+    // are not used for slab freelist metadata. The gate runs
+    // against the post-skip payload bytes when the bridge fired.
     if target_bytes.len() >= 8 {
         let first_qword = u64::from_le_bytes(target_bytes[..8].try_into().unwrap());
         if first_qword >> 56 == 0xff {
@@ -3096,46 +3816,25 @@ fn render_cast_pointer(
                      object freelist pointer)"
                 )),
                 super::cast_analysis::AddrSpace::Kernel,
-                sdt_alloc_resolved,
+                resolved.sdt_alloc_resolved,
             );
         }
     }
-    // Cycle protection mirrors the `Type::Ptr` arm: mark the
-    // value visited before recursing, clear on return so a
-    // sibling branch that legitimately points to the same target
-    // is not treated as a cycle on its own path. Recurse against
-    // `effective_type_id` so a Fwd-resolved sibling is rendered
-    // by its complete layout, not the bodyless Fwd id.
-    visited.insert(value);
-    let inner = render_value_inner(
-        btf,
-        effective_type_id,
-        &target_bytes,
-        depth + 1,
-        Some(mem),
+    let deref_payload = recurse_into_target(
+        &resolved,
+        target_bytes,
+        value,
+        depth,
+        mem,
         visited,
+        truncated_at_cap,
     );
-    visited.remove(&value);
-    let deref_payload = if truncated_at_cap {
-        // Partial render: only the first capped bytes of a
-        // larger struct were read. Wrap so the consumer can tell
-        // the rendered tree is incomplete even though it looks
-        // structurally sound — same shape [`chase_arena_pointer`]
-        // produces for the arena path.
-        Box::new(RenderedValue::Truncated {
-            needed: btf_size,
-            had: target_bytes.len(),
-            partial: Box::new(inner),
-        })
-    } else {
-        Box::new(inner)
-    };
     cast_ptr(
         value,
         Some(deref_payload),
         None,
         super::cast_analysis::AddrSpace::Kernel,
-        sdt_alloc_resolved,
+        resolved.sdt_alloc_resolved,
     )
 }
 
@@ -3260,7 +3959,7 @@ pub(crate) fn peel_modifiers_resolving_fwd(btf: &Btf, type_id: u32) -> Option<(T
     let Type::Fwd(ref fwd) = ty else {
         return Some((ty, tid));
     };
-    let want_struct = fwd.is_struct();
+    let kind = FwdKind::from_is_struct(fwd.is_struct());
     let Ok(name) = btf.resolve_name(fwd) else {
         return Some((ty, tid));
     };
@@ -3279,9 +3978,9 @@ pub(crate) fn peel_modifiers_resolving_fwd(btf: &Btf, type_id: u32) -> Option<(T
         let Some((candidate_ty, candidate_id)) = peel_modifiers_with_id(btf, cid) else {
             continue;
         };
-        match (&candidate_ty, want_struct) {
-            (Type::Struct(_), true) => return Some((candidate_ty, candidate_id)),
-            (Type::Union(_), false) => return Some((candidate_ty, candidate_id)),
+        match (&candidate_ty, kind) {
+            (Type::Struct(_), FwdKind::Struct) => return Some((candidate_ty, candidate_id)),
+            (Type::Union(_), FwdKind::Union) => return Some((candidate_ty, candidate_id)),
             _ => continue,
         }
     }

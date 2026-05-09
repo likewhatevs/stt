@@ -52,8 +52,26 @@ UEI_DEFINE(uei);
  *     `Ptr{value, deref: Some(Struct{type_name: "task_struct", ...})}`
  *     instead of a raw u64 counter. This is the cross-domain
  *     "arena-source -> kernel-target" chase the E2E test asserts on.
+ *   - `stashed_arena_ptr` (offset 24): u64 holding the arena VA of a
+ *     `struct ktstr_cross_btf_target` allocated via `scx_static_alloc`
+ *     and cached in `ktstr_cross_btf_map`. Written by the chase
+ *     helper `ktstr_cross_btf_chase` via the STX-flow alias-tracking
+ *     path: the publish helper STXs the allocator-return arena VA
+ *     into the hash map value's `cached_ptr`, after which an LDX
+ *     through the same hash-value typed base inherits
+ *     `RegState::ArenaU64FromAlloc` and the subsequent STX into this
+ *     field records `(ktstr_arena_ctx, 24) -> AddrSpace::Arena` with
+ *     `target_type_id == 0`. The follow-up E2E layer wires payload-
+ *     type recovery for `scx_static_alloc` payloads (the existing
+ *     `MemReader::resolve_arena_type` bridge in
+ *     `src/monitor/dump/render_map.rs` only indexes sdt_alloc
+ *     slots; scx_static_alloc has no per-slot header, so the bridge
+ *     extension that consumes this fixture is the matching test
+ *     scenario's responsibility). Mirrors the cgx_raw chain in
+ *     lavd's cgroup_bw library — generic-named so the fixture
+ *     doesn't bind to that scheduler.
  *
- * The 24-byte size keeps the struct padded to a multiple of 8 (matches
+ * The 32-byte size keeps the struct padded to a multiple of 8 (matches
  * `SDT_TASK_MIN_ELEM_PER_ALLOC`'s round-up in
  * `lib/sdt_alloc.bpf.c::scx_alloc_init`).
  */
@@ -62,6 +80,7 @@ struct ktstr_arena_ctx {
 	__u32 counter;
 	__u32 _pad;
 	__u64 task_kptr;
+	__u64 stashed_arena_ptr;
 };
 
 /* Sentinel written into `ktstr_arena_ctx::magic` at every alloc.
@@ -123,6 +142,86 @@ struct ktstr_bss_arena_holder {
 };
 
 volatile struct ktstr_bss_arena_holder ktstr_bss_arena_holder;
+
+/* Target struct allocated via `scx_static_alloc` and cached through
+ * `ktstr_cross_btf_map`. Mirrors the lavd `scx_cgroup_ctx` shape: a
+ * small arena-resident struct whose pointer is stashed in a u64 slot
+ * via the allocator-return -> STX-flow path.
+ *
+ * Field roles:
+ *   - `magic` (offset 0): u64 sentinel stamped at every alloc so the
+ *     E2E test can verify the chase landed on a real allocation
+ *     (not a stale arena page or a same-shape decoy).
+ *   - `marker` (offset 8): u64 second sentinel that disambiguates
+ *     this struct from any other 16-byte u64-pair struct in the
+ *     program BTF. Two distinct constants make a {(0,8), (8,8)}
+ *     read pattern uniquely fingerprint this struct shape.
+ */
+struct ktstr_cross_btf_target {
+	__u64 magic;
+	__u64 marker;
+};
+
+/* Sentinels written into `ktstr_cross_btf_target` at every alloc.
+ * The two values are distinct so a successful chase displaying both
+ * proves the renderer descended into the chased struct correctly,
+ * not just that bytes happened to match a single sentinel. */
+#define KTSTR_CROSS_BTF_TARGET_MAGIC 0xC0FFEEFEEDFACE01ULL
+#define KTSTR_CROSS_BTF_TARGET_MARKER 0x1234567890ABCDEFULL
+
+/* Hash map value carrying the cached arena VA of the most recent
+ * `ktstr_cross_btf_target` allocation. The publish helper STXs the
+ * `scx_static_alloc` return into `cached_ptr`; the chase helper LDXs
+ * `cached_ptr` through a typed `Pointer{ktstr_cross_btf_value}` base
+ * so the cast analyzer's STX-flow alias-tracking path inherits the
+ * `RegState::ArenaU64FromAlloc` tag onto the loaded register.
+ *
+ * Single-field struct keeps the access pattern simple — the only
+ * load through a typed base is at offset 0, so the analyzer's
+ * `(ktstr_cross_btf_value, 0) -> AddrSpace::Arena` finding records
+ * cleanly. */
+struct ktstr_cross_btf_value {
+	__u64 cached_ptr;
+};
+
+/* Hash map keyed by a fixed u32 sentinel. The fixture only uses key
+ * `KTSTR_CROSS_BTF_KEY` so a single map entry round-trips the arena
+ * VA between the publish and chase helpers. `BPF_F_NO_PREALLOC`
+ * matches the lavd `cbw_cgrp_map` shape, but the choice is
+ * incidental here — the cast analyzer only cares about the BTF
+ * value type and the hash-map kind, not the allocation policy.
+ *
+ * `__type(value, struct ktstr_cross_btf_value)` makes libbpf publish
+ * the struct as the map's value BTF; the kernel verifier types
+ * `bpf_map_lookup_elem(&ktstr_cross_btf_map, &key)` returns as
+ * `Pointer{ktstr_cross_btf_value}` so the body's typed access
+ * pattern survives verification. The host-side cast analyzer
+ * (`src/monitor/cast_analysis.rs`) does not currently parse the
+ * map's value BTF off `bpf_map_lookup_elem` returns; the chase
+ * detection on this fixture relies on a follow-up enhancement that
+ * mirrors `FuncEntry`'s parameter-typing path for the helper
+ * return. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, __u32);
+	__type(value, struct ktstr_cross_btf_value);
+	__uint(max_entries, 1);
+} ktstr_cross_btf_map SEC(".maps");
+
+/* Single sentinel key for `ktstr_cross_btf_map`. The fixture only
+ * uses one entry — distinct keys would diverge the publish and
+ * chase helpers' lookups, producing a useless empty entry. */
+#define KTSTR_CROSS_BTF_KEY 0u
+
+/* Page count for `scx_static_init` in `ktstr_init`. One page (4 KiB)
+ * holds many `ktstr_cross_btf_target` slots (each 16 bytes); the
+ * fixture only ever allocates one because the hash map's
+ * `BPF_F_NO_PREALLOC` lookup-or-insert in
+ * `ktstr_cross_btf_publish` short-circuits subsequent calls. The
+ * allocator's bump pointer never advances past the first slot, so a
+ * single page is comfortably sufficient. */
+#define KTSTR_CROSS_BTF_STATIC_PAGES 1
 
 /* When non-zero, ktstr_dispatch stops moving tasks from the shared DSQ,
  * causing a deliberate stall that triggers the scx watchdog. */
@@ -279,14 +378,25 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init)
 	if (ret)
 		return ret;
 
+	/* Bring the static allocator online so `scx_static_alloc` calls
+	 * in `ktstr_cross_btf_publish` succeed. `scx_static_init` calls
+	 * `bpf_arena_alloc_pages` to back-fill the static pool from the
+	 * BPF arena (sleepable). One page is sufficient for the fixture
+	 * — see `KTSTR_CROSS_BTF_STATIC_PAGES`. Failure here is
+	 * recoverable downstream: `scx_static_alloc` returns NULL, the
+	 * publish helper's NULL check bails, and the chase fixture
+	 * surfaces an empty hash entry rather than corrupted state. */
+	ret = scx_static_init(KTSTR_CROSS_BTF_STATIC_PAGES);
+	if (ret)
+		return ret;
+
 	/* Bring the sdt_alloc per-task allocator online so subsequent
 	 * `scx_task_alloc(p)` calls in `ktstr_init_task` succeed. The
 	 * data_size argument is the per-task payload size that the
 	 * allocator's pool will hand out; passing
 	 * `sizeof(struct ktstr_arena_ctx)` matches the struct that
 	 * `ktstr_init_task` writes into. `scx_task_init` rounds this up
-	 * to 8 bytes inside `lib/sdt_alloc.bpf.c::pool_set_size`, so
-	 * the actual pool element size is at least 16 bytes. */
+	 * to 8 bytes inside `lib/sdt_alloc.bpf.c::pool_set_size`. */
 	return scx_task_init(sizeof(struct ktstr_arena_ctx));
 }
 
@@ -344,8 +454,10 @@ int ktstr_stash_task_kptr(struct ktstr_arena_ctx __arena *taskc,
  * After the forward walk, `Analyzer::finalize` intersects the recorded
  * `(offset, size)` pattern against every BTF struct in scx-ktstr's
  * program BTF. The pattern {(0,8), (8,4), (16,8)} matches exactly
- * one struct: `ktstr_arena_ctx` (other 24-byte structs in the BTF do
- * not have this field-width layout). The resulting `CastMap` entry is
+ * one struct: `ktstr_arena_ctx` (no other struct in the BTF carries a
+ * u64 at offset 0 plus u32 at offset 8 plus u64 at offset 16, so the
+ * shape is uniquely fingerprinted regardless of fields beyond offset
+ * 24). The resulting `CastMap` entry is
  * `(ktstr_bss_arena_holder, 0) -> (ktstr_arena_ctx, AddrSpace::Arena)`.
  *
  * The body publishes its computed value back into a sibling BSS
@@ -413,6 +525,178 @@ int ktstr_train_bss_to_arena(struct ktstr_bss_arena_holder *holder)
 	return 0;
 }
 
+/*
+ * Cross-BTF-class arena chase trainer (publish side).
+ *
+ * Allocates a `struct ktstr_cross_btf_target` via `scx_static_alloc`
+ * and stashes the returned arena VA into the `cached_ptr` field of a
+ * hash map value. Mirrors the lavd `cbw_alloc_cgx` -> hash-map-update
+ * idiom: the allocator returns a u64 that BTF declares as a generic
+ * integer, but the host-side cast analyzer's allocator-return seed
+ * tags R0 as `RegState::ArenaU64FromAlloc` after the
+ * `BPF_PSEUDO_CALL` to `scx_static_alloc_internal`. The subsequent
+ * STX into the hash value's `cached_ptr` field through a typed
+ * `Pointer{ktstr_cross_btf_value}` base records
+ * `(ktstr_cross_btf_value, 0) -> AddrSpace::Arena` in the cast
+ * map's STX-flow findings.
+ *
+ * The lookup-or-insert dance primes the hash entry on first call and
+ * short-circuits subsequent calls when `cached_ptr` is already
+ * populated, so the static allocator pool advances by exactly one
+ * `sizeof(ktstr_cross_btf_target)` slot across the lifetime of the
+ * scheduler — preventing the bump pointer from racing past the
+ * `KTSTR_CROSS_BTF_STATIC_PAGES`-page reservation under concurrent
+ * `init_task` callbacks.
+ *
+ * `static __noinline __attribute__((used))` follows the same shape as
+ * `ktstr_train_bss_to_arena` and `ktstr_stash_task_kptr`: keeps the
+ * helper as a real BPF-to-BPF call with its own `.BTF.ext`
+ * `func_info` entry so the cast analyzer's function-entry seeding
+ * applies to the helper's first instruction.
+ *
+ * Returns 0 on a successful publish OR when the entry was already
+ * populated by a prior call; negative on first-time failures
+ * (allocator empty, map insert failed, post-insert lookup raced).
+ * The caller treats failures as best-effort — the chase fixture is
+ * a static-analysis affordance, not a load-bearing scheduler op.
+ */
+static __noinline __attribute__((used))
+int ktstr_cross_btf_publish(void)
+{
+	struct ktstr_cross_btf_target __arena *target;
+	struct ktstr_cross_btf_value *entry;
+	struct ktstr_cross_btf_value initial = {};
+	__u32 key = KTSTR_CROSS_BTF_KEY;
+
+	/* Fast path: the entry already carries a non-zero `cached_ptr`
+	 * from a prior call, so re-allocating would just leak static
+	 * pool space. The publish work was completed; the chase helper
+	 * has everything it needs. */
+	entry = bpf_map_lookup_elem(&ktstr_cross_btf_map, &key);
+	if (entry && entry->cached_ptr)
+		return 0;
+
+	/* Static-pool allocate. The bump allocator backs onto BPF arena
+	 * pages reserved by `scx_static_init` in `ktstr_init`, so the
+	 * returned arena VA is in the same arena window as the per-task
+	 * sdt_alloc allocations — both routes funnel into the same
+	 * `MemReader::is_arena_addr` window at chase time. */
+	target = scx_static_alloc(sizeof(*target), 8);
+	if (!target)
+		return -ENOMEM;
+	target->magic = KTSTR_CROSS_BTF_TARGET_MAGIC;
+	target->marker = KTSTR_CROSS_BTF_TARGET_MARKER;
+
+	/* Insert an empty entry if missing, then update its cached_ptr.
+	 * The two-step pattern matches lavd's `cbw_alloc_cgx`-then-
+	 * `bpf_map_update_elem` flow and keeps the STX of the arena VA
+	 * separate from the create — STXing into a freshly-zeroed
+	 * lookup result lets the analyzer see the typed `Pointer{ktstr_cross_btf_value}`
+	 * base register at the store site (the lookup return is what
+	 * the cast analyzer's helper-return type tracking relies on). */
+	if (!entry) {
+		bpf_map_update_elem(&ktstr_cross_btf_map, &key, &initial,
+				    BPF_NOEXIST);
+		entry = bpf_map_lookup_elem(&ktstr_cross_btf_map, &key);
+		if (!entry)
+			return -ENOENT;
+	}
+
+	/* The cast through (unsigned long) is the same arena-tag-stripping
+	 * idiom `ktstr_init_task` uses on the BSS holder side: the verifier
+	 * lowers it to a `BPF_ADDR_SPACE_CAST` (kernel→arena), keeping the
+	 * arena VA value but dropping the `__arena` qualifier so the u64
+	 * field accepts the assignment. Once the cast analyzer types
+	 * `bpf_map_lookup_elem` returns from the map's BTF value type,
+	 * its STX-flow path records
+	 * `(ktstr_cross_btf_value, 0) -> AddrSpace::Arena` here:
+	 *   - R0 carries `RegState::ArenaU64FromAlloc` from the
+	 *     `scx_static_alloc_internal` subprog-return seed (already
+	 *     wired in `cast_analysis.rs::SubprogReturn`).
+	 *   - The store target is `Pointer{ktstr_cross_btf_value} + 0`,
+	 *     typed by the prospective helper-return tracking pass over
+	 *     `bpf_map_lookup_elem` (mirrors `FuncEntry`'s parameter-
+	 *     typing path, follow-up to this fixture).
+	 *   - `handle_stx`'s `StxValueKind::Arena` arm records the
+	 *     finding without shape inference. */
+	entry->cached_ptr = (__u64)(unsigned long)target;
+	return 0;
+}
+
+/*
+ * Cross-BTF-class arena chase trainer (chase side).
+ *
+ * Receives the per-task arena context as a `__u64 task_ctx_raw`
+ * parameter — the lavd cgroup_bw library uses the same shape (e.g.
+ * `cbw_cgroup_bw_throttled(u64 cgrp_id, u64 taskc_raw)`) so a
+ * cast-analyzer enhancement that types u64-cast-to-pointer
+ * parameters at the call boundary can apply uniformly to both
+ * scx-ktstr and lavd. Looks up the `ktstr_cross_btf_map` entry
+ * keyed by `KTSTR_CROSS_BTF_KEY`, reads the cached arena VA out of
+ * `entry->cached_ptr`, and stashes that u64 into the per-task
+ * `taskc->stashed_arena_ptr` slot.
+ *
+ * The expected analyzer trace through the body:
+ *   1. The `task_ctx_raw` u64 parameter is cast to
+ *      `struct ktstr_arena_ctx __arena *taskc`. Once the analyzer's
+ *      cross-call FuncProto inference types this parameter as a
+ *      `Pointer{ktstr_arena_ctx}`, the cast lowers to a
+ *      `BPF_ADDR_SPACE_CAST` and downstream STX through `taskc`
+ *      records into the `(ktstr_arena_ctx, …)` keyspace.
+ *   2. `bpf_map_lookup_elem(&ktstr_cross_btf_map, &key)` returns
+ *      `Pointer{ktstr_cross_btf_value}` once the analyzer's helper-
+ *      return type tracking consumes the map's BTF value type.
+ *   3. `LDX raw, [entry + 0]` (offset 0 = `cached_ptr`) inherits
+ *      `RegState::ArenaU64FromAlloc` via the alias-set tracking
+ *      path: the publish helper's STX previously recorded
+ *      `(ktstr_cross_btf_value, 0) -> Arena` in
+ *      `arena_stx_findings`, so `handle_ldx`'s
+ *      `arena_stx_findings.contains_key` check sets the loaded
+ *      register to `ArenaU64FromAlloc` instead of the generic
+ *      `LoadedU64Field`.
+ *   4. `STX [taskc + offsetof(stashed_arena_ptr)] = raw` records
+ *      `(ktstr_arena_ctx, 24) -> AddrSpace::Arena` with
+ *      `target_type_id == 0`. The fixture's matching test layer
+ *      extends `MemReader::resolve_arena_type` (currently
+ *      sdt_alloc-only) to recover the `ktstr_cross_btf_target`
+ *      payload type from `scx_static_alloc` slot metadata at chase
+ *      time.
+ *
+ * `static __noinline __attribute__((used))` keeps the helper as a
+ * real BPF-to-BPF call so the analyzer's function-entry seeding
+ * applies. The `used` attribute pins the symbol against
+ * interprocedural-elimination passes that might collapse the body
+ * into the caller when `task_ctx_raw` is the only parameter.
+ *
+ * Returns 0 on success, negative on every short-circuit (NULL
+ * input, missing map entry, zero `cached_ptr`). Failure does not
+ * abort the caller — the chase fixture is a static-analysis
+ * affordance, not a load-bearing scheduler op.
+ */
+static __noinline __attribute__((used))
+int ktstr_cross_btf_chase(__u64 task_ctx_raw)
+{
+	struct ktstr_arena_ctx __arena *taskc;
+	struct ktstr_cross_btf_value *entry;
+	__u32 key = KTSTR_CROSS_BTF_KEY;
+	__u64 raw;
+
+	taskc = (struct ktstr_arena_ctx __arena *)(unsigned long)task_ctx_raw;
+	if (!taskc)
+		return -EINVAL;
+
+	entry = bpf_map_lookup_elem(&ktstr_cross_btf_map, &key);
+	if (!entry)
+		return -ENOENT;
+
+	raw = entry->cached_ptr;
+	if (!raw)
+		return -ENOENT;
+
+	taskc->stashed_arena_ptr = raw;
+	return 0;
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init_task, struct task_struct *p,
 			     struct scx_init_task_args *args)
 {
@@ -434,6 +718,15 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init_task, struct task_struct *p,
 	taskc->magic = KTSTR_ARENA_MAGIC;
 	taskc->counter = KTSTR_TASK_COUNTER;
 	taskc->_pad = 0;
+	/* Zero `stashed_arena_ptr` ahead of the chase helper. The
+	 * sdt_alloc layer hands out memory whose contents are
+	 * undefined (no implicit zero-fill — see
+	 * `lib/sdt_alloc.bpf.c::scx_alloc_internal`), so a chase that
+	 * fails before reaching the STX site (publish helper raced and
+	 * left an empty entry, hash lookup miss, etc.) would otherwise
+	 * surface stale bytes from a prior allocation as a phantom
+	 * arena pointer. */
+	taskc->stashed_arena_ptr = 0;
 
 	/* Stash the task_struct kernel pointer in the task_kptr u64 field.
 	 * The store happens inside the helper so the host-side cast analyzer
@@ -469,6 +762,18 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ktstr_init_task, struct task_struct *p,
 	 * a static analysis affordance, not a load-bearing scheduler
 	 * operation. */
 	(void)ktstr_train_bss_to_arena((struct ktstr_bss_arena_holder *)&ktstr_bss_arena_holder);
+
+	/* Cross-BTF-class chase fixture (publish + chase). Run the
+	 * publish first so the hash entry's `cached_ptr` is populated
+	 * before the chase helper looks it up. Both helpers
+	 * short-circuit cleanly on missing state — the chase fixture is
+	 * a static-analysis affordance, not a load-bearing scheduler
+	 * operation. The chase helper's u64 parameter shape mirrors
+	 * lavd's cgroup_bw library so a future cast-analyzer
+	 * cross-call FuncProto inference enhancement applies uniformly
+	 * across both fixtures. */
+	(void)ktstr_cross_btf_publish();
+	(void)ktstr_cross_btf_chase((__u64)(unsigned long)taskc);
 
 	__sync_fetch_and_add(&ktstr_alloc_count, 1);
 	return 0;
@@ -545,8 +850,10 @@ void BPF_STRUCT_OPS(ktstr_dump_cpu, struct scx_dump_ctx *dctx,
  * `scx_task_data(p)` returns the per-task arena context allocated in
  * `ktstr_init_task`. NULL on tasks the allocator never touched (e.g.
  * pre-existing kthreads enqueued before `init_task` ran). Surface the
- * magic and counter so an operator can confirm the per-task arena
- * write actually landed for tasks that were running at freeze time.
+ * magic, counter, kernel kptr, and the cross-BTF-class chase target
+ * so an operator can confirm the per-task arena writes (including
+ * the publish/chase sequence) actually landed for tasks that were
+ * running at freeze time.
  */
 void BPF_STRUCT_OPS(ktstr_dump_task, struct scx_dump_ctx *dctx,
 		    struct task_struct *p)
@@ -558,8 +865,9 @@ void BPF_STRUCT_OPS(ktstr_dump_task, struct scx_dump_ctx *dctx,
 		scx_bpf_dump("  ktstr task: <no arena ctx>\n");
 		return;
 	}
-	scx_bpf_dump("  ktstr task: magic=0x%llx counter=%u task_kptr=0x%llx\n",
-		     taskc->magic, taskc->counter, taskc->task_kptr);
+	scx_bpf_dump("  ktstr task: magic=0x%llx counter=%u task_kptr=0x%llx stashed_arena_ptr=0x%llx\n",
+		     taskc->magic, taskc->counter, taskc->task_kptr,
+		     taskc->stashed_arena_ptr);
 }
 
 SCX_OPS_DEFINE(ktstr_ops,

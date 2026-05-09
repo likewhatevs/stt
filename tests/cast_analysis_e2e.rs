@@ -9,12 +9,18 @@
 //!
 //! # Pipeline under test
 //!
-//! 1. `src/vmm/cast_analysis_load.rs::build_cast_map_from_scheduler`
-//!    parses the scx-ktstr binary's embedded `.bpf.objs` ELF blob,
-//!    runs `analyze_casts` over the program bytecode plus the
-//!    program BTF, and stores the resulting `CastMap` on the VM
-//!    builder.
-//! 2. The BPF program in `scx-ktstr/src/bpf/main.bpf.c` is
+//! 1. The VM builder constructs `LazyCastMap::new(scheduler_binary)`
+//!    (no I/O at builder time).
+//! 2. At first failure-dump, `LazyCastMap::get_full()` runs
+//!    `cached_cast_analysis_for_scheduler`, which reads the binary,
+//!    hashes it, parses each embedded `.bpf.objs` ELF, runs
+//!    `analyze_casts`, and caches the resulting
+//!    `CastAnalysisOutput` (cast map + cross-BTF index).
+//! 3. The freeze coordinator threads
+//!    `CastAnalysisOutput.cast_map` into `DumpContext::cast_map`
+//!    and `CastAnalysisOutput.fwd_index` + `btfs` into
+//!    `DumpContext::cross_btf` for the dump pass.
+//! 4. The BPF program in `scx-ktstr/src/bpf/main.bpf.c` is
 //!    constructed so its bytecode contains the patterns the
 //!    analyzer detects on two distinct cross-domain paths:
 //!      - `ktstr_stash_task_kptr(taskc, p)` is a static BPF-to-BPF
@@ -40,14 +46,14 @@
 //!        AddrSpace::Arena`. Source domain: .bss (a global struct
 //!        in the scheduler's data section); target domain: arena
 //!        (the captured per-task page).
-//! 3. At freeze time, the dump pipeline walks every map. For
+//! 5. At freeze time, the dump pipeline walks every map. For
 //!    scx_task_map (TASK_STORAGE), `chase_sdt_data_payload`
 //!    renders `meta.payload_btf_type_id` (== `ktstr_arena_ctx`)
 //!    against each per-task arena page. For the scheduler's
 //!    `.bss` map, the BTF Datasec walker surfaces every global
 //!    variable, including `ktstr_bss_arena_holder`, as a struct
 //!    render.
-//! 4. Inside each per-member render, the cast intercept in
+//! 6. Inside each per-member render, the cast intercept in
 //!    `render_member` consults
 //!    `MemReader::cast_lookup(parent=*_btf_id, off=*_offset)`. On
 //!    a hit, `render_cast_pointer` chases via `read_kva`
@@ -1077,9 +1083,7 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
         .get("entries")
         .and_then(|e| e.as_array())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "scx_task_map has no `entries` array; task_storage: {task_storage}"
-            )
+            anyhow::anyhow!("scx_task_map has no `entries` array; task_storage: {task_storage}")
         })?;
     if entries.is_empty() {
         anyhow::bail!(
@@ -1185,10 +1189,7 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
         // `cast_annotation` MUST be exactly "sdt_alloc". (BTF
         // Type::Ptr arm -- not the cast-analyzer arm, so no
         // "cast→arena" prefix.)
-        if let Some(ann) = data_value
-            .get("cast_annotation")
-            .and_then(|a| a.as_str())
-        {
+        if let Some(ann) = data_value.get("cast_annotation").and_then(|a| a.as_str()) {
             if ann == "sdt_alloc" {
                 any_bridge_fired = true;
             } else {

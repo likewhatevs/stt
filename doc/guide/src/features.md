@@ -268,14 +268,34 @@ A complementary `sdt_alloc` bridge recovers a chase target's real
 struct id when the scheduler's program BTF declares the pointee as
 a `BTF_KIND_FWD` forward declaration (the typical shape for
 `struct sdt_data __arena *` fields whose body lives in a separate
-library BTF). The freeze pre-pass populates an
-`arena_payload_start → btf_type_id` index from each live
-`sdt_alloc` allocator slot; when a chase lands on a Fwd terminal,
-the renderer consults the index and renders the recovered struct
-with an `sdt_alloc` annotation suffix (`(sdt_alloc)` for the
-BTF-typed `Type::Ptr` arm, or `(cast→arena (sdt_alloc))` /
-`(cast→kernel (sdt_alloc))` when the chase originated from a
-cast-analyzer hit).
+library BTF). The freeze pre-pass populates a
+`slot_start → ArenaSlotInfo` range index from each live
+`sdt_alloc` allocator slot — one entry per slot, carrying
+`elem_size`, `header_size`, and the resolved payload type id.
+When a chase lands on a Fwd terminal, the renderer range-looks
+up the slot the chased address falls in and renders the recovered
+payload struct from the slot's payload start (skipping the
+`union sdt_id` header when the chased pointer lands at slot-start
+rather than payload-start). The result carries an `sdt_alloc`
+annotation suffix: `(sdt_alloc)` for the BTF-typed `Type::Ptr`
+arm, or `cast→arena (sdt_alloc)` / `cast→kernel (sdt_alloc)`
+when the chase originated from a cast-analyzer hit.
+
+A parallel cross-BTF Fwd resolution path covers a different
+multi-BTF shape: a `BTF_KIND_FWD` whose body lives in a sibling
+embedded BPF object's BTF rather than an `sdt_alloc` slot — the
+typical scheduler shape where one `.bpf.c` declares
+`struct cgx_target;` (forward) and another defines the body. The
+cast-analysis pre-pass builds a name-keyed index over every
+parsed embedded program BTF (one entry per complete `!is_fwd`
+`Struct` / `Union`; first-write-wins on duplicate names; anonymous
+types skipped). When a chase target survives the local same-BTF
+Fwd resolve as a Fwd, the renderer consults the cross-BTF index
+by name (matching aggregate kind — `struct` vs `union`); a hit
+switches the recursion to the resolved sibling BTF and renders
+the full body. No new annotation is introduced — the recovered
+subtree carries whatever annotation it would have had if the
+struct body lived in the entry BTF.
 
 Runs unconditionally on every scheduler load; no test-author
 configuration. False negatives (a missed cast — renderer falls

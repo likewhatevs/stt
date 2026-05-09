@@ -410,22 +410,63 @@ pub struct KtstrVm {
     /// test-entry plumbing comes from
     /// [`crate::test_support::entry::KtstrTestEntry::num_snapshots`].
     pub(crate) num_snapshots: u32,
-    /// BPF cast-analysis output for the scheduler binary's embedded
-    /// BPF object(s). Populated by [`KtstrVmBuilder::build`] via
-    /// [`super::cast_analysis_load::build_cast_map_from_scheduler`]
-    /// when [`Self::scheduler_binary`] is `Some` AND the analysis
-    /// produces at least one finding. Threaded into
-    /// [`crate::monitor::dump::DumpContext::cast_map`] at freeze
+    /// Lazy on-demand BPF cast-analysis handle for the scheduler
+    /// binary's embedded BPF object(s). Populated by
+    /// [`KtstrVmBuilder::build`] with the scheduler binary path
+    /// (or `None` for no-scheduler runs). The handle is cheap to
+    /// construct — it captures the path in a `OnceLock` slot and
+    /// runs no file I/O or analyzer work at builder time. The
+    /// actual analyzer (file read + ELF + BTF + register walk)
+    /// runs only when
+    /// [`super::cast_analysis_load::LazyCastMap::get_full`] is
+    /// first called from the failure-dump path. Tests that pass
+    /// without dumping never trigger analyzer work — the dominant
+    /// case under nextest's process-per-test execution model.
+    ///
+    /// `.get_full()` returns the richer
+    /// [`super::cast_analysis_load::CastAnalysisOutput`] which
+    /// carries three pieces:
+    /// 1. `cast_map`: the
+    ///    `(parent_struct, member_offset) -> CastHit` map the
+    ///    instruction-level analyzer recovered.
+    /// 2. `btfs`: every parsed embedded BPF object's program BTF
+    ///    (one entry per object inside `.bpf.objs`).
+    /// 3. `fwd_index`: a `name -> (btfs index, type_id)` index
+    ///    over every complete (`!is_fwd`) struct/union across
+    ///    `btfs`, used by the renderer's
+    ///    [`crate::monitor::btf_render::MemReader::cross_btf_resolve_fwd`]
+    ///    override to chase a `BTF_KIND_FWD` whose body lives in
+    ///    a sibling embedded object's BTF.
+    ///
+    /// `.get()` is a thinner accessor that returns just the
+    /// `Arc<CastMap>`; production callers go through `.get_full()`
+    /// because the freeze-time threading needs all three pieces
+    /// (cast map for promotion, BTFs + fwd_index for cross-BTF
+    /// resolution).
+    ///
+    /// When `.get_full()` fires, results are cached process-wide
+    /// by SHA-256 of the binary bytes so two VMs in the same
+    /// process resolving to the same scheduler binary content
+    /// share one analyzer run (auto-repro path, future in-process
+    /// multi-test drivers). The cast map is threaded into
+    /// [`crate::monitor::dump::DumpContext::cast_map`] and the
+    /// `(btfs, fwd_index)` pair into
+    /// [`crate::monitor::dump::DumpContext::cross_btf`] at freeze
     /// time so the failure-dump renderer can promote `u64` fields
     /// the analyzer flagged into typed-pointer renders via
-    /// [`crate::monitor::btf_render::MemReader::cast_lookup`].
+    /// [`crate::monitor::btf_render::MemReader::cast_lookup`] and
+    /// recover Fwd-pointee bodies via
+    /// [`crate::monitor::btf_render::MemReader::cross_btf_resolve_fwd`].
     ///
-    /// `None` covers every degraded case (no scheduler binary,
-    /// scheduler binary missing `.bpf.objs`, BTF parse failure,
-    /// instruction-stream parse failure, analyzer returned an
-    /// empty map). All paths render every `u64` as a plain
-    /// unsigned counter — the pre-integration default.
-    pub(crate) cast_map: Option<std::sync::Arc<crate::monitor::cast_analysis::CastMap>>,
+    /// `.get_full()` returns `None` for every degraded case (no
+    /// scheduler binary, file read failed, analyzer surfaced an
+    /// empty cast map AND empty cross-BTF index — no `.bpf.objs`,
+    /// BTF parse failure, no recovered casts and no complete
+    /// struct/union definitions). All `None` paths render every
+    /// `u64` as a plain unsigned counter and skip Fwd pointee
+    /// chases with the legacy "forward declaration" skip path,
+    /// matching the pre-integration default.
+    pub(crate) cast_map: std::sync::Arc<crate::vmm::cast_analysis_load::LazyCastMap>,
 }
 
 struct RunLocks {

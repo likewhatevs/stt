@@ -14,6 +14,7 @@
 //! ([`IdrOffsets`]).
 
 use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use anyhow::{Context, Result, bail};
 use btf_rs::{Btf, Type};
@@ -103,6 +104,67 @@ pub use sched_domain::{CPU_MAX_IDLE_TYPES, SchedDomainOffsets, SchedDomainStatsO
 pub(crate) fn load_btf_from_path(path: &Path) -> Result<Btf> {
     let data = std::fs::read(path).context("read file")?;
     load_btf_from_bytes(&data, path)
+}
+
+/// Process-global memo of `/sys/kernel/btf/vmlinux` parsed once.
+///
+/// The host BTF blob is immutable for the lifetime of the running
+/// kernel, so the auto-repro probe pipeline parses the same multi-MB
+/// file every Phase A and Phase B call (once per VM, several MB read +
+/// parse). A nextest test process that runs N `#[ktstr_test]` cases
+/// crashes through this path 2N times. Memoising on first read drops
+/// every subsequent call to a hash lookup + `Arc::clone`.
+///
+/// `Arc<Btf>` is the storage form because `Btf` (`btf-rs` 1.1.1) does
+/// not implement `Clone`; cloning the inner `Arc<BtfObj>` requires
+/// going through the constructor again. `Arc::clone` on the outer
+/// pointer is the cheap shared-handle path.
+///
+/// Failures are not memoised: a transient read error on first call
+/// (e.g. BTF debugfs disabled when the test process started, then
+/// enabled by the time the second test runs) should not persist as
+/// `None` for the rest of the process. Each miss tries again.
+static VMLINUX_BTF_CACHE: OnceLock<RwLock<Option<Arc<Btf>>>> = OnceLock::new();
+
+/// Return the cached `/sys/kernel/btf/vmlinux` parse, populating the
+/// cache on first successful read.
+///
+/// Returns `None` when the file is unreadable or the BTF blob fails to
+/// parse — same disposition as the previous per-call
+/// `load_btf_from_path(...).ok()` pattern at probe-pipeline call sites.
+/// The error case logs at `tracing::warn` once per call so the
+/// operator still sees the underlying cause; only the success case is
+/// memoised.
+pub(crate) fn cached_vmlinux_btf() -> Option<Arc<Btf>> {
+    let slot = VMLINUX_BTF_CACHE.get_or_init(|| RwLock::new(None));
+    {
+        let read = slot.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(btf) = read.as_ref() {
+            return Some(Arc::clone(btf));
+        }
+    }
+    // Slow path: load outside the write lock to keep the hot path
+    // (cache hit) lock-free for readers. A racing second loader pays
+    // the read once each — acceptable: BTF is immutable so both
+    // loaders produce equivalent values; the first to take the write
+    // lock wins, the second observes a populated slot and discards.
+    let path = Path::new("/sys/kernel/btf/vmlinux");
+    let btf = match load_btf_from_path(path) {
+        Ok(b) => Arc::new(b),
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                "btf_offsets: failed to load /sys/kernel/btf/vmlinux for \
+                 process-global cache; falling back to None for this caller",
+            );
+            return None;
+        }
+    };
+    let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
+    if write.is_none() {
+        *write = Some(Arc::clone(&btf));
+    }
+    Some(Arc::clone(write.as_ref().unwrap()))
 }
 
 /// Same as [`load_btf_from_path`] but accepts pre-read file bytes.

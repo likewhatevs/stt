@@ -954,7 +954,12 @@ sections like `.bss`/`.data`) or `entry: key=...` blocks
 [cast analyzer](architecture/monitor.md#cast-analysis) flagged as
 typed pointers chase to the recovered struct and print with a
 `(cast→arena)` or `(cast→kernel)` annotation distinguishing them
-from BTF-typed pointers:
+from BTF-typed pointers; an `(sdt_alloc)` suffix is added when the
+sdt_alloc bridge recovered the real payload struct from a
+forward-declared pointee. A separate cross-BTF Fwd resolution
+path also recovers a forward-declared pointee whose body lives
+in a sibling embedded BPF object's BTF — that path adds no
+annotation, the body is rendered transparently:
 
 ```text
 map scx_lavd.bss (type=array, value_size=4096, max_entries=1)
@@ -964,6 +969,7 @@ map scx_lavd.bss (type=array, value_size=4096, max_entries=1)
   current_task 0xffff90124f80c000 (cast→kernel) → task_struct:
     pid=4321   weight=100
     cpus_ptr 0xffff888103b40000 → cpus={0-3}
+  taskc_data 0x7f0000080000 (cast→arena (sdt_alloc)) → task_data{slice_ns=20000000, vtime=12345678}
 ```
 
 A field that the analyzer cannot prove is a pointer falls back to

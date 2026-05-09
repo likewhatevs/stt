@@ -48,10 +48,12 @@
 //! runs purely on the on-disk binary bytes.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::monitor::cast_analysis::{
     BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL, BpfInsn, CastMap, DatasecPointer, FuncEntry,
-    analyze_casts,
+    SubprogReturn, analyze_casts,
 };
 
 use btf_rs::{Btf, Type};
@@ -111,16 +113,316 @@ const BTF_MAGIC: u16 = 0xEB9F;
 /// + func_info_len(4) + line_info_off(4) + line_info_len(4).
 const BTF_EXT_HEADER_MIN_LEN: u32 = 24;
 
-/// Build the merged cast map for a scheduler binary.
+/// One entry in the cross-BTF Fwd resolution index — locates a
+/// complete struct/union body by `(BTF index, type id)`.
 ///
-/// Returns an empty [`CastMap`] on any failure; the dump path treats an
-/// empty map as "no cast analysis available", which produces the same
-/// rendering as before this integration landed.
+/// `btfs_idx` selects which entry of [`CastAnalysisOutput::btfs`]
+/// carries the body; `type_id` is the type id WITHIN that BTF's
+/// own id space (distinct from the entry BTF's id space the
+/// renderer's chase entered with).
 ///
-/// `path` is the host filesystem path to the scheduler binary (the
-/// builder's `scheduler_binary` field). The function reads the file,
-/// locates every embedded BPF object inside `.bpf.objs`, and merges
-/// each object's per-program cast findings into a single [`CastMap`].
+/// Used as the value type of [`CastAnalysisOutput::fwd_index`] —
+/// the renderer's
+/// [`crate::monitor::btf_render::MemReader::cross_btf_resolve_fwd`]
+/// override looks the entry up by name, picks `btfs[btfs_idx]`,
+/// and recurses against `type_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FwdIndexEntry {
+    /// Index into [`CastAnalysisOutput::btfs`] selecting which
+    /// embedded BPF object's parsed program BTF carries the body.
+    pub(crate) btfs_idx: usize,
+    /// Type id within `btfs[btfs_idx]`'s own id space. Distinct
+    /// from the entry BTF's id space; the chase code switches the
+    /// rendering BTF before resolving the id.
+    pub(crate) type_id: u32,
+}
+
+/// Output of one full pass of host-side scheduler cast analysis: the
+/// `(parent_struct, member_offset) -> CastHit` map, the list of every
+/// embedded BPF object's program BTF, and a name-keyed index over
+/// every complete (`!is_fwd`) struct/union/typedef across those BTFs.
+///
+/// The renderer's chase paths consult the cross-BTF index when a
+/// declared `BTF_KIND_FWD` pointee has no complete sibling in its
+/// own BTF: the index points at the `(btfs[idx], type_id)` pair where
+/// the body lives, so a `cgx_target __arena *` declared in object A
+/// (Fwd-only) renders as the full `struct cgx_target { ... }` body
+/// from object B without dropping into the "forward declaration; body
+/// not in this BTF" skip.
+///
+/// Built once per scheduler binary per process via
+/// [`cached_cast_analysis_for_scheduler`] and shared across VMs by
+/// content hash. The `btfs` vec is `Arc<Btf>` so the rendered
+/// borrows live for the full dump pass without copying the parsed
+/// BTF.
+pub(crate) struct CastAnalysisOutput {
+    /// `(parent_btf_id, member_offset) -> CastHit` recovered by the
+    /// instruction-level cast analyzer. The renderer's
+    /// [`crate::monitor::btf_render::MemReader::cast_lookup`] hits
+    /// against the per-program BTF the rendered map was loaded from.
+    /// Even when the cast hit is empty, the wrapping output is still
+    /// retained because the cross-BTF [`fwd_index`] is independently
+    /// useful — a scheduler whose Fwd pointers all live in
+    /// non-typed-pointer-bearing maps still benefits from the index
+    /// when the renderer chases those maps' [`Type::Ptr`] arms.
+    pub(crate) cast_map: Arc<CastMap>,
+    /// Every embedded BPF object's parsed program BTF, in the same
+    /// order [`iter_embedded_bpf_objects`] yielded the slices. Index
+    /// 0 is the first symbol-driven slice (or the fallback whole-
+    /// section blob), index 1 is the next, and so on. Empty when no
+    /// BTF parsed successfully — the renderer falls back to the
+    /// per-map vmlinux BTF for any cross-BTF resolution that would
+    /// have hit this index.
+    pub(crate) btfs: Vec<Arc<Btf>>,
+    /// `struct_or_union_name -> FwdIndexEntry` for every complete
+    /// (`!is_fwd`) [`btf_rs::Type::Struct`] / [`btf_rs::Type::Union`]
+    /// across [`btfs`]. `Typedef` is NOT indexed — typedefs add no
+    /// body and the chase path peels through them via
+    /// [`peel_modifiers_with_id`] before consulting the index.
+    ///
+    /// First-write-wins: when the same name appears in multiple
+    /// BTFs the index keeps the first-seen entry. Two distinct
+    /// programs declaring `struct foo` with conflicting layouts
+    /// would each see their own program BTF resolve correctly via
+    /// the renderer's local Fwd-resolving peel; the cross-BTF index
+    /// only fires when the local resolve failed. The first-write-
+    /// wins policy keeps the index deterministic across re-runs of
+    /// the analyzer on the same binary.
+    ///
+    /// Anonymous structs/unions are not indexed (no name to key on);
+    /// the chase falls through to the existing "forward declaration;
+    /// body not in this BTF" skip path for those.
+    pub(crate) fwd_index: HashMap<String, FwdIndexEntry>,
+}
+
+/// Per-`KtstrVm` lazy on-demand BPF cast-analysis handle.
+///
+/// Captures the scheduler binary path at VM build time (no analyzer
+/// work runs here) and exposes a lazy accessor (`.get_full()`)
+/// that runs the analysis on first call and caches the result
+/// inside an [`OnceLock`]. The failure-dump path is the only
+/// production caller, so a test that passes without ever dumping
+/// pays zero analyzer cost. A test that triggers multiple dumps
+/// in the same VM (e.g. periodic-capture + final freeze) only
+/// runs the analyzer once.
+///
+/// # Cross-VM sharing
+///
+/// `.get_full()` consults the process-wide content-hash cache via
+/// [`cached_cast_analysis_for_scheduler`], so two VMs in the same
+/// process that share a scheduler binary share one analyzed
+/// `Arc<CastAnalysisOutput>`. Production runs under nextest use
+/// process-per-test by default, so the cross-VM share helps mostly
+/// for the auto-repro path (which boots a second VM in the same
+/// process after a primary-test failure) and for any future
+/// in-process multi-test driver.
+///
+/// # Concurrency
+///
+/// `OnceLock::get_or_init` serialises concurrent first-callers in
+/// the same VM: the second caller blocks while the first runs the
+/// analysis, then both observe the cached
+/// `Option<Arc<CastAnalysisOutput>>`. The inner
+/// [`cached_cast_analysis_for_scheduler`] additionally dedupes work
+/// across VMs by content hash and uses an inner `OnceLock` per
+/// cache entry to avoid the thundering-herd shape where two VMs
+/// find the cache empty under the same lock and both run the
+/// analyzer after releasing it.
+pub(crate) struct LazyCastMap {
+    /// Scheduler binary path captured at VM build time. `None`
+    /// when the builder had no scheduler binary; `.get_full()`
+    /// returns `None` immediately in that case.
+    scheduler_binary: Option<std::path::PathBuf>,
+    /// One-shot per-VM cache of the analysis result. Populated by
+    /// the first `.get_full()` caller via
+    /// [`cached_cast_analysis_for_scheduler`]; `None` is cached
+    /// when no scheduler binary was set OR the analyzer produced
+    /// neither cast findings nor cross-BTF index entries.
+    inner: OnceLock<Option<Arc<CastAnalysisOutput>>>,
+}
+
+impl LazyCastMap {
+    /// Construct a lazy handle for `scheduler_binary`. No file I/O
+    /// or analyzer work runs here — both defer to
+    /// [`Self::get_full`].
+    pub(crate) fn new(scheduler_binary: Option<std::path::PathBuf>) -> Self {
+        Self {
+            scheduler_binary,
+            inner: OnceLock::new(),
+        }
+    }
+
+    /// Force the lazy analysis (or return the cached result) and
+    /// hand back the full [`CastAnalysisOutput`] including the
+    /// cross-BTF Fwd index.
+    ///
+    /// First call runs [`cached_cast_analysis_for_scheduler`] on
+    /// the captured path, which itself consults the process-wide
+    /// content-hash cache — so two VMs that share a scheduler
+    /// binary path produce one analyzer run per process.
+    /// Subsequent `.get_full()` calls on the same VM hit the inner
+    /// `OnceLock` and return immediately.
+    ///
+    /// Returns `None` when no scheduler binary was set, the file
+    /// read failed, or the analyzer produced neither cast findings
+    /// nor cross-BTF index entries.
+    pub(crate) fn get_full(&self) -> Option<Arc<CastAnalysisOutput>> {
+        self.inner
+            .get_or_init(|| {
+                self.scheduler_binary
+                    .as_deref()
+                    .and_then(cached_cast_analysis_for_scheduler)
+            })
+            .clone()
+    }
+}
+
+/// Process-wide cache entry: scheduler binary content hash →
+/// `Arc<OnceLock<Option<Arc<CastAnalysisOutput>>>>`. The outer
+/// `OnceLock` is the deduplication primitive — two VMs that hash
+/// to the same content but find the entry uninitialized both call
+/// `entry.get_or_init(...)`, which runs the analyzer exactly once.
+/// The entry's eventual value is the collapsed
+/// `Option<Arc<CastAnalysisOutput>>` (`None` on empty cast map AND
+/// empty cross-BTF index, `Some` on any non-empty). Without the
+/// inner `OnceLock` shape, two cache misses on the same hash would
+/// each release the `Mutex<HashMap>` lock, then race to run the
+/// analyzer in parallel — the thundering-herd anti-pattern.
+type CastCacheEntry = Arc<OnceLock<Option<Arc<CastAnalysisOutput>>>>;
+
+/// Process-wide cache: scheduler binary content hash → shared
+/// [`OnceLock`]-gated analysis result. Two builders that resolve
+/// to the same scheduler binary content (even via different paths,
+/// hardlinks, or `cp -p` overwrites that preserve mtime) share one
+/// cache entry, so the analyzer runs at most once per distinct
+/// binary content per process. Held under a `Mutex` only for the
+/// hash-lookup-and-insert step; the analyzer itself runs while no
+/// lock is held — so a slow analysis does not block a sibling
+/// lookup for a different binary.
+fn cast_cache() -> &'static Mutex<HashMap<[u8; 32], CastCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<[u8; 32], CastCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Process-wide content-hash-cached entry point.
+///
+/// Reads the scheduler binary once, hashes the bytes (SHA-256 — the
+/// project already depends on `sha2` with `sha2-asm` for SHA-NI
+/// acceleration), and either returns the previously-analysed
+/// `Option<Arc<CastAnalysisOutput>>` for that hash or runs the
+/// analyzer once to populate the cache entry. The cache value is
+/// `Option<Arc>` (collapsed empty → `None`) so the dump path's
+/// borrow expresses "no analysis available" cleanly without an
+/// emptiness check at every freeze.
+///
+/// # Why content-hash, not path-stat
+///
+/// `(path, dev, ino, mtime, len)` would be a stale-tolerant cache
+/// key when scheduler binaries always rebuild with a fresh mtime,
+/// but a `cp -p`-style overwrite or hardlinked rotation can
+/// preserve mtime AND length while the bytes change, hitting a
+/// stale entry and rendering the wrong cast map for a
+/// just-replaced binary. SHA-256 over the actual bytes is the only
+/// key that is correct for every overwrite shape. The hash cost
+/// (single-pass SHA-NI on x86_64 / armv8 crypto) is dominated by
+/// the file read which has to happen anyway.
+///
+/// # Concurrency
+///
+/// Two simultaneous misses for the same hash do NOT both run the
+/// analyzer — they share an `Arc<OnceLock<...>>` and the second
+/// caller blocks inside `OnceLock::get_or_init` until the first
+/// finishes. Misses for different hashes proceed in parallel
+/// because the `Mutex<HashMap>` is held only across the
+/// hash-and-fetch step.
+///
+/// # Returns
+///
+/// `None` when the file read fails (transient I/O) OR the
+/// analyzer's result is empty AND the cross-BTF index is empty.
+/// Otherwise the analyzed `Arc<CastAnalysisOutput>` shared with
+/// every prior caller for the same binary content.
+pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<CastAnalysisOutput>> {
+    use sha2::Digest;
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "cast_analysis: read scheduler binary failed; \
+                 dump renderer will fall back to plain u64 counters"
+            );
+            return None;
+        }
+    };
+    let hash_t0 = std::time::Instant::now();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    let hash: [u8; 32] = hasher.finalize().into();
+    tracing::debug!(
+        elapsed_us = hash_t0.elapsed().as_micros() as u64,
+        len = bytes.len(),
+        "cast_analysis: scheduler binary content hash finished"
+    );
+
+    // Acquire the entry under the cache lock, then drop the lock
+    // before running the analyzer. The entry is an
+    // `Arc<OnceLock<Option<Arc<CastAnalysisOutput>>>>`; concurrent
+    // callers for the same hash share the same `OnceLock` and
+    // serialise on its `get_or_init` rather than the cache lock.
+    // Concurrent callers for different hashes never block on each
+    // other.
+    let entry: CastCacheEntry = {
+        let mut cache = cast_cache().lock().unwrap();
+        cache
+            .entry(hash)
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone()
+    };
+    entry
+        .get_or_init(|| {
+            let analyze_t0 = std::time::Instant::now();
+            let out = build_cast_analysis_from_bytes(&bytes);
+            tracing::debug!(
+                elapsed_ms = analyze_t0.elapsed().as_millis() as u64,
+                casts = out.cast_map.len(),
+                btfs = out.btfs.len(),
+                fwd_index = out.fwd_index.len(),
+                "cast_analysis: on-demand analysis finished"
+            );
+            if out.cast_map.is_empty() && out.fwd_index.is_empty() {
+                None
+            } else {
+                Some(Arc::new(out))
+            }
+        })
+        .clone()
+}
+
+/// Run the cast-analysis pipeline on already-loaded scheduler
+/// binary bytes.
+///
+/// Locates every embedded BPF object inside `.bpf.objs`, parses
+/// each object's program BTF, runs the analyzer per-object, and
+/// returns the merged [`CastMap`] alongside the parsed BTFs and a
+/// name-keyed cross-BTF Fwd resolution index over every complete
+/// struct/union across them. The renderer's chase paths consume
+/// the index when a `BTF_KIND_FWD` pointee in one BTF resolves to
+/// a complete sibling in another — the typical multi-object
+/// scheduler shape where one `.bpf.c` declares
+/// `struct cgx_target;` (forward) and a sibling object defines
+/// `struct cgx_target { ... }` (full body).
+///
+/// Returns an empty [`CastAnalysisOutput`] on parse failure
+/// (`cast_map` empty, `btfs` empty, `fwd_index` empty). Per-stage
+/// timing is emitted at `debug!` so a future regression in any
+/// sub-stage is visible without re-instrumenting.
+///
+/// This is the lowest-level entry point; see
+/// [`cached_cast_analysis_for_scheduler`] for the production
+/// path-driven, content-hash-cached, lazy-on-demand wrapper.
 ///
 /// # Why merge across objects
 ///
@@ -137,20 +439,9 @@ const BTF_EXT_HEADER_MIN_LEN: u32 = 24;
 /// to that BTF). The conservative "false negatives are fine, false
 /// positives are not" stance from
 /// [`crate::monitor::cast_analysis`] still applies.
-pub(crate) fn build_cast_map_from_scheduler(path: &std::path::Path) -> CastMap {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %path.display(),
-                "cast_analysis: read scheduler binary failed; \
-                 dump renderer will fall back to plain u64 counters"
-            );
-            return CastMap::new();
-        }
-    };
-    let outer = match goblin::elf::Elf::parse(&bytes) {
+pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput {
+    let parse_t0 = std::time::Instant::now();
+    let outer = match goblin::elf::Elf::parse(bytes) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
@@ -158,35 +449,69 @@ pub(crate) fn build_cast_map_from_scheduler(path: &std::path::Path) -> CastMap {
                 "cast_analysis: parse outer ELF failed; \
                  dump renderer will fall back to plain u64 counters"
             );
-            return CastMap::new();
+            return CastAnalysisOutput {
+                cast_map: Arc::new(CastMap::new()),
+                btfs: Vec::new(),
+                fwd_index: HashMap::new(),
+            };
         }
     };
     let bpf_objs_section = match find_section(&outer, ".bpf.objs") {
         Some(s) => s,
         None => {
             tracing::warn!(
-                path = %path.display(),
                 "cast_analysis: scheduler binary has no .bpf.objs section; \
                  typed-pointer rendering disabled"
             );
-            return CastMap::new();
+            return CastAnalysisOutput {
+                cast_map: Arc::new(CastMap::new()),
+                btfs: Vec::new(),
+                fwd_index: HashMap::new(),
+            };
         }
     };
+    tracing::debug!(
+        elapsed_us = parse_t0.elapsed().as_micros() as u64,
+        "cast_analysis: outer ELF parse + .bpf.objs lookup finished"
+    );
 
     let mut merged = CastMap::new();
+    let mut btfs: Vec<Arc<Btf>> = Vec::new();
     let started = std::time::Instant::now();
-    tracing::debug!(
-        path = %path.display(),
-        "cast_analysis: starting analyze_casts pipeline"
-    );
-    for inner in iter_embedded_bpf_objects(&outer, &bytes, bpf_objs_section) {
-        merge_into(&mut merged, analyze_one_object(inner));
+    tracing::debug!("cast_analysis: starting analyze_casts pipeline");
+    for inner in iter_embedded_bpf_objects(&outer, bytes, bpf_objs_section) {
+        let one_t0 = std::time::Instant::now();
+        let (one, btf_for_obj) = analyze_one_object_with_btf(inner);
+        tracing::debug!(
+            elapsed_ms = one_t0.elapsed().as_millis() as u64,
+            casts = one.len(),
+            "cast_analysis: analyze_one_object_with_btf finished"
+        );
+        merge_into(&mut merged, one);
+        if let Some(btf) = btf_for_obj {
+            btfs.push(btf);
+        }
     }
     tracing::debug!(
         elapsed_ms = started.elapsed().as_millis() as u64,
         casts = merged.len(),
+        btfs = btfs.len(),
         "cast_analysis: analyze_casts pipeline finished"
     );
+
+    // Build the cross-BTF Fwd resolution index over every parsed
+    // BTF. `build_fwd_index` walks each BTF's id space looking for
+    // complete struct/union definitions and records `name ->
+    // (btfs index, type id)`; first-write-wins on duplicate names
+    // (see [`CastAnalysisOutput::fwd_index`]).
+    let fwd_t0 = std::time::Instant::now();
+    let fwd_index = build_fwd_index(&btfs);
+    tracing::debug!(
+        elapsed_us = fwd_t0.elapsed().as_micros() as u64,
+        entries = fwd_index.len(),
+        "cast_analysis: build_fwd_index finished"
+    );
+
     // Demote to debug! when no casts were recovered: a clean
     // analyze on a scheduler with no typed pointers is a normal
     // outcome, not an event the operator needs to see at info!
@@ -204,7 +529,70 @@ pub(crate) fn build_cast_map_from_scheduler(path: &std::path::Path) -> CastMap {
             "cast_analysis: recovered typed pointers from scheduler"
         );
     }
-    merged
+    CastAnalysisOutput {
+        cast_map: Arc::new(merged),
+        btfs,
+        fwd_index,
+    }
+}
+
+/// Walk every parsed BTF and collect a `name -> FwdIndexEntry`
+/// index of complete (`!is_fwd`) struct/union definitions for the
+/// renderer's cross-BTF Fwd resolution path. First-write-wins —
+/// see [`CastAnalysisOutput::fwd_index`] for the rationale.
+///
+/// The id-space walk uses the same `consecutive_fail` cap pattern
+/// as [`crate::monitor::sdt_alloc::discover_payload_btf_id`]: real
+/// BPF BTFs have dense id tables, so 256 consecutive failed
+/// `resolve_type_by_id` calls is safe to treat as "table
+/// exhausted". The hard ceiling
+/// [`crate::monitor::sdt_alloc::MAX_BTF_ID_PROBE`] backstops a
+/// pathological / synthesized BTF.
+///
+/// Anonymous structs/unions are silently skipped (no name to key
+/// the index entry on). Type kinds that are not Struct/Union are
+/// also skipped — the index is consumed by the renderer's
+/// [`crate::monitor::btf_render::peel_modifiers_resolving_fwd`]
+/// extension, which only looks up Fwd terminals against this
+/// table.
+fn build_fwd_index(btfs: &[Arc<Btf>]) -> HashMap<String, FwdIndexEntry> {
+    let mut out: HashMap<String, FwdIndexEntry> = HashMap::new();
+    const CONSECUTIVE_FAIL_CAP: u32 = 256;
+    for (idx, btf) in btfs.iter().enumerate() {
+        let mut tid: u32 = 1;
+        let mut consecutive_fail: u32 = 0;
+        while tid < crate::monitor::sdt_alloc::MAX_BTF_ID_PROBE {
+            match btf.resolve_type_by_id(tid) {
+                Ok(ty) => {
+                    consecutive_fail = 0;
+                    if let Type::Struct(s) | Type::Union(s) = ty
+                        && let Ok(name) = btf.resolve_name(&s)
+                        && !name.is_empty()
+                    {
+                        // First-write-wins: skip duplicate names so
+                        // a same-named layout in BTF #0 is preferred
+                        // over BTF #1's. The renderer only consults
+                        // the index when the local Fwd resolve
+                        // failed, so a same-name conflict between
+                        // two BTFs would have already resolved
+                        // locally in whichever BTF the Fwd lives.
+                        out.entry(name).or_insert(FwdIndexEntry {
+                            btfs_idx: idx,
+                            type_id: tid,
+                        });
+                    }
+                }
+                Err(_) => {
+                    consecutive_fail += 1;
+                    if consecutive_fail >= CONSECUTIVE_FAIL_CAP {
+                        break;
+                    }
+                }
+            }
+            tid += 1;
+        }
+    }
+    out
 }
 
 /// Walk the outer ELF's symbol tables and yield every byte slice that
@@ -288,12 +676,20 @@ fn iter_embedded_bpf_objects<'data>(
     out
 }
 
-/// Run cast analysis on one embedded BPF object's bytes.
+/// Run cast analysis on one embedded BPF object's bytes and
+/// return the parsed BTF alongside the cast map.
 ///
 /// The bytes are themselves an ELF (the BPF object); parse it, extract
 /// the BTF, the `.BTF.ext`-derived [`FuncEntry`] table, and the
 /// concatenated instruction stream, then call [`analyze_casts`].
-fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
+///
+/// The parsed BTF is returned wrapped in `Arc` so the caller can
+/// retain it across the dump pass without copying. `None` for the
+/// BTF position indicates a parse failure or an inner ELF without
+/// a `.BTF` section — the cast map is still returned (empty in that
+/// case) so the merger keeps working without distinguishing the
+/// no-BTF inner from one with no recovered casts.
+fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>) {
     let elf = match goblin::elf::Elf::parse(obj_bytes) {
         Ok(e) => e,
         Err(e) => {
@@ -301,7 +697,7 @@ fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
                 error = %e,
                 "cast_analysis: parse inner BPF object ELF failed"
             );
-            return CastMap::new();
+            return (CastMap::new(), None);
         }
     };
 
@@ -312,7 +708,7 @@ fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
         Some(b) => b,
         None => {
             tracing::debug!("cast_analysis: inner ELF has no .BTF section");
-            return CastMap::new();
+            return (CastMap::new(), None);
         }
     };
     let btf = match Btf::from_bytes(btf_bytes) {
@@ -322,9 +718,10 @@ fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
                 error = ?e,
                 "cast_analysis: parse .BTF failed"
             );
-            return CastMap::new();
+            return (CastMap::new(), None);
         }
     };
+    let btf = Arc::new(btf);
 
     // Instruction sections in section-header order: every
     // SHF_EXECINSTR-flagged PROGBITS section. Concatenating in this
@@ -376,7 +773,12 @@ fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
     }
     if text_concat.is_empty() {
         tracing::debug!("cast_analysis: inner ELF has no executable BPF program sections");
-        return CastMap::new();
+        // Even on empty text we still return the parsed `Btf` so
+        // the cross-BTF Fwd index can pick up its struct/union
+        // definitions: a header-only object that contributes no
+        // analyzer findings can still expose a complete sibling
+        // for a Fwd in another object.
+        return (CastMap::new(), Some(btf));
     }
 
     // .BTF.ext is optional — without it, every program function still
@@ -410,7 +812,13 @@ fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
     // `bpf_cpumask_first`, …), which seeds R0 so the next STX of
     // R0 into a u64 slot records a `(parent, off) -> target,
     // AddrSpace::Kernel` cast entry.
-    patch_kfunc_calls(&mut text_concat, &btf, &elf, &section_bases);
+    let patch_t0 = std::time::Instant::now();
+    patch_kfunc_calls(&mut text_concat, btf.as_ref(), &elf, &section_bases);
+    tracing::debug!(
+        elapsed_us = patch_t0.elapsed().as_micros() as u64,
+        insns = text_concat.len(),
+        "cast_analysis: patch_kfunc_calls finished"
+    );
 
     // BSS / DATA / RODATA datasec annotations: walk every
     // relocation section in the inner ELF and emit a
@@ -426,9 +834,257 @@ fn analyze_one_object(obj_bytes: &[u8]) -> CastMap {
     // representation so subsequent STX/LDX through the LD_IMM64
     // destination resolve to the right `VarSecinfo` entry via
     // `struct_member_at`.
-    let datasec_pointers = build_datasec_pointers(&text_concat, &btf, &elf, &section_bases);
+    let datasec_t0 = std::time::Instant::now();
+    let datasec_pointers = build_datasec_pointers(&text_concat, btf.as_ref(), &elf, &section_bases);
+    tracing::debug!(
+        elapsed_us = datasec_t0.elapsed().as_micros() as u64,
+        datasec_pointers = datasec_pointers.len(),
+        "cast_analysis: build_datasec_pointers finished"
+    );
 
-    analyze_casts(&text_concat, &btf, &[], &func_entries, &datasec_pointers)
+    // Allocator-return seeds: walk every relocation section to find
+    // `BPF_PSEUDO_CALL` sites whose resolved subprog name matches
+    // the arena-allocator allowlist (e.g. `scx_static_alloc_internal`).
+    // Emit one [`SubprogReturn`] per matching call site so the
+    // analyzer's `BPF_OP_CALL` arm tags R0 as
+    // [`RegState::ArenaU64FromAlloc`] after the standard R0..=R5
+    // clobber. The subsequent STX of the tagged R0 (or its
+    // propagation through MOV / stack spill / LDX of an
+    // already-arena-tagged slot) records `(parent, off)` as an
+    // Arena cast finding via the new STX-flow path. See
+    // [`build_subprog_returns`] for the relocation walk.
+    let alloc_seed_t0 = std::time::Instant::now();
+    let subprog_returns = build_subprog_returns(&text_concat, &elf, &section_bases);
+    tracing::debug!(
+        elapsed_us = alloc_seed_t0.elapsed().as_micros() as u64,
+        subprog_returns = subprog_returns.len(),
+        "cast_analysis: build_subprog_returns finished"
+    );
+
+    let analyze_t0 = std::time::Instant::now();
+    let result = analyze_casts(
+        &text_concat,
+        btf.as_ref(),
+        &[],
+        &func_entries,
+        &datasec_pointers,
+        &subprog_returns,
+    );
+    tracing::debug!(
+        elapsed_ms = analyze_t0.elapsed().as_millis() as u64,
+        casts = result.len(),
+        "cast_analysis: analyze_casts inner pass finished"
+    );
+    (result, Some(btf))
+}
+
+/// Walk every ELF relocation section in `elf` whose target section
+/// is indexed by `section_bases`, validate each relocation's
+/// `r_offset`, and yield surviving entries paired with the
+/// translated instruction index in the concatenated text stream.
+///
+/// Used by [`patch_kfunc_calls`], [`build_subprog_returns`], and
+/// [`build_datasec_pointers`] — every consumer needs the same
+/// "rel section → target program text section → per-reloc
+/// `insn_idx`" pipeline. Centralising it here removes the
+/// rel-section / bounds / alignment preamble from each consumer
+/// and guarantees identical gating across all three.
+///
+/// # Filtering rules (shared with all consumers)
+///
+/// 1. The rel section's `sh_info` must point at a real section
+///    header. Out-of-range `sh_info` is silently skipped.
+/// 2. The target section must appear in `section_bases` — only
+///    program text sections we concatenated into `text_concat` are
+///    eligible. A rel section targeting `.maps`, `.BTF.ext`, or any
+///    non-text section yields no items.
+/// 3. The target section header must resolve so we can read its
+///    byte size (`sh_size`); a missing header rejects the section.
+/// 4. Per-reloc gates: `r_offset` must be a multiple of
+///    [`BPF_INSN_SIZE`] (BPF instructions are 8-byte aligned) and
+///    strictly less than the target section's byte size. Failures
+///    drop the individual relocation.
+///
+/// Each surviving item is `(insn_idx, reloc)` where `insn_idx`
+/// equals `base + r_offset / BPF_INSN_SIZE` (saturating-add against
+/// the unlikely-but-possible overflow of a corrupted ELF). The
+/// caller then fetches the instruction from `text_concat` (mutably
+/// or immutably as needed) and applies its own consumer-specific
+/// gates (call opcode, src_reg, datasec lookup, …).
+fn iter_text_relocs<'a, 'elf: 'a>(
+    elf: &'a goblin::elf::Elf<'elf>,
+    section_bases: &'a HashMap<u32, usize>,
+) -> impl Iterator<Item = (usize, goblin::elf::Reloc)> + 'a {
+    elf.shdr_relocs
+        .iter()
+        .flat_map(move |(rel_section_idx, reloc_section)| {
+            // Resolve which section the relocations target.
+            let target_section_idx = elf
+                .section_headers
+                .get(*rel_section_idx)
+                .map(|h| h.sh_info);
+            // Only program text sections appear in `section_bases`.
+            let scope = target_section_idx.and_then(|idx| {
+                let base = *section_bases.get(&idx)?;
+                let sh = elf.section_headers.get(idx as usize)?;
+                Some((base, sh.sh_size as usize))
+            });
+            // `into_iter` collapses `Option<I>` to an iterator (one
+            // pass when `Some`, empty when `None`), so the outer
+            // `flat_map` sees the correct shape regardless of
+            // whether the rel section was in scope.
+            scope.into_iter().flat_map(move |(base, section_byte_size)| {
+                reloc_section.iter().filter_map(move |reloc| {
+                    let off = reloc.r_offset as usize;
+                    if !off.is_multiple_of(BPF_INSN_SIZE) {
+                        return None;
+                    }
+                    if off >= section_byte_size {
+                        return None;
+                    }
+                    let insn_idx = base.saturating_add(off / BPF_INSN_SIZE);
+                    Some((insn_idx, reloc))
+                })
+            })
+        })
+}
+
+/// Names of in-tree BPF subprograms whose return values are arena
+/// virtual addresses stored in `u64` slots. The cast analyzer's
+/// STX-flow path tags any slot the returned value is stored into as
+/// an Arena cast finding (resolved via the renderer's
+/// [`crate::monitor::btf_render::MemReader::resolve_arena_type`]
+/// bridge at chase time).
+///
+/// Order is alphabetical for readability — the allowlist is
+/// consulted by linear scan in [`build_subprog_returns`] (small N,
+/// no perf concern). Each entry must be `__always_inline`-d in the
+/// scheduler source for the analyzer to see the call site at the
+/// stash location; non-inlined helpers move the `STX` of the
+/// returned R0 into the helper's own frame (R0 is clobbered at the
+/// caller's call site), so the analyzer never sees the tag flow
+/// across the call boundary. The F4 mitigation surfaces a warn at
+/// finalize when arena STX evidence is present but no LDX→cast
+/// chain landed for any slot, prompting operators to mark missing
+/// helpers `__always_inline`.
+const ALLOC_SUBPROG_NAMES: &[&str] = &[
+    // sdt_alloc lib allocator for per-task / per-cgroup contexts
+    // (lib/sdt_alloc.bpf.c). Distinct from `scx_static_alloc_internal`
+    // — sdt_alloc adds a per-allocation header (`union sdt_id`)
+    // before the payload, but the returned u64 is still an arena
+    // VA suitable for STX-flow tagging.
+    "scx_alloc_internal",
+    // scx-shared static allocator that returns a u64 carrying an
+    // arena VA with NO per-allocation header (the slot just holds
+    // the start of an arbitrary-typed payload, e.g. `struct
+    // scx_cgroup_ctx`). Drives the deferred-resolve arena cast
+    // path: the renderer's `resolve_arena_type` bridge resolves
+    // the payload type at chase time.
+    "scx_static_alloc_internal",
+    // The kernel kfunc `bpf_arena_alloc_pages` is intentionally
+    // NOT in this allowlist — it is a kfunc (`SHN_UNDEF` /
+    // `STT_NOTYPE`), not a subprog, so every gate in
+    // [`build_subprog_returns`] (`STT_FUNC`, non-`SHN_UNDEF`,
+    // `BPF_PSEUDO_CALL`) rejects it. Arena allocator kfuncs are
+    // tagged on the kfunc-side allowlist
+    // [`crate::monitor::cast_analysis::ARENA_ALLOC_KFUNC_NAMES`]
+    // consulted by [`crate::monitor::cast_analysis::Analyzer::handle_kfunc_call`].
+    // Putting `bpf_arena_alloc_pages` here would have been dead code
+    // — it failed every gate silently — but kept the wrong impression
+    // that subprog detection covered kernel arena allocation.
+];
+
+/// Walk every ELF relocation section in `elf` and emit one
+/// [`SubprogReturn`] per `BPF_PSEUDO_CALL` site whose resolved
+/// subprog name matches the arena-allocator allowlist (see
+/// [`ALLOC_SUBPROG_NAMES`]).
+///
+/// Pre-relocation `.bpf.o` (the form embedded inside an scx-built
+/// scheduler binary's `.bpf.objs` section) emits BPF-to-BPF calls
+/// to in-tree library subprograms as:
+///
+/// ```text
+///     code = BPF_JMP|BPF_CALL = 0x85
+///     dst_reg = 0, src_reg = BPF_PSEUDO_CALL = 1
+///     off = 0
+///     imm = pc-relative offset to the subprog's first insn
+/// ```
+///
+/// paired with an ELF relocation entry at the call's byte offset
+/// pointing to the subprog's `STT_FUNC` symbol. Unlike kfunc
+/// calls (`SHN_UNDEF`), library subprogs are linked into the same
+/// program text section (or a sibling section with `SHF_EXECINSTR`)
+/// — the reloc's symbol's `st_shndx` is non-`SHN_UNDEF` and
+/// `st_type == STT_FUNC`. The symbol's name is the subprog's name
+/// in the program BTF (clang preserves the C identifier).
+///
+/// The function does NOT patch any instruction; it only records the
+/// call PC for the analyzer to consume. Distinct from
+/// [`patch_kfunc_calls`] which rewrites kfunc call sites in place.
+///
+/// # Errors
+///
+/// Never fails. Symbol resolve failures, relocations on non-call
+/// instructions, missing subprog names — all silent no-ops. The
+/// analyzer falls through to the existing shape-inference path.
+fn build_subprog_returns(
+    text_concat: &[BpfInsn],
+    elf: &goblin::elf::Elf<'_>,
+    section_bases: &HashMap<u32, usize>,
+) -> Vec<SubprogReturn> {
+    let mut out: Vec<SubprogReturn> = Vec::new();
+    // The shared `iter_text_relocs` helper handles the rel-section /
+    // target-section / `r_offset` validation preamble. Each item is
+    // a relocation that targets a known program text section at an
+    // 8-byte-aligned, in-bounds offset; the call-site / symbol /
+    // allowlist gates below are subprog-specific.
+    for (insn_idx, reloc) in iter_text_relocs(elf, section_bases) {
+        let Some(insn) = text_concat.get(insn_idx) else {
+            continue;
+        };
+        // Gate 1: the instruction must be a BPF call site.
+        if insn.code != cast_analysis_load_consts::BPF_JMP_CALL_CODE {
+            continue;
+        }
+        // Gate 2: the call must be a `BPF_PSEUDO_CALL`. Kfunc
+        // calls (`BPF_PSEUDO_KFUNC_CALL`) and helper calls
+        // (`src_reg == 0`) are not subprog calls.
+        if insn.src_reg() != BPF_PSEUDO_CALL {
+            continue;
+        }
+        // Resolve the symbol → name. The symbol must be `STT_FUNC`
+        // with a defined section (`st_shndx != SHN_UNDEF`) — that's
+        // the in-tree-subprog shape. Extern (kfunc) callsites have
+        // `st_shndx == SHN_UNDEF` and are handled by
+        // [`patch_kfunc_calls`] separately.
+        let Some(sym) = elf.syms.get(reloc.r_sym) else {
+            continue;
+        };
+        const STT_FUNC: u8 = goblin::elf::sym::STT_FUNC;
+        const SHN_UNDEF: usize = 0;
+        if sym.st_shndx == SHN_UNDEF {
+            continue;
+        }
+        if sym.st_type() != STT_FUNC {
+            continue;
+        }
+        let name = match elf.strtab.get_at(sym.st_name) {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        // Allowlist match: linear scan over the small list. The
+        // names are exact (no prefix / glob); a future change to
+        // allow prefix matching would require a dedicated test for
+        // cross-allocator name collisions (e.g.
+        // `scx_static_alloc_internal_v2`).
+        if !ALLOC_SUBPROG_NAMES.contains(&name) {
+            continue;
+        }
+        out.push(SubprogReturn {
+            insn_offset: insn_idx,
+        });
+    }
+    out
 }
 
 /// Walk every ELF relocation section in `elf` and emit a
@@ -504,99 +1160,79 @@ fn build_datasec_pointers(
         | libbpf_rs::libbpf_sys::BPF_IMM) as u8;
 
     let mut out: Vec<DatasecPointer> = Vec::new();
-    for (rel_section_idx, reloc_section) in &elf.shdr_relocs {
-        let target_section_idx = match elf.section_headers.get(*rel_section_idx).map(|h| h.sh_info)
-        {
-            Some(idx) => idx,
-            None => continue,
+    // The shared `iter_text_relocs` helper handles the rel-section /
+    // target-section / `r_offset` validation preamble. Each item
+    // is a relocation that targets a known program text section
+    // at an 8-byte-aligned, in-bounds offset; the reloc-type /
+    // opcode / symbol / BTF-lookup gates below are datasec-specific.
+    for (insn_pc, reloc) in iter_text_relocs(elf, section_bases) {
+        // Gate 1: only `R_BPF_64_64` produces a datasec annotation.
+        // Other reloc types touch different instruction kinds
+        // (call sites, ABS32/64 data references) that are not
+        // LD_IMM64.
+        if reloc.r_type != R_BPF_64_64 {
+            continue;
+        }
+        // Gate 2: the reloc must target a `BPF_LD_IMM64`
+        // instruction.
+        let Some(insn) = text_concat.get(insn_pc) else {
+            continue;
         };
-        let base = match section_bases.get(&target_section_idx) {
-            Some(b) => *b,
-            None => continue,
+        if insn.code != bpf_ld_imm64_code {
+            continue;
+        }
+        // Resolve the symbol. `r_sym` indexes the ELF symbol
+        // table; the symbol's section (`st_shndx`) identifies
+        // the target section, and `st_value` contributes to
+        // the base offset for `STT_OBJECT` symbols.
+        let Some(sym) = elf.syms.get(reloc.r_sym) else {
+            continue;
         };
-        let target_sh = match elf.section_headers.get(target_section_idx as usize) {
+        // SHN_UNDEF / SHN_ABS / SHN_COMMON: symbols not bound to a
+        // real section index. None can refer to a datasec section;
+        // drop.
+        const SHN_UNDEF: usize = 0;
+        const SHN_ABS: usize = 0xFFF1;
+        const SHN_COMMON: usize = 0xFFF2;
+        if sym.st_shndx == SHN_UNDEF || sym.st_shndx == SHN_ABS || sym.st_shndx == SHN_COMMON {
+            continue;
+        }
+        let target_sec_idx = sym.st_shndx;
+        // Resolve the target section's name via the ELF section
+        // header strtab.
+        let target_sh_for_name = match elf.section_headers.get(target_sec_idx) {
             Some(s) => s,
             None => continue,
         };
-        let section_byte_size = target_sh.sh_size as usize;
-
-        for reloc in reloc_section.iter() {
-            // Gate 1: only `R_BPF_64_64` produces a datasec
-            // annotation. Other reloc types touch different
-            // instruction kinds (call sites, ABS32/64 data
-            // references) that are not LD_IMM64.
-            if reloc.r_type != R_BPF_64_64 {
-                continue;
-            }
-            let r_off = reloc.r_offset as usize;
-            if !r_off.is_multiple_of(BPF_INSN_SIZE) {
-                continue;
-            }
-            if r_off >= section_byte_size {
-                continue;
-            }
-            let insn_pc = base.saturating_add(r_off / BPF_INSN_SIZE);
-            // Gate 2: the reloc must target a `BPF_LD_IMM64`
-            // instruction.
-            let Some(insn) = text_concat.get(insn_pc) else {
-                continue;
-            };
-            if insn.code != bpf_ld_imm64_code {
-                continue;
-            }
-            // Resolve the symbol. `r_sym` indexes the ELF symbol
-            // table; the symbol's section (`st_shndx`) identifies
-            // the target section, and `st_value` contributes to
-            // the base offset for `STT_OBJECT` symbols.
-            let Some(sym) = elf.syms.get(reloc.r_sym) else {
-                continue;
-            };
-            // SHN_UNDEF / SHN_ABS / SHN_COMMON: symbols not bound
-            // to a real section index. None can refer to a datasec
-            // section; drop.
-            const SHN_UNDEF: usize = 0;
-            const SHN_ABS: usize = 0xFFF1;
-            const SHN_COMMON: usize = 0xFFF2;
-            if sym.st_shndx == SHN_UNDEF || sym.st_shndx == SHN_ABS || sym.st_shndx == SHN_COMMON {
-                continue;
-            }
-            let target_sec_idx = sym.st_shndx;
-            // Resolve the target section's name via the ELF
-            // section header strtab.
-            let target_sh_for_name = match elf.section_headers.get(target_sec_idx) {
-                Some(s) => s,
-                None => continue,
-            };
-            let sec_name = match elf.shdr_strtab.get_at(target_sh_for_name.sh_name) {
-                Some(s) if !s.is_empty() => s,
-                _ => continue,
-            };
-            // Resolve the section name to a `BTF_KIND_DATASEC` id.
-            // `Btf::resolve_ids_by_name` returns every id sharing
-            // the name; the helper filters for the Datasec kind.
-            let Some(datasec_id) = find_datasec_btf_id(btf, sec_name) else {
-                continue;
-            };
-            // Compute base_offset: pre-relocation LD_IMM64 imm
-            // (per-variable offset for `STT_SECTION` syms) plus
-            // `sym.st_value` (per-object offset for `STT_OBJECT`
-            // syms). Both contributions are non-negative in well-
-            // formed input; checked_add guards against overflow
-            // that could only arise from a corrupt ELF.
-            let imm_off = if insn.imm < 0 { 0 } else { insn.imm as u32 };
-            if sym.st_value > u32::MAX as u64 {
-                continue;
-            }
-            let sym_off = sym.st_value as u32;
-            let Some(base_offset) = imm_off.checked_add(sym_off) else {
-                continue;
-            };
-            out.push(DatasecPointer {
-                insn_offset: insn_pc,
-                datasec_type_id: datasec_id,
-                base_offset,
-            });
+        let sec_name = match elf.shdr_strtab.get_at(target_sh_for_name.sh_name) {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        // Resolve the section name to a `BTF_KIND_DATASEC` id.
+        // `Btf::resolve_ids_by_name` returns every id sharing the
+        // name; the helper filters for the Datasec kind.
+        let Some(datasec_id) = find_datasec_btf_id(btf, sec_name) else {
+            continue;
+        };
+        // Compute base_offset: pre-relocation LD_IMM64 imm (per-
+        // variable offset for `STT_SECTION` syms) plus
+        // `sym.st_value` (per-object offset for `STT_OBJECT` syms).
+        // Both contributions are non-negative in well-formed input;
+        // checked_add guards against overflow that could only arise
+        // from a corrupt ELF.
+        let imm_off = if insn.imm < 0 { 0 } else { insn.imm as u32 };
+        if sym.st_value > u32::MAX as u64 {
+            continue;
         }
+        let sym_off = sym.st_value as u32;
+        let Some(base_offset) = imm_off.checked_add(sym_off) else {
+            continue;
+        };
+        out.push(DatasecPointer {
+            insn_offset: insn_pc,
+            datasec_type_id: datasec_id,
+            base_offset,
+        });
     }
     out
 }
@@ -701,128 +1337,95 @@ fn patch_kfunc_calls(
     elf: &goblin::elf::Elf<'_>,
     section_bases: &HashMap<u32, usize>,
 ) {
-    // Walk every (rel_section_idx, RelocSection) pair goblin parsed.
-    // The rel section's `sh_info` is the index of the section being
-    // relocated (per ELF spec; `tools/lib/bpf/libbpf.c` likewise
-    // uses `Elf64_Shdr->sh_info` to identify the program section).
-    for (rel_section_idx, reloc_section) in &elf.shdr_relocs {
-        // Resolve which section the relocations target.
-        let target_section_idx = match elf.section_headers.get(*rel_section_idx).map(|h| h.sh_info)
-        {
-            Some(idx) => idx,
-            None => continue,
+    // The shared `iter_text_relocs` helper handles the rel-section /
+    // target-section / `r_offset` validation preamble. Each item
+    // is a relocation that targets a known program text section
+    // at an 8-byte-aligned, in-bounds offset; the kfunc-specific
+    // gates (call opcode, imm == -1, BPF_PSEUDO_CALL src_reg,
+    // extern NOTYPE symbol, BTF Func/extern resolve) are applied
+    // here. The iterator borrows `elf` and `section_bases`
+    // immutably while we take a disjoint mutable borrow on
+    // `text_concat`.
+    for (insn_idx, reloc) in iter_text_relocs(elf, section_bases) {
+        let Some(insn) = text_concat.get_mut(insn_idx) else {
+            continue;
         };
-        // Only program text sections appear in section_bases. A
-        // rel section targeting `.maps`, `.BTF.ext`, or any other
-        // non-text section is irrelevant to kfunc-call patching.
-        let base = match section_bases.get(&target_section_idx) {
-            Some(b) => *b,
-            None => continue,
-        };
-        let target_sh = match elf.section_headers.get(target_section_idx as usize) {
-            Some(s) => s,
-            None => continue,
-        };
-        let section_byte_size = target_sh.sh_size as usize;
-        // Iterate every relocation. Each Reloc carries r_offset
-        // (byte offset in target section), r_sym (symtab index),
-        // r_type (relocation type — informational; we filter on
-        // instruction code instead), and r_addend (REL: None;
-        // RELA: Some).
-        for reloc in reloc_section.iter() {
-            // Translate byte offset → instruction index inside
-            // `text_concat`. A non-multiple-of-8 offset can never
-            // be a kfunc-call relocation (call insns are 8-byte
-            // aligned); skip.
-            let off = reloc.r_offset as usize;
-            if !off.is_multiple_of(BPF_INSN_SIZE) {
-                continue;
-            }
-            if off >= section_byte_size {
-                continue;
-            }
-            let insn_idx = base.saturating_add(off / BPF_INSN_SIZE);
-            let Some(insn) = text_concat.get_mut(insn_idx) else {
-                continue;
-            };
-            // Gate 1: the instruction must be a BPF call site.
-            // `BPF_JMP|BPF_CALL` = `0x05 | 0x80 = 0x85`. Anything
-            // else (LD_IMM64 referencing a typeless ksym, BTF data
-            // reloc, …) leaves the slot alone.
-            if insn.code != cast_analysis_load_consts::BPF_JMP_CALL_CODE {
-                continue;
-            }
-            // Gate 2: `imm` must be the libbpf placeholder. A
-            // non-`-1` imm means clang already resolved this call
-            // to a same-section subprog (BPF_PSEUDO_CALL with a
-            // pc-relative imm), and patching it as a kfunc would
-            // corrupt subprog dispatch in the analyzer's eyes.
-            if insn.imm != -1 {
-                continue;
-            }
-            // Gate 3: src_reg must be the clang-emitted
-            // `BPF_PSEUDO_CALL` (1). If the embedded object has
-            // already been through libbpf's relocation pass (rare;
-            // observed only when an scheduler binary captures a
-            // post-load object), `src_reg` is already
-            // `BPF_PSEUDO_KFUNC_CALL` and `imm` is the kernel BTF
-            // id — we must not overwrite the kernel id with the
-            // program's id, because the analyzer would then resolve
-            // the call against the wrong BTF universe.
-            if insn.src_reg() != BPF_PSEUDO_CALL {
-                continue;
-            }
-            // Resolve the symbol → name. goblin parses the symbol
-            // table referenced by the rel section's sh_link via
-            // `elf.syms`. The symbol's `st_name` indexes the
-            // associated string table (`elf.strtab`).
-            let Some(sym) = elf.syms.get(reloc.r_sym) else {
-                continue;
-            };
-            // Match libbpf's `sym_is_extern`: the symbol must be
-            // an undefined NOTYPE with global or weak binding.
-            // Anything else is a subprog, a static helper, or a
-            // data symbol; not a kfunc.
-            const STT_NOTYPE: u8 = goblin::elf::sym::STT_NOTYPE;
-            const STB_GLOBAL: u8 = goblin::elf::sym::STB_GLOBAL;
-            const STB_WEAK: u8 = goblin::elf::sym::STB_WEAK;
-            const SHN_UNDEF: usize = 0;
-            if sym.st_shndx != SHN_UNDEF {
-                continue;
-            }
-            if sym.st_type() != STT_NOTYPE {
-                continue;
-            }
-            let bind = sym.st_bind();
-            if bind != STB_GLOBAL && bind != STB_WEAK {
-                continue;
-            }
-            // The string-table interning goblin builds gives us a
-            // borrow of the symbol's name without copying.
-            let name = match elf.strtab.get_at(sym.st_name) {
-                Some(s) if !s.is_empty() => s,
-                _ => continue,
-            };
-            // Look up the symbol name in the program BTF. We want
-            // a `BTF_KIND_FUNC` with extern linkage (mirroring
-            // libbpf's `find_extern_btf_id`). The
-            // helper returns every id sharing this name; we accept
-            // only Func/extern. A name that resolves to multiple
-            // distinct Func ids (impossible in well-formed BPF BTF
-            // since extern names are unique) yields the first
-            // match — same as libbpf.
-            let Some(func_btf_id) = find_extern_func_btf_id(btf, name) else {
-                continue;
-            };
-            // Patch in place. The two changes mirror libbpf's
-            // RELO_EXTERN_CALL handler exactly. Note we mutate the
-            // packed `regs` byte directly: src_reg occupies the
-            // high 4 bits, dst_reg the low 4, and the analyzer's
-            // `BpfInsn::src_reg()` accessor reads them back as
-            // expected after the rewrite.
-            insn.set_src_reg(BPF_PSEUDO_KFUNC_CALL);
-            insn.imm = func_btf_id as i32;
+        // Gate 1: the instruction must be a BPF call site.
+        // `BPF_JMP|BPF_CALL` = `0x05 | 0x80 = 0x85`. Anything
+        // else (LD_IMM64 referencing a typeless ksym, BTF data
+        // reloc, …) leaves the slot alone.
+        if insn.code != cast_analysis_load_consts::BPF_JMP_CALL_CODE {
+            continue;
         }
+        // Gate 2: `imm` must be the libbpf placeholder. A non-`-1`
+        // imm means clang already resolved this call to a same-
+        // section subprog (BPF_PSEUDO_CALL with a pc-relative imm),
+        // and patching it as a kfunc would corrupt subprog dispatch
+        // in the analyzer's eyes.
+        if insn.imm != -1 {
+            continue;
+        }
+        // Gate 3: src_reg must be the clang-emitted
+        // `BPF_PSEUDO_CALL` (1). If the embedded object has
+        // already been through libbpf's relocation pass (rare;
+        // observed only when a scheduler binary captures a
+        // post-load object), `src_reg` is already
+        // `BPF_PSEUDO_KFUNC_CALL` and `imm` is the kernel BTF id —
+        // we must not overwrite the kernel id with the program's
+        // id, because the analyzer would then resolve the call
+        // against the wrong BTF universe.
+        if insn.src_reg() != BPF_PSEUDO_CALL {
+            continue;
+        }
+        // Resolve the symbol → name. goblin parses the symbol
+        // table referenced by the rel section's sh_link via
+        // `elf.syms`. The symbol's `st_name` indexes the
+        // associated string table (`elf.strtab`).
+        let Some(sym) = elf.syms.get(reloc.r_sym) else {
+            continue;
+        };
+        // Match libbpf's `sym_is_extern`: the symbol must be an
+        // undefined NOTYPE with global or weak binding. Anything
+        // else is a subprog, a static helper, or a data symbol;
+        // not a kfunc.
+        const STT_NOTYPE: u8 = goblin::elf::sym::STT_NOTYPE;
+        const STB_GLOBAL: u8 = goblin::elf::sym::STB_GLOBAL;
+        const STB_WEAK: u8 = goblin::elf::sym::STB_WEAK;
+        const SHN_UNDEF: usize = 0;
+        if sym.st_shndx != SHN_UNDEF {
+            continue;
+        }
+        if sym.st_type() != STT_NOTYPE {
+            continue;
+        }
+        let bind = sym.st_bind();
+        if bind != STB_GLOBAL && bind != STB_WEAK {
+            continue;
+        }
+        // The string-table interning goblin builds gives us a
+        // borrow of the symbol's name without copying.
+        let name = match elf.strtab.get_at(sym.st_name) {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        // Look up the symbol name in the program BTF. We want a
+        // `BTF_KIND_FUNC` with extern linkage (mirroring libbpf's
+        // `find_extern_btf_id`). The helper returns every id
+        // sharing this name; we accept only Func/extern. A name
+        // that resolves to multiple distinct Func ids (impossible
+        // in well-formed BPF BTF since extern names are unique)
+        // yields the first match — same as libbpf.
+        let Some(func_btf_id) = find_extern_func_btf_id(btf, name) else {
+            continue;
+        };
+        // Patch in place. The two changes mirror libbpf's
+        // RELO_EXTERN_CALL handler exactly. Note we mutate the
+        // packed `regs` byte directly: src_reg occupies the
+        // high 4 bits, dst_reg the low 4, and the analyzer's
+        // `BpfInsn::src_reg()` accessor reads them back as
+        // expected after the rewrite.
+        insn.set_src_reg(BPF_PSEUDO_KFUNC_CALL);
+        insn.imm = func_btf_id as i32;
     }
 }
 
@@ -1369,12 +1972,12 @@ mod tests {
         blob
     }
 
-    // ----- Tests for build_cast_map_from_scheduler --------------------
+    // ----- Tests for cached_cast_analysis_for_scheduler error paths --
 
     /// 1. Path that does not exist on the filesystem: the
-    ///    `std::fs::read` arm fires, returns empty.
+    ///    `std::fs::read` arm fires, returns `None`.
     #[test]
-    fn build_cast_map_nonexistent_path_returns_empty() {
+    fn cached_cast_analysis_nonexistent_path_returns_none() {
         let p =
             std::path::Path::new("/tmp/ktstr-cast-analysis-nonexistent-fixture-path-do-not-create");
         // Sanity: ensure the path really does not exist so the
@@ -1383,25 +1986,24 @@ mod tests {
             !p.exists(),
             "fixture path must not exist; remove it before running this test"
         );
-        let map = build_cast_map_from_scheduler(p);
-        assert!(map.is_empty());
+        assert!(cached_cast_analysis_for_scheduler(p).is_none());
     }
 
     /// 2. Empty file: `goblin::elf::Elf::parse` rejects a 0-byte
-    ///    input; the parse arm fires.
+    ///    input; the parse arm fires; empty result collapses to `None`.
     #[test]
-    fn build_cast_map_empty_file_returns_empty() {
+    fn cached_cast_analysis_empty_file_returns_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("empty.bin");
         std::fs::write(&p, b"").expect("write empty file");
-        let map = build_cast_map_from_scheduler(&p);
-        assert!(map.is_empty());
+        assert!(cached_cast_analysis_for_scheduler(&p).is_none());
     }
 
     /// 3. Valid ELF without a `.bpf.objs` section: the section-lookup
-    ///    arm fires, no analysis happens.
+    ///    arm fires, no analysis happens; empty result collapses to
+    ///    `None`.
     #[test]
-    fn build_cast_map_no_bpf_objs_section_returns_empty() {
+    fn cached_cast_analysis_no_bpf_objs_section_returns_none() {
         let blob = build_elf64(
             vec![SecSpec::new(".text", sh::SHT_PROGBITS).flags(sh::SHF_EXECINSTR.into())],
             h::EM_X86_64,
@@ -1410,8 +2012,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("no_bpf_objs.elf");
         std::fs::write(&p, &blob).expect("write");
-        let map = build_cast_map_from_scheduler(&p);
-        assert!(map.is_empty());
+        assert!(cached_cast_analysis_for_scheduler(&p).is_none());
     }
 
     // ----- Tests for btf_str_at --------------------------------------
@@ -2041,11 +2642,21 @@ mod tests {
         BpfInsn::new(OP_JMP_EXIT, 0, 0, 0, 0)
     }
 
+    /// `BPF_ADDR_SPACE_CAST` for the F1 mitigation: ALU64 | MOV | X
+    /// with `off=1, imm=1` is the as(1)→as(0) (arena→kernel) cast
+    /// the analyzer treats as `arena_confirmed` evidence on the
+    /// source's `(struct, field_offset)` slot.
+    fn addr_space_cast_insn(dst: u8, src: u8) -> BpfInsn {
+        use libbpf_rs::libbpf_sys as bs;
+        let code = (bs::BPF_ALU64 | bs::BPF_MOV | bs::BPF_X) as u8;
+        BpfInsn::new(code, dst, src, 1, 1)
+    }
+
     // ----- Synthesizers for full BTF (ints, structs, ptr, FuncProto, Func)
     //
     // The error-path tests above only need empty BTFs. The
-    // analyze_one_object end-to-end test needs a real BTF whose
-    // types the analyzer can intersect. This builder mirrors
+    // analyze_one_object_with_btf end-to-end test needs a real BTF
+    // whose types the analyzer can intersect. This builder mirrors
     // `cast_analysis::tests::build_btf` in shape but is local to this
     // module so the two test fixtures stay decoupled.
     const SYN_BTF_KIND_INT: u32 = 1;
@@ -2235,17 +2846,21 @@ mod tests {
         )
     }
 
-    // ----- analyze_one_object error paths ----------------------------
+    // ----- analyze_one_object_with_btf error paths -------------------
 
     /// Inner ELF whose bytes do not start with a valid ELF magic
-    /// fails goblin parse — `analyze_one_object` returns empty.
+    /// fails goblin parse — `analyze_one_object_with_btf` returns
+    /// empty.
     #[test]
     fn analyze_one_object_corrupt_elf_returns_empty() {
         let bytes = vec![0u8; 64]; // all zeros — bad ELF magic
-        assert!(analyze_one_object(&bytes).is_empty());
+        let (map, btf) = analyze_one_object_with_btf(&bytes);
+        assert!(map.is_empty());
+        assert!(btf.is_none());
     }
 
-    /// Inner ELF without a `.BTF` section returns an empty map.
+    /// Inner ELF without a `.BTF` section returns an empty map and
+    /// no parsed BTF.
     #[test]
     fn analyze_one_object_no_btf_returns_empty() {
         let bytes = build_elf64(
@@ -2257,7 +2872,9 @@ mod tests {
             h::EM_BPF,
             h::ET_REL,
         );
-        assert!(analyze_one_object(&bytes).is_empty());
+        let (map, btf) = analyze_one_object_with_btf(&bytes);
+        assert!(map.is_empty());
+        assert!(btf.is_none());
     }
 
     /// Inner ELF whose `.BTF` bytes do not parse as valid BTF
@@ -2274,11 +2891,15 @@ mod tests {
             h::EM_BPF,
             h::ET_REL,
         );
-        assert!(analyze_one_object(&bytes).is_empty());
+        let (map, btf) = analyze_one_object_with_btf(&bytes);
+        assert!(map.is_empty());
+        assert!(btf.is_none());
     }
 
     /// Inner ELF with valid BTF but no executable text section
-    /// produces no instructions to analyze → empty map.
+    /// produces no instructions to analyze → empty map. The parsed
+    /// BTF is still returned so its struct/union definitions can
+    /// feed the cross-BTF Fwd index.
     #[test]
     fn analyze_one_object_no_text_section_returns_empty() {
         let bytes = build_elf64(
@@ -2286,11 +2907,14 @@ mod tests {
             h::EM_BPF,
             h::ET_REL,
         );
-        assert!(analyze_one_object(&bytes).is_empty());
+        let (map, btf) = analyze_one_object_with_btf(&bytes);
+        assert!(map.is_empty());
+        assert!(btf.is_some());
     }
 
     /// Text section whose byte length is not a multiple of 8 is
-    /// skipped during decode → empty map.
+    /// skipped during decode → empty map. As with the no-text case,
+    /// the parsed BTF is still returned for cross-BTF Fwd indexing.
     #[test]
     fn analyze_one_object_misaligned_text_skipped() {
         let bytes = build_elf64(
@@ -2303,10 +2927,12 @@ mod tests {
             h::EM_BPF,
             h::ET_REL,
         );
-        assert!(analyze_one_object(&bytes).is_empty());
+        let (map, btf) = analyze_one_object_with_btf(&bytes);
+        assert!(map.is_empty());
+        assert!(btf.is_some());
     }
 
-    // ----- analyze_one_object end-to-end recovery --------------------
+    // ----- analyze_one_object_with_btf end-to-end recovery -----------
 
     /// Full pipeline: BTF describes T (id=2) with a u64 field at
     /// offset 8 and Q (id=3) with a u64 field at offset 0; .text
@@ -2366,13 +2992,22 @@ mod tests {
             },
         ];
         let btf_blob = build_btf_full(&types, &strings);
-        // r2 = *(u64 *)(r1 + 8); r3 = *(u64 *)(r2 + 0); exit.
-        let insns = vec![ldx_dw_mem(2, 1, 8), ldx_dw_mem(3, 2, 0), exit_insn()];
+        // r2 = *(u64 *)(r1 + 8); r2 = arena_cast(r2);
+        // r3 = *(u64 *)(r2 + 0); exit.
+        // The arena_cast adds (T, 8) to arena_confirmed (F1
+        // mitigation prerequisite for the shape-inference finding).
+        let insns = vec![
+            ldx_dw_mem(2, 1, 8),
+            addr_space_cast_insn(2, 2),
+            ldx_dw_mem(3, 2, 0),
+            exit_insn(),
+        ];
         let text = insns_to_text_bytes(&insns);
         let btf_ext = build_btf_ext(n_text, &[(0, 5)], 8);
 
         let bytes = build_full_bpf_object_elf(text, btf_blob, btf_ext);
-        let map = analyze_one_object(&bytes);
+        let (map, btf) = analyze_one_object_with_btf(&bytes);
+        assert!(btf.is_some(), "valid BTF must be returned");
         let hit = map.get(&(2u32, 8u32)).copied();
         assert_eq!(
             hit,
@@ -2384,12 +3019,13 @@ mod tests {
         );
     }
 
-    // ----- build_cast_map_from_scheduler error & happy paths ---------
+    // ----- cached_cast_analysis_for_scheduler error & happy paths ---
 
     /// Outer ELF that parses successfully but whose `.bpf.objs`
-    /// bytes are not a valid inner ELF — outer merge is empty.
+    /// bytes are not a valid inner ELF — outer merge is empty,
+    /// cache layer collapses to `None`.
     #[test]
-    fn build_cast_map_corrupt_inner_returns_empty() {
+    fn cached_cast_analysis_corrupt_inner_returns_none() {
         let outer = build_elf64(
             vec![SecSpec::new(".bpf.objs", sh::SHT_PROGBITS).data(b"not-an-elf".to_vec())],
             h::EM_X86_64,
@@ -2398,14 +3034,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("bad_inner.bin");
         std::fs::write(&p, &outer).expect("write");
-        let map = build_cast_map_from_scheduler(&p);
-        assert!(map.is_empty());
+        assert!(cached_cast_analysis_for_scheduler(&p).is_none());
     }
 
     /// Outer ELF whose `.bpf.objs` carries an inner BPF ELF
-    /// without a `.BTF` section — outer merge is empty.
+    /// without a `.BTF` section — outer merge is empty, cache
+    /// layer collapses to `None`.
     #[test]
-    fn build_cast_map_inner_without_btf_returns_empty() {
+    fn cached_cast_analysis_inner_without_btf_returns_none() {
         let inner = build_elf64(
             vec![
                 SecSpec::new(".text", sh::SHT_PROGBITS)
@@ -2423,14 +3059,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join("no_inner_btf.bin");
         std::fs::write(&p, &outer).expect("write");
-        let map = build_cast_map_from_scheduler(&p);
-        assert!(map.is_empty());
+        assert!(cached_cast_analysis_for_scheduler(&p).is_none());
     }
 
     /// Full end-to-end through the public driver: outer host ELF
     /// wraps an inner BPF ELF that recovers an arena cast.
     #[test]
-    fn build_cast_map_recovers_arena_cast_end_to_end() {
+    fn cached_cast_analysis_recovers_arena_cast_end_to_end() {
         let mut strings = vec![0u8];
         let n_int = push_btf_name(&mut strings, "u64");
         let n_t = push_btf_name(&mut strings, "T");
@@ -2480,7 +3115,14 @@ mod tests {
             },
         ];
         let btf_blob = build_btf_full(&types, &strings);
-        let insns = vec![ldx_dw_mem(2, 1, 8), ldx_dw_mem(3, 2, 0), exit_insn()];
+        // F1 mitigation: include arena_space_cast on r2 so the
+        // shape-inference finding emits.
+        let insns = vec![
+            ldx_dw_mem(2, 1, 8),
+            addr_space_cast_insn(2, 2),
+            ldx_dw_mem(3, 2, 0),
+            exit_insn(),
+        ];
         let text = insns_to_text_bytes(&insns);
         let btf_ext = build_btf_ext(n_text, &[(0, 5)], 8);
 
@@ -2494,15 +3136,217 @@ mod tests {
         let p = dir.path().join("full.bin");
         std::fs::write(&p, &outer).expect("write");
 
-        let map = build_cast_map_from_scheduler(&p);
-        let hit = map.get(&(2u32, 8u32)).copied();
+        let out =
+            cached_cast_analysis_for_scheduler(&p).expect("non-empty fixture must produce Some");
+        let hit = out.cast_map.get(&(2u32, 8u32)).copied();
         assert_eq!(
             hit,
             Some(CastHit {
                 target_type_id: 3,
                 addr_space: AddrSpace::Arena,
             }),
-            "expected arena cast T.f → Q*, got {map:?}"
+            "expected arena cast T.f → Q*, got {:?}",
+            out.cast_map
+        );
+    }
+
+    // ----- Tests for cached_cast_analysis_for_scheduler --------------
+
+    /// Helper: build the same arena-cast end-to-end fixture used by
+    /// `cached_cast_analysis_recovers_arena_cast_end_to_end`,
+    /// returning the outer ELF bytes. Centralised so cache tests
+    /// share a fixture shape with the path-driven test.
+    fn build_recovers_arena_cast_outer_elf() -> Vec<u8> {
+        let mut strings = vec![0u8];
+        let n_int = push_btf_name(&mut strings, "u64");
+        let n_t = push_btf_name(&mut strings, "T");
+        let n_q = push_btf_name(&mut strings, "Q");
+        let n_f = push_btf_name(&mut strings, "f");
+        let n_x = push_btf_name(&mut strings, "x");
+        let n_func = push_btf_name(&mut strings, "myfunc");
+        let n_text = push_btf_name(&mut strings, ".text");
+        let types = vec![
+            SynKind::Int {
+                name_off: n_int,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynKind::Struct {
+                name_off: n_t,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_f,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+            SynKind::Struct {
+                name_off: n_q,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_x,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            SynKind::Ptr { type_id: 2 },
+            SynKind::FuncProto {
+                return_type_id: 0,
+                params: vec![SynParam {
+                    name_off: 0,
+                    type_id: 4,
+                }],
+            },
+            SynKind::Func {
+                name_off: n_func,
+                type_id: 5,
+                linkage: 1,
+            },
+        ];
+        let btf_blob = build_btf_full(&types, &strings);
+        // F1 mitigation: include arena_space_cast on r2 so the
+        // shape-inference finding emits.
+        let insns = vec![
+            ldx_dw_mem(2, 1, 8),
+            addr_space_cast_insn(2, 2),
+            ldx_dw_mem(3, 2, 0),
+            exit_insn(),
+        ];
+        let text = insns_to_text_bytes(&insns);
+        let btf_ext = build_btf_ext(n_text, &[(0, 5)], 8);
+        let inner = build_full_bpf_object_elf(text, btf_blob, btf_ext);
+        build_elf64(
+            vec![SecSpec::new(".bpf.objs", sh::SHT_PROGBITS).data(inner)],
+            h::EM_X86_64,
+            h::ET_REL,
+        )
+    }
+
+    /// Cache hit by content: two calls on the same bytes (different
+    /// paths) return the same `Arc<CastAnalysisOutput>`. Proves the
+    /// cache is content-keyed (SHA-256), not path-keyed.
+    #[test]
+    fn cached_cast_analysis_returns_same_arc_for_same_content() {
+        let blob = build_recovers_arena_cast_outer_elf();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p1 = dir.path().join("first.bin");
+        let p2 = dir.path().join("second.bin");
+        std::fs::write(&p1, &blob).expect("write 1");
+        std::fs::write(&p2, &blob).expect("write 2");
+
+        let first = cached_cast_analysis_for_scheduler(&p1).expect("Some on non-empty analysis");
+        let second =
+            cached_cast_analysis_for_scheduler(&p2).expect("cache hit on identical content");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "expected pointer-equal Arc when two paths have identical content"
+        );
+        // Sanity: the cached output carries the recovered cast.
+        assert_eq!(
+            first.cast_map.get(&(2u32, 8u32)).copied(),
+            Some(CastHit {
+                target_type_id: 3,
+                addr_space: AddrSpace::Arena,
+            }),
+        );
+    }
+
+    /// Cache miss by content: an empty-result blob caches as
+    /// `None`. Proves the empty-result collapse (cast_map empty
+    /// AND fwd_index empty) is preserved across cache lookups.
+    #[test]
+    fn cached_cast_analysis_collapses_empty_to_none() {
+        let empty_blob = build_elf64(
+            vec![SecSpec::new(".text", sh::SHT_PROGBITS).flags(sh::SHF_EXECINSTR.into())],
+            h::EM_X86_64,
+            h::ET_REL,
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("empty.bin");
+        std::fs::write(&p, &empty_blob).expect("write");
+
+        // First call analyzes; result is empty → None.
+        assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+        // Second call hits the same content-hash cache entry and
+        // also resolves to None without re-running the analyzer.
+        assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+    }
+
+    /// Read-failure path: a non-existent path produces `None`
+    /// without polluting the cache. A later call after the file
+    /// appears must succeed and run the analyzer on demand.
+    #[test]
+    fn cached_cast_analysis_read_failure_does_not_pollute_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("appears_later.bin");
+
+        assert!(!p.exists());
+        assert!(cached_cast_analysis_for_scheduler(&p).is_none());
+
+        let blob = build_recovers_arena_cast_outer_elf();
+        std::fs::write(&p, &blob).expect("write");
+        let out = cached_cast_analysis_for_scheduler(&p)
+            .expect("post-creation read should succeed and produce a non-empty CastAnalysisOutput");
+        assert_eq!(
+            out.cast_map.get(&(2u32, 8u32)).copied(),
+            Some(CastHit {
+                target_type_id: 3,
+                addr_space: AddrSpace::Arena,
+            }),
+            "post-creation analysis should recover the seeded cast"
+        );
+    }
+
+    /// Lazy wrapper: `LazyCastMap::new` runs no analysis. The
+    /// `OnceLock` is empty until `.get_full()` fires, and
+    /// `.get_full()` returns identical `Arc`s on every subsequent
+    /// call (the analyzer ran exactly once).
+    #[test]
+    fn lazy_cast_map_get_full_is_idempotent_and_lazy() {
+        let blob = build_recovers_arena_cast_outer_elf();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("lazy.bin");
+        std::fs::write(&p, &blob).expect("write");
+
+        let lazy = LazyCastMap::new(Some(p.clone()));
+        // Sanity: the lazy slot is empty before any `.get_full()`.
+        assert!(
+            lazy.inner.get().is_none(),
+            "LazyCastMap::new must not run analysis"
+        );
+
+        let first = lazy.get_full().expect("non-empty result");
+        let second = lazy.get_full().expect("non-empty result");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "OnceLock-backed `.get_full()` must return the same Arc on every call"
+        );
+    }
+
+    /// `LazyCastMap::get_full` on a binary with no recoverable
+    /// casts returns `None` (the cache layer collapses empty
+    /// results). The renderer treats `None` identically to an
+    /// empty map, so this keeps the pre-integration default
+    /// behaviour intact.
+    #[test]
+    fn lazy_cast_map_get_full_returns_none_for_no_findings() {
+        let empty_blob = build_elf64(
+            vec![SecSpec::new(".text", sh::SHT_PROGBITS).flags(sh::SHF_EXECINSTR.into())],
+            h::EM_X86_64,
+            h::ET_REL,
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("no_findings.bin");
+        std::fs::write(&p, &empty_blob).expect("write");
+
+        let lazy = LazyCastMap::new(Some(p));
+        assert!(
+            lazy.get_full().is_none(),
+            "no-`.bpf.objs` binary must collapse to None on `.get_full()`"
         );
     }
 
@@ -2684,7 +3528,7 @@ mod tests {
     // tests that synthesize a complete BPF object (program text +
     // BTF + .symtab/.strtab + a SHT_REL section) and feed the
     // patcher the same `(text_concat, btf, elf, section_bases)`
-    // tuple `analyze_one_object` produces. After patching we re-
+    // tuple `analyze_one_object_with_btf` produces. After patching we re-
     // decode the call instruction and assert the analyzer-visible
     // state — this is the exact contract `analyze_casts` consumes
     // downstream, so any drift between the patcher and the analyzer
@@ -3275,6 +4119,205 @@ mod tests {
         assert_eq!(find_extern_func_btf_id(&btf, "absent"), None);
     }
 
+    // ----- build_subprog_returns tests -------------------------------
+    //
+    // Coverage strategy: each test synthesises a minimal BPF object
+    // (program text + symtab/strtab + SHT_REL section) and feeds the
+    // analyzer-visible tuple `(text_concat, elf, section_bases)` to
+    // [`build_subprog_returns`]. The four test cases pin the four
+    // gates the function applies before recording a [`SubprogReturn`]:
+    //
+    //   1. Happy path — symbol is `STT_FUNC` + non-`SHN_UNDEF` +
+    //      `BPF_PSEUDO_CALL` site + name on `ALLOC_SUBPROG_NAMES`.
+    //      The result must contain exactly one entry pointing at the
+    //      call PC.
+    //   2. Gate skip — `BPF_PSEUDO_KFUNC_CALL` (src_reg = 2). Kfunc
+    //      calls are handled by `handle_kfunc_call` separately; a
+    //      subprog-return seed at this site would mis-route the
+    //      arena tag.
+    //   3. Gate skip — `STT_OBJECT` symbol (data, not function). The
+    //      relocation might target a call PC by coincidence but the
+    //      symbol is not a subprog.
+    //   4. Gate skip — `STT_FUNC` symbol whose name is NOT on
+    //      `ALLOC_SUBPROG_NAMES`. A regular subprog call must not
+    //      seed an arena tag — the analyzer's `BPF_OP_CALL` arm
+    //      relies on the seed list to disambiguate.
+    //
+    // These four gates compose the "false-negative-safe" boundary of
+    // the SubprogReturn pipeline; a regression in any one of them
+    // would either drop allocator-call sites silently (false
+    // negative — surfaces as a missing chase) or seed an arena tag
+    // on an unrelated subprog call (false positive — produces a
+    // misleading render). The tests below pin each gate independently.
+
+    /// Encode a `BPF_PSEUDO_CALL` (src_reg = 1) call instruction:
+    /// `code=0x85`, `dst=0`, `src=1`, `off=0`, `imm=any`.
+    /// Mirrors clang's pre-relocation BPF-to-BPF call shape.
+    fn pseudo_call_bytes(imm: i32) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0] = 0x85; // BPF_JMP | BPF_CALL
+        out[1] = 0x10; // dst=0, src=1 (BPF_PSEUDO_CALL)
+        out[2..4].copy_from_slice(&0i16.to_le_bytes());
+        out[4..8].copy_from_slice(&imm.to_le_bytes());
+        out
+    }
+
+    /// Encode a `BPF_PSEUDO_KFUNC_CALL` (src_reg = 2) call
+    /// instruction. Used by the gate-skip test to confirm kfunc
+    /// call sites do not seed SubprogReturn entries.
+    fn pseudo_kfunc_call_bytes(imm: i32) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0] = 0x85;
+        out[1] = 0x20; // dst=0, src=2 (BPF_PSEUDO_KFUNC_CALL)
+        out[2..4].copy_from_slice(&0i16.to_le_bytes());
+        out[4..8].copy_from_slice(&imm.to_le_bytes());
+        out
+    }
+
+    /// Build a `(elf, text_concat, section_bases)` triple that
+    /// [`build_subprog_returns`] consumes. The input is a minimal
+    /// BPF object with one program text section (call + EXIT) plus
+    /// a SHT_REL section pointing at the call PC. The symbol the
+    /// reloc references is parameterised so each gate test can
+    /// vary it independently. Returns the three tuple elements.
+    #[allow(clippy::too_many_arguments)]
+    fn build_subprog_test_scaffold(
+        sym_name: &str,
+        sym_st_type_bind: u8,
+        sym_st_shndx: u16,
+        call_bytes: [u8; 8],
+    ) -> (Vec<u8>, Vec<BpfInsn>, HashMap<u32, usize>) {
+        let mut strtab: Vec<u8> = vec![0];
+        let n_sym = strtab.len() as u32;
+        strtab.extend_from_slice(sym_name.as_bytes());
+        strtab.push(0);
+
+        let mut symtab: Vec<u8> = Vec::new();
+        symtab.extend_from_slice(&elf64_sym(0, 0, 0, 0, 0));
+        symtab.extend_from_slice(&elf64_sym(n_sym, sym_st_type_bind, sym_st_shndx, 0, 0));
+
+        let mut text: Vec<u8> = Vec::new();
+        text.extend_from_slice(&call_bytes);
+        text.extend_from_slice(&kfunc_exit_bytes());
+        // r_offset = 0 (call is at the first slot), sym_idx = 1
+        // (the synthesised symbol), r_type = 1 (R_BPF_64_64 — value
+        // does not matter for the SubprogReturn walk; the function
+        // does not gate on r_type, only on the resolved instruction
+        // and symbol shape).
+        let rel_data: Vec<u8> = elf64_rel(0, 1, 1).to_vec();
+
+        let blob = build_elf64(
+            vec![
+                SecSpec::new(".text", sh::SHT_PROGBITS)
+                    .flags(sh::SHF_EXECINSTR.into())
+                    .data(text),
+                SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
+                SecSpec::new(".symtab", sh::SHT_SYMTAB)
+                    .data(symtab)
+                    .link(2)
+                    .entsize(24),
+                SecSpec::new(".rel.text", sh::SHT_REL)
+                    .data(rel_data)
+                    .link(3)
+                    .info(1)
+                    .entsize(16),
+            ],
+            h::EM_BPF,
+            h::ET_REL,
+        );
+        let text_concat: Vec<BpfInsn> = vec![
+            BpfInsn::from_le_bytes(call_bytes),
+            BpfInsn::from_le_bytes(kfunc_exit_bytes()),
+        ];
+        let mut section_bases: HashMap<u32, usize> = HashMap::new();
+        section_bases.insert(1, 0); // .text at section index 1
+        (blob, text_concat, section_bases)
+    }
+
+    /// Test 1 — happy path. Symbol is `STT_FUNC` global non-extern,
+    /// name is on `ALLOC_SUBPROG_NAMES`, call is `BPF_PSEUDO_CALL`.
+    /// Must emit exactly one [`SubprogReturn`] at the call PC.
+    #[test]
+    fn build_subprog_returns_happy_path_emits_one() {
+        let (blob, text_concat, section_bases) = build_subprog_test_scaffold(
+            "scx_alloc_internal",
+            st_info(syms::STB_GLOBAL, syms::STT_FUNC),
+            1, // st_shndx — .text at shdr[1]
+            pseudo_call_bytes(123),
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let out = build_subprog_returns(&text_concat, &elf, &section_bases);
+        assert_eq!(out.len(), 1, "happy path: expected 1 entry, got {out:?}");
+        assert_eq!(
+            out[0].insn_offset, 0,
+            "SubprogReturn must point at the call PC"
+        );
+    }
+
+    /// Test 2 — gate skip: `BPF_PSEUDO_KFUNC_CALL` site. Even though
+    /// the symbol is `STT_FUNC` and the name is on the allowlist,
+    /// the call's `src_reg = 2` (kfunc) must be rejected. Kfunc
+    /// arena allocators are tagged via
+    /// [`crate::monitor::cast_analysis::ARENA_ALLOC_KFUNC_NAMES`]
+    /// inside [`crate::monitor::cast_analysis::Analyzer::handle_kfunc_call`],
+    /// not via SubprogReturn.
+    #[test]
+    fn build_subprog_returns_skips_pseudo_kfunc_call() {
+        let (blob, text_concat, section_bases) = build_subprog_test_scaffold(
+            "scx_alloc_internal",
+            st_info(syms::STB_GLOBAL, syms::STT_FUNC),
+            1,
+            pseudo_kfunc_call_bytes(0),
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let out = build_subprog_returns(&text_concat, &elf, &section_bases);
+        assert!(
+            out.is_empty(),
+            "BPF_PSEUDO_KFUNC_CALL must not seed a SubprogReturn: {out:?}"
+        );
+    }
+
+    /// Test 3 — gate skip: `STT_OBJECT` symbol. A data symbol
+    /// (`STT_OBJECT`) referenced by a reloc on a call site is
+    /// malformed input — the relocation walks over a call PC but
+    /// the resolved symbol is not a subprog. The
+    /// `sym.st_type() == STT_FUNC` gate must reject it.
+    #[test]
+    fn build_subprog_returns_skips_stt_object() {
+        let (blob, text_concat, section_bases) = build_subprog_test_scaffold(
+            "scx_alloc_internal",
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            1,
+            pseudo_call_bytes(0),
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let out = build_subprog_returns(&text_concat, &elf, &section_bases);
+        assert!(
+            out.is_empty(),
+            "STT_OBJECT symbol must not seed a SubprogReturn: {out:?}"
+        );
+    }
+
+    /// Test 4 — gate skip: `STT_FUNC` symbol whose name is NOT on
+    /// `ALLOC_SUBPROG_NAMES`. A regular BPF-to-BPF call to a
+    /// non-allocator subprog must not seed an arena tag. The
+    /// allowlist keeps the arena finding path strictly scoped.
+    #[test]
+    fn build_subprog_returns_skips_non_allowlist_name() {
+        let (blob, text_concat, section_bases) = build_subprog_test_scaffold(
+            "ktstr_some_unrelated_helper",
+            st_info(syms::STB_GLOBAL, syms::STT_FUNC),
+            1,
+            pseudo_call_bytes(0),
+        );
+        let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+        let out = build_subprog_returns(&text_concat, &elf, &section_bases);
+        assert!(
+            out.is_empty(),
+            "non-allowlist subprog name must not seed a SubprogReturn: {out:?}"
+        );
+    }
+
     // ----- build_datasec_pointers tests ------------------------------
     //
     // The eight gates inside `build_datasec_pointers` reject malformed
@@ -3845,4 +4888,463 @@ mod tests {
             "imm must survive unmodified — kernel BTF id preserved",
         );
     }
+
+    // ----- build_fwd_index tests -----------------------------------
+
+    /// Single BTF carrying complete `Type::Struct` entries indexes
+    /// each name to `(0, type_id)` — the fwd-resolution index is
+    /// the input the renderer's cross-BTF chase consults when a
+    /// `BTF_KIND_FWD` terminal needs a body lookup.
+    #[test]
+    fn build_fwd_index_indexes_single_btf_structs() {
+        let mut strings = vec![0u8];
+        let n_int = push_btf_name(&mut strings, "u64");
+        let n_foo = push_btf_name(&mut strings, "foo");
+        let n_bar = push_btf_name(&mut strings, "bar");
+        let n_x = push_btf_name(&mut strings, "x");
+        let types = vec![
+            // id 1: u64 (skipped by the indexer — only Struct/Union)
+            SynKind::Int {
+                name_off: n_int,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: struct foo { u64 x @ 0 }
+            SynKind::Struct {
+                name_off: n_foo,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_x,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            // id 3: struct bar { u64 x @ 0 }
+            SynKind::Struct {
+                name_off: n_bar,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_x,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+        ];
+        let blob = build_btf_full(&types, &strings);
+        let btf = Arc::new(Btf::from_bytes(&blob).expect("parse btf"));
+        let btfs = vec![btf];
+        let index = build_fwd_index(&btfs);
+        assert_eq!(
+            index.get("foo"),
+            Some(&FwdIndexEntry {
+                btfs_idx: 0,
+                type_id: 2,
+            })
+        );
+        assert_eq!(
+            index.get("bar"),
+            Some(&FwdIndexEntry {
+                btfs_idx: 0,
+                type_id: 3,
+            })
+        );
+        assert!(!index.contains_key("u64"), "Int names must not be indexed");
+    }
+
+    /// Multiple BTFs: the index records the first BTF seen for any
+    /// duplicate name, so an entry's `(idx, type_id)` reflects the
+    /// first-write-wins policy. The renderer only consults the
+    /// cross-BTF index when local in-BTF resolution failed, so a
+    /// name conflict resolved locally never reaches the index.
+    #[test]
+    fn build_fwd_index_first_write_wins_on_duplicate_name() {
+        // BTF #0: struct foo at id 2 (u64 at offset 0)
+        let mut strings_0 = vec![0u8];
+        let n_int_0 = push_btf_name(&mut strings_0, "u64");
+        let n_foo_0 = push_btf_name(&mut strings_0, "foo");
+        let n_x_0 = push_btf_name(&mut strings_0, "x");
+        let types_0 = vec![
+            SynKind::Int {
+                name_off: n_int_0,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynKind::Struct {
+                name_off: n_foo_0,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_x_0,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+        ];
+        let blob_0 = build_btf_full(&types_0, &strings_0);
+        let btf_0 = Arc::new(Btf::from_bytes(&blob_0).expect("parse btf 0"));
+
+        // BTF #1: also has struct foo (different layout!) at id 2.
+        // Index keeps the BTF #0 entry per first-write-wins.
+        let mut strings_1 = vec![0u8];
+        let n_int_1 = push_btf_name(&mut strings_1, "u64");
+        let n_foo_1 = push_btf_name(&mut strings_1, "foo");
+        let n_y_1 = push_btf_name(&mut strings_1, "y");
+        let types_1 = vec![
+            SynKind::Int {
+                name_off: n_int_1,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SynKind::Struct {
+                name_off: n_foo_1,
+                size: 16,
+                members: vec![SynMember {
+                    name_off: n_y_1,
+                    type_id: 1,
+                    byte_offset: 8,
+                }],
+            },
+        ];
+        let blob_1 = build_btf_full(&types_1, &strings_1);
+        let btf_1 = Arc::new(Btf::from_bytes(&blob_1).expect("parse btf 1"));
+
+        let btfs = vec![btf_0, btf_1];
+        let index = build_fwd_index(&btfs);
+        // Entry must point at BTF #0, not #1.
+        assert_eq!(
+            index.get("foo"),
+            Some(&FwdIndexEntry {
+                btfs_idx: 0,
+                type_id: 2,
+            }),
+            "first-write-wins: BTF #0 wins on duplicate name"
+        );
+    }
+
+    /// Anonymous structs (empty resolved name) are silently
+    /// skipped — the index keys on names, so an anonymous type has
+    /// nothing to look up.
+    #[test]
+    fn build_fwd_index_skips_anonymous_structs() {
+        let mut strings = vec![0u8];
+        let n_int = push_btf_name(&mut strings, "u64");
+        let n_x = push_btf_name(&mut strings, "x");
+        let types = vec![
+            SynKind::Int {
+                name_off: n_int,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // Anonymous struct (name_off = 0)
+            SynKind::Struct {
+                name_off: 0,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_x,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+        ];
+        let blob = build_btf_full(&types, &strings);
+        let btf = Arc::new(Btf::from_bytes(&blob).expect("parse btf"));
+        let btfs = vec![btf];
+        let index = build_fwd_index(&btfs);
+        // Anonymous struct must NOT be indexed under the empty
+        // string (would key every anonymous type to the same slot).
+        assert!(
+            index.is_empty(),
+            "anonymous structs must not be indexed: {index:?}"
+        );
+    }
+
+    /// Two-object end-to-end: object A's BTF declares
+    /// `struct cgx_target;` (a `BTF_KIND_FWD`) and references it
+    /// via a Ptr field; object B's BTF carries the full body
+    /// `struct cgx_target { u64 marker @ 0 }`. The cross-BTF index
+    /// produced by [`build_cast_analysis_from_bytes`] indexes
+    /// `cgx_target -> (1, 2)` — BTF #1 (object B) at type id 2,
+    /// the body location.
+    ///
+    /// Mirrors the deferred-resolve arena cast target shape: a
+    /// `__arena u64` declared in object A whose true type is the
+    /// `cgx_target` body in object B. The renderer's chase then
+    /// resolves the Fwd through the cross-BTF index and renders
+    /// the payload.
+    #[test]
+    fn build_cast_analysis_indexes_cross_object_struct_body() {
+        // Object A: declares `struct cgx_target;` as a Fwd at id
+        // 2, used as a pointee. The Fwd has no body — just the
+        // forward declaration.
+        let mut strings_a = vec![0u8];
+        let n_int_a = push_btf_name(&mut strings_a, "u64");
+        let n_cgx_a = push_btf_name(&mut strings_a, "cgx_target");
+        let n_t_a = push_btf_name(&mut strings_a, "outer_a");
+        let n_field_a = push_btf_name(&mut strings_a, "ptr_to_target");
+        let n_func_a = push_btf_name(&mut strings_a, "func_a");
+        let n_text_a = push_btf_name(&mut strings_a, ".text");
+        // SynKind doesn't have a Fwd variant in this test fixture,
+        // so we just emit a placeholder Struct (the body content
+        // doesn't matter — the cross-BTF test assertion only
+        // checks the index of the COMPLETE struct from BTF #1).
+        // The `outer_a` struct just exists so analyze_one_object_with_btf
+        // has something to traverse.
+        let types_a = vec![
+            // id 1: u64
+            SynKind::Int {
+                name_off: n_int_a,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: outer_a (carries a u64 field; just there so
+            // we have any struct at all in this BTF — the
+            // cross-BTF assertion is on object B's body)
+            SynKind::Struct {
+                name_off: n_t_a,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_field_a,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            // id 3: FuncProto returning void with one u64 param
+            SynKind::FuncProto {
+                return_type_id: 0,
+                params: vec![SynParam {
+                    name_off: 0,
+                    type_id: 1,
+                }],
+            },
+            // id 4: Func
+            SynKind::Func {
+                name_off: n_func_a,
+                type_id: 3,
+                linkage: 1,
+            },
+        ];
+        let _ = n_cgx_a; // SynKind in this test module has no Fwd
+        let btf_blob_a = build_btf_full(&types_a, &strings_a);
+        let insns_a = vec![exit_insn()];
+        let text_a = insns_to_text_bytes(&insns_a);
+        let btf_ext_a = build_btf_ext(n_text_a, &[(0, 3)], 8);
+        let inner_a = build_full_bpf_object_elf(text_a, btf_blob_a, btf_ext_a);
+
+        // Object B: defines `struct cgx_target { u64 marker @ 0 }`
+        // as a complete struct at id 2.
+        let mut strings_b = vec![0u8];
+        let n_int_b = push_btf_name(&mut strings_b, "u64");
+        let n_cgx_b = push_btf_name(&mut strings_b, "cgx_target");
+        let n_marker_b = push_btf_name(&mut strings_b, "marker");
+        let n_func_b = push_btf_name(&mut strings_b, "func_b");
+        let n_text_b = push_btf_name(&mut strings_b, ".text");
+        let types_b = vec![
+            // id 1: u64
+            SynKind::Int {
+                name_off: n_int_b,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: struct cgx_target { u64 marker @ 0 }  -- THE
+            // BODY the cross-BTF index keys to.
+            SynKind::Struct {
+                name_off: n_cgx_b,
+                size: 8,
+                members: vec![SynMember {
+                    name_off: n_marker_b,
+                    type_id: 1,
+                    byte_offset: 0,
+                }],
+            },
+            SynKind::FuncProto {
+                return_type_id: 0,
+                params: vec![SynParam {
+                    name_off: 0,
+                    type_id: 1,
+                }],
+            },
+            SynKind::Func {
+                name_off: n_func_b,
+                type_id: 3,
+                linkage: 1,
+            },
+        ];
+        let btf_blob_b = build_btf_full(&types_b, &strings_b);
+        let insns_b = vec![exit_insn()];
+        let text_b = insns_to_text_bytes(&insns_b);
+        let btf_ext_b = build_btf_ext(n_text_b, &[(0, 3)], 8);
+        let inner_b = build_full_bpf_object_elf(text_b, btf_blob_b, btf_ext_b);
+
+        // Outer ELF wraps both inner objects in `.bpf.objs` via
+        // STT_OBJECT symbols so [`iter_embedded_bpf_objects`]
+        // yields them as separate slices.
+        let strtab = b"\0obj_a\0obj_b\0".to_vec();
+        let mut symtab = Vec::new();
+        symtab.extend_from_slice(&elf64_sym(0, 0, 0, 0, 0));
+        // sym for object A: name_off = 1 (b"obj_a"), st_value = 0,
+        // size = inner_a.len()
+        symtab.extend_from_slice(&elf64_sym(
+            1,
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            1, // st_shndx — .bpf.objs at shdr[1]
+            0,
+            inner_a.len() as u64,
+        ));
+        // sym for object B: name_off = 7 (b"obj_b"),
+        // st_value = inner_a.len(), size = inner_b.len()
+        symtab.extend_from_slice(&elf64_sym(
+            7,
+            st_info(syms::STB_GLOBAL, syms::STT_OBJECT),
+            1,
+            inner_a.len() as u64,
+            inner_b.len() as u64,
+        ));
+
+        // Pack both inner objects back-to-back in `.bpf.objs`.
+        let mut bpf_objs_data = Vec::new();
+        bpf_objs_data.extend_from_slice(&inner_a);
+        bpf_objs_data.extend_from_slice(&inner_b);
+
+        let outer = build_elf64(
+            vec![
+                SecSpec::new(".bpf.objs", sh::SHT_PROGBITS).data(bpf_objs_data),
+                SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
+                SecSpec::new(".symtab", sh::SHT_SYMTAB)
+                    .data(symtab)
+                    .link(2)
+                    .entsize(24),
+            ],
+            h::EM_X86_64,
+            h::ET_REL,
+        );
+
+        let out = build_cast_analysis_from_bytes(&outer);
+        // Both BTFs parsed.
+        assert_eq!(
+            out.btfs.len(),
+            2,
+            "both embedded objects' BTFs must be retained: {}",
+            out.btfs.len()
+        );
+        // The cross-BTF index has cgx_target keyed at the FIRST
+        // BTF that carries a complete body. Object A in this
+        // fixture exposes no `cgx_target` struct (SynKind has no
+        // Fwd variant in the test fixture so we omit it), so
+        // object B's id is what gets indexed.
+        let cgx_hit = out.fwd_index.get("cgx_target");
+        assert_eq!(
+            cgx_hit,
+            Some(&FwdIndexEntry {
+                btfs_idx: 1,
+                type_id: 2,
+            }),
+            "cross-BTF index must point cgx_target to BTF #1 at type id 2: {:?}",
+            out.fwd_index
+        );
+        // Both objects' top-level structs are also indexed.
+        assert_eq!(
+            out.fwd_index.get("outer_a"),
+            Some(&FwdIndexEntry {
+                btfs_idx: 0,
+                type_id: 2,
+            }),
+            "object A's struct outer_a must be indexed in BTF #0 at id 2"
+        );
+    }
+
+    // ----- LazyCastMap full-output accessor -------------------------
+
+    /// `LazyCastMap::new(None).get_full()` returns `None` without
+    /// touching the filesystem or the process-wide cache. Matches
+    /// the no-scheduler dump-path contract (every `u64` renders as
+    /// a plain counter) for the production [`Self::get_full`]
+    /// accessor that returns the full [`CastAnalysisOutput`]
+    /// including the cross-BTF Fwd index.
+    #[test]
+    fn lazy_cast_map_get_full_returns_none_when_no_scheduler() {
+        let lazy = LazyCastMap::new(None);
+        assert!(
+            lazy.get_full().is_none(),
+            "no-scheduler builder must short-circuit `.get_full()` to None",
+        );
+    }
+
+    // ----- cached_cast_analysis_for_scheduler concurrency -----------
+
+    /// Multi-thread race on the same scheduler binary path: every
+    /// caller must observe the same `Arc<CastAnalysisOutput>` —
+    /// pointer-equal — proving the per-hash `OnceLock` inside the
+    /// process-wide cache deduplicates concurrent first-callers
+    /// rather than running the analyzer once per caller and
+    /// returning equivalent-but-distinct Arcs.
+    ///
+    /// Uses [`std::thread::scope`] so the threads can borrow the
+    /// path; an [`Arc<std::sync::Barrier>`] coordinates the
+    /// release point so every thread enters
+    /// [`cached_cast_analysis_for_scheduler`] within microseconds
+    /// of one another, maximising the contention on the cache's
+    /// `Mutex<HashMap>` lookup AND the per-hash
+    /// `OnceLock::get_or_init` serialisation. Without the barrier
+    /// the threads might serialise naturally on creation, missing
+    /// the concurrent-init regression the
+    /// `Arc<OnceLock<...>>` shape exists to catch.
+    #[test]
+    fn cached_cast_analysis_concurrent_callers_share_one_oncelock_init() {
+        use std::sync::{Arc as StdArc, Barrier};
+
+        // Build the standard arena-cast end-to-end fixture and
+        // write it to a fresh path so the content hash is unique
+        // to this test run (won't collide with other tests'
+        // cache entries).
+        let blob = build_recovers_arena_cast_outer_elf();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("concurrent.bin");
+        std::fs::write(&p, &blob).expect("write");
+
+        const N_THREADS: usize = 8;
+        let barrier = StdArc::new(Barrier::new(N_THREADS));
+        let path = p.clone();
+        let results: Vec<Arc<CastAnalysisOutput>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..N_THREADS)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    let path = path.clone();
+                    s.spawn(move || {
+                        // Synchronise the release: every thread
+                        // hits `wait()` before any thread enters
+                        // the cache lookup.
+                        barrier.wait();
+                        cached_cast_analysis_for_scheduler(&path)
+                            .expect("non-empty fixture must produce Some")
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(results.len(), N_THREADS);
+        // Every Arc must be pointer-equal to the first — proves
+        // the OnceLock dedup fired and only one analysis ran
+        // across all N concurrent callers.
+        let first = &results[0];
+        for (i, other) in results.iter().enumerate().skip(1) {
+            assert!(
+                Arc::ptr_eq(first, other),
+                "thread {i}: Arc must be pointer-equal to thread 0's; \
+                 OnceLock dedup did NOT fire across concurrent callers",
+            );
+        }
+    }
+
 }

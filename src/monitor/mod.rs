@@ -31,6 +31,7 @@ pub mod perf_counters;
 pub mod reader;
 pub mod reproducer_gen;
 pub mod runnable_scan;
+pub mod scx_static_alloc;
 pub mod scx_walker;
 pub mod sdt_alloc;
 pub mod symbols;

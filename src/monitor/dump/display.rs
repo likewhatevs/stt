@@ -318,6 +318,7 @@ impl std::fmt::Display for FailureDumpReport {
         if self.maps.is_empty()
             && self.vcpu_regs.is_empty()
             && self.sdt_allocations.is_empty()
+            && self.scx_static_ranges.is_empty()
             && self.prog_runtime_stats.is_empty()
             && self.prog_runtime_stats_unavailable.is_none()
             && self.per_cpu_time.is_empty()
@@ -364,6 +365,13 @@ impl std::fmt::Display for FailureDumpReport {
             }
             first = false;
             std::fmt::Display::fmt(snap, f)?;
+        }
+        if !self.scx_static_ranges.is_empty() {
+            if !first {
+                f.write_str("\n\n")?;
+            }
+            first = false;
+            std::fmt::Display::fmt(&self.scx_static_ranges, f)?;
         }
         if !self.prog_runtime_stats.is_empty() {
             if !first {

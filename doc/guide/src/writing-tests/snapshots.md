@@ -233,6 +233,17 @@ address-space-appropriate reader. The full set of
 | `"cast→arena (sdt_alloc)"` | Cast analyzer flagged a `u64` field AND the chase target peeled to a Fwd; the bridge recovered the real arena payload struct id. |
 | `"cast→kernel (sdt_alloc)"` | Cast analyzer flagged a `u64` field AND the chase target peeled to a Fwd; the bridge recovered the real kernel-side struct id. |
 
+A parallel cross-BTF Fwd resolution path is consulted whenever a
+chase target survives the local same-BTF Fwd resolve as a
+`BTF_KIND_FWD`: when the body lives in a sibling embedded BPF
+object's BTF (the multi-`.bpf.objs` shape), the renderer switches
+the recursion to that sibling BTF and renders the full body.
+Cross-BTF resolution does NOT add a new annotation — the body is
+recovered transparently and the rendered subtree carries whichever
+annotation (`"cast→arena"`, `"cast→kernel"`, or `None` for a
+BTF-typed `Type::Ptr`) it would have had if the same struct lived
+in the entry BTF.
+
 From the test author's perspective:
 
 - `as_u64()` returns the raw pointer value (matching pre-analysis

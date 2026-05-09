@@ -2791,12 +2791,30 @@ struct CastStubReader {
     arena_window: Option<(u64, u64)>,
     arena_bytes_at: std::collections::HashMap<u64, Vec<u8>>,
     kva_bytes_at: std::collections::HashMap<u64, Vec<u8>>,
-    /// `addr → btf_type_id` lookup the stub returns from
+    /// `addr → ArenaResolveHit` lookup the stub returns from
     /// [`MemReader::resolve_arena_type`]. Empty by default — the
     /// trait method then surfaces the trait-default `None` for
     /// every query, matching every existing test that does not
-    /// exercise the sdt_alloc bridge.
-    arena_type_at: std::collections::HashMap<u64, u32>,
+    /// exercise the sdt_alloc bridge. The
+    /// [`ArenaResolveHit::header_skip`] field is the byte count
+    /// the chase must skip from `addr` before the payload struct
+    /// begins (0 for payload-start chases, the slot's header size
+    /// for slot-start chases) — see
+    /// [`MemReader::resolve_arena_type`] for the production
+    /// contract.
+    arena_type_at: std::collections::HashMap<u64, ArenaResolveHit>,
+    /// Owned BTFs the stub holds for cross-BTF Fwd resolution.
+    /// `cross_btf_resolve_fwd` returns a borrow into this vec when
+    /// `cross_btf_index` has a hit. None / empty disables the
+    /// trait method's response (default `None`).
+    cross_btf_btfs: Vec<std::sync::Arc<Btf>>,
+    /// `name -> (cross_btf_btfs index, type_id, want_struct)` for
+    /// cross-BTF Fwd resolution. The `bool` is the
+    /// aggregate-kind flag the trait gates on
+    /// (`true = Type::Struct`, `false = Type::Union`); a
+    /// stored entry only fires when the query's `kind`
+    /// matches.
+    cross_btf_index: std::collections::HashMap<String, (usize, u32, bool)>,
 }
 
 impl MemReader for CastStubReader {
@@ -2832,8 +2850,24 @@ impl MemReader for CastStubReader {
         // unit tests above.
         self.hit
     }
-    fn resolve_arena_type(&self, addr: u64) -> Option<u32> {
+    fn resolve_arena_type(&self, addr: u64) -> Option<ArenaResolveHit> {
         self.arena_type_at.get(&addr).copied()
+    }
+    fn cross_btf_resolve_fwd(
+        &self,
+        name: &str,
+        kind: super::FwdKind,
+    ) -> Option<super::CrossBtfRef<'_>> {
+        let &(idx, type_id, idx_is_struct) = self.cross_btf_index.get(name)?;
+        let idx_kind = super::FwdKind::from_is_struct(idx_is_struct);
+        if idx_kind != kind {
+            return None;
+        }
+        let btf = self.cross_btf_btfs.get(idx)?;
+        Some(super::CrossBtfRef {
+            btf: btf.as_ref(),
+            type_id,
+        })
     }
 }
 
@@ -3393,6 +3427,17 @@ fn cast_exit() -> BpfInsn {
     BpfInsn::new(cast_exit_code(), 0, 0, 0, 0)
 }
 
+/// One-shot helper: emit `BPF_ADDR_SPACE_CAST` (ALU64 | MOV | X
+/// with `off=1`). The analyzer treats `imm=1` as the as(1)→as(0)
+/// cast (arena→kernel), which adds the source's `(struct,
+/// field_offset)` to `arena_confirmed` — the F1 mitigation
+/// prerequisite for shape-inference findings.
+fn cast_addr_space_cast(dst: u8, src: u8, imm: i32) -> BpfInsn {
+    use libbpf_rs::libbpf_sys as bs;
+    let code = (bs::BPF_ALU64 | bs::BPF_MOV | bs::BPF_X) as u8;
+    BpfInsn::new(code, dst, src, 1, imm)
+}
+
 /// Build a BTF blob shaped to drive [`analyze_casts`] to a unique
 /// (T, 8) → (Q, Arena) finding when run against the canonical
 /// `r2 = T.f; r3 = *r2` pair. Layout:
@@ -3462,9 +3507,15 @@ fn cast_pipeline_analyzer_output_drives_renderer_intercept() {
 
     // BPF program:
     //   r2 = *(u64 *)(r1 + 8)   ; load T.f → r2 = LoadedU64Field{T, 8}
+    //   r2 = arena_cast(r2)     ; arena_confirmed evidence (F1)
     //   r3 = *(u64 *)(r2 + 0)   ; deref @0 records access (0, 8) under (T, 8)
     //   exit
-    let insns = vec![cast_ldx_dw(2, 1, 8), cast_ldx_dw(3, 2, 0), cast_exit()];
+    let insns = vec![
+        cast_ldx_dw(2, 1, 8),
+        cast_addr_space_cast(2, 2, 1),
+        cast_ldx_dw(3, 2, 0),
+        cast_exit(),
+    ];
     let cast_map = analyze_casts(
         &insns,
         &btf,
@@ -3472,6 +3523,7 @@ fn cast_pipeline_analyzer_output_drives_renderer_intercept() {
             reg: 1,
             struct_type_id: t_id,
         }],
+        &[],
         &[],
         &[],
     );
@@ -3630,7 +3682,15 @@ fn cast_pipeline_modifier_chain_renderer_peels_to_analyzer_struct_id() {
     // index skips them). InitialReg seeds with the typedef wrapper
     // to verify the analyzer's `resolve_to_struct_id` peels through
     // the same chain the renderer does.
-    let insns = vec![cast_ldx_dw(2, 1, 8), cast_ldx_dw(3, 2, 0), cast_exit()];
+    // F1 mitigation: include arena_space_cast on r2 to
+    // populate arena_confirmed for (T, 8) so the shape-inference
+    // finding emits.
+    let insns = vec![
+        cast_ldx_dw(2, 1, 8),
+        cast_addr_space_cast(2, 2, 1),
+        cast_ldx_dw(3, 2, 0),
+        cast_exit(),
+    ];
     let cast_map = analyze_casts(
         &insns,
         &btf,
@@ -3638,6 +3698,7 @@ fn cast_pipeline_modifier_chain_renderer_peels_to_analyzer_struct_id() {
             reg: 1,
             struct_type_id: typedef_id,
         }],
+        &[],
         &[],
         &[],
     );
@@ -6625,22 +6686,50 @@ fn mem_reader_default_resolve_arena_type_is_none() {
     );
 }
 
-/// Custom [`MemReader`] override returns the configured BTF type
-/// id for known addresses and `None` for everything else. Mirrors
-/// the production [`super::super::dump::render_map::AccessorMemReader::resolve_arena_type`]
-/// shape: an `addr → btf_type_id` lookup gated on the configured
-/// arena window.
+/// Custom [`MemReader`] override returns the configured
+/// [`ArenaResolveHit`] for known addresses and `None` for
+/// everything else. Mirrors the production
+/// [`super::super::dump::render_map::AccessorMemReader::resolve_arena_type`]
+/// shape. Two distinct seeded entries cover the two production
+/// shapes — payload-start chase (`header_skip = 0`) and slot-start
+/// chase (`header_skip = header_size`).
 #[test]
-fn mem_reader_resolve_arena_type_override_returns_configured_id() {
+fn mem_reader_resolve_arena_type_override_returns_configured_hit() {
     let mut arena_types = std::collections::HashMap::new();
-    arena_types.insert(0x10_0000_1008u64, 7u32);
-    arena_types.insert(0x10_0000_2008u64, 11u32);
+    // Payload-start entry: header_skip = 0.
+    arena_types.insert(
+        0x10_0000_1008u64,
+        ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 0,
+        },
+    );
+    // Slot-start entry: header_skip = 8 (the size of `union sdt_id`).
+    arena_types.insert(
+        0x10_0000_2000u64,
+        ArenaResolveHit {
+            target_type_id: 11,
+            header_skip: 8,
+        },
+    );
     let reader = CastStubReader {
         arena_type_at: arena_types,
         ..Default::default()
     };
-    assert_eq!(reader.resolve_arena_type(0x10_0000_1008), Some(7));
-    assert_eq!(reader.resolve_arena_type(0x10_0000_2008), Some(11));
+    assert_eq!(
+        reader.resolve_arena_type(0x10_0000_1008),
+        Some(ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 0,
+        }),
+    );
+    assert_eq!(
+        reader.resolve_arena_type(0x10_0000_2000),
+        Some(ArenaResolveHit {
+            target_type_id: 11,
+            header_skip: 8,
+        }),
+    );
     assert!(
         reader.resolve_arena_type(0x10_0000_3000).is_none(),
         "address not in index must return None",
@@ -6764,7 +6853,15 @@ fn arena_chase_fwd_target_resolved_via_bridge() {
     let mut arena_bytes = std::collections::HashMap::new();
     arena_bytes.insert(TARGET_ADDR, inner_bytes);
     let mut arena_types = std::collections::HashMap::new();
-    arena_types.insert(TARGET_ADDR, task_ctx_id);
+    // Payload-start chase: header_skip = 0 — the renderer reads
+    // `btf_size` bytes directly from the chased address.
+    arena_types.insert(
+        TARGET_ADDR,
+        ArenaResolveHit {
+            target_type_id: task_ctx_id,
+            header_skip: 0,
+        },
+    );
     let reader = CastStubReader {
         arena_window: Some((ARENA_LO, ARENA_HI)),
         arena_bytes_at: arena_bytes,
@@ -6824,6 +6921,123 @@ fn arena_chase_fwd_target_resolved_via_bridge() {
         cast_annotation.as_deref(),
         Some("sdt_alloc"),
         "Type::Ptr arm bridge resolve must surface 'sdt_alloc' annotation",
+    );
+}
+
+/// Type::Ptr arena arm with a Fwd pointee resolved via the
+/// bridge for a SLOT-START chase: the bridge returns
+/// `header_skip = header_size`, the chase reads
+/// `header_skip + btf_size` bytes from the chased address, slices
+/// off the header, and renders the payload struct. Pins the bug
+/// fix that surfaced the `data` field in `scx_task_map_val` (a
+/// slot-start pointer that did not resolve under the previous
+/// payload-start-only key shape).
+///
+/// Layout: 8-byte header (the `union sdt_id` shape — two
+/// arbitrary u32s here, not interpreted by the bridge), followed
+/// by the payload struct (`task_ctx { u64 weight }`, 8 bytes).
+/// Total elem_size = 16. The chased address points at slot start;
+/// the renderer must NOT decode the header bytes as the payload.
+#[test]
+fn arena_chase_fwd_target_resolved_via_bridge_slot_start_skips_header() {
+    let (blob, outer_id, _fwd_id, task_ctx_id) = bridge_btf_outer_fwd_taskctx();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    // Chased address = slot start. The bridge must direct the
+    // chase to skip the first 8 bytes of header before rendering.
+    const SLOT_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = SLOT_ADDR.to_le_bytes().to_vec();
+    // 16 bytes of slot contents at SLOT_ADDR:
+    //   [0..8]   header bytes — sentinel pattern, NOT the payload.
+    //            If the renderer decoded them as payload, weight
+    //            would resolve to 0xDEADBEEFCAFEBABE.
+    //   [8..16]  payload (task_ctx.weight = 0x42, LE u64).
+    let header_sentinel = 0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes();
+    let payload_bytes = 0x42u64.to_le_bytes();
+    let mut slot_bytes = Vec::with_capacity(16);
+    slot_bytes.extend_from_slice(&header_sentinel);
+    slot_bytes.extend_from_slice(&payload_bytes);
+
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(SLOT_ADDR, slot_bytes);
+    let mut arena_types = std::collections::HashMap::new();
+    // Slot-start chase: header_skip = 8 — the renderer reads
+    // `header_skip + btf_size` bytes from the chased address and
+    // slices off the first 8 bytes (the header) before rendering.
+    arena_types.insert(
+        SLOT_ADDR,
+        ArenaResolveHit {
+            target_type_id: task_ctx_id,
+            header_skip: 8,
+        },
+    );
+    let reader = CastStubReader {
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        arena_type_at: arena_types,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, outer_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected outer Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ref cast_annotation,
+    } = members[0].value
+    else {
+        panic!("data field must render as Ptr; got {:?}", members[0].value);
+    };
+    assert_eq!(value, SLOT_ADDR);
+    assert!(
+        deref_skipped_reason.is_none(),
+        "slot-start bridge resolve must not surface a skip reason; got {deref_skipped_reason:?}"
+    );
+    let inner = deref
+        .as_deref()
+        .expect("slot-start bridge resolve must produce a deref");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = *inner
+    else {
+        panic!("deref payload must be the resolved task_ctx struct, got {inner:?}");
+    };
+    assert_eq!(
+        inner_name.as_deref(),
+        Some("task_ctx"),
+        "bridge must land on the resolved struct's name even with slot-start skip",
+    );
+    let RenderedValue::Uint {
+        bits,
+        value: weight,
+    } = inner_members[0].value
+    else {
+        panic!(
+            "task_ctx.weight must render as Uint, got {:?}",
+            inner_members[0].value
+        );
+    };
+    assert_eq!(bits, 64);
+    // Critical assertion: weight is the PAYLOAD value (0x42),
+    // not the HEADER sentinel (0xDEADBEEFCAFEBABE). If the
+    // renderer skipped the header_skip step it would decode the
+    // header bytes as the payload struct.
+    assert_eq!(
+        weight, 0x42,
+        "slot-start chase must skip header — weight \
+         must be payload value 0x42, not header sentinel \
+         0xDEADBEEFCAFEBABE",
+    );
+    assert_eq!(
+        cast_annotation.as_deref(),
+        Some("sdt_alloc"),
+        "Type::Ptr arm slot-start bridge resolve must surface 'sdt_alloc' annotation",
     );
 }
 
@@ -6961,7 +7175,14 @@ fn cast_chase_arena_fwd_target_resolved_via_bridge() {
     let mut arena_bytes = std::collections::HashMap::new();
     arena_bytes.insert(TARGET_ADDR, inner_bytes);
     let mut arena_types = std::collections::HashMap::new();
-    arena_types.insert(TARGET_ADDR, local_task_ctx_id);
+    // Payload-start chase: header_skip = 0.
+    arena_types.insert(
+        TARGET_ADDR,
+        ArenaResolveHit {
+            target_type_id: local_task_ctx_id,
+            header_skip: 0,
+        },
+    );
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
@@ -7199,7 +7420,14 @@ fn cast_chase_kernel_fwd_target_resolved_via_bridge() {
     let mut kva_bytes = std::collections::HashMap::new();
     kva_bytes.insert(KVA, inner_bytes);
     let mut arena_types = std::collections::HashMap::new();
-    arena_types.insert(KVA, real_id);
+    // Payload-start chase: header_skip = 0.
+    arena_types.insert(
+        KVA,
+        ArenaResolveHit {
+            target_type_id: real_id,
+            header_skip: 0,
+        },
+    );
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
@@ -7259,6 +7487,287 @@ fn cast_chase_kernel_fwd_target_resolved_via_bridge() {
     );
 }
 
+/// Cast intercept arena arm with `target_type_id == 0` (the
+/// STX-flow analyzer sentinel for "deferred resolve"): the
+/// `chase_arena_pointer` special case at the head of the helper
+/// consults [`MemReader::resolve_arena_type`] BEFORE the normal
+/// peel + Fwd resolve, expecting the bridge to supply the real
+/// payload type id. With a populated `arena_type_at` entry the
+/// chase succeeds: the bridge returns the resolved struct id, the
+/// renderer reads `btf_size` bytes from the chased address (no
+/// header skip), renders the payload struct, and `cast_ptr` emits
+/// `cast_annotation: "cast→arena (sdt_alloc)"` because
+/// `outcome.sdt_alloc_resolved == true` for the deferred-resolve
+/// path (line ~3031 in `mod.rs`).
+///
+/// Pins the new STX-flow renderer path: a regression that broke
+/// the deferred-resolve special case would surface as either a
+/// miss (skip reason) or a wrong-id chase (rendered struct name
+/// reflects the unrelated u64 underlying type).
+#[test]
+fn cast_chase_arena_target_type_id_zero_resolves_via_resolve_arena_type() {
+    // BTF: u64(1), T(2, u64@0 source field), Q(3, u64@0 payload).
+    // The CastHit's target_type_id is 0 (deferred); the bridge
+    // must supply Q's id at chase time so the rendered subtree
+    // names "Q", not "T" or anything else.
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let inner_bytes = 0x42u64.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, inner_bytes);
+    let mut arena_types = std::collections::HashMap::new();
+    // Payload-start chase: header_skip = 0 — the renderer reads
+    // `btf_size` bytes starting at TARGET_ADDR.
+    arena_types.insert(
+        TARGET_ADDR,
+        ArenaResolveHit {
+            target_type_id: q_id,
+            header_skip: 0,
+        },
+    );
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            // STX-flow sentinel: analyzer left the target id
+            // unresolved, expecting the bridge to fill it in.
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        arena_type_at: arena_types,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ref cast_annotation,
+    } = members[0].value
+    else {
+        panic!(
+            "intercept must produce Ptr (not Uint); got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, TARGET_ADDR);
+    assert!(
+        deref_skipped_reason.is_none(),
+        "deferred-resolve bridge fire must not surface a skip reason; \
+         got {deref_skipped_reason:?}"
+    );
+    let inner = deref
+        .as_deref()
+        .expect("deferred-resolve bridge must produce a deref");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = *inner
+    else {
+        panic!("deref payload must be the resolved Q Struct, got {inner:?}");
+    };
+    assert_eq!(
+        inner_name.as_deref(),
+        Some("Q"),
+        "bridge must land on the resolved struct's name (Q), \
+         not the analyzer's deferred sentinel",
+    );
+    let RenderedValue::Uint { value, .. } = inner_members[0].value else {
+        panic!("Q.x must render as Uint, got {:?}", inner_members[0].value);
+    };
+    assert_eq!(value, 0x42);
+    assert_eq!(
+        cast_annotation.as_deref(),
+        Some("cast→arena (sdt_alloc)"),
+        "deferred-resolve bridge fire must extend annotation with \
+         '(sdt_alloc)' since `outcome.sdt_alloc_resolved` is set; \
+         got {cast_annotation:?}",
+    );
+}
+
+/// Cast intercept arena arm with `target_type_id == 0` AND no
+/// bridge entry: the `chase_arena_pointer` special case calls
+/// [`MemReader::resolve_arena_type`], gets `None`, and surfaces a
+/// skip reason mentioning that the analyzer's STX-flow path tagged
+/// the slot as Arena with deferred resolve but the bridge had no
+/// entry. Pin the skip reason text so an operator reading a
+/// failure dump can correlate the analyzer's hint with the
+/// missing bridge population.
+///
+/// Without this gate, a stale or absent allocator pre-pass would
+/// fall through to the normal peel + Fwd resolve path with
+/// target_type_id=0 — which would either fail or, worse, succeed
+/// against an unrelated BTF id 0 if such existed.
+#[test]
+fn cast_chase_arena_target_type_id_zero_no_bridge_entry_skips() {
+    let (blob, t_id, _q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    // arena_window configured (so `is_arena_addr` returns true and
+    // the chase enters the arena arm), but `arena_type_at` is
+    // empty — the bridge query for TARGET_ADDR returns None.
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ref cast_annotation,
+    } = members[0].value
+    else {
+        panic!(
+            "intercept must produce Ptr (not Uint); got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, TARGET_ADDR);
+    assert!(
+        deref.is_none(),
+        "no-bridge deferred-resolve must not produce a deref"
+    );
+    let reason = deref_skipped_reason
+        .as_deref()
+        .expect("no-bridge deferred-resolve must populate skip reason");
+    assert!(
+        reason.contains("STX-flow path tagged slot as Arena"),
+        "skip reason must surface the analyzer's STX-flow tag cause; \
+         got: {reason}",
+    );
+    // `outcome.sdt_alloc_resolved` is `false` on the no-bridge
+    // path, so the annotation stays at the unprefixed `cast→arena`
+    // form (no `(sdt_alloc)` suffix).
+    assert_eq!(
+        cast_annotation.as_deref(),
+        Some("cast→arena"),
+        "no-bridge deferred-resolve must NOT include '(sdt_alloc)' suffix; \
+         got {cast_annotation:?}",
+    );
+}
+
+/// Cast intercept kernel arm with `target_type_id == 0`: the
+/// analyzer hinted Arena (the STX-flow sentinel only emits with
+/// `addr_space: Arena`) but the runtime value falls outside the
+/// arena window so `is_arena_addr` returns false and the kernel
+/// arm fires. The kernel arm's special case at line ~3390 of
+/// `mod.rs` recognises `target_type_id == 0` as the cgx-bridge
+/// sentinel and surfaces a skip reason explaining the
+/// analyzer/runtime mismatch — without a BTF id there is no way
+/// to size the kernel read.
+///
+/// Pins the kernel-arm fall-through behaviour: a regression that
+/// stripped the special case would attempt to peel type id 0 in
+/// the program BTF (which fails) and surface a less useful
+/// "kernel cast target type id 0 unresolvable" message.
+#[test]
+fn cast_chase_kernel_target_type_id_zero_falls_through_with_mismatch_reason() {
+    let (blob, t_id, _q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    // KVA pattern (kernel direct-map range) outside ANY arena
+    // window — the dispatcher routes to the kernel arm. The reader
+    // has no `arena_window` configured, so `is_arena_addr` returns
+    // `false` for every value and the kernel arm receives the
+    // chase.
+    const KVA: u64 = 0xffff_8000_0000_4000;
+    let outer_bytes = KVA.to_le_bytes().to_vec();
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            // STX-flow analyzer sentinel — intentionally `Arena`
+            // since that is the only space the analyzer emits with
+            // target_type_id=0. Runtime detection sees the value
+            // outside the arena window and routes to the kernel
+            // arm, exercising the kernel-arm `target_type_id == 0`
+            // special case.
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ref cast_annotation,
+    } = members[0].value
+    else {
+        panic!(
+            "intercept must produce Ptr (not Uint); got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, KVA);
+    assert!(
+        deref.is_none(),
+        "kernel-arm `target_type_id == 0` special case must skip the chase",
+    );
+    let reason = deref_skipped_reason
+        .as_deref()
+        .expect("kernel-arm `target_type_id == 0` must populate skip reason");
+    assert!(
+        reason.contains("kernel cast target unresolved"),
+        "skip reason must mention `kernel cast target unresolved`; \
+         got: {reason}",
+    );
+    assert!(
+        reason.contains("analyzer hinted Arena with deferred resolve"),
+        "skip reason must surface the analyzer-hint / runtime-window \
+         mismatch; got: {reason}",
+    );
+    // Kernel-arm path: `cast_ptr` is called with `sdt_alloc_resolved = false`
+    // (line ~3401 in mod.rs), so the annotation reflects the actual
+    // path taken (kernel) without the sdt_alloc suffix.
+    assert_eq!(
+        cast_annotation.as_deref(),
+        Some("cast→kernel"),
+        "kernel-arm fall-through must use `cast→kernel` annotation \
+         (the path actually taken); got {cast_annotation:?}",
+    );
+}
+
 /// `Type::Ptr` arena arm: an out-of-arena-window pointer must
 /// NOT fire the sdt_alloc bridge, even when the
 /// `MemReader::resolve_arena_type` table contains a stale entry
@@ -7292,7 +7801,15 @@ fn arena_chase_bridge_address_outside_window_is_no_op() {
     const OUT_OF_WINDOW: u64 = 0x0F_0000_1000;
     let outer_bytes = OUT_OF_WINDOW.to_le_bytes().to_vec();
     let mut arena_types = std::collections::HashMap::new();
-    arena_types.insert(OUT_OF_WINDOW, task_ctx_id);
+    // Stale entry mapped to a payload-start shape — the gate must
+    // reject the address before this entry is consulted.
+    arena_types.insert(
+        OUT_OF_WINDOW,
+        ArenaResolveHit {
+            target_type_id: task_ctx_id,
+            header_skip: 0,
+        },
+    );
     let reader = CastStubReader {
         arena_window: Some((ARENA_LO, ARENA_HI)),
         arena_type_at: arena_types,
@@ -7331,4 +7848,389 @@ fn arena_chase_bridge_address_outside_window_is_no_op() {
     // a Fwd pointee. The test only asserts the bridge did NOT
     // fire (no successful deref, no annotation).
     let _ = deref_skipped_reason;
+}
+
+/// Cross-BTF Fwd resolution end-to-end: the entry BTF declares
+/// `outer { u64 cgx_raw @ 0 }` plus `struct cgx_target;` (a
+/// `BTF_KIND_FWD` only — no body). A sibling BTF defines
+/// `struct cgx_target { u64 marker @ 0 }` (the body). The cast
+/// analyzer recovered `(outer, 0) -> (cgx_target, Arena)` so the
+/// chase enters [`render_cast_pointer`] → arena branch →
+/// [`chase_arena_pointer`]. Local Fwd resolve fails (no sibling in
+/// the entry BTF), the sdt_alloc bridge stays dormant, then
+/// [`try_cross_btf_fwd_resolve`] consults
+/// [`MemReader::cross_btf_resolve_fwd`] which returns the sibling
+/// BTF's `cgx_target` body. The recursion renders against that
+/// body and produces `cgx_target { marker = 0xCAFE }`.
+///
+/// Without the cross-BTF bridge, the chase would have skipped
+/// with "forward declaration; body not in this BTF" and the
+/// rendered output would be a bare `Ptr` carrying the chased
+/// address.
+#[test]
+fn cross_btf_fwd_resolve_renders_cgx_body_through_sibling_btf() {
+    use std::sync::Arc;
+
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+
+    // Entry BTF: outer (id 2) carrying a u64 cgx_raw @ 0; Fwd of
+    // cgx_target (id 3, struct, no body).
+    let mut s_a = vec![0u8];
+    let n_a_u64 = push(&mut s_a, "u64");
+    let n_a_outer = push(&mut s_a, "outer");
+    let n_a_field = push(&mut s_a, "cgx_raw");
+    let n_a_cgx = push(&mut s_a, "cgx_target");
+    let types_a = vec![
+        CastSynType::Int {
+            name_off: n_a_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_a_outer,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_a_field,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        CastSynType::Fwd {
+            name_off: n_a_cgx,
+            is_union: false,
+        },
+    ];
+    let blob_a = cast_build_btf(&types_a, &s_a);
+    let btf_entry = Btf::from_bytes(&blob_a).expect("entry BTF parses");
+
+    // Sibling BTF: cgx_target as a complete struct (id 2) with
+    // `u64 marker @ 0`.
+    let mut s_b = vec![0u8];
+    let n_b_u64 = push(&mut s_b, "u64");
+    let n_b_cgx = push(&mut s_b, "cgx_target");
+    let n_b_marker = push(&mut s_b, "marker");
+    let types_b = vec![
+        CastSynType::Int {
+            name_off: n_b_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_b_cgx,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_b_marker,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob_b = cast_build_btf(&types_b, &s_b);
+    let btf_sibling = Arc::new(Btf::from_bytes(&blob_b).expect("sibling BTF parses"));
+
+    // Configure CastStubReader: outer.cgx_raw u64 maps to a
+    // Pointer{cgx_target}; the chased value is an arena address;
+    // arena bytes at that address carry the cgx_target body.
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_2000;
+    let outer_id = 2u32;
+    // Cast hint resolves the u64 slot at (outer, 0) to the entry
+    // BTF's Fwd `cgx_target` (id 3). The chase then asks the
+    // reader to bridge that Fwd via cross-BTF resolution.
+    let cgx_fwd_id = 3u32;
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (outer_id, 0),
+        CastHit {
+            target_type_id: cgx_fwd_id,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    // Sibling cgx_target body: marker = 0xCAFE.
+    arena_bytes.insert(TARGET_ADDR, 0xCAFEu64.to_le_bytes().to_vec());
+    let mut cross_btf_index = std::collections::HashMap::new();
+    cross_btf_index.insert("cgx_target".to_string(), (0usize, 2u32, true));
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        cross_btf_btfs: vec![btf_sibling.clone()],
+        cross_btf_index,
+        ..Default::default()
+    };
+
+    // Render outer; cgx_raw must surface as a Ptr whose deref
+    // renders against the SIBLING BTF's cgx_target body — the
+    // marker field is 0xCAFE.
+    let v = render_value_with_mem(&btf_entry, outer_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr { ref deref, .. } = members[0].value else {
+        panic!("cgx_raw must render as Ptr; got {:?}", members[0].value);
+    };
+    let inner = deref
+        .as_ref()
+        .expect("cross-BTF Fwd resolve must produce a deref (sibling BTF body), but got None");
+    let RenderedValue::Struct {
+        ref type_name,
+        ref members,
+    } = **inner
+    else {
+        panic!("inner must be Struct (cgx_target body); got {inner:?}");
+    };
+    assert_eq!(
+        type_name.as_deref(),
+        Some("cgx_target"),
+        "rendered subtree must carry the sibling BTF's struct name"
+    );
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].name, "marker");
+    let RenderedValue::Uint { value: marker, .. } = members[0].value else {
+        panic!("marker must render as Uint; got {:?}", members[0].value);
+    };
+    assert_eq!(
+        marker, 0xCAFE,
+        "rendered marker must come from the cross-BTF body's bytes"
+    );
+
+    // Sanity: drop the cross-BTF index and re-render — without
+    // the bridge, the chase must skip with the Fwd reason and
+    // the deref stays None.
+    let reader_no_bridge = CastStubReader {
+        cast_map: Some({
+            let mut m = super::super::cast_analysis::CastMap::new();
+            m.insert(
+                (outer_id, 0),
+                CastHit {
+                    target_type_id: cgx_fwd_id,
+                    addr_space: AddrSpace::Arena,
+                },
+            );
+            m
+        }),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: {
+            let mut a = std::collections::HashMap::new();
+            a.insert(TARGET_ADDR, 0xCAFEu64.to_le_bytes().to_vec());
+            a
+        },
+        ..Default::default()
+    };
+    let v = render_value_with_mem(&btf_entry, outer_id, &outer_bytes, &reader_no_bridge);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!("cgx_raw must render as Ptr; got {:?}", members[0].value);
+    };
+    assert!(
+        deref.is_none(),
+        "without cross-BTF bridge, Fwd target must not chase"
+    );
+    let reason = deref_skipped_reason
+        .as_ref()
+        .expect("Fwd skip must populate deref_skipped_reason");
+    assert!(
+        reason.contains("cgx_target") && reason.contains("forward declaration"),
+        "skip reason must name the Fwd target: {reason:?}"
+    );
+}
+
+/// Kernel-arm cross-BTF Fwd resolution: a `CastHit` with
+/// `addr_space: Kernel` whose target_type_id resolves to a
+/// `BTF_KIND_FWD` in the entry BTF — the renderer's kernel arm
+/// dispatches on `is_arena_addr(value)` returning false (no arena
+/// window matches), then peels the Fwd target. With the
+/// sdt_alloc bridge dormant (no `arena_type_at` entry for the
+/// kernel value), `chase_arena_pointer` is NOT invoked but the
+/// kernel arm shares the same `try_cross_btf_fwd_resolve` shortcut
+/// (line ~3447 in `mod.rs`): a sibling BTF whose
+/// [`MemReader::cross_btf_resolve_fwd`] override matches the Fwd
+/// name surfaces the body, the kernel read fires against the
+/// sibling-BTF's resolved type id, and the rendered subtree
+/// names the sibling struct.
+///
+/// Pin the symmetric kernel-arm wiring against a regression that
+/// stripped the cross-BTF probe from the kernel arm (only arena
+/// arm honoured it). The shared
+/// [`try_cross_btf_fwd_resolve`] call at the kernel-arm
+/// fall-through is the only mechanism for kernel-targeted Fwd
+/// resolves through a sibling BTF.
+#[test]
+fn cast_chase_kernel_cross_btf_fwd_resolve_succeeds() {
+    use std::sync::Arc;
+
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+
+    // Entry BTF: T (id 2) with a u64 field at offset 0; Fwd of
+    // kern_target (id 3, struct, no body in this BTF).
+    let mut s_entry = vec![0u8];
+    let n_e_u64 = push(&mut s_entry, "u64");
+    let n_e_t = push(&mut s_entry, "T");
+    let n_e_f = push(&mut s_entry, "f");
+    let n_e_kern = push(&mut s_entry, "kern_target");
+    let types_entry = vec![
+        CastSynType::Int {
+            name_off: n_e_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_e_t,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_e_f,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 3: BTF_KIND_FWD struct kern_target — body lives in
+        // the sibling BTF, the renderer must consult the cross-BTF
+        // index.
+        CastSynType::Fwd {
+            name_off: n_e_kern,
+            is_union: false,
+        },
+    ];
+    let blob_entry = cast_build_btf(&types_entry, &s_entry);
+    let btf_entry = Btf::from_bytes(&blob_entry).expect("entry BTF parses");
+    let t_id: u32 = 2;
+    let kern_fwd_id: u32 = 3;
+
+    // Sibling BTF: kern_target as a complete struct (id 2) with
+    // `u64 marker @ 0`.
+    let mut s_sib = vec![0u8];
+    let n_s_u64 = push(&mut s_sib, "u64");
+    let n_s_kern = push(&mut s_sib, "kern_target");
+    let n_s_marker = push(&mut s_sib, "marker");
+    let types_sib = vec![
+        CastSynType::Int {
+            name_off: n_s_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        CastSynType::Struct {
+            name_off: n_s_kern,
+            size: 8,
+            members: vec![CastSynMember {
+                name_off: n_s_marker,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+    ];
+    let blob_sib = cast_build_btf(&types_sib, &s_sib);
+    let btf_sib = Arc::new(Btf::from_bytes(&blob_sib).expect("sibling BTF parses"));
+
+    // Kernel value outside any arena window — the dispatcher
+    // routes to the kernel arm. Use the kernel direct-map range
+    // so the plausibility-gate sanity holds (top byte 0xff would
+    // trigger the freed-slab heuristic).
+    const KVA: u64 = 0xffff_8000_0001_2000;
+    let outer_bytes = KVA.to_le_bytes().to_vec();
+    // Sibling kern_target body: marker = 0xBEEF.
+    let inner_bytes = 0xBEEFu64.to_le_bytes().to_vec();
+    let mut kva_bytes = std::collections::HashMap::new();
+    kva_bytes.insert(KVA, inner_bytes);
+    let mut cross_btf_index = std::collections::HashMap::new();
+    // Cross-BTF index: kern_target -> (sibling BTF index 0, type
+    // id 2, want_struct=true).
+    cross_btf_index.insert("kern_target".to_string(), (0usize, 2u32, true));
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: kern_fwd_id,
+            addr_space: AddrSpace::Kernel,
+        },
+    );
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        kva_bytes_at: kva_bytes,
+        // No arena_window — `is_arena_addr` returns false for KVA,
+        // dispatcher routes to the kernel arm. No `arena_type_at`
+        // — the sdt_alloc bridge stays dormant on the kernel arm
+        // so the cross-BTF shortcut fires instead.
+        cross_btf_btfs: vec![btf_sib.clone()],
+        cross_btf_index,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf_entry, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected outer Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "kernel cast intercept must surface as Ptr; got {:?}",
+            members[0].value
+        );
+    };
+    assert!(
+        deref_skipped_reason.is_none(),
+        "kernel-arm cross-BTF Fwd resolve must succeed; \
+         got skip reason {deref_skipped_reason:?}"
+    );
+    let inner = deref
+        .as_ref()
+        .expect("kernel-arm cross-BTF Fwd resolve must produce a deref");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        members: ref inner_members,
+    } = **inner
+    else {
+        panic!(
+            "deref payload must be the kern_target body Struct; got {inner:?}"
+        );
+    };
+    assert_eq!(
+        inner_name.as_deref(),
+        Some("kern_target"),
+        "rendered subtree must carry the sibling BTF's struct name",
+    );
+    assert_eq!(inner_members.len(), 1);
+    assert_eq!(inner_members[0].name, "marker");
+    let RenderedValue::Uint { value: marker, .. } = inner_members[0].value else {
+        panic!(
+            "kern_target.marker must render as Uint; got {:?}",
+            inner_members[0].value
+        );
+    };
+    assert_eq!(
+        marker, 0xBEEF,
+        "rendered marker must come from the kva-side body bytes \
+         decoded against the sibling BTF",
+    );
 }

@@ -188,6 +188,7 @@ fn report_serde_roundtrip() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let json = serde_json::to_string(&report).unwrap();
@@ -265,6 +266,7 @@ fn report_display_one_map_with_value() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let out = format!("{report}");
@@ -302,6 +304,7 @@ fn report_display_multiple_maps_separated() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let out = format!("{report}");
@@ -420,6 +423,7 @@ fn report_display_includes_vcpu_regs_section() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let out = format!("{report}");
@@ -462,6 +466,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let out = format!("{report}");
@@ -493,6 +498,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let out = format!("{report}");
@@ -539,6 +545,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
 
@@ -601,6 +608,7 @@ fn dual_report_serde_roundtrip_with_early() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let late = FailureDumpReport {
@@ -623,6 +631,7 @@ fn dual_report_serde_roundtrip_with_early() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let dual = DualFailureDumpReport {
@@ -971,6 +980,7 @@ fn prog_runtime_stats_serde_roundtrip_with_saturation() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let json = serde_json::to_string(&report).expect("serialize");
@@ -1041,6 +1051,7 @@ fn report_display_renders_prog_runtime_stats() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let out = format!("{report}");
@@ -1090,6 +1101,7 @@ fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
         vcpu_perf_at_freeze: Vec::new(),
         dump_truncated_at_us: None,
         probe_counters: None,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
     let out = format!("{report}");
@@ -2210,157 +2222,308 @@ fn accessor_mem_reader_cast_lookup_with_none_map() {
 //
 // `AccessorMemReader::resolve_arena_type` (render_map.rs) gates on
 // `is_arena_addr` (snapshot's [user_vm_start, user_vm_start + 4 GiB)),
-// masks the chased address with `0xFFFF_FFFF`, and looks up the result
-// in the per-pass [`ArenaTypeIndex`]. The struct itself is private to
-// render_map.rs, so the tests use a stand-in `StubReader` that
-// mirrors the production method body verbatim — same convention as
-// the surrounding `accessor_mem_reader_*` tests above.
+// masks the chased address with `0xFFFF_FFFF`, then runs a range
+// lookup against the per-pass [`ArenaTypeIndex`] keyed on
+// slot-start to find the slot containing the address.
+// `AccessorMemReader` itself is private to render_map.rs, but the
+// gate / range / dispatch logic lives in the free helper
+// `resolve_arena_type_in_index`. The tests below use a stand-in
+// `ResolveArenaTypeStub` whose `resolve_arena_type` impl delegates
+// directly to that helper — so the tests exercise the production
+// path without duplicating its body.
+//
+// Hit shape: `Some(ArenaResolveHit { target_type_id, header_skip })`.
+// `header_skip == header_size` for slot-start chases, `0` for
+// payload-start chases, and the entry returns `None` for any
+// other in-slot offset (or out-of-range address).
 
-/// `resolve_arena_type` masks the chased address with
-/// `0xFFFF_FFFF` and looks up the result in the per-pass index.
-/// Two different 64-bit addresses sharing the same low-32-bit
-/// window resolve to the SAME bridge entry — pinning the masking
-/// step that bridges the production
-/// `walk_sdt_allocator -> emit_leaf` low-32 keys against the
-/// renderer's full-64-bit chase values.
+/// Stand-in for `AccessorMemReader::resolve_arena_type` shared by
+/// every test in this section. The trait method delegates to the
+/// free helper [`super::render_map::resolve_arena_type_in_index`]
+/// — the gate/range/dispatch logic the production
+/// `AccessorMemReader::resolve_arena_type` reaches via the
+/// outer [`super::render_map::resolve_arena_type_with_static_fallback`]
+/// wrapper. With no scx_static index seeded the wrapper degrades
+/// to exactly [`super::render_map::resolve_arena_type_in_index`]'s
+/// behaviour, so this stub still exercises the production
+/// per-instance allocator path byte for byte. Dedicated tests in
+/// the `resolve_arena_type_with_static_fallback` section below
+/// cover the wrapper's scx_static fall-through.
+///
+/// The stub itself only carries the two borrows the helper needs
+/// (`arena_snapshot`, `arena_type_index`); `is_arena_addr` is also
+/// implemented for parity with the production reader's surface,
+/// though the tests below only assert against `resolve_arena_type`.
+struct ResolveArenaTypeStub<'a> {
+    arena_snapshot: Option<&'a super::super::arena::ArenaSnapshot>,
+    arena_type_index: Option<&'a super::render_map::ArenaTypeIndex>,
+}
+
+impl super::super::btf_render::MemReader for ResolveArenaTypeStub<'_> {
+    fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
+        None
+    }
+    fn is_arena_addr(&self, addr: u64) -> bool {
+        super::render_map::is_arena_addr_in_snapshot(self.arena_snapshot, addr)
+    }
+    fn resolve_arena_type(&self, addr: u64) -> Option<super::super::btf_render::ArenaResolveHit> {
+        super::render_map::resolve_arena_type_in_index(
+            self.arena_snapshot,
+            self.arena_type_index,
+            addr,
+        )
+    }
+}
+
+/// Slot-start chase: a chased address that equals the slot's start
+/// resolves with `header_skip = header_size`. The renderer reads
+/// `header_skip + btf_size` bytes from the chased address and slices
+/// off the header before rendering the payload — covers the
+/// `scx_task_map_val.data` shape that prompted the range-based
+/// rewrite.
 #[test]
-fn accessor_mem_reader_resolve_arena_type_masks_low_32() {
+fn accessor_mem_reader_resolve_arena_type_slot_start_returns_header_skip() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::ArenaTypeIndex;
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
 
-    // Production resolve_arena_type body (render_map.rs):
-    //   let index = self.arena_type_index?;
-    //   if !self.is_arena_addr(addr) { return None; }
-    //   let key = (addr & 0xFFFF_FFFF) as u32;
-    //   index.get(&key).copied()
-    struct StubReader<'a> {
-        arena_snapshot: Option<&'a ArenaSnapshot>,
-        arena_type_index: Option<&'a ArenaTypeIndex>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn is_arena_addr(&self, addr: u64) -> bool {
-            let Some(snap) = self.arena_snapshot else {
-                return false;
-            };
-            if snap.user_vm_start == 0 {
-                return false;
-            }
-            let Some(end) = snap.user_vm_start.checked_add(1 << 32) else {
-                return false;
-            };
-            addr >= snap.user_vm_start && addr < end
-        }
-        fn resolve_arena_type(&self, addr: u64) -> Option<u32> {
-            let index = self.arena_type_index?;
-            if !self.is_arena_addr(addr) {
-                return None;
-            }
-            let key = (addr & 0xFFFF_FFFF) as u32;
-            index.get(&key).copied()
-        }
-    }
-
-    // Snapshot: arena window covering [0x10_0000_0000,
-    // 0x11_0000_0000). Two payload-start keys (low 32 bits) seeded
-    // into the index.
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
     let mut index = ArenaTypeIndex::new();
-    index.insert(0x0000_1008, 7); // payload start at slot @ 0x1000 + 8
-    index.insert(0x0000_2008, 11);
+    index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 24, // 8-byte header + 16-byte payload
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
 
-    let r = StubReader {
+    let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
         arena_type_index: Some(&index),
     };
 
-    // Full 64-bit address that masks to 0x0000_1008 hits id=7.
+    // Slot-start chase: full 64-bit address whose low 32 bits
+    // match the slot start. Returns the payload type id paired
+    // with `header_skip = 8`.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1000),
+        Some(super::super::btf_render::ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 8,
+        }),
+        "slot-start address must resolve with header_skip = header_size",
+    );
+}
+
+/// Payload-start chase: a chased address that lands at
+/// `slot_start + header_size` resolves with `header_skip = 0`.
+/// The renderer reads `btf_size` bytes from the chased address
+/// directly — the historical case (`scx_task_data(p)` return cached
+/// in `cached_taskc_raw`) keeps working under the new range index.
+#[test]
+fn accessor_mem_reader_resolve_arena_type_payload_start_returns_zero_skip() {
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut index = ArenaTypeIndex::new();
+    index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 24,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
+
+    let r = ResolveArenaTypeStub {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    // Payload-start chase: address = slot_start + header_size.
     assert_eq!(
         r.resolve_arena_type(0x10_0000_1008),
-        Some(7),
-        "in-window address with matching low-32 must resolve",
+        Some(super::super::btf_render::ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 0,
+        }),
+        "payload-start address must resolve with header_skip = 0",
     );
+}
+
+/// Mid-header / mid-payload addresses fall inside the slot range but
+/// at offsets the bridge cannot route into a payload render.
+/// Pinning the None return so a future "render mid-struct" extension
+/// is a deliberate change of behaviour, not an accidental fall-through.
+#[test]
+fn accessor_mem_reader_resolve_arena_type_interior_returns_none() {
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut index = ArenaTypeIndex::new();
+    index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 24,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
+
+    let r = ResolveArenaTypeStub {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    // Mid-header (offset 4 < header_size 8): no payload render.
+    assert!(
+        r.resolve_arena_type(0x10_0000_1004).is_none(),
+        "mid-header offset must not resolve",
+    );
+    // Mid-payload (offset 12, header_size 8 → payload offset 4):
+    // bridge does not render mid-struct today.
+    assert!(
+        r.resolve_arena_type(0x10_0000_100C).is_none(),
+        "mid-payload offset must not resolve",
+    );
+}
+
+/// Range search across multiple seeded slots picks the slot whose
+/// `[slot_start, slot_start + elem_size)` range contains the
+/// chased address. Pins the `BTreeMap::range(..=key).next_back()`
+/// step against a regression that might fall through to an
+/// unrelated entry whose key collides on the low 32 bits.
+#[test]
+fn accessor_mem_reader_resolve_arena_type_range_picks_correct_slot() {
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut index = ArenaTypeIndex::new();
+    // Two non-overlapping slots, distinct payload type ids.
+    index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 16,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
+    index.insert(
+        0x0000_2000,
+        ArenaSlotInfo {
+            elem_size: 16,
+            header_size: 8,
+            payload_btf_type_id: 11,
+        },
+    );
+
+    let r = ResolveArenaTypeStub {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    use super::super::btf_render::ArenaResolveHit;
+
+    // First slot — slot-start of slot 0x1000.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1000),
+        Some(ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 8,
+        }),
+    );
+    // First slot — payload-start of slot 0x1000.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1008),
+        Some(ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 0,
+        }),
+    );
+    // Second slot — slot-start of slot 0x2000.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_2000),
+        Some(ArenaResolveHit {
+            target_type_id: 11,
+            header_skip: 8,
+        }),
+    );
+    // Second slot — payload-start of slot 0x2000.
     assert_eq!(
         r.resolve_arena_type(0x10_0000_2008),
-        Some(11),
-        "second seeded entry must resolve to its distinct id",
+        Some(ArenaResolveHit {
+            target_type_id: 11,
+            header_skip: 0,
+        }),
     );
-    // In-window address whose low 32 bits are NOT in the index:
-    // returns None.
+    // Address between the two slots (past slot 1's end, before
+    // slot 2's start): no slot contains it.
+    assert!(
+        r.resolve_arena_type(0x10_0000_1800).is_none(),
+        "address between known slots must not resolve",
+    );
+    // Address past every seeded slot's end.
     assert!(
         r.resolve_arena_type(0x10_0000_3000).is_none(),
-        "in-window address absent from the index must return None",
+        "address past every known slot must not resolve",
     );
 }
 
 /// `resolve_arena_type` returns `None` for an address that lies
-/// OUTSIDE the arena window, even when the index contains an entry
-/// matching the address's low 32 bits. The is_arena_addr gate
-/// fires first; without it a stale index entry could surface for
-/// any 64-bit value whose low 32 bits collide with a captured
-/// payload-start by happenstance.
+/// OUTSIDE the arena window, even when the index has a seeded entry
+/// whose low-32 range covers the address's low 32 bits. The
+/// `is_arena_addr` gate fires first; without it a stale index entry
+/// could surface for any 64-bit value whose low 32 bits land in a
+/// captured slot's range by happenstance.
 #[test]
 fn accessor_mem_reader_resolve_arena_type_rejects_out_of_window() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::ArenaTypeIndex;
-
-    struct StubReader<'a> {
-        arena_snapshot: Option<&'a ArenaSnapshot>,
-        arena_type_index: Option<&'a ArenaTypeIndex>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn is_arena_addr(&self, addr: u64) -> bool {
-            let Some(snap) = self.arena_snapshot else {
-                return false;
-            };
-            if snap.user_vm_start == 0 {
-                return false;
-            }
-            let Some(end) = snap.user_vm_start.checked_add(1 << 32) else {
-                return false;
-            };
-            addr >= snap.user_vm_start && addr < end
-        }
-        fn resolve_arena_type(&self, addr: u64) -> Option<u32> {
-            let index = self.arena_type_index?;
-            if !self.is_arena_addr(addr) {
-                return None;
-            }
-            let key = (addr & 0xFFFF_FFFF) as u32;
-            index.get(&key).copied()
-        }
-    }
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
     let mut index = ArenaTypeIndex::new();
-    index.insert(0x0000_1008, 7);
+    index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 16,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
 
-    let r = StubReader {
+    let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
         arena_type_index: Some(&index),
     };
 
-    // Below the window: matches the index's low-32 key but
-    // `is_arena_addr` gate rejects.
+    // Below the window: low-32 maps inside the seeded slot but
+    // is_arena_addr rejects.
     assert!(
         r.resolve_arena_type(0x0F_0000_1008).is_none(),
-        "below-window address with colliding low-32 must NOT resolve",
+        "below-window address must NOT resolve regardless of low-32 collision",
     );
     // Above the window: same gate.
     assert!(
         r.resolve_arena_type(0x12_0000_1008).is_none(),
-        "above-window address with colliding low-32 must NOT resolve",
+        "above-window address must NOT resolve regardless of low-32 collision",
     );
 }
 
@@ -2372,43 +2535,12 @@ fn accessor_mem_reader_resolve_arena_type_rejects_out_of_window() {
 #[test]
 fn accessor_mem_reader_resolve_arena_type_none_index_short_circuits() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::ArenaTypeIndex;
-
-    struct StubReader<'a> {
-        arena_snapshot: Option<&'a ArenaSnapshot>,
-        arena_type_index: Option<&'a ArenaTypeIndex>,
-    }
-    impl super::super::btf_render::MemReader for StubReader<'_> {
-        fn read_kva(&self, _: u64, _: usize) -> Option<Vec<u8>> {
-            None
-        }
-        fn is_arena_addr(&self, addr: u64) -> bool {
-            let Some(snap) = self.arena_snapshot else {
-                return false;
-            };
-            if snap.user_vm_start == 0 {
-                return false;
-            }
-            let Some(end) = snap.user_vm_start.checked_add(1 << 32) else {
-                return false;
-            };
-            addr >= snap.user_vm_start && addr < end
-        }
-        fn resolve_arena_type(&self, addr: u64) -> Option<u32> {
-            let index = self.arena_type_index?;
-            if !self.is_arena_addr(addr) {
-                return None;
-            }
-            let key = (addr & 0xFFFF_FFFF) as u32;
-            index.get(&key).copied()
-        }
-    }
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let r = StubReader {
+    let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
         arena_type_index: None,
     };
@@ -2419,6 +2551,372 @@ fn accessor_mem_reader_resolve_arena_type_none_index_short_circuits() {
     assert!(
         r.resolve_arena_type(0x10_0000_1008).is_none(),
         "None index must short-circuit before is_arena_addr gate",
+    );
+}
+
+/// Exact slot-end boundary: the address immediately following the
+/// slot's last byte (`slot_start + elem_size`) is OUT of range and
+/// must not resolve. Pins the `<` (not `<=`) bound check that keeps
+/// adjacent-slot lookups from spuriously hitting the prior slot.
+#[test]
+fn accessor_mem_reader_resolve_arena_type_slot_end_boundary_excluded() {
+    use super::super::arena::ArenaSnapshot;
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut index = ArenaTypeIndex::new();
+    // One slot at 0x1000 with elem_size=16 → range
+    // [0x1000, 0x1010). 0x100F is the last byte; 0x1010 is the
+    // first byte of the next (uninstalled) slot.
+    index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 16,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
+
+    let r = ResolveArenaTypeStub {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    // Last byte of the slot (offset = 15 = elem_size - 1): inside
+    // the range; falls to the mid-payload branch and returns None
+    // because the bridge does not render mid-struct.
+    assert!(
+        r.resolve_arena_type(0x10_0000_100F).is_none(),
+        "last byte of slot must not resolve (mid-payload offset)",
+    );
+    // Exactly slot_start + elem_size: OUT of range. The `<`
+    // comparison rejects.
+    assert!(
+        r.resolve_arena_type(0x10_0000_1010).is_none(),
+        "slot_start + elem_size must not resolve (boundary excluded)",
+    );
+}
+
+/// Adjacent slots with no gap (`slot_a_end == slot_b_start`): the
+/// range lookup picks each slot for its own range; the exact
+/// boundary belongs to the second slot, not the first. Pins the
+/// behaviour of `BTreeMap::range(..=key).next_back()` against an
+/// off-by-one regression where the prior slot might "win" on the
+/// next slot's first byte.
+#[test]
+fn accessor_mem_reader_resolve_arena_type_adjacent_slots_picked_correctly() {
+    use super::super::arena::ArenaSnapshot;
+    use super::super::btf_render::ArenaResolveHit;
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut index = ArenaTypeIndex::new();
+    // Slot A at 0x1000, elem_size=16 → range [0x1000, 0x1010).
+    index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 16,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
+    // Slot B at 0x1010, elem_size=16 → range [0x1010, 0x1020).
+    // Adjacent, no gap.
+    index.insert(
+        0x0000_1010,
+        ArenaSlotInfo {
+            elem_size: 16,
+            header_size: 8,
+            payload_btf_type_id: 11,
+        },
+    );
+
+    let r = ResolveArenaTypeStub {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    // Slot A start (offset 0): payload type 7 with
+    // `header_skip = 8`.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1000),
+        Some(ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 8,
+        }),
+    );
+    // Slot A payload-start (offset 8): payload type 7 with
+    // `header_skip = 0`.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1008),
+        Some(ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 0,
+        }),
+    );
+    // Slot B start (offset 0 within B; this is `slot_a_end`):
+    // payload type 11 — slot B wins, NOT slot A.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1010),
+        Some(ArenaResolveHit {
+            target_type_id: 11,
+            header_skip: 8,
+        }),
+    );
+    // Slot B payload-start.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1018),
+        Some(ArenaResolveHit {
+            target_type_id: 11,
+            header_skip: 0,
+        }),
+    );
+}
+
+/// High-edge slot near `u32::MAX`: a slot whose `slot_start +
+/// elem_size` would overflow `u32` must still resolve correctly
+/// for in-range addresses. Pins the `u64`-widened bound that
+/// replaced the old `u32::checked_add` (which silently dropped
+/// the last few KiB of a 4 GiB arena window).
+#[test]
+fn accessor_mem_reader_resolve_arena_type_high_edge_slot_resolves() {
+    use super::super::arena::ArenaSnapshot;
+    use super::super::btf_render::ArenaResolveHit;
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut index = ArenaTypeIndex::new();
+    // Slot near the top of the 4 GiB window. slot_start +
+    // elem_size = 0xFFFF_F000 + 4096 = 0x1_0000_0000, which
+    // overflows u32. The widened bound resolves both endpoints
+    // correctly.
+    index.insert(
+        0xFFFF_F000,
+        ArenaSlotInfo {
+            elem_size: 4096,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
+
+    let r = ResolveArenaTypeStub {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    // Slot start: full 64-bit address re-attaches the high 32 bits
+    // from `user_vm_start` (0x10_0000_0000) onto the windowed slot
+    // start (0xFFFF_F000) → 0x10_FFFF_F000.
+    assert_eq!(
+        r.resolve_arena_type(0x10_FFFF_F000),
+        Some(ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 8,
+        }),
+    );
+    // Last byte inside the slot: low-32 = 0xFFFF_FFFF (=
+    // slot_start + elem_size - 1). Mid-payload offset → None
+    // (the bridge does not render mid-struct). The critical
+    // assertion is that the bound check did NOT reject this
+    // address as "outside the slot" — the wide arithmetic kept
+    // the comparison meaningful.
+    assert!(
+        r.resolve_arena_type(0x10_FFFF_FFFF).is_none(),
+        "last byte must reach the mid-payload branch (None), \
+         not be rejected as out-of-range by overflow",
+    );
+}
+
+// -- resolve_arena_type_with_static_fallback ---------------------
+//
+// The fall-through helper composes the per-instance sdt_alloc index
+// (typed) with the scx_static range index (membership-only). When
+// the sdt_alloc index resolves the chase, the result is returned
+// verbatim; when sdt_alloc misses but the address falls in a live
+// scx_static region, the helper deliberately returns `None` (the
+// "no invalid data made" contract — the bridge cannot recover a
+// per-allocation type from scx_static memory).
+
+/// sdt_alloc hit path: the helper returns the same `ArenaResolveHit`
+/// that `resolve_arena_type_in_index` would. Pinning the
+/// "fall-through doesn't reorder behaviour" invariant — adding the
+/// scx_static fall-through must not change the output for any
+/// address the inner index resolves.
+#[test]
+fn resolve_arena_type_with_static_fallback_returns_sdt_alloc_hit() {
+    use super::super::arena::ArenaSnapshot;
+    use super::super::btf_render::ArenaResolveHit;
+    use super::super::scx_static_alloc::{ScxStaticRangeIndex, ScxStaticSnapshot};
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let mut sdt_index = ArenaTypeIndex::new();
+    sdt_index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 24,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
+    // scx_static index intentionally empty for this test; the
+    // sdt_alloc hit must fire first regardless.
+    let static_index: ScxStaticRangeIndex =
+        super::super::scx_static_alloc::build_scx_static_range_index(&ScxStaticSnapshot::default());
+
+    let hit = super::render_map::resolve_arena_type_with_static_fallback(
+        Some(&snap),
+        Some(&sdt_index),
+        Some(&static_index),
+        0x10_0000_1000, // slot start
+    );
+    assert_eq!(
+        hit,
+        Some(ArenaResolveHit {
+            target_type_id: 7,
+            header_skip: 8,
+        }),
+        "sdt_alloc index hit must propagate through fallback helper unchanged",
+    );
+}
+
+/// scx_static-only hit path: when sdt_alloc misses AND the address
+/// falls inside a live `scx_static` range, the helper returns
+/// `None` deliberately — the bridge has no per-allocation type to
+/// recover. Pinning the fail-closed contract.
+#[test]
+fn resolve_arena_type_with_static_fallback_scx_static_hit_returns_none() {
+    use super::super::arena::ArenaSnapshot;
+    use super::super::scx_static_alloc::{ScxStaticRange, ScxStaticSnapshot};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    // No sdt_alloc index → every address misses sdt_alloc.
+    let scx_static_snap = ScxStaticSnapshot {
+        ranges: vec![ScxStaticRange {
+            instance_name: "scx_static".into(),
+            start_low32: 0x2000,
+            size: 4096,
+            capacity: 8192,
+        }],
+        skipped: 0,
+    };
+    let static_index =
+        super::super::scx_static_alloc::build_scx_static_range_index(&scx_static_snap);
+
+    // Address inside scx_static range. sdt_alloc misses; scx_static
+    // hits; helper returns None.
+    let hit = super::render_map::resolve_arena_type_with_static_fallback(
+        Some(&snap),
+        None,
+        Some(&static_index),
+        0x10_0000_2010,
+    );
+    assert!(
+        hit.is_none(),
+        "scx_static-only hit must return None — bridge cannot recover \
+         per-allocation type without per-call-site hook from cast analysis",
+    );
+}
+
+/// Out-of-window address with both indexes seeded → None.
+/// `is_arena_addr_in_snapshot` gates the sdt_alloc lookup, and
+/// the scx_static fall-through also gates on the same window. An
+/// address whose low-32 lands in either index but whose full
+/// 64-bit value lives outside the arena window must NOT spuriously
+/// hit either path.
+#[test]
+fn resolve_arena_type_with_static_fallback_out_of_window_returns_none() {
+    use super::super::arena::ArenaSnapshot;
+    use super::super::scx_static_alloc::{ScxStaticRange, ScxStaticSnapshot};
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    // Both indexes have entries.
+    let mut sdt_index = ArenaTypeIndex::new();
+    sdt_index.insert(
+        0x0000_1000,
+        ArenaSlotInfo {
+            elem_size: 24,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        },
+    );
+    let scx_static_snap = ScxStaticSnapshot {
+        ranges: vec![ScxStaticRange {
+            instance_name: "scx_static".into(),
+            start_low32: 0x2000,
+            size: 4096,
+            capacity: 8192,
+        }],
+        skipped: 0,
+    };
+    let static_index =
+        super::super::scx_static_alloc::build_scx_static_range_index(&scx_static_snap);
+
+    // Address has correct low-32 to hit sdt_alloc but high bits
+    // are outside the window.
+    let hit = super::render_map::resolve_arena_type_with_static_fallback(
+        Some(&snap),
+        Some(&sdt_index),
+        Some(&static_index),
+        0x05_0000_1000,
+    );
+    assert!(
+        hit.is_none(),
+        "out-of-window address must NOT hit sdt_alloc even with low-32 collision",
+    );
+
+    // Same idea, low-32 hits scx_static.
+    let hit = super::render_map::resolve_arena_type_with_static_fallback(
+        Some(&snap),
+        Some(&sdt_index),
+        Some(&static_index),
+        0x05_0000_2010,
+    );
+    assert!(
+        hit.is_none(),
+        "out-of-window address must NOT hit scx_static even with low-32 collision",
+    );
+}
+
+/// Both indexes None → behaves exactly like the trait default
+/// (return None). Pinning that the helper short-circuits cleanly
+/// when neither index is wired.
+#[test]
+fn resolve_arena_type_with_static_fallback_both_none_returns_none() {
+    use super::super::arena::ArenaSnapshot;
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let hit = super::render_map::resolve_arena_type_with_static_fallback(
+        Some(&snap),
+        None,
+        None,
+        0x10_0000_1000,
+    );
+    assert!(
+        hit.is_none(),
+        "both-None must return None — same as trait default",
     );
 }
 
@@ -4385,6 +4883,8 @@ fn render_map_struct_ops_no_offsets_returns_error() {
         sdt_alloc_metas: &sdt_alloc_metas,
         cast_map: None,
         arena_type_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered
@@ -4451,6 +4951,8 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
         sdt_alloc_metas: &sdt_alloc_metas,
         cast_map: None,
         arena_type_index: None,
+        cross_btf_fwd_index: None,
+        scx_static_index: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered
@@ -4987,5 +5489,306 @@ fn map_display_skips_table_when_entry_has_no_btf_render() {
     assert!(
         out.contains("ab (raw)"),
         "hex fallback must still surface: {out}",
+    );
+}
+
+// -- append_arena_type_index_for_allocator -----------------------
+//
+// Coverage for the index-build helper that the dump pre-pass calls
+// per allocator. The helper handles size-fits-u32 conversion, the
+// dedup-on-duplicate-slot-start `tracing::debug!` path, and the
+// "no payload type" short-circuit. Tests run against a synthesized
+// `Vec<SdtAllocEntry>` rather than booting a VM — the helper is a
+// pure function over its inputs.
+
+/// Construct an [`SdtAllocEntry`] for the index-build tests.
+/// `payload` is set to a placeholder `Bytes` value — the index
+/// build path only reads `user_addr`, so the rest is filler.
+fn mk_alloc_entry(idx: i32, genn: i32, user_addr: u64) -> super::super::sdt_alloc::SdtAllocEntry {
+    super::super::sdt_alloc::SdtAllocEntry {
+        idx,
+        genn,
+        user_addr,
+        payload: super::super::btf_render::RenderedValue::Bytes { hex: String::new() },
+    }
+}
+
+/// `payload_btf_type_id == 0` short-circuits — the helper does not
+/// produce any index entries because the bridge gate would filter
+/// them as "no payload type" anyway. Pinning the early bail keeps
+/// callers from accidentally polluting the index with zero ids.
+#[test]
+fn append_arena_type_index_for_allocator_zero_btf_type_id_skips() {
+    use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
+    let mut index = ArenaTypeIndex::new();
+    let entries = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
+    append_arena_type_index_for_allocator(
+        &mut index,
+        "test_allocator",
+        0, // payload_btf_type_id == 0 ⇒ short-circuit
+        8,
+        16,
+        &entries,
+    );
+    assert!(
+        index.is_empty(),
+        "zero btf_type_id must skip every entry; got {} index entries",
+        index.len(),
+    );
+}
+
+/// `header_size` or `elem_size` that would not fit `u32` (only
+/// reachable from a corrupted snapshot — the kernel caps both well
+/// below `u32::MAX`) skips silently. Pinning the no-panic behaviour
+/// keeps a torn read from aborting the whole dump.
+#[test]
+fn append_arena_type_index_for_allocator_oversized_skips() {
+    use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
+    let mut index = ArenaTypeIndex::new();
+    let entries = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
+    // elem_size > u32::MAX ⇒ try_from fails, helper bails.
+    append_arena_type_index_for_allocator(
+        &mut index,
+        "test_allocator",
+        7,
+        8,
+        u64::from(u32::MAX) + 1,
+        &entries,
+    );
+    assert!(
+        index.is_empty(),
+        "elem_size > u32::MAX must skip every entry; got {} entries",
+        index.len(),
+    );
+}
+
+/// Multi-entry insert: each `SdtAllocEntry` becomes one index entry
+/// keyed by `user_addr as u32` with the shared `ArenaSlotInfo`.
+/// Pinning the per-allocator append shape so a future inner-loop
+/// rewrite can't silently drop entries.
+#[test]
+fn append_arena_type_index_for_allocator_multi_entry_insert() {
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
+    let mut index = ArenaTypeIndex::new();
+    let entries = vec![
+        mk_alloc_entry(0, 0, 0x0000_1000),
+        mk_alloc_entry(1, 0, 0x0000_2000),
+        mk_alloc_entry(2, 0, 0x0000_3000),
+    ];
+    append_arena_type_index_for_allocator(&mut index, "test_allocator", 7, 8, 16, &entries);
+    let expected_info = ArenaSlotInfo {
+        elem_size: 16,
+        header_size: 8,
+        payload_btf_type_id: 7,
+    };
+    assert_eq!(index.len(), 3);
+    assert_eq!(index.get(&0x0000_1000), Some(&expected_info));
+    assert_eq!(index.get(&0x0000_2000), Some(&expected_info));
+    assert_eq!(index.get(&0x0000_3000), Some(&expected_info));
+}
+
+/// Duplicate `slot_start` keeps the FIRST entry. The
+/// `tracing::debug!` line for the collision is not asserted — the
+/// behaviour test is "vacant wins, occupied keeps prior value". Pin
+/// the dedup policy against a future flip to last-wins (which would
+/// silently overwrite a live slot's metadata with a stale one when
+/// a freed allocation racing the freeze surfaces in two passes).
+#[test]
+fn append_arena_type_index_for_allocator_duplicate_slot_keeps_first() {
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
+    let mut index = ArenaTypeIndex::new();
+    // First call seeds slot 0x1000 with payload type 7.
+    let entries_first = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
+    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &entries_first);
+    // Second call tries to insert the same slot start with a
+    // distinct payload type 11 (e.g. a stale snapshot after free
+    // racing the freeze). Helper must keep the first entry.
+    let entries_second = vec![mk_alloc_entry(0, 0, 0x0000_1000)];
+    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &entries_second);
+    assert_eq!(index.len(), 1);
+    assert_eq!(
+        index.get(&0x0000_1000),
+        Some(&ArenaSlotInfo {
+            elem_size: 16,
+            header_size: 8,
+            payload_btf_type_id: 7,
+        }),
+        "duplicate slot_start must keep first entry's payload type",
+    );
+}
+
+/// Two distinct allocators contribute non-overlapping slot ranges
+/// to one index. Pinning the multi-allocator merge against a
+/// regression where one allocator's metadata might silently
+/// overwrite another's because both used the same low-32 windowed
+/// keys.
+#[test]
+fn append_arena_type_index_for_allocator_multi_allocator_merge() {
+    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
+    let mut index = ArenaTypeIndex::new();
+    // Allocator A — payload type 7, two slots.
+    let entries_a = vec![
+        mk_alloc_entry(0, 0, 0x0000_1000),
+        mk_alloc_entry(1, 0, 0x0000_2000),
+    ];
+    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &entries_a);
+    // Allocator B — payload type 11, two distinct slots.
+    let entries_b = vec![
+        mk_alloc_entry(0, 0, 0x0000_3000),
+        mk_alloc_entry(1, 0, 0x0000_4000),
+    ];
+    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &entries_b);
+    let info_a = ArenaSlotInfo {
+        elem_size: 16,
+        header_size: 8,
+        payload_btf_type_id: 7,
+    };
+    let info_b = ArenaSlotInfo {
+        elem_size: 16,
+        header_size: 8,
+        payload_btf_type_id: 11,
+    };
+    assert_eq!(index.len(), 4);
+    assert_eq!(index.get(&0x0000_1000), Some(&info_a));
+    assert_eq!(index.get(&0x0000_2000), Some(&info_a));
+    assert_eq!(index.get(&0x0000_3000), Some(&info_b));
+    assert_eq!(index.get(&0x0000_4000), Some(&info_b));
+}
+
+// -- resolve_cross_btf_fwd_in_index --------------------------------
+//
+// The free helper backs [`AccessorMemReader::cross_btf_resolve_fwd`].
+// Tests below exercise gates that are difficult to reach through a
+// full `GuestKernel` mock: aggregate-kind mismatch is the most
+// important — the indexer keeps Struct/Union entries tagged in
+// production, but the helper still validates the kind at lookup
+// time against the caller's [`FwdKind`] argument because (a) the
+// index format does not encode the kind and (b) a future indexer
+// rewrite could let a same-name Union entry slip through that the
+// caller specifically asked for as a Struct (or vice versa).
+
+/// Build a minimal `.BTF` blob containing a single named
+/// `BTF_KIND_STRUCT` so the helper's `resolve_type_by_id` succeeds
+/// for the caller-supplied id. Returns `(blob, struct_foo_id)`.
+/// Inlined here rather than reusing `cast_analysis_load::tests`
+/// builders because the dump tests module is not in that file's
+/// `cfg(test)` scope.
+fn build_btf_with_named_struct(name: &str) -> (Vec<u8>, u32) {
+    use std::io::Write;
+    // String section: leading NUL + "u64\0" + "<name>\0" + "x\0".
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = strings.len() as u32;
+    strings.extend_from_slice(b"u64");
+    strings.push(0);
+    let n_struct = strings.len() as u32;
+    strings.extend_from_slice(name.as_bytes());
+    strings.push(0);
+    let n_x = strings.len() as u32;
+    strings.extend_from_slice(b"x");
+    strings.push(0);
+
+    // Type section: id 1 = BTF_KIND_INT u64, id 2 = BTF_KIND_STRUCT
+    // <name> { u64 x @ 0 }.
+    const BTF_KIND_INT: u32 = 1;
+    const BTF_KIND_STRUCT: u32 = 4;
+    let mut types: Vec<u8> = Vec::new();
+    // id 1: Int u64.
+    types.extend_from_slice(&n_u64.to_le_bytes());
+    let int_info = (BTF_KIND_INT << 24) & 0x1f00_0000;
+    types.extend_from_slice(&int_info.to_le_bytes());
+    types.extend_from_slice(&8u32.to_le_bytes()); // size
+    let int_data: u32 = 64;
+    types.extend_from_slice(&int_data.to_le_bytes()); // encoding=0, offset=0, bits=64
+    // id 2: Struct <name> { u64 x @ bit 0 }.
+    types.extend_from_slice(&n_struct.to_le_bytes());
+    let struct_info = ((BTF_KIND_STRUCT << 24) & 0x1f00_0000) | 1u32; // vlen=1
+    types.extend_from_slice(&struct_info.to_le_bytes());
+    types.extend_from_slice(&8u32.to_le_bytes()); // size
+    types.extend_from_slice(&n_x.to_le_bytes()); // member name_off
+    types.extend_from_slice(&1u32.to_le_bytes()); // member type id (u64)
+    types.extend_from_slice(&0u32.to_le_bytes()); // bit_offset
+
+    // Header (24 bytes) + type section + string section.
+    let type_len = types.len() as u32;
+    let str_len = strings.len() as u32;
+    let mut blob: Vec<u8> = Vec::new();
+    blob.write_all(&0xEB9F_u16.to_le_bytes()).unwrap(); // magic
+    blob.push(1); // version
+    blob.push(0); // flags
+    blob.write_all(&24u32.to_le_bytes()).unwrap(); // hdr_len
+    blob.write_all(&0u32.to_le_bytes()).unwrap(); // type_off
+    blob.write_all(&type_len.to_le_bytes()).unwrap();
+    blob.write_all(&type_len.to_le_bytes()).unwrap(); // str_off = type_len
+    blob.write_all(&str_len.to_le_bytes()).unwrap();
+    blob.extend_from_slice(&types);
+    blob.extend_from_slice(&strings);
+    (blob, 2)
+}
+
+/// Aggregate-kind gate fires: index has `("foo", FwdIndexEntry { 0,
+/// struct_foo_id })` pointing at a `BTF_KIND_STRUCT`, but the
+/// caller queries with [`FwdKind::Union`]. The helper's kind-match
+/// arm in [`super::render_map::resolve_cross_btf_fwd_in_index`]
+/// rejects with `None`, dropping the chase back to the historical
+/// Fwd skip.
+///
+/// Without this gate, a same-name Union body in a sibling BTF
+/// could surface for a caller that asked for a Struct (and
+/// vice versa), corrupting the rendered subtree's layout
+/// interpretation. Pin the rejection so a future indexer rewrite
+/// that admits Union entries cannot silently bypass the kind
+/// check.
+#[test]
+fn resolve_cross_btf_fwd_in_index_rejects_kind_mismatch() {
+    use crate::monitor::btf_render::FwdKind;
+    use crate::vmm::cast_analysis_load::FwdIndexEntry;
+    use std::sync::Arc;
+
+    // Build a sibling BTF whose `foo` is a Struct (id 2). The
+    // index will key `foo -> (0, 2)`; the kind-match check in
+    // the helper resolves type id 2, sees it's a Struct, and
+    // when the caller asks for [`FwdKind::Union`] returns None.
+    let (blob, struct_foo_id) = build_btf_with_named_struct("foo");
+    let btf = Arc::new(btf_rs::Btf::from_bytes(&blob).expect("synthetic BTF parses"));
+    let btfs = vec![btf];
+    let mut fwd_index: std::collections::HashMap<String, FwdIndexEntry> =
+        std::collections::HashMap::new();
+    fwd_index.insert(
+        "foo".to_string(),
+        FwdIndexEntry {
+            btfs_idx: 0,
+            type_id: struct_foo_id,
+        },
+    );
+    let cross = super::CrossBtfFwdIndex {
+        btfs: &btfs,
+        fwd_index: &fwd_index,
+    };
+    // Query with [`FwdKind::Union`] (caller is asking for a Union
+    // body). The index entry is a Struct → kind mismatch → helper
+    // returns None.
+    let result = super::render_map::resolve_cross_btf_fwd_in_index(
+        Some(&cross),
+        "foo",
+        FwdKind::Union,
+    );
+    assert!(
+        result.is_none(),
+        "kind mismatch (Struct entry, FwdKind::Union) must reject; \
+         got Some(...)",
+    );
+
+    // Sanity: same query with [`FwdKind::Struct`] succeeds —
+    // proves the index lookup itself works and the kind gate is
+    // the rejection cause, not an unrelated absence.
+    let success = super::render_map::resolve_cross_btf_fwd_in_index(
+        Some(&cross),
+        "foo",
+        FwdKind::Struct,
+    );
+    assert!(
+        success.is_some(),
+        "matching kind (Struct entry, FwdKind::Struct) must succeed; \
+         this confirms the rejection above is the kind gate firing",
     );
 }

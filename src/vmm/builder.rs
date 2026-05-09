@@ -833,25 +833,32 @@ impl KtstrVmBuilder {
             );
         }
 
-        // Run BPF cast analysis on the scheduler binary's embedded
-        // `.bpf.objs` ELF blob now, while the host has the file open
-        // and before the binary is consumed by the initramfs builder.
-        // The analysis is host-only (raw ELF parse + register-state
-        // walk over BPF instructions; no libbpf, no kernel
-        // interaction, no CAP_BPF). It runs in milliseconds on the
-        // schedulers we target. Failures (missing section, malformed
-        // BTF, parse errors) silently produce an empty CastMap; we
-        // collapse empty to `None` here so the dump path's
-        // `Option<&CastMap>` borrow expresses "no analysis
-        // available" cleanly. Both branches keep the failure-dump
-        // renderer's default (every `u64` rendered as a plain
-        // counter — the pre-integration behavior). See
-        // [`super::cast_analysis_load::build_cast_map_from_scheduler`]
-        // for the full pipeline.
-        let cast_map = self.scheduler_binary.as_deref().and_then(|p| {
-            let m = super::cast_analysis_load::build_cast_map_from_scheduler(p);
-            (!m.is_empty()).then(|| std::sync::Arc::new(m))
-        });
+        // Build a lazy on-demand BPF cast-analysis handle for the
+        // scheduler binary. NO file I/O and NO analyzer work runs
+        // here — the handle just captures the scheduler binary
+        // path and a `OnceLock` slot. The actual analyzer (file
+        // read + raw ELF parse + BTF parse + register-state walk
+        // over BPF instructions; no libbpf, no kernel interaction,
+        // no CAP_BPF) defers until the failure-dump path first
+        // calls
+        // [`super::cast_analysis_load::LazyCastMap::get_full`]
+        // (production accessor — `.get()` is `#[allow(dead_code)]`
+        // and used only by the lazy-handle unit tests).
+        // Schedulers whose tests pass never trigger analyzer
+        // work — the dominant case for nextest's process-per-test
+        // execution model where steady-state tests boot a VM,
+        // run, and exit without ever touching the dump path.
+        //
+        // When `.get_full()` does fire, it consults the process-
+        // wide content-hash cache via
+        // [`super::cast_analysis_load::cached_cast_analysis_for_scheduler`].
+        // Within a single process (auto-repro after a primary
+        // failure, future in-process multi-test drivers), two VMs
+        // resolving to the same scheduler binary content share
+        // one analyzer run.
+        let cast_map = std::sync::Arc::new(super::cast_analysis_load::LazyCastMap::new(
+            self.scheduler_binary.clone(),
+        ));
 
         Ok(KtstrVm {
             kernel,

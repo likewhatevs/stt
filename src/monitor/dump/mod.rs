@@ -752,6 +752,27 @@ pub struct FailureDumpReport {
     /// on whether they want raw bytes or named-field allocations.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sdt_allocations: Vec<SdtAllocatorSnapshot>,
+    /// Live `scx_static` bump-allocator regions discovered in
+    /// `.bss`. One entry per `struct scx_static` instance with
+    /// `memory != 0` and an in-range `(off, max_alloc_bytes)` pair.
+    /// Distinct from [`Self::sdt_allocations`]: scx_static is a
+    /// program-lifetime bump allocator (`lib/sdt_alloc.bpf.c:577`)
+    /// with no per-allocation header, so the surfaced view is
+    /// region-granular ranges rather than per-slot named allocations.
+    /// Empty when the scheduler doesn't link `lib/sdt_alloc.bpf.c`,
+    /// when the program BTF lacks `struct scx_static`, or when no
+    /// `scx_static` instance has been initialised at freeze time.
+    ///
+    /// The dump pipeline uses the same ranges to populate the
+    /// renderer's `ScxStaticRangeIndex` so a deferred-resolve arena
+    /// chase whose target lives inside scx_static memory can
+    /// fail-closed cleanly (no per-slot type recovery is possible
+    /// without a per-call-site type hook from cast analysis).
+    #[serde(
+        default,
+        skip_serializing_if = "super::scx_static_alloc::ScxStaticSnapshot::is_empty"
+    )]
+    pub scx_static_ranges: super::scx_static_alloc::ScxStaticSnapshot,
     /// Per-program BPF runtime stats summed across CPUs at freeze
     /// time (cnt, nsecs, misses). One entry per discovered
     /// struct_ops BPF program. Empty when no struct_ops programs are
@@ -974,6 +995,7 @@ impl Default for FailureDumpReport {
             maps: Vec::new(),
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
+            scx_static_ranges: super::scx_static_alloc::ScxStaticSnapshot::default(),
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
@@ -1613,6 +1635,57 @@ pub struct DumpContext<'a> {
     /// pre-integration default); same effect as passing an empty
     /// map but cheaper to thread.
     pub cast_map: Option<&'a super::cast_analysis::CastMap>,
+    /// Cross-BTF Fwd resolution context: every parsed embedded
+    /// BPF object's program BTF plus a name-keyed index over
+    /// every complete struct/union across them. Threaded into
+    /// every per-map [`RenderMapCtx`] so the renderer's
+    /// [`super::btf_render::MemReader::cross_btf_resolve_fwd`]
+    /// can chase a `BTF_KIND_FWD` whose body lives in a sibling
+    /// embedded object's BTF. Borrowed slices in the
+    /// `(btfs, fwd_index)` pair point into the
+    /// [`crate::vmm::cast_analysis_load::CastAnalysisOutput`] the
+    /// freeze coordinator holds alive via `Arc` for the dump
+    /// pass; `None` (no scheduler binary, or analyzer found no
+    /// complete struct/union definitions) keeps the renderer's
+    /// "forward declaration; body not in this BTF" skip path
+    /// intact.
+    pub cross_btf_fwd_index: Option<CrossBtfFwdIndex<'a>>,
+}
+
+/// Per-dump cross-BTF Fwd resolution context: every parsed program
+/// BTF the cast-analysis pre-pass discovered, plus a name-keyed
+/// index over the complete (`!is_fwd`) struct/union definitions
+/// across them.
+///
+/// Built once at the freeze-coordinator side from
+/// [`crate::vmm::cast_analysis_load::CastAnalysisOutput`] and
+/// threaded through [`DumpContext::cross_btf_fwd_index`] into
+/// every per-map [`AccessorMemReader`]. The renderer's
+/// [`super::btf_render::MemReader::cross_btf_resolve_fwd`]
+/// override range-looks up the hit and returns a
+/// [`super::btf_render::CrossBtfRef`] whose `btf` borrow points at
+/// the matching `Arc<Btf>` inside `btfs`.
+///
+/// Empty `btfs` / empty `fwd_index` are valid (no scheduler binary,
+/// or analyzer found no Struct/Union definitions); the bridge stays
+/// dormant and the chase falls through to the legacy
+/// "forward declaration" skip path.
+pub struct CrossBtfFwdIndex<'a> {
+    /// Every parsed program BTF in the order
+    /// [`crate::vmm::cast_analysis_load::iter_embedded_bpf_objects`]
+    /// yielded the embedded objects. Index 0 is the first object's
+    /// BTF, etc. Empty when the scheduler binary had no parseable
+    /// `.bpf.objs`. Borrowed from the
+    /// [`crate::vmm::cast_analysis_load::CastAnalysisOutput`] held
+    /// alive by the freeze coordinator's `Arc` for the dump pass.
+    pub btfs: &'a [std::sync::Arc<Btf>],
+    /// `name -> FwdIndexEntry` over every complete struct/union
+    /// across `btfs`. See
+    /// [`crate::vmm::cast_analysis_load::CastAnalysisOutput::fwd_index`]
+    /// for the construction policy (first-write-wins on duplicate
+    /// names, anonymous types skipped).
+    pub fwd_index:
+        &'a std::collections::HashMap<String, crate::vmm::cast_analysis_load::FwdIndexEntry>,
 }
 
 /// Reconstruct an `ScxSchedState` from the probe BPF program's
@@ -1915,7 +1988,9 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         perf_capture,
         deadline,
         cast_map,
+        cross_btf_fwd_index,
     } = ctx;
+    let cross_btf_fwd_index_ref = cross_btf_fwd_index.as_ref();
     // Wall-clock origin for per-phase elapsed_us tracing and the
     // soft-deadline bailout. Each heavy phase compares
     // `Instant::now()` against `deadline` AFTER it finishes, so a
@@ -2281,6 +2356,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         vcpu_perf_at_freeze,
         dump_truncated_at_us: None,
         probe_counters,
+        scx_static_ranges: Default::default(),
         is_placeholder: false,
     };
 
@@ -2412,48 +2488,97 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // its own payload type instead of forcing the renderer to give
     // up.
     let mut sdt_alloc_metas: Vec<crate::monitor::dump::render_map::SdtAllocMeta> = Vec::new();
-    // `payload_start_low32 → payload_btf_type_id` lookup
-    // populated as each allocator walk completes.
-    // [`MemReader::resolve_arena_type`] consults this to recover
-    // the real payload struct id for chased arena pointers whose
-    // declared pointee is a `BTF_KIND_FWD` (typical for `struct
-    // sdt_data __arena *` fields where the body lives in a
-    // separate library BTF). Built incrementally inside the walk
-    // loop so the per-allocator snapshot moves into
-    // `report.sdt_allocations` after each iteration without a
-    // clone.
+    // `slot_start → ArenaSlotInfo` lookup populated as each
+    // allocator walk completes.
+    // [`MemReader::resolve_arena_type`] consults this index via a
+    // range lookup: given a chased address, find the slot whose
+    // `[slot_start, slot_start + elem_size)` range contains it,
+    // then route on `offset_in_slot`:
+    //
+    //   - `offset_in_slot == 0` (slot-start pointer, e.g. the
+    //     `data` field of `scx_task_map_val` storing the raw
+    //     `sdt_alloc()` return) → render the payload skipping
+    //     `header_size` bytes of header.
+    //   - `offset_in_slot == header_size` (payload-start pointer,
+    //     e.g. the return of `scx_task_data(p)` cached in
+    //     `cached_taskc_raw`) → render the payload directly.
+    //   - Other in-slot offsets → no resolve; the renderer falls
+    //     back to its existing skip behaviour.
+    //
+    // Built incrementally inside the walk loop so the
+    // per-allocator snapshot moves into `report.sdt_allocations`
+    // after each iteration without a clone.
     //
     // [`crate::monitor::sdt_alloc::TreeWalker::emit_leaf`]
     // populates each [`SdtAllocEntry::user_addr`] as
     // `data_ptr & 0xFFFF_FFFF` — the slot-START address windowed
-    // to the low 32 bits. The bridge does NOT key on slot-start
-    // because the production trigger is post-header pointers:
-    // `scx_task_data(p)` (`lib/sdt_task.bpf.c`) returns
-    // `data->payload`, and lavd caches that exact value in
-    // `cached_taskc_raw`. Every chase the renderer issues for a
-    // typed field whose value comes from those helpers carries
-    // the payload start (slot start + header_size), not the slot
-    // start. Adding `data_header_size` here (8 bytes —
-    // `sizeof(union sdt_id)`) shifts the key from slot-start to
-    // payload-start so the renderer's
-    // [`MemReader::resolve_arena_type`] override — which masks the
-    // chased value with `0xFFFF_FFFF` — finds a match.
+    // to the low 32 bits. The index keys directly on this
+    // windowed slot start, paired with an [`ArenaSlotInfo`] that
+    // carries `elem_size`, `header_size`, and the payload BTF
+    // type id so the [`MemReader::resolve_arena_type`] range
+    // lookup has every value it needs to decide the chase shape.
     //
-    // `checked_add` guards against a `user_addr + header_size`
-    // sum overflowing `u32::MAX`: the additive end of the windowed
-    // payload start. The mask in [`emit_leaf`] keeps `user_addr`
-    // within `u32::MAX`, but a slot at the very top of the window
-    // could push the post-header start past it; saturate by
-    // skipping those slots rather than wrapping into a
-    // low-numbered key that would alias a different slot. Duplicates
-    // (two slots reporting the same payload start, indicating a
-    // stale snapshot from a freed allocation racing with the
-    // freeze) keep the FIRST entry; this matches the
+    // Slot non-overlap invariant: the kernel allocator places
+    // slots back-to-back inside one `sdt_chunk` and never re-uses
+    // a position while the bitmap still has it marked allocated
+    // (see `lib/sdt_alloc.bpf.c::scx_alloc_internal`'s
+    // bitmap-then-data ordering). Two distinct slots cannot have
+    // overlapping `[start, start + elem_size)` ranges, so
+    // dedup-on-exact-key here is sufficient — we cannot land on a
+    // case where `slot_a + elem_a > slot_b > slot_a` with
+    // `slot_b` separately keyed.
+    //
+    // Duplicates (two slots reporting the same slot start,
+    // indicating a stale snapshot from a freed allocation racing
+    // with the freeze) keep the FIRST entry; this matches the
     // [`build_arena_page_index`] policy on duplicate user_addr
     // pages and emits a `tracing::debug!` line so an operator
     // diagnosing a wrong-render can spot the collision.
     let mut arena_type_index = crate::monitor::dump::render_map::ArenaTypeIndex::new();
+    // 4 GiB-alignment invariant: the bridge keys on the low 32
+    // bits of slot start. That is correct iff `user_vm_start` is
+    // 4 GiB-aligned — `slot_full_addr - slot_low32 == user_vm_start`
+    // and the renderer reconstructs full addresses by masking
+    // chased values with `0xFFFF_FFFF`. Every in-tree scx scheduler
+    // sets `map_extra` to a 4 GiB-aligned value (`1 << 32`,
+    // `1 << 44`); the kernel auto-pick path in
+    // `bpf_arena_map_alloc` (kernel/bpf/arena.c) rounds the user
+    // VM area up to `SZ_4G` before mounting. The kernel does
+    // accept arbitrary `map_extra` from userspace, so an
+    // out-of-tree scheduler could in theory pass an unaligned
+    // value — surface a warning and skip the index build rather
+    // than silently misroute every chase.
+    let user_vm_aligned = shared_arena_snapshot
+        .as_ref()
+        .map(|(_, snap)| snap.user_vm_start & 0xFFFF_FFFF == 0)
+        .unwrap_or(false);
+    if !user_vm_aligned && let Some((_, snap)) = shared_arena_snapshot.as_ref() {
+        tracing::warn!(
+            user_vm_start = format_args!("{:#x}", snap.user_vm_start),
+            "sdt_alloc bridge skipped: user_vm_start is not 4 GiB-aligned; \
+             low-32 keying would misroute every chase",
+        );
+    }
+    // F7 mitigation: `user_vm_start == 0` is technically 4 GiB-
+    // aligned (and the gate above accepts it), but the
+    // [`super::dump::render_map::is_arena_addr_in_snapshot`] helper
+    // rejects every address when `user_vm_start == 0` — silently
+    // disabling the bridge. Surface a warn so an operator
+    // diagnosing missing typed-pointer renders sees the cause
+    // (likely a snapshot capture failure that produced an
+    // uninitialized arena VM start).
+    if let Some((_, snap)) = shared_arena_snapshot.as_ref()
+        && snap.user_vm_start == 0
+    {
+        tracing::warn!(
+            "sdt_alloc bridge effectively disabled: user_vm_start == 0 \
+             (snapshot capture may have failed before resolving the \
+             arena's user VM window); every chase will skip with \
+             `is_arena_addr` = false",
+        );
+    }
     if !deadline_exceeded(&mut truncated_at_us)
+        && user_vm_aligned
         && let Some((bss_bytes, btf_kva)) = sched_bss_bytes
         && arena_kern_vm_start != 0
         && let Some(prog_btf) = program_btfs.get(&btf_kva)
@@ -2488,6 +2613,21 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // the dump, instead of degrading to plain counters
             // for fields the analyzer recovered.
             cast_map,
+            None,
+            // The sdt_alloc pre-pass reads BTF type metadata for
+            // the typed allocator payload from the scheduler's
+            // own program BTF; no cross-BTF Fwd resolution is
+            // needed here. The per-map renders below pass the
+            // built `cross_btf_fwd_index` where it matters.
+            None,
+            // The sdt_alloc pre-pass runs BEFORE the
+            // [`crate::monitor::scx_static_alloc`] walker (the
+            // walks are independent, but the per-allocator leaf
+            // payload renders here happen during the sdt_alloc
+            // walk's own loop, so the scx_static index is not yet
+            // built). Pass `None` so the bridge stays a no-op for
+            // these pre-pass renders; the per-map renders below
+            // pass the built `scx_static_index` where it matters.
             None,
         );
         // Locate every sdt_alloc allocator instance declared in
@@ -2562,36 +2702,23 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                     payload_btf_type_id: choice.btf_type_id,
                     kern_vm_start: arena_kern_vm_start,
                 });
-                if let Ok(header_low32) = u32::try_from(sdt_offsets.data_header_size) {
-                    for entry in &snap.entries {
-                        // user_addr comes back as a `u64` whose top
-                        // 32 bits are zero (per
-                        // `walk_sdt_allocator`'s mask in
-                        // `emit_leaf`). The narrowing cast
-                        // preserves the meaningful low half; the
-                        // assertion is encoded in the source
-                        // comment for the masking site rather than
-                        // re-checked here.
-                        let user_addr_low32 = entry.user_addr as u32;
-                        let Some(payload_start) = user_addr_low32.checked_add(header_low32) else {
-                            continue;
-                        };
-                        match arena_type_index.entry(payload_start) {
-                            std::collections::btree_map::Entry::Vacant(v) => {
-                                v.insert(choice.btf_type_id);
-                            }
-                            std::collections::btree_map::Entry::Occupied(o) => {
-                                tracing::debug!(
-                                    payload_start = format_args!("{:#x}", payload_start),
-                                    first_btf_type_id = *o.get(),
-                                    duplicate_btf_type_id = choice.btf_type_id,
-                                    allocator = %var_name,
-                                    "sdt_alloc bridge has duplicate payload_start; keeping first entry",
-                                );
-                            }
-                        }
-                    }
-                }
+                // Append this allocator's slots to the bridge index.
+                // The helper handles the size-fits-u32 check, the
+                // dedup-on-duplicate-slot-start, and the
+                // `tracing::debug!` collision diagnostic — see
+                // [`append_arena_type_index_for_allocator`] for the
+                // full contract. Bridge gate (`payload_btf_type_id
+                // != 0`) is encoded inside the helper as well; the
+                // outer guard here is a fast-path bail before we
+                // even allocate metadata for the allocator.
+                crate::monitor::dump::render_map::append_arena_type_index_for_allocator(
+                    &mut arena_type_index,
+                    &var_name,
+                    choice.btf_type_id,
+                    sdt_offsets.data_header_size,
+                    elem_size,
+                    &snap.entries,
+                );
             }
             // Surface only allocators with a non-empty result OR a
             // diagnostic elem_size; an all-zero snapshot from a
@@ -2611,6 +2738,70 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         allocations = report.sdt_allocations.len(),
         index_entries = arena_type_index.len(),
         "dump_state phase: sdt_alloc"
+    );
+
+    // Pre-pass: walk every `scx_static` bump-allocator instance in
+    // `.bss` and surface its live-allocated range. Distinct from the
+    // sdt_alloc per-instance allocator walk above:
+    //
+    //   - sdt_alloc (`struct scx_allocator`) hands out fixed-stride
+    //     slots via a 3-level radix tree with per-slot metadata; the
+    //     walker produces one entry per live slot keyed on slot start.
+    //   - scx_static (`struct scx_static`) is a flat bump allocator
+    //     with no per-slot metadata; the walker produces one entry
+    //     per live region keyed on the region's base address.
+    //
+    // The walk runs only when:
+    //   - we have a scheduler `.bss` blob to read from (re-located
+    //     here because the sdt_alloc walk above consumed the
+    //     pre-pass `sched_bss_bytes` Option),
+    //   - we have a program BTF to resolve `struct scx_static`
+    //     against,
+    //   - the program BTF carries `struct scx_static`.
+    //
+    // When any prerequisite is missing, the walk leaves
+    // `report.scx_static_ranges` empty (default) rather than failing
+    // the dump — schedulers that don't link `lib/sdt_alloc.bpf.c` or
+    // don't use the static allocator simply skip the walk.
+    //
+    // Membership-only: the walker produces an UNTYPED range index.
+    // Per-allocation type recovery requires a per-call-site type
+    // hook from cast analysis that does not exist today (see the
+    // module-level doc in [`crate::monitor::scx_static_alloc`] for
+    // why). When the renderer's deferred-resolve arena chase lands
+    // on an address inside an scx_static range, the bridge
+    // recognises the address as "in scx_static memory" and
+    // fails closed (returns `None` from `resolve_arena_type`)
+    // rather than returning a wrong type — the "no invalid data
+    // made" contract.
+    let scx_static_t0 = std::time::Instant::now();
+    if !deadline_exceeded(&mut truncated_at_us) {
+        if let Some((bss_bytes, prog_btf)) = relocate_sched_bss(&maps, accessor, &program_btfs)
+            && let Ok(scx_static_offsets) =
+                crate::monitor::scx_static_alloc::ScxStaticOffsets::from_btf(prog_btf)
+        {
+            let snap = crate::monitor::scx_static_alloc::walk_scx_static(
+                &bss_bytes,
+                &scx_static_offsets,
+                iter_bss_vars_with_type(prog_btf, ".bss"),
+                |type_id| is_scx_static_type(prog_btf, type_id),
+            );
+            report.scx_static_ranges = snap;
+        }
+    }
+    let scx_static_index =
+        crate::monitor::scx_static_alloc::build_scx_static_range_index(&report.scx_static_ranges);
+    let scx_static_index_ref = if scx_static_index.is_empty() {
+        None
+    } else {
+        Some(&scx_static_index)
+    };
+    tracing::debug!(
+        elapsed_us = scx_static_t0.elapsed().as_micros() as u64,
+        ranges = report.scx_static_ranges.ranges.len(),
+        skipped = report.scx_static_ranges.skipped,
+        index_entries = scx_static_index.len(),
+        "dump_state phase: scx_static"
     );
 
     let render_map_t0 = std::time::Instant::now();
@@ -2711,18 +2902,45 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // unsigned counter (the trait default).
                 cast_map,
                 // Built from the sdt_alloc pre-pass above:
-                // `payload_start → payload_btf_type_id` for
-                // every live allocator slot. Lets the renderer
+                // `slot_start → ArenaSlotInfo` for every live
+                // allocator slot. Lets the renderer range-lookup
+                // the slot a chased arena address falls in and
                 // recover a `BTF_KIND_FWD` pointee's real
-                // struct id via [`MemReader::resolve_arena_type`]
-                // — a `struct sdt_data __arena *` field whose
-                // pointee body lives in the sdt_alloc library's
-                // BTF still chases as the typed per-task /
-                // per-cgroup struct, instead of skipping with
-                // "forward declaration; body not in this BTF".
-                // `None` when no allocator with a typed payload
-                // was discovered.
+                // struct id (plus a `header_skip` byte count)
+                // via [`MemReader::resolve_arena_type`] — a
+                // `struct sdt_data __arena *` field (or a `data`
+                // field caching the raw `sdt_alloc()` return)
+                // whose pointee body lives in the sdt_alloc
+                // library's BTF still chases as the typed
+                // per-task / per-cgroup struct, instead of
+                // skipping with "forward declaration; body not
+                // in this BTF". `None` when no allocator with a
+                // typed payload was discovered.
                 arena_type_index: arena_type_index_ref,
+                // Threaded in from
+                // [`DumpContext::cross_btf_fwd_index`]: the
+                // cross-BTF Fwd resolution context populated by
+                // the cast-analysis pre-pass over every embedded
+                // BPF object's BTF. `Some(&idx)` lets the
+                // renderer chase a `BTF_KIND_FWD` whose body
+                // lives in a sibling embedded object via
+                // [`MemReader::cross_btf_resolve_fwd`]. `None`
+                // keeps the renderer's "forward declaration;
+                // body not in this BTF" skip path intact.
+                cross_btf_fwd_index: cross_btf_fwd_index_ref,
+                // Built from the scx_static pre-pass above:
+                // `start_low32 → size` for every live
+                // `scx_static` bump-allocator region. Lets the
+                // renderer's
+                // [`MemReader::resolve_arena_type`]
+                // diagnose-and-skip on a chased arena address
+                // that lands inside scx_static memory — the
+                // bridge cannot recover a per-allocation type
+                // (no per-slot header) so the chase falls through
+                // to the historical Fwd-skip / cross-BTF
+                // resolution path. `None` when no live
+                // `scx_static` instance was discovered.
+                scx_static_index: scx_static_index_ref,
             },
             &info,
         );
@@ -2913,6 +3131,90 @@ fn is_scx_allocator_type(btf: &Btf, type_id: u32) -> bool {
         }
     }
     false
+}
+
+/// True iff `type_id` resolves to a struct named `scx_static`,
+/// stripping the BTF modifier chain en route. Mirrors the
+/// modifier-handling shape of [`is_scx_allocator_type`] — the five
+/// modifier kinds (`Const`, `Volatile`, `Typedef`, `Restrict`,
+/// `TypeTag`) are the complete set the kernel BPF pipeline emits for
+/// global variable types in `.bss`; any other kind terminates the
+/// lookup with a non-match.
+///
+/// Used by the [`crate::monitor::scx_static_alloc::walk_scx_static`]
+/// pre-pass to filter `.bss` Vars to only `struct scx_static`
+/// instances. A scheduler that doesn't link `lib/sdt_alloc.bpf.c`
+/// has no such Var; the filter rejects every candidate and the
+/// walker produces an empty snapshot.
+fn is_scx_static_type(btf: &Btf, type_id: u32) -> bool {
+    use btf_rs::Type as T;
+    let Ok(mut t) = btf.resolve_type_by_id(type_id) else {
+        return false;
+    };
+    for _ in 0..20 {
+        match t {
+            T::Struct(s) => {
+                return btf.resolve_name(&s).is_ok_and(|n| n == "scx_static");
+            }
+            T::Const(_) | T::Volatile(_) | T::Typedef(_) | T::Restrict(_) | T::TypeTag(_) => {
+                let Some(btf_ty) = t.as_btf_type() else {
+                    return false;
+                };
+                let Ok(next) = btf.resolve_chained_type(btf_ty) else {
+                    return false;
+                };
+                t = next;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Locate the scheduler's `.bss` array map and pull out (raw bytes,
+/// program BTF) for the [`crate::monitor::scx_static_alloc`] pre-pass.
+///
+/// The earlier sdt_alloc pre-pass at the top of [`dump_state`]
+/// already collected `sched_bss_bytes` once but the if-let chain at
+/// the sdt_alloc walk consumed the `Option`. Re-locating here keeps
+/// both walkers independent: each owns its own bss-bytes read so a
+/// future ordering change can't accidentally leave one walker
+/// without input. The cost is one extra map walk; small compared to
+/// the per-map render loop that follows.
+///
+/// Returns `None` when:
+///   - no `*.bss` map exists (libbpf only creates this map when the
+///     program has any global non-const data),
+///   - the map's `btf_kva == 0` (no program BTF — type resolution
+///     would fail),
+///   - the program BTF for that `btf_kva` was not loaded in the
+///     pre-pass (parse failed earlier; the caller already logged),
+///   - the map's value bytes can't be read.
+fn relocate_sched_bss<'btf>(
+    maps: &[BpfMapInfo],
+    accessor: &GuestMemMapAccessor<'_>,
+    program_btfs: &'btf std::collections::HashMap<u64, Btf>,
+) -> Option<(Vec<u8>, &'btf Btf)> {
+    for info in maps {
+        let name = info.name();
+        if name.starts_with("probe_bp.")
+            || name.starts_with("fentry_p.")
+            || name == "probe_bp"
+            || name == "fentry_p"
+            || KTSTR_INTERNAL_MAPS.contains(&name.as_ref())
+        {
+            continue;
+        }
+        if info.map_type == BPF_MAP_TYPE_ARRAY
+            && info.btf_kva != 0
+            && name.ends_with(".bss")
+            && let Some(prog_btf) = program_btfs.get(&info.btf_kva)
+            && let Some(bytes) = accessor.read_value(info, 0, info.value_size as usize)
+        {
+            return Some((bytes, prog_btf));
+        }
+    }
+    None
 }
 
 /// Load a BPF program's `struct btf` from guest memory at `btf_kva`.

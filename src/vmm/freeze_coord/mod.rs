@@ -33,7 +33,7 @@ use super::vcpu::{
     register_vcpu_signal_handler, self_arm_watchpoint, set_rt_priority, set_thread_cpumask,
     vcpu_signal,
 };
-use super::vmlinux::find_vmlinux;
+use super::vmlinux::{cached_vmlinux_bytes, find_vmlinux};
 use super::{
     KtstrVm, console, host_comms, vcpu_panic, virtio_blk, virtio_console, virtio_net, wire,
 };
@@ -1071,16 +1071,18 @@ impl KtstrVm {
         // into the scx walker (per-node global DSQ pass) and the
         // per-node NUMA event walker. Defaults to 1 on UMA topologies.
         let freeze_coord_num_nodes = self.topology.num_numa_nodes();
-        // BPF cast-analysis output produced once at builder time
-        // from the scheduler binary's embedded `.bpf.objs` ELF.
-        // Wrapped in `Arc` and cloned into the coord closure so the
-        // dump-state call site can hand a borrowed reference to
-        // [`crate::monitor::dump::DumpContext::cast_map`] without
-        // round-tripping the BTreeMap through `Clone` on every
-        // freeze. The builder collapses an empty map (no scheduler,
-        // parse failure, no findings) to `None` so the borrow site
-        // needs no extra emptiness check.
-        let freeze_coord_cast_map: Option<Arc<crate::monitor::cast_analysis::CastMap>> =
+        // Lazy BPF cast-analysis handle produced at builder time.
+        // The handle is `Arc<LazyCastMap>` and holds only the
+        // scheduler binary path plus a `OnceLock` slot; the
+        // analyzer runs only when `.get_full()` is first called
+        // at dump time on the freeze-coordinator host thread (NOT
+        // a vCPU thread — the freeze rendezvous has already
+        // paused vCPUs by the time `dump_state` runs). The clone
+        // shares the `OnceLock`, so a periodic-capture dump and
+        // the final freeze in the same VM both resolve to the
+        // same analyzed `Arc<CastAnalysisOutput>` after the first
+        // `.get_full()`.
+        let freeze_coord_cast_map: Arc<crate::vmm::cast_analysis_load::LazyCastMap> =
             self.cast_map.clone();
         let freeze_coord_on_demand_in_flight = on_demand_in_flight.clone();
         let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
@@ -4037,6 +4039,40 @@ impl KtstrVm {
                                     }
                                     _ => None,
                                 };
+                                // Force the lazy cast-analysis on this
+                                // dump's host coordinator thread (NOT a
+                                // vCPU thread — vCPUs are paused at the
+                                // freeze rendezvous). Bind the resulting
+                                // `Option<Arc<CastAnalysisOutput>>`
+                                // BEFORE the `DumpContext` literal so
+                                // the inner `Arc` outlives
+                                // `dump_state`'s borrow. First dump does
+                                // the work; subsequent dumps in the same
+                                // VM hit the `OnceLock` and return
+                                // immediately.
+                                //
+                                // The full output carries both the cast
+                                // map AND the cross-BTF Fwd resolution
+                                // index (every parsed embedded BPF
+                                // object's BTF + a name-keyed lookup).
+                                // Both halves are threaded into
+                                // `DumpContext` so the renderer's chase
+                                // paths can resolve `BTF_KIND_FWD`
+                                // pointees that live in a sibling
+                                // object's BTF — the typical multi-
+                                // `.bpf.objs` shape where one object
+                                // declares `struct foo;` (forward) and
+                                // another defines the body.
+                                let cast_analysis = freeze_coord_cast_map.get_full();
+                                let cast_map_ref = cast_analysis
+                                    .as_ref()
+                                    .map(|out| out.cast_map.as_ref());
+                                let cross_btf_fwd_index_owned = cast_analysis.as_ref().map(|out| {
+                                    crate::monitor::dump::CrossBtfFwdIndex {
+                                        btfs: &out.btfs,
+                                        fwd_index: &out.fwd_index,
+                                    }
+                                });
                                 let dump_state_t0 = std::time::Instant::now();
                                 let mut report = crate::monitor::dump::dump_state(
                                     crate::monitor::dump::DumpContext {
@@ -4078,9 +4114,18 @@ impl KtstrVm {
                                         // hardware lacks counters).
                                         perf_capture: (*freeze_coord_perf_capture).as_ref(),
                                         deadline: capture_deadline,
-                                        cast_map: freeze_coord_cast_map
-                                            .as_ref()
-                                            .map(|a| a.as_ref()),
+                                        // The bound `cast_map_ref` is
+                                        // `Option<&CastMap>` derived from
+                                        // the full output's inner `Arc`.
+                                        // The full output keeps the
+                                        // `CastMap` alive for the
+                                        // duration of this `dump_state`
+                                        // call.
+                                        cast_map: cast_map_ref,
+                                        // Cross-BTF Fwd resolution
+                                        // context — see
+                                        // [`DumpContext::cross_btf_fwd_index`].
+                                        cross_btf_fwd_index: cross_btf_fwd_index_owned,
                                     },
                                 );
                                 tracing::debug!(
@@ -4141,6 +4186,7 @@ impl KtstrVm {
                                     ),
                                     dump_truncated_at_us: None,
                                     probe_counters: None,
+                                    scx_static_ranges: Default::default(),
                                     is_placeholder: false,
                                 };
                                 tracing::warn!(
@@ -7928,6 +7974,13 @@ impl KtstrVm {
 
     /// Shutdown threads and collect output.
     pub(super) fn collect_results(&self, start: Instant, run: VmRunState) -> Result<VmResult> {
+        // Whole-cleanup timer for the perf-repro tracing pipeline.
+        // `cleanup_duration` below already records the post-BSP-exit
+        // window via `run.cleanup_start.elapsed()`; this captures the
+        // collect_results function span itself so a regression isolates
+        // to either the run.cleanup_start window (set by run_vm before
+        // it called us) or the function body.
+        let collect_results_start = Instant::now();
         let mut exit_code = run.exit_code;
         let timed_out = run.timed_out;
         // Belt-and-braces: kill + kill_evt are already set by run_vm
@@ -8241,13 +8294,16 @@ impl KtstrVm {
         // a userspace binary or kernel-built enable commands).
         let has_scheduler = self.scheduler_binary.is_some() || !self.sched_enable_cmds.is_empty();
         let vs_t = std::time::Instant::now();
+        let mut vs_path: &'static str = "skipped_no_scheduler";
         let verifier_stats = if has_scheduler {
             if let Some(ref prog) = run.prog_accessor {
                 use crate::monitor::bpf_prog::BpfProgAccessor;
+                vs_path = "prebuilt_accessor";
                 eprintln!("CLEANUP: verifier_stats using pre-built accessor");
                 let a = prog.as_accessor();
                 a.struct_ops_progs()
             } else {
+                vs_path = "fallback_full_parse";
                 eprintln!("CLEANUP: verifier_stats fallback (full parse)");
                 self.collect_verifier_stats(
                     &run.vm,
@@ -8260,6 +8316,12 @@ impl KtstrVm {
         } else {
             Vec::new()
         };
+        tracing::info!(
+            elapsed_ms = vs_t.elapsed().as_millis() as u64,
+            path = vs_path,
+            n_progs = verifier_stats.len(),
+            "auto_repro: collect_verifier_stats",
+        );
         eprintln!("CLEANUP: verifier_stats done {:?}", vs_t.elapsed());
 
         // Sample cleanup elapsed AFTER every blocking step that runs on
@@ -8272,6 +8334,13 @@ impl KtstrVm {
         // the result so the `Instant::now()` here is the latest possible
         // read.
         let cleanup_duration = Some(run.cleanup_start.elapsed());
+        tracing::info!(
+            elapsed_ms = collect_results_start.elapsed().as_millis() as u64,
+            cleanup_window_ms = cleanup_duration
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            "auto_repro: collect_results",
+        );
         eprintln!("CLEANUP: collect_results done {:?}", cleanup_t.elapsed());
 
         // Forward the scheduler-stats client. `run.stats_client` is
@@ -8356,16 +8425,22 @@ impl KtstrVm {
             .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
             .unwrap_or(0);
         let cr3_val = cr3.load(std::sync::atomic::Ordering::Acquire);
+        // Fallback when the caller did not pre-load the vmlinux ELF.
+        // Routes through `cached_vmlinux_bytes` so a test process that
+        // boots N VMs against the same kernel pays the 50-340 MB read
+        // exactly once. Without the cache this path was the dominant
+        // cost on `collect_results` cleanup for nextest runs of
+        // `#[ktstr_test]` cases that share a kernel.
         let owned_data;
         let vmlinux_data: &[u8] = match cached_vmlinux_data {
             Some(d) => d,
-            None => {
-                owned_data = match std::fs::read(&vmlinux) {
-                    Ok(d) => d,
-                    Err(_) => return Vec::new(),
-                };
-                &owned_data
-            }
+            None => match cached_vmlinux_bytes(&vmlinux) {
+                Some(arc) => {
+                    owned_data = arc;
+                    owned_data.as_slice()
+                }
+                None => return Vec::new(),
+            },
         };
         // Parse the vmlinux ELF once and share the result between
         // `GuestKernel` (kernel symbols + paging state) and

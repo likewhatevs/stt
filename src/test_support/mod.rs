@@ -109,8 +109,8 @@ pub use payload::{
 pub(crate) use payload::{RawPayloadOutput, WireMetricHint};
 pub(crate) use probe::maybe_dispatch_vm_test;
 pub(crate) use probe::{
-    maybe_dispatch_vm_test_with_args, maybe_dispatch_vm_test_with_phase_a,
-    propagate_rust_env_from_cmdline, start_probe_phase_a,
+    finalize_probe_after_unwind, maybe_dispatch_vm_test_with_args,
+    maybe_dispatch_vm_test_with_phase_a, propagate_rust_env_from_cmdline, start_probe_phase_a,
 };
 pub use probe_metrics::{
     MAX_SCAN_INDEX, ThreadLookup, count_indexed_metrics, find_metric, find_metric_u64,

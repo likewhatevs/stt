@@ -1604,3 +1604,37 @@ fn parse_stackmap_offsets_from_vmlinux() {
         "stack_map_bucket nr and data must be distinct fields"
     );
 }
+
+/// `cached_vmlinux_btf` returns the same `Arc<Btf>` on every call
+/// once the cache is populated. `Arc::ptr_eq` is the load-bearing
+/// assertion — content equality would also hold from a re-parse, but
+/// only the cache hit produces a shared allocation.
+///
+/// Skipped when `/sys/kernel/btf/vmlinux` is unreadable (the function
+/// returns `None` on the first call). On test hosts where the file
+/// exists but is unreadable for the test user, the cache will not
+/// populate and the assertion would fail spuriously; the early
+/// `is_none` short-circuit lets such an environment skip the test
+/// rather than misreport a cache bug.
+#[test]
+fn cached_vmlinux_btf_hits_on_second_call() {
+    let first = match super::cached_vmlinux_btf() {
+        Some(b) => b,
+        None => {
+            // `/sys/kernel/btf/vmlinux` unreadable on this host —
+            // every probe-pipeline call site that consumes the cache
+            // also handles `None` by falling back to the no-BTF
+            // path, so there is nothing to assert here.
+            return;
+        }
+    };
+    let second = super::cached_vmlinux_btf().expect(
+        "second call must succeed when first did — the cache slot is populated and \
+         no error path is taken on cache hit",
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "cached_vmlinux_btf must return the same Arc on every call once populated; \
+         got fresh allocations, indicating the cache hit path did not fire",
+    );
+}

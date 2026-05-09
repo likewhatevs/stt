@@ -20,7 +20,7 @@
 //! scheduler is up.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::assert::AssertResult;
 
@@ -112,6 +112,67 @@ fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
     }
     let start = lines.len().saturating_sub(n);
     Some(format!("--- {header} ---\n{}", lines[start..].join("\n")))
+}
+
+/// Detect dmesg corruption shapes that would render as opaque garbage
+/// in a `format_tail` block, and return a single-line operator-readable
+/// diagnostic instead.
+///
+/// Returns:
+/// - `Some(diagnostic)` when `text` is empty, contains only 0xFF bytes,
+///   contains only U+FFFD replacement characters, or contains only
+///   whitespace + 0xFF + U+FFFD. Each shape maps to a distinct
+///   diagnostic so the operator can tell "no kernel printk fired"
+///   apart from "UART buffer trimmed/uninitialized".
+/// - `None` when the text contains at least one ordinary character —
+///   in that case the caller falls through to the standard
+///   `format_tail` rendering.
+///
+/// The 0xFF byte is `vm-superio`'s convention for uninitialized read
+/// positions in the UART ring buffer (see
+/// vm-superio/src/serial.rs); a stream of 0xFF means the scheduler
+/// crashed before any kernel printk reached the buffer, OR the COM1
+/// capture buffer overflowed and trimmed the relevant bytes.
+/// U+FFFD (decoded `\u{fffd}`) is what
+/// [`String::from_utf8_lossy`] (the conversion used by the host
+/// COM1 capture path) emits for non-UTF-8 input, including the raw
+/// 0xFF byte.
+fn classify_dmesg_corruption(text: &str) -> Option<&'static str> {
+    if text.is_empty() {
+        return Some("empty (scheduler crashed before kernel printk reached the UART buffer)");
+    }
+    // Walk every char. If we ever see something other than
+    // whitespace / 0xFF (raw) / U+FFFD (lossy-decoded 0xFF), the
+    // text has real content and we let format_tail render it.
+    let mut saw_ff = false;
+    let mut saw_replacement = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c == '\u{fffd}' {
+            saw_replacement = true;
+            continue;
+        }
+        if c == '\u{ff}' {
+            saw_ff = true;
+            continue;
+        }
+        return None;
+    }
+    match (saw_ff, saw_replacement) {
+        (false, false) => {
+            // Whitespace only — same outcome as empty for the
+            // operator: the kernel never wrote anything readable.
+            Some("empty (scheduler crashed before kernel printk reached the UART buffer)")
+        }
+        _ => {
+            Some(
+                "corrupt or no readable text (UART buffer uninitialized or \
+                 trimmed — scheduler likely crashed before any kernel printk)",
+            )
+        }
+    }
 }
 
 /// Read the repro VM's failure-dump JSON, parse it via
@@ -287,6 +348,13 @@ pub(crate) fn attempt_auto_repro(
     active_flags: &[String],
 ) -> Option<String> {
     use crate::probe::stack::extract_stack_functions_all;
+
+    // Whole-function timer. Per-phase markers below sit at the boundaries
+    // identified by the perf-repro investigation: VM build, VM run, and
+    // the post-run formatting tail. Without these the 60s claim is
+    // unverifiable from a single test invocation, and any future
+    // regression in a single phase is invisible against the aggregate.
+    let auto_repro_start = Instant::now();
 
     // Extract scheduler log from COM2 output.
     let has_sched_start = first_vm_output.contains(SCHED_OUTPUT_START);
@@ -468,21 +536,51 @@ pub(crate) fn attempt_auto_repro(
         }
     }
 
+    // VM build phase: KVM create, vCPU pinning, virtio device setup,
+    // freeze-coord arming, ELF/BTF parses for monitor accessors. Any
+    // regression here shows as a wider gap between the start of
+    // attempt_auto_repro and the start of the run phase.
+    let build_start = Instant::now();
     let vm = match builder.build() {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("ktstr_test: auto-repro: failed to build VM: {e:#}");
+            tracing::info!(
+                elapsed_ms = auto_repro_start.elapsed().as_millis() as u64,
+                outcome = "build_failed",
+                "auto_repro: total",
+            );
             return None;
         }
     };
+    tracing::info!(
+        elapsed_ms = build_start.elapsed().as_millis() as u64,
+        "auto_repro: vm_build",
+    );
 
+    // VM run phase: full guest lifecycle (boot, sched attach, Phase A
+    // probe attach, Phase B BPF discovery + fentry attach, workload,
+    // cleanup, virtio-console drain). The dominant share of auto-repro
+    // wall time lives here; per-phase guest-side breakdown is emitted
+    // by the probe pipeline inside the guest itself.
+    let run_start = Instant::now();
     let repro_result = match vm.run() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("ktstr_test: auto-repro: VM run failed: {e:#}");
+            tracing::info!(
+                elapsed_ms = auto_repro_start.elapsed().as_millis() as u64,
+                outcome = "run_failed",
+                "auto_repro: total",
+            );
             return None;
         }
     };
+    tracing::info!(
+        elapsed_ms = run_start.elapsed().as_millis() as u64,
+        guest_duration_ms = repro_result.duration.as_millis() as u64,
+        "auto_repro: vm_run",
+    );
     drop(vm);
 
     // Forward guest stderr (COM1) and COM2 probe lines when verbose.
@@ -546,13 +644,28 @@ pub(crate) fn attempt_auto_repro(
 
     // Filter sched_ext_dump lines from dmesg tail to avoid duplicating
     // the dump section. Only non-dump kernel console lines are shown.
+    //
+    // When the captured stderr is all-empty / all-0xff / all-replacement
+    // (U+FFFD) characters, render an explicit diagnostic instead of an
+    // empty or garbage tail block. 0xff bytes are vm-superio's
+    // uninitialized-read default; a single 0xff or a stream of them
+    // means the scheduler crashed before the kernel printk path
+    // initialised the UART buffer. format_tail's output for such
+    // input is either a header with a blank body (empty stderr) or a
+    // header followed by U+FFFD characters — both confuse operators
+    // who expect a parseable kernel console excerpt. Distinguishing
+    // the cases up-front keeps the rendered section actionable.
     let dmesg_filtered: String = repro_result
         .stderr
         .lines()
         .filter(|l| !l.contains("sched_ext_dump"))
         .collect::<Vec<_>>()
         .join("\n");
-    let dmesg_tail = format_tail(&dmesg_filtered, REPRO_TAIL_LINES, "repro VM dmesg");
+    let dmesg_tail = if let Some(diag) = classify_dmesg_corruption(&dmesg_filtered) {
+        Some(format!("--- repro VM dmesg ---\n{diag}"))
+    } else {
+        format_tail(&dmesg_filtered, REPRO_TAIL_LINES, "repro VM dmesg")
+    };
 
     // Inline-render the freeze coordinator's failure-dump JSON when
     // present. The freeze-coord writes a `FailureDumpReport` /
@@ -571,6 +684,11 @@ pub(crate) fn attempt_auto_repro(
         .collect();
 
     if probe_section.is_none() && tails.is_empty() {
+        tracing::info!(
+            elapsed_ms = auto_repro_start.elapsed().as_millis() as u64,
+            outcome = "no_data",
+            "auto_repro: total",
+        );
         return None;
     }
 
@@ -601,6 +719,11 @@ pub(crate) fn attempt_auto_repro(
         out.push_str("\n\n");
         out.push_str(tail);
     }
+    tracing::info!(
+        elapsed_ms = auto_repro_start.elapsed().as_millis() as u64,
+        outcome = if has_probe { "probe_data" } else { "tails_only" },
+        "auto_repro: total",
+    );
     Some(out)
 }
 
@@ -822,6 +945,60 @@ fn find_balanced_object_end(s: &str) -> Option<usize> {
     None
 }
 
+/// Classify the "events captured but 0 after stitch" failure mode.
+/// Returns a static description of WHY every event was dropped in
+/// stitch, grounded in BPF-side counters (`bpf_trigger_fires` +
+/// `bpf_exit_kind_snap`) so the explanation is causal, not
+/// speculative.
+///
+/// Branch order matches the failure-mode taxonomy:
+///   1. `bpf_trigger_fires == 0` — the `tp_btf/sched_ext_exit`
+///      handler never executed. Either the scheduler clean-exited
+///      (kind < SCX_EXIT_ERROR, handler early-returns at line 565
+///      of probe.bpf.c) or the scheduler crashed before reaching
+///      the tracepoint at all.
+///   2. `bpf_trigger_fires > 0 && exit_kind_snap == ERROR_STALL` —
+///      the handler fired but skipped the ringbuf submit (probe.bpf.c
+///      line 699 explicit early-return for STALL). target_tptr is
+///      None at the host, run_probe_skeleton suppresses the chain.
+///   3. `bpf_trigger_fires > 0 && exit_kind_snap == ERROR (generic)` —
+///      handler fired but `args[0] = 0` because the generic ERROR
+///      exit can come from kworker context where `current` is the
+///      worker thread, not the causal task.
+///   4. `bpf_trigger_fires > 0 && exit_kind_snap == ERROR_BPF` —
+///      handler fired with a real causal task in args[0], but
+///      stitch matched no events. Suspected `func_idx_offset` bug
+///      or ID mismatch between Phase A and Phase B.
+///   5. fallback — kind value we don't recognize (future kernel
+///      version or value not yet wired up); surface the raw value
+///      so the operator can map it via include/linux/sched/ext.h.
+fn stitch_drop_cause(skeleton: &crate::probe::process::ProbeDiagnostics) -> &'static str {
+    use crate::probe::scx_defs::{EXIT_ERROR, EXIT_ERROR_BPF, EXIT_ERROR_STALL};
+    if skeleton.bpf_trigger_fires == 0 {
+        return "trigger never fired (timing race or scheduler clean-exited; \
+                no error-class sched_ext_exit observed)";
+    }
+    match skeleton.bpf_exit_kind_snap as u64 {
+        EXIT_ERROR_STALL => {
+            "trigger fired with kind=STALL (no causal task; pre-trigger events \
+             suppressed because watchdog-context exit lacks a current task)"
+        }
+        EXIT_ERROR => {
+            "trigger fired with kind=ERROR (no current task at exit time; \
+             pre-trigger events suppressed because generic ERROR can fire \
+             from kworker context where `current` is not the causal task)"
+        }
+        EXIT_ERROR_BPF => {
+            "trigger fired with kind=BPF_ERROR but stitch found no matching \
+             task_ptr (suspected ID mismatch or func_idx_offset bug — file a ticket)"
+        }
+        _ => {
+            "trigger fired but exit kind is unrecognized; pre-trigger events \
+             suppressed because no causal task was identified"
+        }
+    }
+}
+
 /// Format probe pipeline diagnostics into a human-readable summary.
 pub(crate) fn format_probe_diagnostics(
     pipeline: &PipelineDiagnostics,
@@ -955,10 +1132,43 @@ pub(crate) fn format_probe_diagnostics(
     ));
 
     // Stage 9: events + stitching
+    //
+    // When events disappear during stitch (`events_before_stitch > 0`
+    // but `events_after_stitch == 0`), surface a CONCRETE causal
+    // explanation. The previous renderer emitted the bare counter
+    // pair, leaving the operator to guess WHY the events dropped:
+    //   - trigger never fired (no error-class exit, scheduler clean
+    //     exit, or scheduler crashed before the tracepoint fired)
+    //   - trigger fired with kind=STALL → BPF handler returns early
+    //     without submitting a ringbuf event, so target_tptr is None
+    //     and `run_probe_skeleton` suppresses the unstitched chain
+    //   - trigger fired with kind=ERROR (generic) → args[0] = 0
+    //     because exit can fire from kworker context where `current`
+    //     is the worker thread, not the causal task
+    //   - trigger fired with kind=ERROR_BPF but stitch found no
+    //     matching task_ptr → suspected ID mismatch or
+    //     func_idx_offset bug
+    // Each branch reads `bpf_trigger_fires` and `bpf_exit_kind_snap`
+    // from the skeleton diag, already plumbed via the BSS-read site
+    // in `run_probe_skeleton`, so the explanation is grounded in
+    // BPF-side ground truth, not host-side speculation.
     out.push_str(&format!(
-        "  events:      {} captured, {} after stitch\n",
+        "  events:      {} captured, {} after stitch",
         skeleton.events_before_stitch, skeleton.events_after_stitch,
     ));
+    if skeleton.events_before_stitch > 0 && skeleton.events_after_stitch == 0 {
+        let cause = stitch_drop_cause(skeleton);
+        out.push_str(" — ");
+        out.push_str(cause);
+    } else if skeleton.stitch_fallback_used {
+        // Best-effort fallback path: events after stitch is non-zero
+        // but the chain was grouped by task_ptr frequency rather than
+        // matched against a verified trigger task pointer. Mark the
+        // output explicitly so the operator does not mistake the
+        // candidate chain for a verified stitch.
+        out.push_str(" — trigger absent, grouped by task_ptr frequency (best-effort)");
+    }
+    out.push('\n');
 
     // Stage 10: BPF-side counters
     if skeleton.bpf_kprobe_fires > 0
@@ -1382,6 +1592,7 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
 
     let stack_input = extract_probe_stack_arg(args)?;
 
+    let phase_a_start = Instant::now();
     eprintln!("ktstr_test: probe phase_a: loading kernel functions");
     let mut pipe_diag = PipelineDiagnostics::default();
     let raw_functions = load_probe_stack(&stack_input);
@@ -1458,6 +1669,12 @@ pub(crate) fn start_probe_phase_a(args: &[String]) -> Option<ProbePhaseAState> {
 
     // Wait for Phase A probes (kprobes + trigger + kernel fexit) to attach.
     pipeline.probes_ready.wait();
+
+    tracing::info!(
+        elapsed_ms = phase_a_start.elapsed().as_millis() as u64,
+        kernel_functions = kernel_functions.len(),
+        "auto_repro: phase_a_attach",
+    );
 
     eprintln!(
         "ktstr_test: probe phase_a: {} kernel functions attached, waiting for Phase B",
@@ -1546,15 +1763,60 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         pipeline: pa_pipeline,
         kernel_func_names: pa_kernel_func_names,
         kernel_func_count: pa_kernel_func_count,
-        pipe_diag: pa_pipe_diag,
+        pipe_diag: mut pa_pipe_diag,
         param_names: pa_param_names,
         render_hints: pa_render_hints,
     } = pa;
 
     // Phase B: discover BPF symbols from the running scheduler.
+    //
+    // Distinguish the two zero-result modes so the `bpf_discover` line
+    // in the rendered probe pipeline summary explains itself: when
+    // discovery returns zero AND the scheduler is still alive, the
+    // walk genuinely found no struct_ops programs — surface a warn
+    // so the operator notices the unexpected configuration. When the
+    // scheduler exited before discovery (fast crash path), the empty
+    // result is by-design and gets logged at info level so the
+    // operator doesn't chase it as a bug. The pa_pipe_diag value
+    // itself is updated below regardless so the host sees the actual
+    // discovered count rather than the stale Phase A 0.
     eprintln!("ktstr_test: probe phase_b: discovering BPF symbols");
+    let discover_start = Instant::now();
     let stack_display_names: Vec<&str> = Vec::new(); // Discovery uses empty hint list
     let bpf_syms = discover_bpf_symbols(&stack_display_names);
+    if bpf_syms.is_empty() {
+        let sched_alive = crate::vmm::rust_init::sched_pid()
+            .is_some_and(|pid| unsafe { libc::kill(pid, 0) == 0 });
+        if sched_alive {
+            tracing::warn!(
+                "phase_b: bpf_discover returned 0 programs while scheduler is \
+                 still alive — verify ProgInfoIter access permissions or BTF \
+                 (this is the unexpected case; the auto-repro pipeline is now \
+                 attached to no BPF struct_ops callbacks)"
+            );
+        } else {
+            tracing::info!(
+                "phase_b: bpf_discover returned 0 programs — scheduler exited \
+                 before the discovery window (expected for fast-crash paths)"
+            );
+        }
+    }
+    // Update Phase A's pipeline-diag counter with the Phase B
+    // discovery result. Phase A only counts kernel functions; the
+    // BPF discovery is intrinsically a Phase B event but the same
+    // diag struct travels through the host-side renderer, so without
+    // this assignment the rendered `bpf_discover: 0 programs found`
+    // line would understate every successful run. The raw Phase B
+    // discover count (NOT the post-`expand_bpf_to_kernel_callers`
+    // count) goes here because the pipeline-diag invariant is
+    // "discovered struct_ops + auxiliary programs", not "fentry
+    // attach plan".
+    pa_pipe_diag.bpf_discovered = bpf_syms.len() as u32;
+    tracing::info!(
+        elapsed_ms = discover_start.elapsed().as_millis() as u64,
+        bpf_syms = bpf_syms.len(),
+        "auto_repro: phase_b_discover",
+    );
     eprintln!(
         "ktstr_test: probe phase_b: {} BPF symbols discovered",
         bpf_syms.len()
@@ -1565,6 +1827,17 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         // and kernel callers (for additional kprobes) are included in
         // Phase B input.
         let phase_b_functions = expand_bpf_to_kernel_callers(bpf_syms);
+        // Roll the post-expansion total into Phase A's diag. The
+        // `after_expand` counter is the host-side render's sense of
+        // "total probe targets the pipeline planned"; Phase A only
+        // contributed kernel functions (already in
+        // `pa_pipe_diag.total_after_expand`), so add Phase B's
+        // contribution here. Without this, the
+        // `after_expand: N total probe targets` line undercounts by
+        // every Phase B function attached.
+        pa_pipe_diag.total_after_expand = pa_pipe_diag
+            .total_after_expand
+            .saturating_add(phase_b_functions.len() as u32);
 
         // Open BPF program FDs while the scheduler is alive.
         let bpf_fds = crate::probe::process::open_bpf_prog_fds(&phase_b_functions);
@@ -1596,6 +1869,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
         let phase_b_done = std::sync::Arc::new(crate::sync::Latch::new());
         let phase_b_done_clone = phase_b_done.clone();
 
+        let n_phase_b_functions = phase_b_functions.len();
         let phase_b_input = crate::probe::process::PhaseBInput {
             functions: phase_b_functions,
             bpf_prog_fds: bpf_fds,
@@ -1604,11 +1878,17 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
             func_idx_offset: pa_kernel_func_count,
         };
 
+        let attach_start = Instant::now();
         if let Err(e) = pa_phase_b_tx.send(phase_b_input) {
             eprintln!("ktstr_test: probe phase_b: failed to send: {e}");
         } else {
             // Wait for Phase B attachment to complete.
             phase_b_done.wait();
+            tracing::info!(
+                elapsed_ms = attach_start.elapsed().as_millis() as u64,
+                phase_b_functions = n_phase_b_functions,
+                "auto_repro: phase_b_attach",
+            );
             eprintln!("ktstr_test: probe phase_b: BPF fentry attached");
         }
     } else {
@@ -1618,11 +1898,18 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     }
 
     let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
+    // Settle is `Duration::ZERO` to match the single-phase
+    // `maybe_dispatch_vm_test_with_args` path. The Phase A `probes_ready`
+    // latch already synchronises probe attachment with the test start;
+    // a host-side post-cgroup-creation sleep adds no correctness over
+    // the latch, only auto-repro overhead. Tests that need cgroup
+    // settle override `Ctx::settle` themselves; this default keeps
+    // the auto-repro fast path on par with the non-probe path.
     let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
         .duration(entry.duration)
         .workers_per_cgroup(entry.workers_per_cgroup as usize)
         .sched_pid(sched_pid)
-        .settle(std::time::Duration::from_millis(500))
+        .settle(Duration::ZERO)
         .work_type_override(work_type_override)
         .assert(merged_assert)
         .wait_for_map_write(!entry.bpf_map_write.is_empty())
@@ -1697,6 +1984,15 @@ pub(crate) struct ProbeBytesDiagnostics {
 
 /// Serialize probe payload to stdout (COM2) between delimiters.
 /// Resolves BPF source locations from loaded programs before serializing.
+///
+/// Skips the BPF symbol discovery + source-loc resolution walk when
+/// `events` is empty: with no captured events, the source-loc map is
+/// never read by the host renderer, but the walk over every loaded
+/// BPF program (`ProgInfoIter` + per-prog BTF parse + per-prog
+/// `bpf_obj_get_info_by_fd` line_info cross-reference) still pays the
+/// full cost. Skipping when there is nothing to render trims that
+/// overhead from the auto-repro readout path on every clean (no-
+/// trigger) run and on stop-driven empty drains.
 fn emit_probe_payload(
     events: &[crate::probe::process::ProbeEvent],
     func_names: &[(u32, String)],
@@ -1705,18 +2001,27 @@ fn emit_probe_payload(
     param_names: &std::collections::HashMap<String, Vec<(String, String)>>,
     render_hints: &std::collections::HashMap<String, crate::probe::btf::RenderHint>,
 ) {
-    let source_loc_names: Vec<&str> = func_names.iter().map(|(_, name)| name.as_str()).collect();
-    let bpf_syms = crate::probe::btf::discover_bpf_symbols(&source_loc_names);
-    let bpf_prog_ids: Vec<u32> = func_names
-        .iter()
-        .filter_map(|(_, name)| {
-            bpf_syms
-                .iter()
-                .find(|s| s.display_name == *name)
-                .and_then(|s| s.bpf_prog_id)
-        })
-        .collect();
-    let bpf_source_locs = crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids);
+    let bpf_source_locs = if events.is_empty() {
+        // Nothing to render — skip the ProgInfoIter walk + per-prog
+        // line_info resolution. The host-side formatter only reads
+        // `bpf_source_locs` when iterating events, so an empty map is
+        // semantically equivalent here.
+        std::collections::HashMap::new()
+    } else {
+        let source_loc_names: Vec<&str> =
+            func_names.iter().map(|(_, name)| name.as_str()).collect();
+        let bpf_syms = crate::probe::btf::discover_bpf_symbols(&source_loc_names);
+        let bpf_prog_ids: Vec<u32> = func_names
+            .iter()
+            .filter_map(|(_, name)| {
+                bpf_syms
+                    .iter()
+                    .find(|s| s.display_name == *name)
+                    .and_then(|s| s.bpf_prog_id)
+            })
+            .collect();
+        crate::probe::btf::resolve_bpf_source_locs(&bpf_prog_ids)
+    };
 
     let payload = ProbeBytes {
         events: events.to_vec(),
@@ -1737,11 +2042,169 @@ fn emit_probe_payload(
     println!("{PROBE_OUTPUT_END}");
 }
 
-/// Flush profraw, publish the assert result to guest stdout, then stop
-/// and join the probe thread. Called on both success and error paths
-/// at the tail of every dispatch entry point so the host sees the
-/// verdict even when the guest aborts early. Owns the probe-handle
-/// value so callers don't reuse it after publication.
+/// Probe-collection state stashed at the end of dispatch and drained
+/// after the guest's Phase 6 scheduler teardown. Holds the `stop`
+/// signal and probe handle that [`collect_and_print_probe_data`]
+/// consumes; deferring the consumption past `child.kill()` is what
+/// keeps the `tp_btf/sched_ext_exit` listener attached while the
+/// kernel's `scx_claim_exit` path fires the trigger.
+///
+/// Stored in [`DEFERRED_PROBE_COLLECT`]; [`take_deferred_probe`]
+/// drains it.
+struct DeferredProbe {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<ProbeHandle>,
+}
+
+/// SAFETY-relevant invariants:
+/// - Single producer: each VM run executes exactly one dispatch
+///   call (`maybe_dispatch_vm_test_with_args` or
+///   `maybe_dispatch_vm_test_with_phase_a`) which calls
+///   [`stash_deferred_probe`] at most once.
+/// - Single consumer: only `ktstr_guest_init` Phase 6 calls
+///   [`finalize_probe_after_unwind`], which calls
+///   [`take_deferred_probe`].
+/// - Process-local: every guest VM is a fresh process; the static
+///   resets between runs because the process exits.
+///
+/// `Mutex<Option<DeferredProbe>>` is the standard "stash for later
+/// consumer" shape and matches `BPF_MAP_WRITE_DONE_LATCH` /
+/// similar one-shot statics elsewhere in the crate.
+static DEFERRED_PROBE_COLLECT: std::sync::Mutex<Option<DeferredProbe>> =
+    std::sync::Mutex::new(None);
+
+/// Stash the probe stop signal + handle for deferred consumption.
+/// Replaces any prior value (a re-entrant dispatch is not a supported
+/// pattern; the previous stash would belong to a phantom run).
+fn stash_deferred_probe(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<ProbeHandle>,
+) {
+    let mut guard = DEFERRED_PROBE_COLLECT.lock().unwrap();
+    *guard = Some(DeferredProbe { stop, handle });
+}
+
+/// Drain the stashed probe stop+handle, if any. Returns `None` when
+/// no deferred collection was stashed (single-phase ctor path, or no
+/// probes attached). Called from `ktstr_guest_init` Phase 6.
+fn take_deferred_probe() -> Option<DeferredProbe> {
+    DEFERRED_PROBE_COLLECT.lock().unwrap().take()
+}
+
+/// Wait up to `timeout` for `/sys/kernel/sched_ext/state` to read
+/// "disabled". Returns `true` when the transition is observed,
+/// `false` on timeout or when the file is unreadable (kernels
+/// without sched_ext or non-root probes can't read it).
+///
+/// `disabled` means the kernel's `scx_disable_irq_workfn` ran to
+/// completion — which is exactly the path that calls
+/// `scx_claim_exit` and fires `trace_sched_ext_exit`. Polling for
+/// this transition is the most reliable signal that the trigger
+/// tracepoint has fired (or never will, in which case the timeout
+/// is the correct signal).
+///
+/// Polls every 50 ms — short enough to bound the post-test
+/// finalisation latency, long enough that the per-iteration
+/// `read_to_string` doesn't dominate. The poll loop with bounded
+/// timeout is the coordinator-approved pattern for this signal:
+/// sysfs has no eventfd-style notify, and inotify on `state`
+/// would be marginally simpler in code but pull a dependency
+/// for sub-second savings.
+fn wait_for_sched_disabled(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let path = "/sys/kernel/sched_ext/state";
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if s.trim() == "disabled" {
+                return true;
+            }
+        } else {
+            // File unreadable: kernel without sched_ext, or sysfs
+            // restriction. The probe-attach path already ran a
+            // tp_btf/sched_ext_exit attach; if the file doesn't
+            // exist, the tracepoint can't fire either. Treat as
+            // "no-op wait" rather than spinning.
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Finalise probes after the guest's Phase 6 scheduler teardown.
+///
+/// Called from `ktstr_guest_init` AFTER `child.kill()` /
+/// `child.wait()` / `/sched_disable`. By the time the kernel
+/// finishes `scx_disable_irq_workfn` (signalled by
+/// `/sys/kernel/sched_ext/state` transitioning to `disabled`),
+/// the probe's `tp_btf/sched_ext_exit` listener has had its one
+/// guaranteed fire — the trigger event lands in the ring buffer
+/// with a real `target_tptr`, the probe poll loop's BSS latch
+/// check observes `ktstr_err_exit_detected != 0`, and the
+/// readout phase stitches the kprobe events that fired during
+/// the actual stall window.
+///
+/// Returns immediately when no probes were stashed (single-phase
+/// ctor path, EEVDF runs, etc.) — a no-op in that case.
+///
+/// Bounds the wait at 5 s so a non-responding kernel cannot stall
+/// guest teardown indefinitely; on timeout the existing
+/// stop-then-join path runs and the diagnostic surfaces "trigger
+/// never fired" to the host.
+pub(crate) fn finalize_probe_after_unwind() {
+    let Some(deferred) = take_deferred_probe() else {
+        return;
+    };
+    // Skip the kernel-unwind wait when no probe handle is attached.
+    // The wait exists exclusively to give the probe's
+    // tp_btf/sched_ext_exit listener time to observe the trigger;
+    // when there is no listener, the wait is wasted teardown
+    // latency on every test (auto-repro is the only path that
+    // installs a probe handle, and even then only when the primary
+    // failed). The unconditional `collect_and_print_probe_data`
+    // call below early-returns on `handle.is_none()`, so the no-op
+    // path is preserved.
+    if deferred.handle.is_some() {
+        // Wait for the kernel to finish unwinding the scheduler.
+        // The probe poll loop is still running; once
+        // `ktstr_err_exit_detected` flips, the loop drains any
+        // pending ringbuf events and breaks on its own. We wait
+        // first so the subsequent stop signal can't pre-empt the
+        // loop's BSS check.
+        //
+        // No grace sleep after `wait_for_sched_disabled` returns
+        // true: the kernel's `scx_disable_irq_workfn` calls
+        // `scx_claim_exit` (which fires `trace_sched_ext_exit`)
+        // BEFORE `scx_set_enable_state(SCX_DISABLED)`, so a
+        // `state == disabled` observation establishes a
+        // happens-after relationship with the BPF handler's CAS
+        // on `ktstr_err_exit_detected` and the ringbuf-event
+        // commit. The probe poll loop already breaks on
+        // `bss_triggered` without needing `stop` set; setting
+        // `stop` immediately is correct and event-driven.
+        let _ = wait_for_sched_disabled(std::time::Duration::from_secs(5));
+    }
+    collect_and_print_probe_data(deferred.stop, deferred.handle);
+}
+
+/// Flush profraw, publish the assert result to guest stdout, then
+/// either STASH the probe stop+handle for deferred collection (when
+/// running as the guest VM's PID 1, where Phase 6 scheduler
+/// teardown lives) or collect-and-emit immediately (ctor path on
+/// the host, where there is no Phase 6).
+///
+/// The deferred path is what keeps the `tp_btf/sched_ext_exit`
+/// listener attached while the kernel fires the trigger from
+/// `scx_claim_exit` during scheduler unwind — without it, the probe
+/// is detached before `child.kill()` runs and the stall-class
+/// trigger fires into a void (146 captured kprobe events, 0
+/// trigger fires, 0 after stitch).
+///
+/// The deferred collection runs from
+/// [`finalize_probe_after_unwind`] in `ktstr_guest_init` Phase 6
+/// after `child.wait()` + `/sched_disable`.
 fn publish_result_and_collect(
     result: &AssertResult,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1749,7 +2212,11 @@ fn publish_result_and_collect(
 ) {
     try_flush_profraw();
     print_assert_result(result);
-    collect_and_print_probe_data(stop, handle);
+    if crate::vmm::guest_comms::is_guest() {
+        stash_deferred_probe(stop, handle);
+    } else {
+        collect_and_print_probe_data(stop, handle);
+    }
 }
 
 /// Stop probes, join the probe thread. The probe thread emits output
@@ -3057,5 +3524,529 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(tmp.path(), "not json").expect("write tempfile");
         assert!(render_failure_dump_file(tmp.path()).is_none());
+    }
+
+    // -- stitch_drop_cause / format_probe_diagnostics events line --
+    //
+    // The user's symptom report from the lavd run was:
+    //   bpf_discover: 0 programs found
+    //   trigger:      not fired (tp_btf)
+    //   probe_data:   146 keys, 0 unmatched IPs
+    //   events:       146 captured, 0 after stitch
+    //   bpf_counts:   16567 kprobe fires, 0 trigger fires, 0 meta misses
+    //
+    // The renderer used to silently emit `events: 146 captured, 0
+    // after stitch` and stop. Operators had no way to disambiguate
+    // "trigger never fired" (lifecycle race) from "trigger fired
+    // with kind=STALL" (suppressed by the BPF handler) from "trigger
+    // fired with kind=BPF_ERROR but stitch found no match" (a real
+    // bug). These tests pin every branch of the new
+    // `stitch_drop_cause` ladder against synthetic
+    // `ProbeDiagnostics` fixtures so a future change to the BPF
+    // exit-kind values, the stitch logic, or the renderer surfaces
+    // here at compile time, not as a missing diagnostic in
+    // production.
+
+    fn diag_with_events(
+        before: u32,
+        after: u32,
+        trigger_fires: u64,
+        exit_kind: u32,
+    ) -> crate::probe::process::ProbeDiagnostics {
+        crate::probe::process::ProbeDiagnostics {
+            events_before_stitch: before,
+            events_after_stitch: after,
+            bpf_trigger_fires: trigger_fires,
+            bpf_exit_kind_snap: exit_kind,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stitch_drop_cause_trigger_never_fired() {
+        // bpf_trigger_fires == 0 → the tp_btf handler never executed.
+        // Either the scheduler clean-exited (kind < SCX_EXIT_ERROR
+        // hits the early-return at probe.bpf.c:565) or the scheduler
+        // crashed before reaching the tracepoint at all. The cause
+        // string MUST mention "trigger never fired" so an operator
+        // grepping the section can land on the lifecycle bug rather
+        // than chasing a stitch failure.
+        let diag = diag_with_events(146, 0, 0, 0);
+        let cause = stitch_drop_cause(&diag);
+        assert!(
+            cause.contains("trigger never fired"),
+            "expected 'trigger never fired' branch, got: {cause}"
+        );
+    }
+
+    #[test]
+    fn stitch_drop_cause_kind_stall() {
+        // bpf_trigger_fires > 0 AND exit_kind_snap == ERROR_STALL →
+        // probe.bpf.c:699 explicit early-return for STALL. Tracepoint
+        // fired (counter incremented) but no ringbuf event submitted,
+        // so target_tptr is None at the host. The cause string MUST
+        // mention "kind=STALL" so the operator knows the watchdog
+        // path was the cause rather than a stitch bug.
+        use crate::probe::scx_defs::EXIT_ERROR_STALL;
+        let diag = diag_with_events(146, 0, 1, EXIT_ERROR_STALL as u32);
+        let cause = stitch_drop_cause(&diag);
+        assert!(
+            cause.contains("kind=STALL"),
+            "expected 'kind=STALL' branch, got: {cause}"
+        );
+    }
+
+    #[test]
+    fn stitch_drop_cause_kind_error_generic() {
+        // bpf_trigger_fires > 0 AND exit_kind_snap == ERROR (1024) →
+        // generic ERROR exit can fire from kworker context where
+        // `current` is the worker thread, not the causal task. The
+        // BPF handler sets args[0] = 0 (probe.bpf.c:731 ternary) so
+        // target_tptr is None at the host. The cause string MUST
+        // mention "kind=ERROR" without the BPF or STALL qualifier.
+        use crate::probe::scx_defs::EXIT_ERROR;
+        let diag = diag_with_events(146, 0, 1, EXIT_ERROR as u32);
+        let cause = stitch_drop_cause(&diag);
+        assert!(
+            cause.contains("kind=ERROR"),
+            "expected 'kind=ERROR' branch, got: {cause}"
+        );
+        // Negative assertion: must NOT match the STALL or BPF_ERROR
+        // branches just because the substring "kind=" appears.
+        assert!(
+            !cause.contains("kind=STALL"),
+            "kind=ERROR branch must not say STALL: {cause}"
+        );
+        assert!(
+            !cause.contains("kind=BPF_ERROR"),
+            "kind=ERROR branch must not say BPF_ERROR: {cause}"
+        );
+    }
+
+    #[test]
+    fn stitch_drop_cause_kind_bpf_error() {
+        // bpf_trigger_fires > 0 AND exit_kind_snap == ERROR_BPF →
+        // BPF callback faulted in a real task's context, args[0]
+        // resolved to bpf_get_current_task(). If we still have
+        // events_after_stitch == 0, something is wrong with the
+        // stitch logic itself (func_idx_offset bug, ID mismatch).
+        // The cause string MUST flag this as a suspected bug
+        // ("file a ticket") so the operator escalates rather than
+        // chasing a misconfigured probe.
+        use crate::probe::scx_defs::EXIT_ERROR_BPF;
+        let diag = diag_with_events(146, 0, 1, EXIT_ERROR_BPF as u32);
+        let cause = stitch_drop_cause(&diag);
+        assert!(
+            cause.contains("kind=BPF_ERROR"),
+            "expected 'kind=BPF_ERROR' branch, got: {cause}"
+        );
+        assert!(
+            cause.contains("file a ticket") || cause.contains("ID mismatch"),
+            "kind=BPF_ERROR branch must signal a suspected bug: {cause}"
+        );
+    }
+
+    #[test]
+    fn stitch_drop_cause_unrecognized_kind() {
+        // bpf_trigger_fires > 0 AND exit_kind_snap == an unknown
+        // value (e.g. a future kernel version, or a value not yet
+        // wired into scx_defs.rs). The cause string falls through
+        // to a generic "unrecognized" branch so future kernels
+        // don't silently render with no diagnostic.
+        let diag = diag_with_events(146, 0, 1, 9999);
+        let cause = stitch_drop_cause(&diag);
+        assert!(
+            cause.contains("unrecognized") || cause.contains("no causal"),
+            "unrecognized-kind branch must surface a diagnostic, got: {cause}"
+        );
+    }
+
+    #[test]
+    fn format_probe_diagnostics_appends_cause_when_zero_after_stitch() {
+        // End-to-end: the rendered probe pipeline summary must
+        // include the cause explanation on the events line, not
+        // just emit the bare counter pair. Reproduces the user's
+        // lavd report shape: 146 captured, 0 after stitch, 0
+        // trigger fires.
+        let pipeline = PipelineDiagnostics::default();
+        let skeleton = diag_with_events(146, 0, 0, 0);
+        let rendered = format_probe_diagnostics(&pipeline, &skeleton);
+        assert!(
+            rendered.contains("146 captured, 0 after stitch"),
+            "rendered output missing counter pair: {rendered}"
+        );
+        assert!(
+            rendered.contains("trigger never fired"),
+            "rendered output missing cause explanation: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_probe_diagnostics_appends_kind_stall_diagnostic() {
+        // Renderer must surface STALL as a distinct diagnostic so
+        // the operator can immediately distinguish the watchdog
+        // path from a generic timing race.
+        use crate::probe::scx_defs::EXIT_ERROR_STALL;
+        let pipeline = PipelineDiagnostics::default();
+        let skeleton = diag_with_events(146, 0, 1, EXIT_ERROR_STALL as u32);
+        let rendered = format_probe_diagnostics(&pipeline, &skeleton);
+        assert!(
+            rendered.contains("kind=STALL"),
+            "rendered output missing kind=STALL diagnostic: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_probe_diagnostics_no_cause_when_clean_run() {
+        // Sanity check: when events_before_stitch == 0 (clean run,
+        // no probe data captured), the cause-explanation logic
+        // MUST NOT fire. The bare counter pair is the correct
+        // output for a no-op run.
+        let pipeline = PipelineDiagnostics::default();
+        let skeleton = diag_with_events(0, 0, 0, 0);
+        let rendered = format_probe_diagnostics(&pipeline, &skeleton);
+        assert!(
+            rendered.contains("0 captured, 0 after stitch"),
+            "missing zero-zero counter line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("trigger never fired"),
+            "must not append cause for clean run: {rendered}"
+        );
+        assert!(
+            !rendered.contains("kind=STALL"),
+            "must not append cause for clean run: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_probe_diagnostics_no_cause_when_stitch_succeeded() {
+        // Successful stitch: events_before == events_after > 0.
+        // The cause line MUST NOT fire — the events line is its own
+        // sufficient summary.
+        let pipeline = PipelineDiagnostics::default();
+        let skeleton = diag_with_events(146, 100, 1, 1025);
+        let rendered = format_probe_diagnostics(&pipeline, &skeleton);
+        assert!(
+            rendered.contains("146 captured, 100 after stitch"),
+            "missing counter line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("trigger never fired"),
+            "must not append cause when stitch succeeded: {rendered}"
+        );
+        assert!(
+            !rendered.contains("kind=STALL"),
+            "must not append cause when stitch succeeded: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_probe_diagnostics_appends_fallback_marker() {
+        // When `stitch_fallback_used` is set and the counter is
+        // non-zero, the renderer must mark the chain as best-effort
+        // grouping so the operator does not mistake it for a verified
+        // stitch. This protects the user-direction "no invalid data
+        // made" — the candidate chain is real probe data, but the
+        // labelling has to make clear it is grouped by frequency,
+        // not anchored to a verified trigger task pointer.
+        let pipeline = PipelineDiagnostics::default();
+        let skeleton = crate::probe::process::ProbeDiagnostics {
+            events_before_stitch: 146,
+            events_after_stitch: 80,
+            stitch_fallback_used: true,
+            bpf_trigger_fires: 0,
+            bpf_exit_kind_snap: 0,
+            ..Default::default()
+        };
+        let rendered = format_probe_diagnostics(&pipeline, &skeleton);
+        assert!(
+            rendered.contains("trigger absent") && rendered.contains("frequency"),
+            "fallback marker missing from rendered output: {rendered}"
+        );
+    }
+
+    // -- classify_dmesg_corruption --
+    //
+    // The user's lavd report showed `dmesg: � (single 0xff byte)`.
+    // The renderer was emitting that opaque garbage as if it were a
+    // real kernel console excerpt. These tests pin the corruption
+    // classifier so empty / all-0xff / all-replacement-character
+    // inputs become operator-readable diagnostics, not garbage tail
+    // blocks.
+
+    #[test]
+    fn classify_dmesg_corruption_empty_text() {
+        let diag = classify_dmesg_corruption("");
+        assert!(diag.is_some());
+        assert!(diag.unwrap().contains("empty"));
+    }
+
+    #[test]
+    fn classify_dmesg_corruption_only_whitespace() {
+        // Whitespace-only stderr is the same operator outcome as
+        // empty (kernel never wrote anything readable).
+        let diag = classify_dmesg_corruption("   \n\n\t  \n");
+        assert!(diag.is_some());
+        assert!(diag.unwrap().contains("empty"));
+    }
+
+    #[test]
+    fn classify_dmesg_corruption_only_replacement_chars() {
+        // A stream of U+FFFD characters is what the host's lossy
+        // UTF-8 decoder emits for a UART buffer full of 0xff
+        // bytes. The diagnostic must say "corrupt" not "empty"
+        // so the operator knows the kernel TRIED to fill the
+        // buffer but the bytes were uninitialised.
+        let diag = classify_dmesg_corruption("\u{fffd}\u{fffd}\u{fffd}");
+        assert!(diag.is_some());
+        assert!(diag.unwrap().contains("corrupt"));
+    }
+
+    #[test]
+    fn classify_dmesg_corruption_only_raw_0xff() {
+        // Raw 0xFF bytes (i.e. char value U+00FF, which is what
+        // a literal 0xff in a String would decode to before lossy
+        // conversion) also signal an uninitialised UART buffer.
+        let diag = classify_dmesg_corruption("\u{ff}\u{ff}\u{ff}");
+        assert!(diag.is_some());
+        assert!(diag.unwrap().contains("corrupt"));
+    }
+
+    #[test]
+    fn classify_dmesg_corruption_real_kernel_text_passes_through() {
+        // A real kernel printk excerpt MUST NOT be classified as
+        // corrupt. The classifier returns None and the caller falls
+        // through to format_tail.
+        let diag = classify_dmesg_corruption("[    0.000000] Linux version 6.16.0\n");
+        assert!(
+            diag.is_none(),
+            "real kernel text must not be classified as corrupt: {diag:?}"
+        );
+    }
+
+    #[test]
+    fn classify_dmesg_corruption_mixed_garbage_and_text_passes_through() {
+        // Even one ordinary byte amidst 0xff noise means there's
+        // SOMETHING for the operator to read. Don't suppress it.
+        let diag = classify_dmesg_corruption("\u{fffd}A\u{fffd}");
+        assert!(diag.is_none());
+    }
+
+    // -- end-to-end: extract_probe_output carries the new diagnostics --
+    //
+    // These tests are the host-only equivalent of the brief's "E2E:
+    // synthetic ProbeBytes" requirement. They construct a full
+    // ProbeBytes payload that mirrors what a guest VM emits over
+    // COM2 between the PROBE_OUTPUT_START / _END sentinels, then
+    // assert the host-side extract_probe_output reproduces the
+    // diagnostic line through the normal parse → format pipeline
+    // (no shortcuts into format_probe_diagnostics directly). A
+    // regression that breaks the end-to-end wiring (e.g.
+    // ProbeBytesDiagnostics serde drift, format_probe_diagnostics
+    // getting bypassed in extract_probe_output) shows up here, not
+    // only in the unit-level helper tests.
+
+    #[test]
+    fn extract_probe_output_emits_kind_stall_diagnostic_end_to_end() {
+        // Symptom that motivated the fix: `events: 146 captured, 0
+        // after stitch` with `bpf_trigger_fires: 1` and
+        // `bpf_exit_kind_snap: SCX_EXIT_ERROR_STALL`. Wire up the
+        // payload as the guest would emit it; the host renderer
+        // MUST surface "kind=STALL" in the diagnostics block.
+        use crate::probe::process::ProbeDiagnostics;
+        use crate::probe::scx_defs::EXIT_ERROR_STALL;
+        let skeleton = ProbeDiagnostics {
+            events_before_stitch: 146,
+            events_after_stitch: 0,
+            bpf_trigger_fires: 1,
+            bpf_exit_kind_snap: EXIT_ERROR_STALL as u32,
+            ..Default::default()
+        };
+        let payload = ProbeBytes {
+            events: Vec::new(),
+            func_names: Vec::new(),
+            bpf_source_locs: Default::default(),
+            diagnostics: Some(ProbeBytesDiagnostics {
+                pipeline: PipelineDiagnostics::default(),
+                skeleton,
+            }),
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let output = format!("noise\n{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}\n");
+        let formatted = extract_probe_output(&output, None, None)
+            .expect("ProbeBytes with diagnostics must produce some output");
+        assert!(
+            formatted.contains("--- probe pipeline ---"),
+            "missing pipeline header: {formatted}"
+        );
+        assert!(
+            formatted.contains("146 captured, 0 after stitch"),
+            "missing events counter line: {formatted}"
+        );
+        assert!(
+            formatted.contains("kind=STALL"),
+            "missing kind=STALL diagnostic in end-to-end output: {formatted}"
+        );
+    }
+
+    #[test]
+    fn extract_probe_output_emits_trigger_never_fired_end_to_end() {
+        // Lifecycle race symptom: `bpf_trigger_fires: 0`. The host
+        // renderer MUST say "trigger never fired" in the diagnostics
+        // block so the operator chases the lifecycle bug rather than
+        // a stitch failure.
+        use crate::probe::process::ProbeDiagnostics;
+        let skeleton = ProbeDiagnostics {
+            events_before_stitch: 146,
+            events_after_stitch: 0,
+            bpf_trigger_fires: 0,
+            bpf_exit_kind_snap: 0,
+            bpf_kprobe_fires: 16567,
+            bpf_meta_misses: 0,
+            ..Default::default()
+        };
+        let payload = ProbeBytes {
+            events: Vec::new(),
+            func_names: Vec::new(),
+            bpf_source_locs: Default::default(),
+            diagnostics: Some(ProbeBytesDiagnostics {
+                pipeline: PipelineDiagnostics::default(),
+                skeleton,
+            }),
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");
+        let formatted = extract_probe_output(&output, None, None)
+            .expect("ProbeBytes with diagnostics must produce some output");
+        assert!(
+            formatted.contains("trigger never fired"),
+            "missing 'trigger never fired' diagnostic: {formatted}"
+        );
+        assert!(
+            formatted.contains("16567 kprobe fires"),
+            "missing bpf_counts line: {formatted}"
+        );
+    }
+
+    #[test]
+    fn extract_probe_output_emits_fallback_marker_end_to_end() {
+        // When the lifecycle race still loses (e.g. kernel doesn't
+        // call scx_claim_exit at all in some edge case), the
+        // best-effort fallback must produce events with the
+        // grouped-by-frequency marker — NOT a silent empty section.
+        use crate::probe::process::{ProbeDiagnostics, ProbeEvent};
+        let skeleton = ProbeDiagnostics {
+            events_before_stitch: 146,
+            events_after_stitch: 80,
+            stitch_fallback_used: true,
+            bpf_trigger_fires: 0,
+            ..Default::default()
+        };
+        // One synthetic event so the formatter actually emits an
+        // events block — pin both the diagnostic AND the events
+        // line being present together.
+        let payload = ProbeBytes {
+            events: vec![ProbeEvent {
+                func_idx: 0,
+                task_ptr: 0xa,
+                ts: 100,
+                args: [0; 6],
+                fields: Vec::new(),
+                kstack: Vec::new(),
+                str_val: None,
+                ..Default::default()
+            }],
+            func_names: vec![(0, "schedule".to_string())],
+            bpf_source_locs: Default::default(),
+            diagnostics: Some(ProbeBytesDiagnostics {
+                pipeline: PipelineDiagnostics::default(),
+                skeleton,
+            }),
+            nr_cpus: None,
+            param_names: Default::default(),
+            render_hints: Default::default(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let output = format!("{PROBE_OUTPUT_START}\n{json}\n{PROBE_OUTPUT_END}");
+        let formatted = extract_probe_output(&output, None, None)
+            .expect("ProbeBytes with events must produce output");
+        assert!(
+            formatted.contains("trigger absent") && formatted.contains("frequency"),
+            "fallback marker missing from end-to-end output: {formatted}"
+        );
+    }
+
+    // -- deferred probe stash / take --
+    //
+    // The lifecycle fix adds a process-wide stash for the probe
+    // stop+handle so the rust_init Phase 6 finaliser can drain it
+    // after `child.kill()`. Pin the stash/take API behaviour so a
+    // future refactor doesn't accidentally reintroduce the
+    // immediate-detach path that was the original bug.
+    //
+    // The mutex guarding the stash is process-wide and the tests
+    // run in parallel within one process, so all stash/take
+    // exercises live in a single test that holds an internal
+    // serialisation mutex for the duration of every assertion.
+    // This keeps the stash invariants pinned without creating
+    // cross-test interference.
+
+    #[test]
+    fn deferred_probe_stash_take_invariants() {
+        // Process-wide guard: every assertion below executes under
+        // this lock so concurrent unit tests can't poison the
+        // stash. The lock is a fresh per-test static; the lock
+        // ITSELF is shared across invocations of this test (only
+        // one path actually runs the test, so this is moot in
+        // practice, but the lock ensures the order is well
+        // defined even if a future test refactor introduces
+        // parallel callers).
+        static SERIALISE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = SERIALISE.lock().unwrap();
+
+        // Drain any prior state (paranoid; a prior test on the
+        // same process should have cleared, but a re-entrant
+        // future test could leave a stash behind).
+        let _ = take_deferred_probe();
+
+        // 1) Empty stash → take returns None.
+        assert!(take_deferred_probe().is_none(), "empty stash must yield None");
+
+        // 2) Single stash → take round-trips and drains.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        stash_deferred_probe(stop.clone(), None);
+        let taken = take_deferred_probe().expect("stash must round-trip");
+        assert!(
+            !taken.stop.load(std::sync::atomic::Ordering::Relaxed),
+            "stop flag must round-trip with original value"
+        );
+        assert!(taken.handle.is_none(), "handle round-trip preserved None");
+        assert!(
+            take_deferred_probe().is_none(),
+            "drained: subsequent take must return None"
+        );
+
+        // 3) Re-entrant stash → second value wins (single-shot
+        // semantics: a stale prior value would belong to a
+        // phantom run).
+        let stop_a = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_b = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        stash_deferred_probe(stop_a, None);
+        stash_deferred_probe(stop_b, None);
+        let taken = take_deferred_probe().expect("stash present");
+        assert!(
+            taken.stop.load(std::sync::atomic::Ordering::Relaxed),
+            "second stash must win — got stop_a value instead of stop_b"
+        );
+
+        // Final drain so a subsequent test (if any) starts clean.
+        let _ = take_deferred_probe();
     }
 }

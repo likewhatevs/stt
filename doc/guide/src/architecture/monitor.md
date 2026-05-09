@@ -263,34 +263,85 @@ its output:
    from `bpf_func_info` reseeds R1..R5 from the BTF FuncProto so
    typed parameters propagate correctly across subprogram joins.
 4. The result is a `CastMap` (`BTreeMap<(source_struct_btf_id,
-   field_byte_offset), CastHit>`) attached to the live
-   `MonitorState` and consulted by the renderer at every dump
-   site.
+   field_byte_offset), CastHit>`) cached on the per-VM
+   `KtstrVm.cast_map` (a `LazyCastMap` that runs the analyzer on
+   first dump and caches the result process-wide by scheduler
+   binary content hash). The freeze coordinator threads the cached
+   `CastMap` through `DumpContext::cast_map` into every per-map
+   render so the renderer can consult it at every dump site.
 5. `render_cast_pointer` in `monitor::btf_render` consumes
    `CastHit` via `MemReader::cast_lookup`. When a `u64` field at a
    recorded `(struct, offset)` is rendered, the renderer chases
    the pointer through the address-space-appropriate reader (arena
    vs slab/vmalloc) and tags the result with a `cast_annotation`
-   of `"cast→arena"` or `"cast→kernel"`. Failure dumps show the
-   annotation alongside the resolved struct fields, so cast-
-   recovered pointers are visually distinct from BTF-typed ones.
+   of `"cast→arena"` or `"cast→kernel"` (plus a `(sdt_alloc)`
+   suffix when the bridge described below fired). Failure dumps
+   show the annotation alongside the resolved struct fields, so
+   cast-recovered pointers are visually distinct from BTF-typed
+   ones.
 
 The renderer also consults an `sdt_alloc` bridge whenever a chase
 target peels to a `BTF_KIND_FWD` forward declaration (typical for
 `struct sdt_data __arena *` fields whose body lives in the
 sdt_alloc library's BTF rather than the scheduler's program BTF).
 The dump-state pre-pass walks each live `scx_allocator` and
-populates a `payload_start_low32 → payload_btf_type_id` index that
+populates a `slot_start → ArenaSlotInfo` index — one entry
+per live allocator slot, carrying `elem_size`, `header_size`, and
+the resolved payload BTF type id — that
 `MemReader::resolve_arena_type` (in
-`dump::render_map::AccessorMemReader`) consults during the
-chase. On a hit, the renderer recovers the real payload struct id
-and renders the chased subtree against it; the resulting `Ptr`
-carries a `sdt_alloc`-flavoured annotation: `"sdt_alloc"` on the
-BTF-typed `Type::Ptr` arm, and `"cast→arena (sdt_alloc)"` /
-`"cast→kernel (sdt_alloc)"` on the cast-analyzer-driven path.
-The bridge fires only when the BTF-only resolve has already
-exhausted same-name siblings — false-positive risk is bounded by
-the same arena-window check the analyzer's arena arm uses.
+`dump::render_map::AccessorMemReader`) range-looks up during the
+chase. The lookup finds the slot whose
+`[slot_start, slot_start + elem_size)` range contains the chased
+address and routes by `offset_in_slot`: a slot-start chase
+(`offset == 0`, e.g. the `data` field of `scx_task_map_val`
+storing the raw `sdt_alloc()` return) returns the payload type id
+with `header_skip = header_size`; a payload-start chase
+(`offset == header_size`, e.g. the return of `scx_task_data(p)`
+cached in `cached_taskc_raw`) returns the same payload type id
+with `header_skip = 0`. The renderer reads `header_skip + btf_size`
+bytes from the chased address, slices off the leading
+`header_skip` bytes, and renders the payload struct. The
+resulting `Ptr` carries a `sdt_alloc`-flavoured annotation:
+`"sdt_alloc"` on the BTF-typed `Type::Ptr` arm, and
+`"cast→arena (sdt_alloc)"` / `"cast→kernel (sdt_alloc)"` on the
+cast-analyzer-driven path. The `sdt_alloc` bridge fires only when
+the BTF-only resolve has already exhausted same-name siblings;
+false-positive risk on that arm is bounded by the arena-window
+range check (`MemReader::resolve_arena_type` returns `None` for
+addresses outside every known allocator slot).
+
+A separate cross-BTF Fwd resolution path covers the case where a
+`BTF_KIND_FWD` pointee's body lives in a sibling embedded BPF
+object's BTF rather than an `sdt_alloc` slot — the typical
+multi-`.bpf.objs` shape where one object declares
+`struct cgx_target;` (forward) and a sibling object defines
+`struct cgx_target { ... }` (full body). The cast-analysis
+pre-pass (`vmm::cast_analysis_load::build_fwd_index`) walks every
+parsed embedded program BTF and records a
+`name -> (btfs index, type_id)` entry for every complete
+(`!is_fwd`) `Type::Struct` / `Type::Union`. First-write-wins on
+duplicate names: when the same name appears in multiple BTFs the
+index keeps the first-seen entry. Anonymous types and `Typedef`
+are not indexed (no name to key on, and typedefs add no body —
+the chase peels through them via `peel_modifiers_with_id` before
+consulting the index). The index is threaded through
+`DumpContext::cross_btf` and exposed to the renderer via
+`MemReader::cross_btf_resolve_fwd`. When `chase_arena_pointer` /
+`render_cast_pointer` peel a chase target through
+`peel_modifiers_resolving_fwd` and the local same-BTF sibling
+search came up empty, `try_cross_btf_fwd_resolve` consults the
+cross-BTF index by the Fwd's name (and aggregate kind — `struct`
+vs `union`); a hit returns a `CrossBtfRef { btf, type_id }` and
+the chase recursion switches to the resolved sibling BTF for the
+pointee render. Cross-BTF resolution does NOT introduce a new
+annotation — the body is recovered transparently and the rendered
+subtree carries the cast or BTF-typed annotation it would have
+had if the same struct lived in the entry BTF. Unlike the
+`sdt_alloc` bridge the cross-BTF index is consulted whenever a
+Fwd terminal survives the local resolve — there is no
+arena-window gate, since the lookup is purely a name-keyed BTF
+table and a name miss simply leaves the chase on its existing
+"forward declaration; body not in this BTF" skip path.
 
 The analyzer is deliberately conservative: branch joins reset
 register and stack state, conflicts drop the offending entry, and

@@ -162,6 +162,27 @@ pub struct ProbeDiagnostics {
     /// ktstr_last_trigger_ts). 0 when no error-class exit fired.
     #[serde(default)]
     pub bpf_first_trigger_ns: u64,
+    /// `kind` argument captured by the BPF trigger handler on the
+    /// first error-class `sched_ext_exit` (from BSS
+    /// `ktstr_exit_kind_snap`). 0 when no error-class exit fired,
+    /// otherwise one of the [`SCX_EXIT_*`](super::scx_defs) values.
+    /// Used by the host renderer to disambiguate "trigger fired with
+    /// kind=STALL/ERROR (no causal task; events suppressed)" from
+    /// "trigger never fired" when the post-stitch event count is 0.
+    #[serde(default)]
+    pub bpf_exit_kind_snap: u32,
+    /// `true` when the readout phase reached the no-causal-tptr
+    /// branch and emitted events grouped by frequency rather than
+    /// stitched against a real trigger task pointer. Set in
+    /// [`run_probe_skeleton`] when the trigger fired with
+    /// `args[0] == 0` (kind=STALL or generic ERROR) or never fired
+    /// at all but at least one captured kprobe event had a non-zero
+    /// task pointer. Surfaced by the host renderer as
+    /// `events: ... — trigger absent, grouped by frequency` so the
+    /// operator does not misread the candidate chain as a verified
+    /// stitch.
+    #[serde(default)]
+    pub stitch_fallback_used: bool,
     /// Cumulative count of `tp_btf/sched_switch +
     /// sched_migrate_task + sched_wakeup` records committed into
     /// the dedicated `timeline_events` ringbuf by the timeline
@@ -538,6 +559,118 @@ pub fn open_bpf_prog_fds(functions: &[StackFunction]) -> std::collections::HashM
     fds
 }
 
+/// `&ProgramMut<'_>` newtype that asserts thread-shared access is
+/// safe for [`libbpf_rs::ProgramMut::attach_kprobe`].
+///
+/// `ProgramMut` holds a `NonNull<bpf_program>` which keeps it
+/// `!Sync` at the Rust type-system level. Concurrent attach is
+/// nonetheless sound:
+/// - `bpf_program__attach_kprobe_opts` (the libbpf C path
+///   `attach_kprobe` calls) takes `const struct bpf_program *prog` —
+///   it does not mutate the program through that pointer.
+/// - Each attach call creates an independent `perf_event_open` fd
+///   plus an independent `BPF_LINK_CREATE` syscall; those resources
+///   are not shared with the program object.
+/// - The only program-adjacent state the path touches is the global
+///   feature-detection cache via `kernel_supports` →
+///   `feat_supported`, which uses `READ_ONCE` / `WRITE_ONCE` and is
+///   idempotent across racing readers (see
+///   `libbpf-sys/libbpf/src/features.c::feat_supported`).
+/// All threads call only `attach_kprobe` on the inner reference; no
+/// mutating method is invoked here.
+///
+/// `Send` is paired with `Sync` because `std::thread::scope` requires
+/// the captured reference's referent to be `Sync` for `&_` to be
+/// `Send`.
+struct AttachableProgRef<'a, 'obj> {
+    inner: &'a libbpf_rs::ProgramMut<'obj>,
+}
+// SAFETY: see the type-level doc.
+unsafe impl Send for AttachableProgRef<'_, '_> {}
+// SAFETY: see the type-level doc.
+unsafe impl Sync for AttachableProgRef<'_, '_> {}
+
+/// Attach `prog` as a kprobe to every name in `func_names`,
+/// parallelising across worker threads.
+///
+/// Each attach is an independent `perf_event_open` + `BPF_LINK_CREATE`
+/// syscall pair. Sequentialised, the per-attach syscall round-trip
+/// dominates the auto-repro setup phase when the crash backtrace
+/// names many kernel functions. Spawning a small worker pool lets
+/// the kernel run the attaches concurrently and shrinks the total
+/// wall-clock cost of the loop to roughly `total / parallelism`
+/// (bounded by kernel-side serialisation inside `perf_event_open` for
+/// kprobe registration).
+///
+/// Worker count is `min(func_names.len(), 8)` — a fixed cap that
+/// matches the typical small ktstr backtrace width while avoiding
+/// thread-spawn overhead when there are only a handful of probes.
+/// Returns one `(name, Result<Link, libbpf_rs::Error>)` entry per
+/// input in input order, so the caller can populate
+/// [`ProbeDiagnostics::kprobe_attach_failed`] / `links` with the
+/// same shape as the prior sequential loop.
+fn parallel_attach_kprobes<'a, 'obj>(
+    prog: &'a libbpf_rs::ProgramMut<'obj>,
+    func_names: &[String],
+) -> Vec<(String, libbpf_rs::Result<libbpf_rs::Link>)> {
+    if func_names.is_empty() {
+        return Vec::new();
+    }
+
+    let prog_ref = AttachableProgRef { inner: prog };
+    // `min(N, 8)` balances syscall parallelism against thread-spawn
+    // overhead. Empirically the kernel kprobe registration path
+    // serialises on `kprobe_mutex` so going wider yields diminishing
+    // returns; the cap keeps us comfortably under that wall.
+    const MAX_WORKERS: usize = 8;
+    let workers = func_names.len().min(MAX_WORKERS);
+
+    // Slot the function names into round-robin per-worker buckets
+    // so each thread owns a disjoint subset. Index-tagged so the
+    // output preserves input order regardless of which worker
+    // finishes first.
+    let mut buckets: Vec<Vec<(usize, String)>> = (0..workers).map(|_| Vec::new()).collect();
+    for (i, name) in func_names.iter().enumerate() {
+        buckets[i % workers].push((i, name.clone()));
+    }
+
+    let mut results: Vec<Option<(String, libbpf_rs::Result<libbpf_rs::Link>)>> =
+        (0..func_names.len()).map(|_| None).collect();
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for bucket in buckets {
+            if bucket.is_empty() {
+                continue;
+            }
+            let prog_ref = &prog_ref;
+            handles.push(s.spawn(move || {
+                let mut out: Vec<(usize, String, libbpf_rs::Result<libbpf_rs::Link>)> =
+                    Vec::with_capacity(bucket.len());
+                for (i, name) in bucket {
+                    let r = prog_ref.inner.attach_kprobe(false, &name);
+                    out.push((i, name, r));
+                }
+                out
+            }));
+        }
+        for h in handles {
+            // Worker panics propagate as the join Err — re-panic on
+            // the main thread to surface bugs rather than silently
+            // dropping attach results.
+            let out = h.join().expect("kprobe attach worker panicked");
+            for (i, name, r) in out {
+                results[i] = Some((name, r));
+            }
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|o| o.expect("every input slot must be filled by exactly one worker"))
+        .collect()
+}
+
 /// Attach the fentry program in slot 0..=3 on the fentry skeleton.
 ///
 /// The fentry skeleton exposes four indexed programs
@@ -810,19 +943,12 @@ pub fn run_probe_skeleton(
     // `None` (load failure) leaves `cached_btf` empty and downstream
     // call sites fall back to the no-BTF path — same behaviour as
     // the previous per-call `Err(...) -> Vec::new()` branch.
-    let cached_btf = crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(
-        "/sys/kernel/btf/vmlinux",
-    ))
-    .map_err(|e| {
-        tracing::warn!(
-            %e,
-            "process: failed to pre-load /sys/kernel/btf/vmlinux for \
-             kprobe meta population — field specs will be empty for \
-             this batch"
-        );
-        e
-    })
-    .ok();
+    //
+    // `cached_vmlinux_btf` memoises the first successful parse
+    // process-wide so repeated auto-repro cycles in the same nextest
+    // process share one `Arc<Btf>` instead of re-reading and
+    // re-parsing the multi-MB blob each time.
+    let cached_btf = crate::monitor::btf_offsets::cached_vmlinux_btf();
 
     for (idx, func) in functions.iter().enumerate() {
         if func.is_bpf {
@@ -890,16 +1016,27 @@ pub fn run_probe_skeleton(
     // Attach kprobes to each function for entry capture. Exit capture
     // for kernel functions uses fexit via the fentry skeleton (batched
     // separately below with fd=0 for vmlinux BTF).
+    //
+    // Parallelised via [`parallel_attach_kprobes`]: each attach is an
+    // independent `perf_event_open` + `BPF_LINK_CREATE` syscall pair,
+    // and the sequential loop's round-trip cost dominated the auto-
+    // repro Phase A setup time when the crash backtrace named many
+    // functions. Worker pool runs them concurrently; results land
+    // back in the original input order so the post-attach
+    // `kprobe_attach_failed` / `links` shape matches the prior loop.
     let mut links: Vec<(Link, String)> = Vec::new();
-    for (idx, _ip, _name) in &func_ips {
-        let raw = &functions[*idx as usize].raw_name;
-        match skel.progs.ktstr_probe.attach_kprobe(false, raw) {
+    let attach_input: Vec<String> = func_ips
+        .iter()
+        .map(|(idx, _, _)| functions[*idx as usize].raw_name.clone())
+        .collect();
+    for (raw, result) in parallel_attach_kprobes(&skel.progs.ktstr_probe, &attach_input) {
+        match result {
             Ok(link) => {
-                links.push((link, raw.clone()));
+                links.push((link, raw));
             }
             Err(e) => {
-                tracing::warn!(%e, func = raw, "kprobe attach failed");
-                diag.kprobe_attach_failed.push((raw.clone(), e.to_string()));
+                tracing::warn!(%e, func = %raw, "kprobe attach failed");
+                diag.kprobe_attach_failed.push((raw, e.to_string()));
             }
         }
     }
@@ -1569,6 +1706,31 @@ pub fn run_probe_skeleton(
         // and the recorded `trigger_fired` could disagree.
         let triggered_snapshot = triggered.load(Ordering::Acquire);
         if triggered_snapshot || bss_triggered || stop.load(Ordering::Acquire) {
+            // Final ringbuf drain before breaking. BPF-side ordering:
+            // the trigger handler does
+            // `__sync_val_compare_and_swap(&ktstr_err_exit_detected, 0u, 1u)`
+            // BEFORE `bpf_ringbuf_reserve` + `bpf_ringbuf_submit`
+            // (see src/bpf/probe.bpf.c near line 687-731). A userspace
+            // observer can therefore see `bss_triggered=true` (CAS
+            // visible) while the ringbuf event is still in transit
+            // (submit not yet visible to `rb.poll`). Without an
+            // explicit drain here, breaking out of the loop on
+            // `bss_triggered` would lose the trigger event — the
+            // readout phase below would see `events.last() = None`
+            // (or the prior probe's trailing event), drop into the
+            // no-causal-tptr fallback path, and produce
+            // grouped-by-frequency output instead of a verified
+            // stitch even though the kernel did publish a real
+            // causal task pointer.
+            //
+            // 100 ms is bounded by the same teardown budget the loop's
+            // top-level `rb.poll(100ms)` uses; libbpf's
+            // `RingBuffer::poll` returns as soon as events are
+            // consumed (it uses epoll-edge under the hood), so the
+            // worst case is one full timeout window when no event
+            // arrives — acceptable since we already know the trigger
+            // fired (bss_triggered is true).
+            let _ = rb.poll(Duration::from_millis(100));
             diag.trigger_fired = triggered_snapshot || bss_triggered;
 
             // Read BPF-side diagnostic counters from BSS. The hot
@@ -1687,6 +1849,17 @@ pub fn run_probe_skeleton(
                 // pre-trigger zero.
                 diag.bpf_first_trigger_ns =
                     unsafe { std::ptr::read_volatile(&bss.ktstr_last_trigger_ts as *const u64) };
+                // SAFETY: `ktstr_exit_kind_snap` is a `u32` written
+                // by the BPF trigger handler in the same publishing
+                // CAS sequence as `ktstr_err_exit_detected` (see
+                // `src/bpf/probe.bpf.c::ktstr_exit_kind_snap`).
+                // Aligned u32 loads are atomic on every supported
+                // arch; the volatile qualifier prevents the compiler
+                // from hoisting the load across the outer poll loop
+                // so userspace observes the post-trigger SCX_EXIT_*
+                // value rather than the pre-trigger zero.
+                diag.bpf_exit_kind_snap =
+                    unsafe { std::ptr::read_volatile(&bss.ktstr_exit_kind_snap as *const u32) };
                 diag.bpf_timeline_count = sum_pcpu(PCPU_TIMELINE_COUNT);
                 diag.bpf_timeline_drops = sum_pcpu(PCPU_TIMELINE_DROPS);
             }
@@ -1851,10 +2024,70 @@ pub fn run_probe_skeleton(
             };
 
             let Some(tptr) = target_tptr else {
-                // No causal task (stall, sysrq, unregistration) —
-                // suppress probe output rather than dumping unstitched noise.
-                tracing::debug!("no causal tptr — suppressing probe output");
-                return (None, diag, Vec::new());
+                // No causal task identified — the trigger fired with
+                // args[0]==0 (kind=STALL or generic ERROR from kworker
+                // context), or never fired at all (probe lifecycle
+                // race, scheduler clean-exited).
+                //
+                // Best-effort fallback: instead of returning empty,
+                // group the captured events by task_struct pointer
+                // (resolved via task_param_idx for events with a
+                // task_struct param, otherwise key.task_ptr from the
+                // probe map) and pick the top-N most-frequent
+                // pointers. The events that fired during the actual
+                // crash window ARE causal data — the host renderer
+                // will mark the output as "trigger absent —
+                // best-effort grouped by frequency" so the operator
+                // doesn't mistake the candidate chain for a verified
+                // stitch. Cap at 3 candidates to keep the output
+                // readable; one task usually dominates a single
+                // crash window.
+                use std::collections::HashMap;
+                let mut counts: HashMap<u64, u32> = HashMap::new();
+                for ev in &probe_events {
+                    let key = if let Some(&pidx) = task_param_idx.get(&ev.func_idx) {
+                        ev.args[pidx]
+                    } else {
+                        ev.task_ptr
+                    };
+                    if key != 0 {
+                        *counts.entry(key).or_default() += 1;
+                    }
+                }
+                if counts.is_empty() {
+                    tracing::debug!(
+                        "no causal tptr and no candidate task_ptrs — suppressing probe output"
+                    );
+                    return (None, diag, Vec::new());
+                }
+                let mut sorted: Vec<(u64, u32)> = counts.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                const MAX_CANDIDATES: usize = 3;
+                sorted.truncate(MAX_CANDIDATES);
+                let candidate_set: std::collections::HashSet<u64> =
+                    sorted.iter().map(|(k, _)| *k).collect();
+                let before = probe_events.len();
+                probe_events.retain(|e| {
+                    let key = if let Some(&pidx) = task_param_idx.get(&e.func_idx) {
+                        e.args[pidx]
+                    } else {
+                        e.task_ptr
+                    };
+                    candidate_set.contains(&key)
+                });
+                tracing::debug!(
+                    candidates = sorted.len(),
+                    kept = probe_events.len(),
+                    total = before,
+                    "stitched by frequency (fallback — no causal tptr)"
+                );
+                diag.events_after_stitch = probe_events.len() as u32;
+                diag.stitch_fallback_used = true;
+                let fnames: Vec<(u32, String)> = func_ips
+                    .iter()
+                    .map(|(idx, _, name)| (*idx, name.clone()))
+                    .collect();
+                return (Some(probe_events), diag, fnames);
             };
 
             let before = probe_events.len();
@@ -1930,21 +2163,30 @@ fn attach_phase_b_fentry(
     // would re-parse the multi-MB vmlinux BTF on every iteration,
     // dominating Phase B attach time on a kernel with thousands of
     // probed functions.
-    let cached_btf = crate::monitor::btf_offsets::load_btf_from_path(std::path::Path::new(
-        "/sys/kernel/btf/vmlinux",
-    ))
-    .map_err(|e| {
-        tracing::warn!(
-            %e,
-            "phase_b: failed to pre-load /sys/kernel/btf/vmlinux for \
-             kprobe/fentry meta population — field specs will be empty \
-             for this batch"
-        );
-        e
-    })
-    .ok();
+    //
+    // `cached_vmlinux_btf` shares the process-global memo with Phase
+    // A so a single auto-repro VM pays one parse for both phases, and
+    // a multi-VM nextest run pays one parse total.
+    let cached_btf = crate::monitor::btf_offsets::cached_vmlinux_btf();
 
     // --- Phase B kernel functions: kprobes + func_meta ---
+    //
+    // Two-pass shape: first populate `func_meta_map` for every
+    // resolvable target and stage the (raw_name, idx, ip,
+    // display_name) tuples, then run all kprobe attaches in
+    // parallel via [`parallel_attach_kprobes`]. Splitting the loop
+    // matters because the attach is the slow syscall pair (one
+    // `perf_event_open` + one `BPF_LINK_CREATE` each); meta
+    // population is a quick map update. Doing them as a single
+    // sequential loop forces the slow attach to gate the next
+    // iteration's meta update for no good reason.
+    struct PhaseBKprobeTarget {
+        raw_name: String,
+        display_name: String,
+        idx: u32,
+        ip: u64,
+    }
+    let mut kprobe_targets: Vec<PhaseBKprobeTarget> = Vec::new();
     for (i, func) in pb.functions.iter().enumerate() {
         if func.is_bpf {
             continue;
@@ -1990,21 +2232,35 @@ fn attach_phase_b_fentry(
             continue;
         }
 
-        // Attach kprobe using Phase A's skeleton.
-        match skel.progs.ktstr_probe.attach_kprobe(false, &func.raw_name) {
+        kprobe_targets.push(PhaseBKprobeTarget {
+            raw_name: func.raw_name.clone(),
+            display_name: func.display_name.clone(),
+            idx,
+            ip,
+        });
+    }
+
+    let attach_input: Vec<String> = kprobe_targets.iter().map(|t| t.raw_name.clone()).collect();
+    let attach_results = parallel_attach_kprobes(&skel.progs.ktstr_probe, &attach_input);
+    // Pair the attach result with its target metadata. `attach_results`
+    // is in the same order as `attach_input` is in the same order as
+    // `kprobe_targets`, so a zip-and-iterate replays the original
+    // sequential post-attach bookkeeping (links push, func_ips push,
+    // counter bumps) without reordering.
+    for (target, (raw_name, result)) in kprobe_targets.into_iter().zip(attach_results.into_iter()) {
+        debug_assert_eq!(target.raw_name, raw_name);
+        match result {
             Ok(link) => {
-                links.push((link, func.raw_name.clone()));
+                links.push((link, raw_name));
                 diag.kprobe_attached += 1;
             }
             Err(e) => {
-                tracing::warn!(%e, func = %func.raw_name, "phase_b kprobe attach failed");
-                diag.kprobe_attach_failed
-                    .push((func.raw_name.clone(), e.to_string()));
+                tracing::warn!(%e, func = %raw_name, "phase_b kprobe attach failed");
+                diag.kprobe_attach_failed.push((raw_name, e.to_string()));
             }
         }
-
         diag.kprobe_resolved += 1;
-        func_ips.push((idx, ip, func.display_name.clone()));
+        func_ips.push((target.idx, target.ip, target.display_name));
     }
 
     // --- Phase B kernel function fexit batches (fd=0 = vmlinux BTF) ---

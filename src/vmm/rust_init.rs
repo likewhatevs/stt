@@ -991,6 +991,27 @@ pub(crate) fn ktstr_guest_init() -> ! {
     }
     exec_shell_script("/sched_disable");
 
+    // Phase 6b: probe finalisation. Now that the scheduler is
+    // killed and `/sched_disable` has run, the kernel's
+    // `scx_disable_irq_workfn` path runs `scx_claim_exit` which
+    // fires `trace_sched_ext_exit`. The probe's tp_btf listener is
+    // STILL attached at this point because
+    // [`crate::test_support::probe::publish_result_and_collect`]
+    // stashed the probe stop+handle into a deferred slot rather
+    // than detaching at end-of-dispatch. Draining now means the
+    // trigger event lands in the ring buffer, the BSS latch flips,
+    // the probe poll loop sees `ktstr_err_exit_detected != 0`, and
+    // the readout phase stitches the kprobe events that fired
+    // during the actual stall window.
+    //
+    // The drain is bounded internally (5 s wait for
+    // `/sys/kernel/sched_ext/state == disabled`, plus a one-shot
+    // `rb.poll(100 ms)` final ringbuf drain inside the probe loop
+    // when `bss_triggered` is observed); a non-responding kernel
+    // cannot stall teardown. When no probes were stashed
+    // (single-phase ctor path or EEVDF runs), the call is a no-op.
+    crate::test_support::finalize_probe_after_unwind();
+
     // Stop remaining background threads.
     if let Some(ref stop) = vc_poll_stop {
         stop.store(true, Ordering::Release);
