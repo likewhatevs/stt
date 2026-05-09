@@ -1000,9 +1000,11 @@ impl BpfMapAccessor for BpfSyscallAccessor {
         )
         .ok()?;
 
-        // Parse the bytes. Program BTF is split-BTF over vmlinux's
-        // base BTF — same code path as the guest-memory backend.
-        Btf::from_split_bytes(&buf, base_btf).ok()
+        if info.kernel_btf != 0 {
+            Btf::from_split_bytes(&buf, base_btf).ok()
+        } else {
+            Btf::from_bytes(&buf).ok()
+        }
     }
 }
 
