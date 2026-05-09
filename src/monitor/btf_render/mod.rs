@@ -2654,6 +2654,44 @@ fn render_member(
     if let Some(rv) = cast_intercept {
         return rv;
     }
+    // Arena address heuristic: when the CastMap has no entry for
+    // this u64 field but its runtime value falls inside the arena
+    // window, try resolve_arena_type as a best-effort chase. This
+    // covers fields the flow-insensitive analyzer missed (e.g.,
+    // arena stores behind conditional branches that create jump
+    // targets, or cross-function dataflow the linear walk can't
+    // track). False positives are bounded: a u64 that happens to
+    // fall in the 4 GiB arena range but isn't a pointer would
+    // produce a failed chase (no slot match in ArenaTypeIndex →
+    // render falls through to plain u64).
+    if let Some(reader) = mem
+        && let Type::Int(ref int) = member_ty
+        && int.size() == 8
+        && !int.is_signed()
+        && !int.is_bool()
+        && !int.is_char()
+    {
+        let field_bytes = parent_bytes.get(byte_off..).unwrap_or_default();
+        if let Some(head) = field_bytes.get(..8) {
+            let val = u64::from_le_bytes(head.try_into().unwrap());
+            if val != 0
+                && reader.is_arena_addr(val)
+                && let Some(hit) = reader.resolve_arena_type(val)
+            {
+                return render_cast_pointer(
+                    btf,
+                    CastHit {
+                        target_type_id: hit.target_type_id,
+                        addr_space: super::cast_analysis::AddrSpace::Arena,
+                    },
+                    val,
+                    depth,
+                    reader,
+                    visited,
+                );
+            }
+        }
+    }
 
     if let Some(parent) = parent_type_id
         && let Type::Array(arr) = &member_ty

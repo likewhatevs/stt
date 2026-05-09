@@ -2526,7 +2526,7 @@ impl MemberAt {
 /// so the LDX / STX paths can peel modifiers and check for a
 /// plain u64 just like they do for struct members.
 fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<MemberAt> {
-    let t = btf.resolve_type_by_id(parent_type_id).ok()?;
+    let (t, parent_type_id) = super::btf_render::peel_modifiers_with_id(btf, parent_type_id)?;
     match t {
         Type::Struct(s) | Type::Union(s) => {
             for m in &s.members {
