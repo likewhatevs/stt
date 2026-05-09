@@ -2936,62 +2936,24 @@ struct ArenaChaseOutcome {
 /// chased pointer lands on slot-start (the new path that handles
 /// the raw return of `sdt_alloc()` cached in `data` fields).
 ///
-/// `btf_size` is the storage size of the recovered payload type
-/// (post Fwd-resolving peel). `try_sdt_alloc_bridge` already paid
-/// the [`type_size`] resolve to confirm the bridge can fire;
-/// returning the value lets both chase arms reuse it instead of
-/// re-running the same lookup against the same type.
-#[derive(Debug, Clone)]
-struct SdtAllocBridgeFire {
-    target_ty: Type,
-    effective_type_id: u32,
-    header_skip: usize,
-    btf_size: usize,
-}
-
 /// Try the sdt_alloc bridge for a `BTF_KIND_FWD` chase target.
 ///
-/// Both [`chase_arena_pointer`] and [`render_cast_pointer`]'s kernel
-/// arm fall into the same fix-up after the BTF-only Fwd resolve
-/// fails: ask the [`MemReader`] for an arena-resolve hit at the
-/// chased value, peel the recovered id back through
-/// [`peel_modifiers_resolving_fwd`], and only adopt it when the
-/// resolved type has a known size. The helper centralises that flow
-/// so both call sites stay in lockstep on the gating policy.
-///
-/// Pure return: the helper produces an [`SdtAllocBridgeFire`] when
-/// the bridge fires (carrying the resolved `target_ty`, the matching
-/// `effective_type_id`, the `header_skip` the caller applies, and
-/// the payload's `btf_size`) or `None` otherwise. The caller
-/// rebinds its own `target_ty` / `effective_type_id` from the
-/// returned struct — no `&mut` plumbing. The `btf_size` field saves
-/// callers from re-running [`type_size`] on the same resolved
-/// type — the helper has already paid that resolve to gate the
-/// bridge fire.
-///
-/// Preconditions:
-///   * `target_ty` is whatever [`peel_modifiers_resolving_fwd`]
-///     produced for the original chase target. The helper itself
-///     gates on `matches!(target_ty, Type::Fwd(_))`, so calling on a
-///     non-Fwd terminal is a no-op.
+/// Returns the raw [`ArenaResolveHit`] when the chased address
+/// falls in a known sdt_alloc slot. The caller feeds the hit's
+/// `target_type_id` through the same peel → cross-BTF → size
+/// pipeline it runs for the direct target, so the bridge hit
+/// gets the full resolution chain (including cross-BTF Fwd
+/// fallback) instead of being silently dropped when the resolved
+/// type is also Fwd in the entry BTF.
 fn try_sdt_alloc_bridge(
-    btf: &Btf,
     mem: &dyn MemReader,
     val: u64,
     target_ty: &Type,
-) -> Option<SdtAllocBridgeFire> {
+) -> Option<ArenaResolveHit> {
     if !matches!(target_ty, Type::Fwd(_)) {
         return None;
     }
-    let hit = mem.resolve_arena_type(val)?;
-    let (resolved_ty, resolved_id) = peel_modifiers_resolving_fwd(btf, hit.target_type_id)?;
-    let btf_size = type_size(btf, &resolved_ty)?;
-    Some(SdtAllocBridgeFire {
-        target_ty: resolved_ty,
-        effective_type_id: resolved_id,
-        header_skip: hit.header_skip,
-        btf_size,
-    })
+    mem.resolve_arena_type(val)
 }
 
 /// Slice past `header_skip` bytes when the sdt_alloc bridge fires.
@@ -3221,14 +3183,18 @@ fn resolve_chase_target<'a>(
     // produces a fresh target_ty / effective_type_id which we
     // rebind here, plus the slot's `header_skip` and the
     // resolved payload's `btf_size`.
-    let bridge = try_sdt_alloc_bridge(btf, mem, val, &target_ty);
-    let (sdt_alloc_resolved, header_skip, bridge_btf_size) = match bridge {
-        Some(f) => {
-            target_ty = f.target_ty;
-            effective_type_id = f.effective_type_id;
-            (true, f.header_skip, Some(f.btf_size))
+    let bridge = try_sdt_alloc_bridge(mem, val, &target_ty);
+    let (sdt_alloc_resolved, header_skip) = match &bridge {
+        Some(hit) => {
+            if let Some((resolved_ty, resolved_id)) =
+                peel_modifiers_resolving_fwd(btf, hit.target_type_id)
+            {
+                target_ty = resolved_ty;
+                effective_type_id = resolved_id;
+            }
+            (true, hit.header_skip)
         }
-        None => (false, 0usize, None),
+        None => (false, 0usize),
     };
     // Step 3: when the bridge stayed dormant, try the cross-BTF
     // Fwd index. A `Type::Fwd` terminal whose complete body
@@ -3240,7 +3206,7 @@ fn resolve_chase_target<'a>(
     // adopt its type id. The bridge-fired path skips this
     // probe — its resolved id is in the entry BTF and the
     // recursion doesn't need to switch.
-    let cross_btf_hit = if bridge_btf_size.is_none() {
+    let cross_btf_hit = if matches!(target_ty, Type::Fwd(_)) {
         try_cross_btf_fwd_resolve(mem, btf, &target_ty)
     } else {
         None
@@ -3268,22 +3234,19 @@ fn resolve_chase_target<'a>(
     };
     // Step 4: resolve the final `btf_size`. The bridge fire
     // already paid this resolve; reuse its value when present.
-    let btf_size = match bridge_btf_size {
-        Some(sz) => sz,
-        None => {
-            let Some(sz) = type_size(current_btf, &target_ty) else {
-                return ChaseResolve::Skip {
-                    reason: unsizable_chase_reason(
-                        current_btf,
-                        kind_label,
-                        target_type_id,
-                        &target_ty,
-                    ),
-                    sdt_alloc_resolved,
-                };
+    let btf_size = {
+        let Some(sz) = type_size(current_btf, &target_ty) else {
+            return ChaseResolve::Skip {
+                reason: unsizable_chase_reason(
+                    current_btf,
+                    kind_label,
+                    target_type_id,
+                    &target_ty,
+                ),
+                sdt_alloc_resolved,
             };
-            sz
-        }
+        };
+        sz
     };
     // Step 5: reject zero-size payloads (incomplete types whose
     // BTF size resolves but is zero). The `incomplete type`
