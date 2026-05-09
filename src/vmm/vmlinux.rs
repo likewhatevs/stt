@@ -33,7 +33,9 @@ static VMLINUX_BYTES_CACHE: OnceLock<RwLock<std::collections::HashMap<PathBuf, A
 /// permissions arrive on the next ms) should not poison the cache for
 /// the rest of the process.
 pub(crate) fn cached_vmlinux_bytes(path: &Path) -> Option<Arc<Vec<u8>>> {
-    let canon = std::fs::canonicalize(path).ok().unwrap_or_else(|| path.to_path_buf());
+    let canon = std::fs::canonicalize(path)
+        .ok()
+        .unwrap_or_else(|| path.to_path_buf());
     let slot = VMLINUX_BYTES_CACHE.get_or_init(|| RwLock::new(std::collections::HashMap::new()));
     {
         let read = slot.read().unwrap_or_else(|e| e.into_inner());

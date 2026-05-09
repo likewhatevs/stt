@@ -559,11 +559,11 @@ fn parse_btfs_from_bytes(bytes: &[u8]) -> Vec<Arc<Btf>> {
             Ok(e) => e,
             Err(_) => continue,
         };
-        let btf_bytes =
-            match find_section(&elf, ".BTF").and_then(|i| section_data(&elf, inner, i)) {
-                Some(b) => b,
-                None => continue,
-            };
+        let btf_bytes = match find_section(&elf, ".BTF").and_then(|i| section_data(&elf, inner, i))
+        {
+            Some(b) => b,
+            None => continue,
+        };
         if let Ok(btf) = Btf::from_bytes(btf_bytes) {
             btfs.push(Arc::new(btf));
         }
@@ -954,10 +954,7 @@ fn iter_text_relocs<'a, 'elf: 'a>(
         .iter()
         .flat_map(move |(rel_section_idx, reloc_section)| {
             // Resolve which section the relocations target.
-            let target_section_idx = elf
-                .section_headers
-                .get(*rel_section_idx)
-                .map(|h| h.sh_info);
+            let target_section_idx = elf.section_headers.get(*rel_section_idx).map(|h| h.sh_info);
             // Only program text sections appear in `section_bases`.
             let scope = target_section_idx.and_then(|idx| {
                 let base = *section_bases.get(&idx)?;
@@ -968,19 +965,21 @@ fn iter_text_relocs<'a, 'elf: 'a>(
             // pass when `Some`, empty when `None`), so the outer
             // `flat_map` sees the correct shape regardless of
             // whether the rel section was in scope.
-            scope.into_iter().flat_map(move |(base, section_byte_size)| {
-                reloc_section.iter().filter_map(move |reloc| {
-                    let off = reloc.r_offset as usize;
-                    if !off.is_multiple_of(BPF_INSN_SIZE) {
-                        return None;
-                    }
-                    if off >= section_byte_size {
-                        return None;
-                    }
-                    let insn_idx = base.saturating_add(off / BPF_INSN_SIZE);
-                    Some((insn_idx, reloc))
+            scope
+                .into_iter()
+                .flat_map(move |(base, section_byte_size)| {
+                    reloc_section.iter().filter_map(move |reloc| {
+                        let off = reloc.r_offset as usize;
+                        if !off.is_multiple_of(BPF_INSN_SIZE) {
+                            return None;
+                        }
+                        if off >= section_byte_size {
+                            return None;
+                        }
+                        let insn_idx = base.saturating_add(off / BPF_INSN_SIZE);
+                        Some((insn_idx, reloc))
+                    })
                 })
-            })
         })
 }
 
@@ -1721,7 +1720,6 @@ fn section_data<'a>(
     let end = start.checked_add(sh.sh_size as usize)?;
     file_bytes.get(start..end)
 }
-
 
 mod persist;
 

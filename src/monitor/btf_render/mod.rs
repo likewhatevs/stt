@@ -2680,7 +2680,9 @@ fn render_member(
                                 let mut elements = Vec::with_capacity(cap);
                                 for i in 0..cap {
                                     let elem_off = byte_off + i * 8;
-                                    let elem_bytes = parent_bytes.get(elem_off..elem_off + 8).unwrap_or_default();
+                                    let elem_bytes = parent_bytes
+                                        .get(elem_off..elem_off + 8)
+                                        .unwrap_or_default();
                                     if let Some(rv) = try_cast_intercept(
                                         btf,
                                         (parent, elem_off),
@@ -2693,7 +2695,12 @@ fn render_member(
                                         elements.push(rv);
                                     } else {
                                         elements.push(render_value_inner(
-                                            btf, elem_tid, elem_bytes, depth + 1, mem, visited,
+                                            btf,
+                                            elem_tid,
+                                            elem_bytes,
+                                            depth + 1,
+                                            mem,
+                                            visited,
                                         ));
                                     }
                                 }
@@ -3778,22 +3785,21 @@ fn render_cast_pointer(
     // `read_kva`, or a skip reason that flows into the `cast_ptr`
     // builder so the no-deref render still surfaces the bridge
     // state when it fired before the skip.
-    let resolved =
-        match resolve_chase_target(btf, mem, value, hit.target_type_id, "kernel cast") {
-            ChaseResolve::Ready(r) => r,
-            ChaseResolve::Skip {
-                reason,
+    let resolved = match resolve_chase_target(btf, mem, value, hit.target_type_id, "kernel cast") {
+        ChaseResolve::Ready(r) => r,
+        ChaseResolve::Skip {
+            reason,
+            sdt_alloc_resolved,
+        } => {
+            return cast_ptr(
+                value,
+                None,
+                Some(reason),
+                super::cast_analysis::AddrSpace::Kernel,
                 sdt_alloc_resolved,
-            } => {
-                return cast_ptr(
-                    value,
-                    None,
-                    Some(reason),
-                    super::cast_analysis::AddrSpace::Kernel,
-                    sdt_alloc_resolved,
-                );
-            }
-        };
+            );
+        }
+    };
     // Kernel reads honour [`POINTER_CHASE_CAP`] and also cap at
     // the remaining bytes in the current 4 KiB page so `read_kva`
     // cannot accidentally cross a page boundary into an unrelated

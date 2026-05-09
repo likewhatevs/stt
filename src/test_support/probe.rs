@@ -166,12 +166,10 @@ fn classify_dmesg_corruption(text: &str) -> Option<&'static str> {
             // operator: the kernel never wrote anything readable.
             Some("empty (scheduler crashed before kernel printk reached the UART buffer)")
         }
-        _ => {
-            Some(
-                "corrupt or no readable text (UART buffer uninitialized or \
+        _ => Some(
+            "corrupt or no readable text (UART buffer uninitialized or \
                  trimmed — scheduler likely crashed before any kernel printk)",
-            )
-        }
+        ),
     }
 }
 
@@ -721,7 +719,11 @@ pub(crate) fn attempt_auto_repro(
     }
     tracing::info!(
         elapsed_ms = auto_repro_start.elapsed().as_millis() as u64,
-        outcome = if has_probe { "probe_data" } else { "tails_only" },
+        outcome = if has_probe {
+            "probe_data"
+        } else {
+            "tails_only"
+        },
         "auto_repro: total",
     );
     Some(out)
@@ -972,7 +974,9 @@ fn find_balanced_object_end(s: &str) -> Option<usize> {
 ///   5. fallback — kind value we don't recognize (future kernel
 ///      version or value not yet wired up); surface the raw value
 ///      so the operator can map it via include/linux/sched/ext.h.
-fn stitch_drop_cause(skeleton: &crate::probe::process::ProbeDiagnostics) -> std::borrow::Cow<'static, str> {
+fn stitch_drop_cause(
+    skeleton: &crate::probe::process::ProbeDiagnostics,
+) -> std::borrow::Cow<'static, str> {
     use crate::probe::scx_defs::{EXIT_ERROR, EXIT_ERROR_BPF, EXIT_ERROR_STALL};
     if skeleton.bpf_trigger_fires == 0 {
         return std::borrow::Cow::Borrowed(
@@ -4024,7 +4028,10 @@ mod tests {
         let _ = take_deferred_probe();
 
         // 1) Empty stash → take returns None.
-        assert!(take_deferred_probe().is_none(), "empty stash must yield None");
+        assert!(
+            take_deferred_probe().is_none(),
+            "empty stash must yield None"
+        );
 
         // 2) Single stash → take round-trips and drains.
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

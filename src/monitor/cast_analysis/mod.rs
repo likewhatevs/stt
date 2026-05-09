@@ -1299,11 +1299,8 @@ impl<'a> Analyzer<'a> {
                             datasec_type_id,
                             base_offset,
                         } = pre_call_r1
-                            && let Some(sid) = map_value_struct_id(
-                                self.btf,
-                                datasec_type_id,
-                                base_offset,
-                            )
+                            && let Some(sid) =
+                                map_value_struct_id(self.btf, datasec_type_id, base_offset)
                         {
                             self.regs[0] = RegState::Pointer {
                                 struct_type_id: sid,
@@ -1776,8 +1773,7 @@ impl<'a> Analyzer<'a> {
                 // STX state.
                 match self.arena_stx_findings.get(&key).copied() {
                     None => {
-                        self.arena_stx_findings
-                            .insert(key, ArenaStxEntry::Pending);
+                        self.arena_stx_findings.insert(key, ArenaStxEntry::Pending);
                     }
                     Some(ArenaStxEntry::Pending) => {
                         // Same arena observation — no-op dedup.
@@ -2368,10 +2364,7 @@ fn jump_targets(insns: &[BpfInsn]) -> BTreeSet<usize> {
 /// whose member type has the given size. The matching phase
 /// intersects sets across observed accesses to collapse to a single
 /// candidate when one exists.
-fn build_layout_index(
-    btf: &Btf,
-    max_id: u32,
-) -> HashMap<(u32, u32), HashSet<u32>> {
+fn build_layout_index(btf: &Btf, max_id: u32) -> HashMap<(u32, u32), HashSet<u32>> {
     let mut out: HashMap<(u32, u32), HashSet<u32>> = HashMap::new();
     let mut size_cache: HashMap<u32, Option<u32>> = HashMap::new();
     let mut consecutive_fail: u32 = 0;
@@ -2419,7 +2412,9 @@ fn cached_member_size(
     cache: &mut HashMap<u32, Option<u32>>,
 ) -> Option<u32> {
     let tid = m.get_type_id().ok()?;
-    *cache.entry(tid).or_insert_with(|| member_size_bytes(btf, m))
+    *cache
+        .entry(tid)
+        .or_insert_with(|| member_size_bytes(btf, m))
 }
 
 /// Resolve `bpf_member` to a byte size, peeling Const / Volatile /
@@ -2532,15 +2527,12 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                     return Some(MemberAt::Struct { member_type_id });
                 }
                 if member_off < byte_offset {
-                    if let Some(terminal) =
-                        super::btf_render::peel_modifiers(btf, member_type_id)
-                    {
+                    if let Some(terminal) = super::btf_render::peel_modifiers(btf, member_type_id) {
                         if let Type::Array(arr) = &terminal {
                             let elem_tid = arr.get_type_id().ok()?;
-                            let elem_size =
-                                super::btf_render::type_size(btf, &{
-                                    super::btf_render::peel_modifiers(btf, elem_tid)?
-                                })? as u32;
+                            let elem_size = super::btf_render::type_size(btf, &{
+                                super::btf_render::peel_modifiers(btf, elem_tid)?
+                            })? as u32;
                             if elem_size > 0 {
                                 let arr_len = arr.len() as u32;
                                 let arr_byte_size = elem_size * arr_len;
@@ -2707,7 +2699,10 @@ fn map_value_struct_id(btf: &Btf, datasec_id: u32, var_offset: u32) -> Option<u3
     // not a map descriptor — the analyzer's R1 must point at the
     // map's struct, never mid-struct, because clang's relocation
     // emission uses the var's start offset).
-    let var_info = datasec.variables.iter().find(|v| v.offset() == var_offset)?;
+    let var_info = datasec
+        .variables
+        .iter()
+        .find(|v| v.offset() == var_offset)?;
     let chained = btf.resolve_chained_type(var_info).ok()?;
     let var = match chained {
         Type::Var(v) => v,
@@ -2935,7 +2930,6 @@ const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = bs::BPF_FUNC_map_lookup_elem as i32;
 /// from post-relocation forms — by the time it runs every kfunc
 /// call carries its BTF id.
 pub(crate) const BPF_PSEUDO_CALL: u8 = bs::BPF_PSEUDO_CALL as u8;
-
 
 #[cfg(test)]
 mod tests;

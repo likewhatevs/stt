@@ -1032,7 +1032,10 @@ mod tests {
             "missing header: {out}"
         );
         assert!(out.contains("elem_size=24"), "missing elem_size: {out}");
-        assert!(out.contains("target_type_id=42"), "missing target_type_id: {out}");
+        assert!(
+            out.contains("target_type_id=42"),
+            "missing target_type_id: {out}"
+        );
         assert!(out.contains("1 live"), "missing entry count: {out}");
         assert!(out.contains("idx=7"), "missing entry render: {out}");
     }
@@ -1093,7 +1096,10 @@ mod tests {
             }
         };
         let choice = discover_payload_btf_id(&btf, 0);
-        assert_eq!(choice.target_type_id, 0, "zero-size must yield target_type_id=0");
+        assert_eq!(
+            choice.target_type_id, 0,
+            "zero-size must yield target_type_id=0"
+        );
         assert_eq!(
             choice.reason, "payload_size == 0",
             "zero-size reason must be the early-return marker, got: {}",
@@ -1245,9 +1251,7 @@ mod tests {
         /// the `sdt_data` Fwd-fallback test — the only path
         /// `from_btf` accepts a Fwd on, since the header size is
         /// kernel-source-fixed at `SIZEOF_SDT_ID = 8`.
-        Fwd {
-            name_off: u32,
-        },
+        Fwd { name_off: u32 },
     }
 
     /// Append a NUL-terminated string to the BTF strings buffer and
@@ -1284,8 +1288,7 @@ mod tests {
                     let info = (SDTA_BTF_KIND_INT << 24) & 0x1f00_0000;
                     type_section.extend_from_slice(&info.to_le_bytes());
                     type_section.extend_from_slice(&size.to_le_bytes());
-                    let int_data =
-                        (*encoding << 24) | ((*offset & 0xff) << 16) | (*bits & 0xff);
+                    let int_data = (*encoding << 24) | ((*offset & 0xff) << 16) | (*bits & 0xff);
                     type_section.extend_from_slice(&int_data.to_le_bytes());
                 }
                 SdtaSynType::Struct {
@@ -1295,8 +1298,7 @@ mod tests {
                 } => {
                     type_section.extend_from_slice(&name_off.to_le_bytes());
                     let vlen = members.len() as u32;
-                    let info =
-                        ((SDTA_BTF_KIND_STRUCT << 24) & 0x1f00_0000) | (vlen & 0xffff);
+                    let info = ((SDTA_BTF_KIND_STRUCT << 24) & 0x1f00_0000) | (vlen & 0xffff);
                     type_section.extend_from_slice(&info.to_le_bytes());
                     type_section.extend_from_slice(&size.to_le_bytes());
                     for m in members {
@@ -1493,8 +1495,8 @@ mod tests {
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
 
-        let err = SdtAllocOffsets::from_btf(&btf)
-            .expect_err("missing sdt_pool must surface as Err");
+        let err =
+            SdtAllocOffsets::from_btf(&btf).expect_err("missing sdt_pool must surface as Err");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("sdt_pool"),
@@ -1567,8 +1569,8 @@ mod tests {
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
 
-        let err = SdtAllocOffsets::from_btf(&btf)
-            .expect_err("missing sdt_desc must surface as Err");
+        let err =
+            SdtAllocOffsets::from_btf(&btf).expect_err("missing sdt_desc must surface as Err");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("sdt_desc"),
@@ -1652,8 +1654,8 @@ mod tests {
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
 
-        let err = SdtAllocOffsets::from_btf(&btf)
-            .expect_err("missing sdt_chunk must surface as Err");
+        let err =
+            SdtAllocOffsets::from_btf(&btf).expect_err("missing sdt_chunk must surface as Err");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("sdt_chunk"),

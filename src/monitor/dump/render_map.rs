@@ -51,9 +51,9 @@ use super::super::btf_render::{
 use super::super::cast_analysis::CastMap;
 
 use super::{
-    CrossBtfFwdIndex, FailureDumpEntry, FailureDumpFdArray, FailureDumpMap,
-    FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpRingbuf,
-    FailureDumpStackTrace, FailureDumpStackTraceEntry, hex_dump,
+    CrossBtfFwdIndex, FailureDumpEntry, FailureDumpFdArray, FailureDumpMap, FailureDumpPercpuEntry,
+    FailureDumpPercpuHashEntry, FailureDumpRingbuf, FailureDumpStackTrace,
+    FailureDumpStackTraceEntry, hex_dump,
 };
 
 /// Maximum per-CPU array key span the dump path will iterate.
@@ -567,8 +567,7 @@ struct AccessorMemReader<'a> {
     /// the "no invalid data made" contract: the renderer falls
     /// back to the historical Fwd-skip / cross-BTF behaviour
     /// rather than risking a wrong-type render.
-    scx_static_index:
-        Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
+    scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
 }
 
 impl MemReader for AccessorMemReader<'_> {
@@ -976,8 +975,7 @@ pub(super) struct RenderMapCtx<'a> {
     /// module-level doc). `None` (no scheduler with an initialised
     /// `scx_static` instance was discovered) keeps the chase
     /// pipeline's existing skip path intact.
-    pub(super) scx_static_index:
-        Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
+    pub(super) scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
 }
 
 /// Render `bytes` via BTF when both a `Btf` is available AND the

@@ -148,10 +148,7 @@ pub(super) fn try_save(
     let persisted = PersistedCastAnalysis {
         schema_version: SCHEMA_VERSION,
         content_hash: hash,
-        cast_entries: cast_map
-            .iter()
-            .map(|(&k, &v)| (k, v.into()))
-            .collect(),
+        cast_entries: cast_map.iter().map(|(&k, &v)| (k, v.into())).collect(),
         fwd_entries: fwd_index
             .iter()
             .map(|(k, v)| (k.clone(), v.into()))
@@ -226,9 +223,7 @@ mod tests {
         assert!(loaded.is_some(), "roundtrip must succeed");
         let (loaded_map, loaded_fwd) = loaded.unwrap();
         assert_eq!(loaded_map.len(), 2);
-        assert_eq!(
-            loaded_map.get(&(2, 8)).unwrap().target_type_id, 5
-        );
+        assert_eq!(loaded_map.get(&(2, 8)).unwrap().target_type_id, 5);
         assert_eq!(
             loaded_map.get(&(2, 8)).unwrap().addr_space,
             AddrSpace::Arena

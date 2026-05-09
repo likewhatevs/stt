@@ -5767,11 +5767,8 @@ fn resolve_cross_btf_fwd_in_index_rejects_kind_mismatch() {
     // Query with [`FwdKind::Union`] (caller is asking for a Union
     // body). The index entry is a Struct → kind mismatch → helper
     // returns None.
-    let result = super::render_map::resolve_cross_btf_fwd_in_index(
-        Some(&cross),
-        "foo",
-        FwdKind::Union,
-    );
+    let result =
+        super::render_map::resolve_cross_btf_fwd_in_index(Some(&cross), "foo", FwdKind::Union);
     assert!(
         result.is_none(),
         "kind mismatch (Struct entry, FwdKind::Union) must reject; \
@@ -5781,11 +5778,8 @@ fn resolve_cross_btf_fwd_in_index_rejects_kind_mismatch() {
     // Sanity: same query with [`FwdKind::Struct`] succeeds —
     // proves the index lookup itself works and the kind gate is
     // the rejection cause, not an unrelated absence.
-    let success = super::render_map::resolve_cross_btf_fwd_in_index(
-        Some(&cross),
-        "foo",
-        FwdKind::Struct,
-    );
+    let success =
+        super::render_map::resolve_cross_btf_fwd_in_index(Some(&cross), "foo", FwdKind::Struct);
     assert!(
         success.is_some(),
         "matching kind (Struct entry, FwdKind::Struct) must succeed; \

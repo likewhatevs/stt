@@ -8269,9 +8269,7 @@ fn cast_chase_kernel_cross_btf_fwd_resolve_succeeds() {
         members: ref inner_members,
     } = **inner
     else {
-        panic!(
-            "deref payload must be the kern_target body Struct; got {inner:?}"
-        );
+        panic!("deref payload must be the kern_target body Struct; got {inner:?}");
     };
     assert_eq!(
         inner_name.as_deref(),

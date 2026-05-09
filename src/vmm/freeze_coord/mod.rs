@@ -8336,9 +8336,7 @@ impl KtstrVm {
         let cleanup_duration = Some(run.cleanup_start.elapsed());
         tracing::info!(
             elapsed_ms = collect_results_start.elapsed().as_millis() as u64,
-            cleanup_window_ms = cleanup_duration
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            cleanup_window_ms = cleanup_duration.map(|d| d.as_millis() as u64).unwrap_or(0),
             "auto_repro: collect_results",
         );
         eprintln!("CLEANUP: collect_results done {:?}", cleanup_t.elapsed());
@@ -8492,12 +8490,11 @@ impl KtstrVm {
     }
 }
 
-
-#[cfg(test)]
-mod snapshot_tlv_tests;
 #[cfg(test)]
 mod crc_defense_tests;
 #[cfg(test)]
 mod rendezvous_tests;
+#[cfg(test)]
+mod snapshot_tlv_tests;
 #[cfg(test)]
 mod tx_dispatch_tests;

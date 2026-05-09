@@ -204,8 +204,7 @@ fn run_cargo_sub(
 }
 
 fn precompute_cast_cache() {
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .unwrap_or_else(|_| "target".to_string());
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string());
     let mut binaries = Vec::new();
     for profile in ["debug", "release"] {
         let dir = std::path::Path::new(&target_dir).join(profile);
@@ -214,7 +213,9 @@ fn precompute_cast_cache() {
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(name_str) = name.to_str() else { continue };
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
             if name_str.starts_with("scx_") && !name_str.contains('.') {
                 let path = entry.path();
                 if path.is_file() {
