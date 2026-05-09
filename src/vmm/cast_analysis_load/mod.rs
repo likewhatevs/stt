@@ -304,9 +304,9 @@ fn ahash_bytes(bytes: &[u8]) -> u64 {
 
 /// Process-wide content-hash-cached entry point.
 ///
-/// Reads the scheduler binary once, hashes the bytes (SHA-256 — the
-/// project already depends on `sha2` with `sha2-asm` for SHA-NI
-/// acceleration), and either returns the previously-analysed
+/// Reads the scheduler binary once, hashes the bytes via ahash
+/// (AES-NI accelerated, deterministic per-binary with fixed seeds),
+/// and either returns the previously-analysed
 /// `Option<Arc<CastAnalysisOutput>>` for that hash or runs the
 /// analyzer once to populate the cache entry. The cache value is
 /// `Option<Arc>` (collapsed empty → `None`) so the dump path's
@@ -320,10 +320,10 @@ fn ahash_bytes(bytes: &[u8]) -> u64 {
 /// but a `cp -p`-style overwrite or hardlinked rotation can
 /// preserve mtime AND length while the bytes change, hitting a
 /// stale entry and rendering the wrong cast map for a
-/// just-replaced binary. SHA-256 over the actual bytes is the only
-/// key that is correct for every overwrite shape. The hash cost
-/// (single-pass SHA-NI on x86_64 / armv8 crypto) is dominated by
-/// the file read which has to happen anyway.
+/// just-replaced binary. Content-hash over the actual bytes is
+/// the only key that is correct for every overwrite shape. The
+/// hash cost is dominated by the file read which has to happen
+/// anyway.
 ///
 /// # Concurrency
 ///
@@ -467,7 +467,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
     let bpf_objs_section = match find_section(&outer, ".bpf.objs") {
         Some(s) => s,
         None => {
-            tracing::warn!(
+            tracing::debug!(
                 "cast_analysis: scheduler binary has no .bpf.objs section; \
                  typed-pointer rendering disabled"
             );

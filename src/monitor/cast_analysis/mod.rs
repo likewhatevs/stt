@@ -2211,9 +2211,7 @@ impl<'a> Analyzer<'a> {
             // Intersection of candidate type ids across every
             // observed (offset, size). The first lookup seeds
             // `candidates` by cloning once; subsequent lookups
-            // borrow from `layout` and intersect into a fresh set,
-            // avoiding a per-access clone of the full candidate
-            // BTreeSet.
+            // retain only elements present in the next set.
             let mut iter = accesses.iter();
             let first = iter.next().expect("non-empty checked above");
             let empty = HashSet::new();

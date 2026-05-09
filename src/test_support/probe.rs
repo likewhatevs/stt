@@ -972,11 +972,13 @@ fn find_balanced_object_end(s: &str) -> Option<usize> {
 ///   5. fallback — kind value we don't recognize (future kernel
 ///      version or value not yet wired up); surface the raw value
 ///      so the operator can map it via include/linux/sched/ext.h.
-fn stitch_drop_cause(skeleton: &crate::probe::process::ProbeDiagnostics) -> &'static str {
+fn stitch_drop_cause(skeleton: &crate::probe::process::ProbeDiagnostics) -> std::borrow::Cow<'static, str> {
     use crate::probe::scx_defs::{EXIT_ERROR, EXIT_ERROR_BPF, EXIT_ERROR_STALL};
     if skeleton.bpf_trigger_fires == 0 {
-        return "trigger never fired (timing race or scheduler clean-exited; \
-                no error-class sched_ext_exit observed)";
+        return std::borrow::Cow::Borrowed(
+            "trigger never fired (timing race or scheduler clean-exited; \
+             no error-class sched_ext_exit observed)",
+        );
     }
     match skeleton.bpf_exit_kind_snap as u64 {
         EXIT_ERROR_STALL => {
@@ -992,11 +994,16 @@ fn stitch_drop_cause(skeleton: &crate::probe::process::ProbeDiagnostics) -> &'st
             "trigger fired with kind=BPF_ERROR but stitch found no matching \
              task_ptr (suspected ID mismatch or func_idx_offset bug — file a ticket)"
         }
-        _ => {
-            "trigger fired but exit kind is unrecognized; pre-trigger events \
-             suppressed because no causal task was identified"
+        other => {
+            return format!(
+                "trigger fired but exit kind {other} is unrecognized; \
+                 pre-trigger events suppressed because no causal task \
+                 was identified (map value via include/linux/sched/ext.h)"
+            )
+            .into();
         }
     }
+    .into()
 }
 
 /// Format probe pipeline diagnostics into a human-readable summary.
@@ -1159,7 +1166,7 @@ pub(crate) fn format_probe_diagnostics(
     if skeleton.events_before_stitch > 0 && skeleton.events_after_stitch == 0 {
         let cause = stitch_drop_cause(skeleton);
         out.push_str(" — ");
-        out.push_str(cause);
+        out.push_str(&cause);
     } else if skeleton.stitch_fallback_used {
         // Best-effort fallback path: events after stitch is non-zero
         // but the chain was grouped by task_ptr frequency rather than
