@@ -197,7 +197,7 @@ The dotted-path walker:
 
 | Method | Returns | Accepts |
 |---|---|---|
-| `as_u64()` | `u64` | `Uint`, non-negative `Int`/`Enum`, `Bool` (0/1), `Char` (raw byte), `Ptr` (pointer value), per-CPU array key |
+| `as_u64()` | `u64` | `Uint`, non-negative `Int`/`Enum`, `Bool` (0/1), `Char` (raw byte), `Ptr` (pointer value, including cast-recovered pointers — see [Cast-recovered pointers](#cast-recovered-pointers)), per-CPU array key |
 | `as_i64()` | `i64` | `Int`, `Uint` ≤ i64::MAX, `Bool`, `Char`, `Enum`, per-CPU array key |
 | `as_bool()` | `bool` | `Bool` direct; `Int`/`Uint`/`Char`/`Enum`/`Ptr` non-zero is true; per-CPU array key |
 | `as_f64()` | `f64` | `Float`, `Int`, `Uint`, `Enum`, per-CPU array key |
@@ -207,6 +207,33 @@ The dotted-path walker:
 Type mismatches surface as `SnapshotError::TypeMismatch { expected,
 actual, requested }` — for example, `as_str()` on a `Uint` reports
 `expected: "Enum"`, `actual: "Uint"`.
+
+### Cast-recovered pointers
+
+Schedulers stash kernel pointers (`task_struct *`, `cgroup *`, …)
+and arena pointers in BPF map fields whose BTF declares them as
+`u64` because BTF cannot express a pointer to a per-allocation
+type. The host-side
+[cast analyzer](../architecture/monitor.md#cast-analysis) walks the
+scheduler's `.bpf.o` instruction stream during load, recovers the
+target struct for each provable `(source_struct, field_offset) →
+target_struct` mapping, and feeds the result into the renderer.
+
+When the renderer encounters a `u64` slot the analyzer flagged, it
+emits a [`RenderedValue::Ptr`](#field-accessors-and-dotted-paths)
+with `cast_annotation` set to `"cast→arena"` or `"cast→kernel"` and
+chases the dereference through the address-space-appropriate
+reader. From the test author's perspective:
+
+- `as_u64()` returns the raw pointer value (matching pre-analysis
+  behavior, so existing tests do not need updating).
+- `entry.get("ctx.task")` and similar dotted-path walks transparently
+  follow the cast-recovered chase; nested struct fields appear under
+  the same path the BTF would suggest for a natively-typed pointer.
+- The `cast_annotation` is visible in failure-dump rendering and
+  diagnostic output so an operator can distinguish cast-recovered
+  pointers from BTF-typed ones; the test API does not require any
+  extra calls to consume them.
 
 ## Error handling
 

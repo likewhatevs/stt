@@ -462,11 +462,29 @@ N cpus (threshold N%)` is the exact format produced by
 same producer emits:
 
 - `tid {N} starved (0 work units)` — when a worker made no
-  progress.
+  progress. Example:
+
+  ```text
+  ktstr_test 'mixed_workloads' [topo=1n2l2c1t] failed:
+    tid 2 starved (0 work units)
+  ```
+
 - `tid {N} stuck {N}ms on cpu{N} at +{N}ms (threshold {N}ms)` —
   when a worker's longest off-CPU gap crossed
   `Assert::max_gap_ms`. Example:
-  `tid 7 stuck 1500ms on cpu3 at +4200ms (threshold 2000ms)`.
+
+  ```text
+  ktstr_test 'mixed_workloads' [topo=1n2l2c1t] failed:
+    tid 7 stuck 1500ms on cpu3 at +4200ms (threshold 2000ms)
+  ```
+
+- `unfair cgroup: spread={pct}% ({lo}-{hi}%)` — when per-cgroup
+  fairness exceeded `max_spread_pct`. Example:
+
+  ```text
+  ktstr_test 'mixed_workloads' [topo=1n2l2c1t] failed:
+    unfair cgroup: spread=22% (10-32%) 2 workers on 2 cpus (threshold 20%)
+  ```
 
 The reporting layer does NOT include the cgroup name — `cg{i}`
 is the positional index in the stats roll-up (`cg0`, `cg1`, ...)
@@ -758,6 +776,21 @@ returns it, so calls chain into the same accumulator.
 `field.each(&mut v).at_least(1u64)`,
 `field.each(&mut v).between(0.0, 100.0)`.
 
+When a temporal pattern fails, the `AssertDetail` entries
+identify the offending sample by tag and elapsed-ms timestamp.
+Example for `nondecreasing` flagging a regression on
+`bpf:nr_dispatched`:
+
+```text
+bpf:nr_dispatched (nondecreasing): regression at sample s2 (+10000ms): \
+value 41 after prior value 42 at sample s1 (+7000ms)
+```
+
+The rate, steady, converges, ratio, and always-true variants emit
+parallel shapes — every detail names the pattern, the specific
+sample(s) involved, and the violating value, so a failing test
+points at the data without re-running.
+
 For boundary timing, spacing rules, and the bridge cap, see
 [Periodic Capture](writing-tests/periodic-capture.md). For the full
 projection API (`bpf`, `stats`, auto-projectors) and failure
@@ -772,9 +805,10 @@ complexity, and scheduling behavior across commits. This is a
 post-run CLI workflow, not part of the test definition:
 
 ```sh
-cargo ktstr stats                    # summary: gauntlet coverage, verifier, KVM stats
-cargo ktstr stats list               # list runs with date, test count, arch
-cargo ktstr stats compare RUN_A RUN_B  # diff two runs
+cargo ktstr stats                                 # summary: gauntlet coverage, verifier, KVM stats
+cargo ktstr stats list                            # list runs with date, test count, arch
+cargo ktstr stats compare --a-kernel 6.14 \       # diff sidecar partitions defined by
+    --b-kernel 6.15                               #   per-side --a-X / --b-X filter flags
 ```
 
 Statistics are collected even on test failure (`if: !cancelled()` in
@@ -857,6 +891,123 @@ Run it:
 ```sh
 cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
 ```
+
+## What you'll see when things break
+
+The output examples below are the shapes ktstr emits in real
+runs. They're worth skimming before you ship a test so a future
+failure is recognisable.
+
+### Auto-repro probe chain
+
+When the scheduler crashes, ktstr re-runs the scenario with BPF
+probes attached and dumps the path leading to the exit. Decoded
+struct fields appear inline, with `→` between fentry-captured
+entry values and fexit-captured exit values:
+
+```text
+ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] failed:
+  scheduler died
+
+--- auto-repro ---
+=== AUTO-PROBE: scx_exit fired ===
+
+  ktstr_enqueue                                                   main.bpf.c:21
+    task_struct *p
+      pid         97
+      cpus_ptr    0xf(0-3)
+      dsq_id      SCX_DSQ_INVALID
+      enq_flags   NONE
+      slice       0
+      vtime       0
+      weight      100
+      sticky_cpu  -1
+      scx_flags   QUEUED|ENABLED
+  do_enqueue_task                                               kernel/sched/ext.c:1344
+    rq *rq
+      cpu         1
+    task_struct *p
+      pid         97
+      cpus_ptr    0xf(0-3)
+      dsq_id      SCX_DSQ_INVALID          →  SCX_DSQ_LOCAL
+      enq_flags   NONE
+      slice       20000000
+      vtime       0
+      weight      100
+      sticky_cpu  -1
+      scx_flags   QUEUED|DEQD_FOR_SLEEP    →  QUEUED
+```
+
+For the probe pipeline architecture, the BTF resolution path,
+event-stitching rules, and the `demo_host_crash_auto_repro`
+fixture, see [Auto-Repro](running-tests/auto-repro.md).
+
+### Failure dumps with cast-recovered pointers
+
+The freeze coordinator builds a
+[`FailureDumpReport`](architecture/monitor.md) on every snapshot,
+periodic capture, and post-failure dump. Each captured map prints
+as a `map <name> (type=..., value_size=..., max_entries=...)`
+header followed by `entry: key=...` / `value: ...` blocks. `u64`
+fields the
+[cast analyzer](architecture/monitor.md#cast-analysis) flagged as
+typed pointers chase to the recovered struct and print with a
+`(cast→arena)` or `(cast→kernel)` annotation distinguishing them
+from BTF-typed pointers:
+
+```text
+map scx_lavd.bss (type=array, value_size=4096, max_entries=1)
+entry: key=0
+  value: BssData {
+    nr_cpus_onln=4,
+    task_ctx_root=0xffff8881_03a01000 (cast→arena) → TaskCtx {
+      cpu_id=2,
+      last_runtime_ns=12_345_678,
+      nice=0,
+    },
+    current_task=0xffff9012_4f80c000 (cast→kernel) → TaskStruct {
+      pid=4321,
+      cpus_ptr=0xf(0-3),
+      weight=100,
+    },
+  }
+```
+
+A field that the analyzer cannot prove is a pointer falls back to
+its raw `u64` shape, which is the prior behavior — no
+test-author configuration is required either way.
+
+### Verifier output
+
+`cargo ktstr verifier --scheduler scx_my_sched` runs the BPF
+verifier against the scheduler's struct_ops programs inside a real
+kernel and prints per-callback verified-instruction counts. With
+`--include-log`, the verifier's own log appears below the stats:
+
+```text
+llc+steal
+  enqueue                                  verified_insns=42
+
+llc+steal --- verifier stats ---
+  processed=42  states=8/10
+
+llc+steal --- scheduler log ---
+func#0 @0
+0: R1=ctx() R10=fp0
+processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_states 8 mark_read 5
+```
+
+Without the log flag the output is just the per-callback table:
+
+```text
+default
+  enqueue                                  verified_insns=500
+  dispatch                                 verified_insns=1200
+  init                                     verified_insns=300
+```
+
+For the verifier-flag matrix, cycle-collapse rules, and the
+sidecar-friendly JSON variant, see [Verifier](running-tests/verifier.md).
 
 ## What's next
 

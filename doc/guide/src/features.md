@@ -246,6 +246,34 @@ reproduction.
 </details>
 
 <details>
+<summary><b>Cast analysis</b> — recover typed pointers from <code>u64</code> map fields automatically; no annotations required</summary>
+
+Schedulers stash kernel kptrs (`task_struct *`, `cgroup *`, …) and
+arena pointers in BPF map fields the BTF declares as `u64` because
+BTF cannot express a pointer to a per-allocation type. The cast
+analyzer walks the scheduler's `.bpf.o` instruction stream, tracks
+register state across LDX / STX / stack-spill / kfunc-return, and
+records every `(source_struct, field_offset) → target_struct`
+mapping it can prove from the program's own access pattern.
+
+The renderer feeds those mappings into `render_cast_pointer` so a
+field that previously surfaced as a raw `0xffff…` integer now
+chases through to the target struct's fields and prints with a
+`(cast→arena)` or `(cast→kernel)` annotation distinguishing
+cast-recovered pointers from BTF-typed ones. Failure dumps,
+periodic captures, and on-demand snapshots all benefit
+automatically.
+
+Runs unconditionally on every scheduler load; no test-author
+configuration. False negatives (a missed cast — renderer falls
+back to raw `u64`, the prior behavior) are acceptable; false
+positives (a misidentified cast) are not, so the analyzer is
+deliberately conservative on conflicting evidence and branch
+joins. See [Monitor → Cast analysis](architecture/monitor.md#cast-analysis).
+
+</details>
+
+<details>
 <summary><b>Unified timeline</b> — correlate scenario phases with scheduler telemetry</summary>
 
 Stimulus events (cgroup ops, cpuset changes, step transitions)
@@ -267,9 +295,10 @@ pause-adjusted elapsed-ms timestamp.
 
 A `post_vm` callback drains the bridge into a `SampleSeries` and
 projects per-sample columns (`SeriesField<T>`) along the BPF or
-stats axis. Six temporal patterns evaluate the projections:
+stats axis. Seven temporal patterns evaluate the projections:
 
-- `nondecreasing` / `strictly_increasing` — counter monotonicity
+- `nondecreasing` — counter monotonicity (`v[i] <= v[i+1]`)
+- `strictly_increasing` — strict counter monotonicity (`v[i] < v[i+1]`)
 - `rate_within(lo, hi)` — bounded delta-per-millisecond
 - `steady_within(warmup_ms, tolerance)` — post-warmup mean band
 - `converges_to(target, tolerance, deadline_ms)` — three-consecutive-in-band witness before deadline
@@ -298,7 +327,7 @@ thread additionally sets its own `task->comm` via the per-WorkSpec
 `.comm()`. Models real applications like `chrome` (pcomm) hosting
 `ThreadPoolForeg` (per-thread comm). `PipeIo`/`CachePipe` and
 `SignalStorm` work correctly under Fork and Thread clone modes,
-including inside pcomm-coalesced thread groups. See [Tutorial: Step 10](tutorial.md#step-10-name-and-prioritize-workers).
+including inside pcomm-coalesced thread groups. See [Tutorial: Step 11](tutorial.md#step-11-name-and-prioritize-workers).
 
 </details>
 
@@ -315,7 +344,7 @@ template before launching the scheduler. A bidirectional pairing
 gate (compile time + runtime) catches mismatched declarations: a
 scheduler with `config_file_def` REQUIRES `config = …` on every
 test, and a scheduler without it REJECTS `config = …`. See
-[Tutorial: Step 11](tutorial.md#step-11-inline-scheduler-config) and
+[Tutorial: Step 12](tutorial.md#step-12-inline-scheduler-config) and
 [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md#inline-scheduler-config).
 
 </details>
@@ -330,7 +359,7 @@ mbind, RT scheduling, and KVM exit suppression are skipped, and
 gauntlet preset filtering relaxes host-topology checks to the
 single "host has enough total CPUs" inequality. Mutually exclusive
 with `performance_mode = true` (validated at runtime by `KtstrTestEntry::validate`). See
-[Tutorial: Step 12](tutorial.md#step-12-decouple-virtual-topology-from-host-hardware)
+[Tutorial: Step 13](tutorial.md#step-13-decouple-virtual-topology-from-host-hardware)
 and [Performance Mode](concepts/performance-mode.md#tier-2-no-perf-mode-with-cpu-cap-reservation).
 
 </details>

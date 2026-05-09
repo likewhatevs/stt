@@ -202,11 +202,11 @@ This generates two consts and per-variant flag constants:
 - `const MY_SCHED: Scheduler` — the scheduler definition itself,
   for use in builder chains and library code that needs the bare
   `Scheduler` type.
-- `const MY_SCHED_PAYLOAD: Payload` — a `&'static Payload`
-  wrapper around `MY_SCHED` (kind: `PayloadKind::Scheduler`), used
-  wherever a `Payload` reference is expected. The `scheduler =`
-  slot on `#[ktstr_test]` is one such site; pass the
-  `_PAYLOAD` form, not the bare `Scheduler` form.
+- `const MY_SCHED_PAYLOAD: Payload` — a `Payload` wrapper around
+  `MY_SCHED` (kind: `PayloadKind::Scheduler`), used wherever a
+  `Payload` value is expected. The `scheduler =` slot on
+  `#[ktstr_test]` is one such site; pass the `_PAYLOAD` form, not
+  the bare `Scheduler` form.
 
 Tests referencing `MY_SCHED_PAYLOAD` inherit its topology and
 flags. Add `scheduler = MY_SCHED_PAYLOAD` to `#[ktstr_test]` to use it:
@@ -263,8 +263,8 @@ use common::fixtures::*;
 
 #[ktstr_test(scheduler = MY_SCHED_PAYLOAD, payload = SCHBENCH)]
 fn schbench_under_my_sched(ctx: &Ctx) -> Result<AssertResult> {
-    let report = ctx.payload(&SCHBENCH).run()?;
-    Ok(AssertResult::from(report))
+    let (result, _metrics) = ctx.payload(&SCHBENCH).run()?;
+    Ok(result)
 }
 ```
 
@@ -337,6 +337,7 @@ cargo ktstr model fetch                                    # prefetch the LlmExt
 cargo ktstr model status                                   # report whether a SHA-checked model is cached
 cargo ktstr verifier --scheduler scx_my_sched              # BPF verifier stats
 cargo ktstr stats                                          # aggregate gauntlet sidecars
+cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15  # diff sidecar partitions across kernels
 cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run
 cargo ktstr show-host                                      # print current host context
 cargo ktstr show-thresholds my_test                        # print resolved Assert thresholds for a test

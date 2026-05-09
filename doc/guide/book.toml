@@ -1,11 +1,14 @@
 [book]
 title = "ktstr"
 authors = ["sched-ext contributors"]
+description = "Test harness for Linux process schedulers"
 language = "en"
 src = "src"
 
 [output.html]
+default-theme = "rust"
 git-repository-url = "https://github.com/likewhatevs/ktstr"
+edit-url-template = "https://github.com/likewhatevs/ktstr/edit/main/doc/guide/{path}"
 
 [output.linkcheck2]
 follow-web-links = false

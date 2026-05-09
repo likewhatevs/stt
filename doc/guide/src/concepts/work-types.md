@@ -144,6 +144,14 @@ pub enum WorkType {
 }
 ```
 
+> **Imports:** `WorkType`, `Phase`, `SchedPolicy`, `WorkSpec`, and
+> `WorkloadConfig` are in `ktstr::prelude::*`. The auxiliary enums
+> `FutexLockMode` (used by `PriorityInversion::pi_mode`),
+> `WakeMechanism` (used by `WakeChain::wake`), and `SchedClass`
+> (used by `AsymmetricWaker`) live under `ktstr::workload`. Bring
+> them into scope with `use ktstr::workload::*;` (or import each
+> by name) before writing variant literals that reference them.
+
 Parameterized variants have snake-case convenience constructors —
 e.g. `WorkType::bursty(burst_duration, sleep_duration)`,
 `WorkType::pipe_io(burst_iters)`,
@@ -404,7 +412,7 @@ as `std::thread::spawn` threads, reaped via `JoinHandle`).
 
 `pcomm` is **not** a `CloneMode` variant — it is a `WorkSpec`
 field set via `WorkSpec::pcomm(name)` /
-[`CgroupDef::pcomm(name)`](../tutorial.md#step-10-name-and-prioritize-workers)
+[`CgroupDef::pcomm(name)`](../tutorial.md#step-11-name-and-prioritize-workers)
 in the tutorial.
 When a `WorkSpec` carries `pcomm = Some(name)`, `apply_setup`
 routes it through the fork-then-thread spawn path: ONE forked

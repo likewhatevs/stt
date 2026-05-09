@@ -117,8 +117,9 @@ writes guest BPF maps directly through the physical memory mapping
 provides bounds-checked volatile reads and writes for scalar types
 (u8/u32/u64). Byte-slice reads (`read_bytes`) use
 `copy_nonoverlapping`. It also implements x86-64 page table walks
-(`translate_kva`) for both 4-level and 5-level paging, and 3-level
-aarch64 walks (64KB granule).
+(`translate_kva`) for both 4-level and 5-level paging, and
+granule-agnostic aarch64 walks (4 KB / 16 KB / 64 KB; level count
+derived from TCR_EL1's TG1 + T1SZ fields).
 
 Scalar accesses use volatile semantics because the guest kernel
 modifies memory concurrently.
@@ -235,6 +236,54 @@ u32 at the specified byte offset within the map's value region.
   be resolved via a page-table walk through the BSP's CR3, breaking
   the chicken-and-egg between text-symbol PA translation and KASLR.
 
+### Cast analysis
+
+BPF maps frequently store kernel pointers (`task_struct *`,
+`cgroup *`, …) and arena pointers in `u64` fields because BTF cannot
+express a pointer to a per-allocation type. Without intervention the
+renderer treats them as integers and the failure dump shows raw
+0xffff…ffff values with no further chase.
+
+The cast analyzer (`monitor::cast_analysis::analyze_casts`) closes
+that gap. The freeze coordinator runs it once per scheduler load,
+before any periodic capture or on-demand snapshot would consume
+its output:
+
+1. The host loads the scheduler binary and locates each `.bpf.o`
+   ELF in the build artifacts.
+2. Each program section is decoded through
+   `cast_analysis::BpfInsn::from_le_bytes` into a flat `&[BpfInsn]`
+   slab; relocations against `.bss` / `.data` / `.rodata` annotate
+   the corresponding `BPF_LD_IMM64` PCs with their datasec target.
+3. `analyze_casts` walks the slab forward, tracking register and
+   stack-slot state for each instruction. Two detection paths feed
+   the output: the arena pointer path (LDX through a previously
+   loaded `u64` field) and the kernel kptr path (STX of a typed
+   pointer register into a `u64` field). Function-entry seeding
+   from `bpf_func_info` reseeds R1..R5 from the BTF FuncProto so
+   typed parameters propagate correctly across subprogram joins.
+4. The result is a `CastMap` (`BTreeMap<(source_struct_btf_id,
+   field_byte_offset), CastHit>`) attached to the live
+   `MonitorState` and consulted by the renderer at every dump
+   site.
+5. `render_cast_pointer` in `monitor::btf_render` consumes
+   `CastHit` via `MemReader::cast_lookup`. When a `u64` field at a
+   recorded `(struct, offset)` is rendered, the renderer chases
+   the pointer through the address-space-appropriate reader (arena
+   vs slab/vmalloc) and tags the result with a `cast_annotation`
+   of `"cast→arena"` or `"cast→kernel"`. Failure dumps show the
+   annotation alongside the resolved struct fields, so cast-
+   recovered pointers are visually distinct from BTF-typed ones.
+
+The analyzer is deliberately conservative: branch joins reset
+register and stack state, conflicts drop the offending entry, and
+self-stores are rejected. False negatives fall back to raw `u64`
+(the prior behavior); false positives would chase garbage and are
+avoided. The analysis is unconditional — no test-author
+configuration, no opt-in flag — and the freeze coordinator wires
+the resulting `CastMap` through every snapshot, periodic capture,
+and failure dump.
+
 ## Probe pipeline
 
 The probe pipeline captures function arguments and struct fields during
@@ -247,7 +296,7 @@ two BPF skeletons that share maps.
 crash stack -> extract functions -> BTF resolve -> load skeletons -> poll
                                                          |
                                     kprobe skeleton      |     fentry/fexit skeleton
-                                    (kernel entry)       |     (BPF + kernel exit)
+                                    (kernel entry)       |     (BPF entry + kernel exit)
                                          |               |          |
                                          v               v          v
                                     func_meta_map  <--shared-->  probe_data
@@ -317,7 +366,11 @@ Callback signatures are resolved by:
 
 The output formatter decodes field values based on their key name:
 - `dsq_id` -> `SCX_DSQ_INVALID`, `SCX_DSQ_GLOBAL`, `SCX_DSQ_LOCAL`, `SCX_DSQ_BYPASS`, `SCX_DSQ_LOCAL_ON|{cpu}`, `BUILTIN({v})`, `DSQ(0x{hex})`
-- `cpumask_0..3` -> coalesced `cpus_ptr 0xf(0-3)`
+- `cpumask_0..3` -> coalesced into one `cpus_ptr` field rendered as
+  `0x{hex}({cpu-list})` — the masked hex of the cpumask words
+  (low-order word first; multi-word masks join with `_` between
+  64-bit chunks) followed by the run-length-collapsed CPU range
+  list (e.g. `0xf(0-3)`, `0x1_00000000000000ff(0-7,64)`)
 - `enq_flags` -> `WAKEUP|HEAD|PREEMPT`
 - `exit_kind` -> `ERROR`, `ERROR_BPF`, `ERROR_STALL`, etc.
 - `scx_flags` -> `QUEUED|ENABLED`

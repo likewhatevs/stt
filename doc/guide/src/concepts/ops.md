@@ -121,7 +121,13 @@ let def = CgroupDef::named("cg_0")
 - `.work(WorkSpec)` -- add a work group (multiple calls for concurrent groups).
 - `.workload(&'static Payload)` -- attach a binary workload payload
   to run alongside the worker group; the framework launches it as a
-  child process inside the cgroup.
+  child process inside the cgroup. **Panics** when called with a
+  scheduler-kind `Payload` (`PayloadKind::Scheduler(_)`); the
+  scheduler slot is `#[ktstr_test(scheduler = ...)]` at the test
+  level, not the cgroup-level `workload` slot. Step-level
+  `Op::RunPayload` rejects scheduler-kind payloads with an
+  `anyhow::Error` instead of panicking; the build-time `workload`
+  call panics because there is no scenario-level recovery path.
 - `.affinity(AffinityIntent)` -- set per-worker affinity (default: `Inherit`).
 - `.mem_policy(MemPolicy)` -- set NUMA memory placement policy
   (default: `Default`). See [MemPolicy](mem-policy.md).
@@ -129,7 +135,7 @@ let def = CgroupDef::named("cg_0")
   (default: `NONE`). See [MemPolicy](mem-policy.md#mpolflags).
 - `.nice(n)` -- cgroup-level default per-worker nice value, merged
   into every WorkSpec whose own `nice` is unset. See
-  [Tutorial: Step 10](../tutorial.md#step-10-name-and-prioritize-workers).
+  [Tutorial: Step 11](../tutorial.md#step-11-name-and-prioritize-workers).
 - `.comm(name)` -- cgroup-level default per-worker `task->comm` via
   `prctl(PR_SET_NAME)`. Merged into every WorkSpec whose own `comm`
   is unset.

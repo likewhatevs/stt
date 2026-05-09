@@ -8,19 +8,20 @@
 //! sample so any failure-path message can name the offending tag
 //! and timestamp without re-walking the source data.
 //!
-//! The six built-in patterns are:
-//!   1. `nondecreasing` / `strictly_increasing` — counter
-//!      monotonicity with optional warmup skip.
-//!   2. `rate_within(lo, hi)` — bounded delta-per-millisecond
+//! The seven built-in patterns are:
+//!   1. `nondecreasing` — counter monotonicity (`v[i] <= v[i+1]`).
+//!   2. `strictly_increasing` — strict counter monotonicity
+//!      (`v[i] < v[i+1]`).
+//!   3. `rate_within(lo, hi)` — bounded delta-per-millisecond
 //!      between consecutive samples.
-//!   3. `steady_within(warmup, tolerance)` — post-warmup samples
+//!   4. `steady_within(warmup, tolerance)` — post-warmup samples
 //!      stay inside `[mean·(1-tol), mean·(1+tol)]`.
-//!   4. `converges_to(target, tol, deadline_ms)` — three
+//!   5. `converges_to(target, tol, deadline_ms)` — three
 //!      consecutive samples land inside `[target-tol, target+tol]`
 //!      before `deadline_ms`.
-//!   5. `always_true` — boolean invariant at every sample
+//!   6. `always_true` — boolean invariant at every sample
 //!      (`SeriesField<bool>` only).
-//!   6. `ratio_within(other, lo, hi)` — cross-field correlation
+//!   7. `ratio_within(other, lo, hi)` — cross-field correlation
 //!      between two same-length series.
 //!
 //! Per-sample scalar checks bypass the temporal patterns via
@@ -314,7 +315,7 @@ where
     }
 }
 
-// ----- Six temporal patterns -----
+// ----- Seven temporal patterns -----
 
 impl<T> SeriesField<T>
 where

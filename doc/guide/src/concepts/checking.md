@@ -224,12 +224,39 @@ aggregated statistics from a scenario run.
 - `AssertResult::pass()` -- creates a passing result with empty
   details and default stats.
 - `AssertResult::skip(reason)` -- creates a passing result with a
-  skip reason in `details`. Used when a scenario cannot run under the
-  current topology or flag combination but is not a failure.
+  skip reason in `details` and `skipped = true`. Used when a
+  scenario cannot run under the current topology or flag
+  combination but is not a failure.
+- `AssertResult::fail(detail)` -- failing result carrying a single
+  `AssertDetail`. Mirrors `pass` / `skip` for the failure axis.
+- `AssertResult::fail_msg(msg)` -- shortcut for the common case
+  where the failure is a plain diagnostic message tagged
+  `DetailKind::Other`.
+
+### Mutation and inspection
+
+- `result.note(msg)` -- append an informational annotation tagged
+  `DetailKind::Note`. Does NOT flip `passed` or `skipped` — a
+  note is context, not a verdict. Returns `&mut Self` so calls
+  chain.
+- `result.with_note(msg)` -- builder-style sibling of `note` that
+  consumes and returns `self`. Use at the return site to chain a
+  context annotation onto a fresh result without an intermediate
+  `let mut`.
+- `result.is_skipped()` -- convenience accessor returning
+  `skipped`. Stats tooling uses this to subtract non-executions
+  from pass counts.
+- `result.is_failed()` -- convenience accessor returning
+  `!passed`. Mirrors `is_skipped` so branches reading "did this
+  claim fail?" don't negate `.passed` inline.
 
 ### Fields
 
 - `passed: bool` -- whether all checks passed.
+- `skipped: bool` -- distinguishes a passing result that ran every
+  check from one that skipped execution (topology / flag mismatch,
+  prerequisite absent). `AssertResult::skip` sets this; `pass` /
+  `fail` / `fail_msg` leave it `false`.
 - `details: Vec<AssertDetail>` -- structured diagnostic entries; each
   carries a `kind: DetailKind` (`Other`, `Note`, `Skip`, `Temporal`,
   …) plus a human-readable `message: String`. Consumers filter by
@@ -237,6 +264,12 @@ aggregated statistics from a scenario run.
   `message` for display.
 - `stats: ScenarioStats` -- aggregated worker telemetry across all
   cgroups (spread, gaps, migrations, wake latency, iterations).
+- `measurements: BTreeMap<String, NoteValue>` -- structured
+  per-test measurements keyed by name. Sidecar consumers and
+  comparison tooling read this map directly without parsing
+  `details` strings, so populate it (via `Verdict::note_value`
+  during claim evaluation) for any value a downstream comparison
+  needs to lift programmatically.
 
 ### Merging
 
@@ -253,8 +286,8 @@ combined.merge(cgroup_1_result);
 ```
 
 Stats merging takes worst values across cgroups for spread, gap, wake
-latency, and migration ratio. Counters (workers, cpus, migrations,
-iterations) are summed.
+latency, and migration ratio. Counters (`total_workers`, `total_cpus`,
+`total_migrations`, `total_iterations`) are summed.
 
 For examples of overriding thresholds at the scheduler and per-test
 level, see [Customize Checking](../recipes/custom-checking.md).

@@ -31,6 +31,11 @@ Bind the `CgroupGroup` to a named variable (e.g. `_guard`) so it
 lives until end of scope.
 See [CgroupGroup](../architecture/cgroup-group.md) for drop semantics.
 
+> **Imports:** `setup_cgroups` and `dfl_wl` live in `ktstr::scenario`,
+> not in the prelude. The `use ktstr::scenario::*;` line in the
+> example above is required — `use ktstr::prelude::*;` alone does
+> not bring them into scope.
+
 **`collect_all(handles, checks)`** -- stops all workers, collects reports,
 runs worker-level checks when configured, otherwise falls back to
 `assert_not_starved()`. Merges results: if any worker group fails, the
