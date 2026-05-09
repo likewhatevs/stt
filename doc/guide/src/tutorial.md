@@ -417,7 +417,7 @@ Run the test with `cargo ktstr test`, scoped to this one test name:
 cargo ktstr test --kernel ../linux -- -E 'test(mixed_workloads)'
 ```
 
-If `cargo ktstr test` reports "no kernel found", the `--kernel` path
+If `cargo ktstr test` reports "kernel not found", the `--kernel` path
 either points at a directory without a built vmlinux or at a kernel
 the cache cannot locate. Run `cargo ktstr kernel build` to populate
 the cache, or pass an explicit path to a built kernel source tree —
@@ -475,7 +475,7 @@ same producer emits:
 
   ```text
   ktstr_test 'mixed_workloads' [topo=1n2l2c1t] failed:
-    tid 7 stuck 1500ms on cpu3 at +4200ms (threshold 2000ms)
+    tid 7 stuck 2500ms on cpu3 at +4200ms (threshold 2000ms)
   ```
 
 - `unfair cgroup: spread={pct}% ({lo}-{hi}%)` — when per-cgroup
@@ -779,11 +779,11 @@ returns it, so calls chain into the same accumulator.
 When a temporal pattern fails, the `AssertDetail` entries
 identify the offending sample by tag and elapsed-ms timestamp.
 Example for `nondecreasing` flagging a regression on
-`bpf:nr_dispatched`:
+`nr_dispatched`:
 
 ```text
-bpf:nr_dispatched (nondecreasing): regression at sample s2 (+10000ms): \
-value 41 after prior value 42 at sample s1 (+7000ms)
+nr_dispatched (nondecreasing): regression at sample periodic_002 (+10000ms): \
+value 41 after prior value 42 at sample periodic_001 (+7000ms)
 ```
 
 The rate, steady, converges, ratio, and always-true variants emit
@@ -906,7 +906,7 @@ struct fields appear inline, with `→` between fentry-captured
 entry values and fexit-captured exit values:
 
 ```text
-ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] failed:
+ktstr_test 'demo_host_crash_auto_repro' [sched=scx-ktstr] [topo=1n1l2c1t] failed:
   scheduler died
 
 --- auto-repro ---
@@ -948,8 +948,9 @@ The freeze coordinator builds a
 [`FailureDumpReport`](architecture/monitor.md) on every snapshot,
 periodic capture, and post-failure dump. Each captured map prints
 as a `map <name> (type=..., value_size=..., max_entries=...)`
-header followed by `entry: key=...` / `value: ...` blocks. `u64`
-fields the
+header followed by the rendered value (single-entry global
+sections like `.bss`/`.data`) or `entry: key=...` blocks
+(multi-entry maps). `u64` fields the
 [cast analyzer](architecture/monitor.md#cast-analysis) flagged as
 typed pointers chase to the recovered struct and print with a
 `(cast→arena)` or `(cast→kernel)` annotation distinguishing them
@@ -957,20 +958,12 @@ from BTF-typed pointers:
 
 ```text
 map scx_lavd.bss (type=array, value_size=4096, max_entries=1)
-entry: key=0
-  value: BssData {
-    nr_cpus_onln=4,
-    task_ctx_root=0xffff8881_03a01000 (cast→arena) → TaskCtx {
-      cpu_id=2,
-      last_runtime_ns=12_345_678,
-      nice=0,
-    },
-    current_task=0xffff9012_4f80c000 (cast→kernel) → TaskStruct {
-      pid=4321,
-      cpus_ptr=0xf(0-3),
-      weight=100,
-    },
-  }
+.bss:
+  nr_cpus_onln=4
+  task_ctx_root 0xffff888103a01000 (cast→arena) → task_ctx{cpu_id=2, last_runtime_ns=12345678, nice=0}
+  current_task 0xffff90124f80c000 (cast→kernel) → task_struct:
+    pid=4321   weight=100
+    cpus_ptr 0xffff888103b40000 → cpus={0-3}
 ```
 
 A field that the analyzer cannot prove is a pointer falls back to
@@ -981,8 +974,9 @@ test-author configuration is required either way.
 
 `cargo ktstr verifier --scheduler scx_my_sched` runs the BPF
 verifier against the scheduler's struct_ops programs inside a real
-kernel and prints per-callback verified-instruction counts. With
-`--include-log`, the verifier's own log appears below the stats:
+kernel and prints per-callback verified-instruction counts. When
+the verifier captures a libbpf log, it appears below the stats
+automatically. `--raw` disables cycle collapsing in that section:
 
 ```text
 llc+steal
@@ -997,7 +991,8 @@ func#0 @0
 processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_states 8 mark_read 5
 ```
 
-Without the log flag the output is just the per-callback table:
+When the scheduler did not capture a log, the output is just the
+per-callback table:
 
 ```text
 default
