@@ -3377,7 +3377,7 @@ fn chase_arena_pointer(
                      but the type does not resolve in the program BTF",
                     hit.target_type_id
                 )),
-                sdt_alloc_resolved: false,
+                sdt_alloc_resolved: true,
             };
         };
         let Some(btf_size) = type_size(btf, &resolved_ty) else {
@@ -3389,7 +3389,7 @@ fn chase_arena_pointer(
                     hit.target_type_id,
                     &resolved_ty,
                 )),
-                sdt_alloc_resolved: false,
+                sdt_alloc_resolved: true,
             };
         };
         if btf_size == 0 {
