@@ -9254,24 +9254,23 @@ fn only_ld_imm64_no_oob() {
 fn arena_stx_pending_then_duplicate_is_idempotent() {
     let (blob, t_id, _q_id) = btf_with_source_and_target(8, 0);
     let btf = Btf::from_bytes(&blob).unwrap();
-    let cast = addr_space_cast(2, 3, 1);
+    let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
     let insns = vec![
-        ldx(BPF_SIZE_DW, 3, 1, 8),
-        cast,
-        stx(BPF_SIZE_DW, 1, 2, 8),
-        stx(BPF_SIZE_DW, 1, 2, 8),
+        pseudo_call,
+        stx(BPF_SIZE_DW, 6, 0, 8),
+        stx(BPF_SIZE_DW, 6, 0, 8),
         exit(),
     ];
     let map = analyze_casts(
         &insns,
         &btf,
         &[InitialReg {
-            reg: 1,
+            reg: 6,
             struct_type_id: t_id,
         }],
         &[],
         &[],
-        &[],
+        &[SubprogReturn { insn_offset: 0 }],
     );
     assert!(
         !map.is_empty(),

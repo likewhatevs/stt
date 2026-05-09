@@ -763,6 +763,12 @@ enum StxValueKind {
     /// Source register held [`RegState::ArenaU64FromAlloc`]: record
     /// into [`Analyzer::arena_stx_findings`].
     Arena,
+    /// Source register held a non-pointer state (Unknown,
+    /// LoadedU64Field, DatasecPointer). Invalidates any prior
+    /// arena_stx_findings entry for the same slot — the slot is
+    /// used for non-arena values on at least one code path, making
+    /// the arena observation ambiguous.
+    Unknown,
 }
 
 impl<'a> Analyzer<'a> {
@@ -1709,6 +1715,7 @@ impl<'a> Analyzer<'a> {
                 struct_type_id: tid,
             } => StxValueKind::Kptr { target: tid },
             RegState::ArenaU64FromAlloc => StxValueKind::Arena,
+            RegState::Unknown => StxValueKind::Unknown,
             _ => return,
         };
         let Some(insn_off) = field_byte_offset(off as i32) else {
@@ -1847,6 +1854,17 @@ impl<'a> Analyzer<'a> {
                         );
                     }
                 }
+            }
+            StxValueKind::Unknown => {
+                if self.arena_stx_findings.remove(&key).is_some() {
+                    tracing::debug!(
+                        parent = key.0,
+                        offset = key.1,
+                        "cast_analysis: arena_stx_findings invalidated \
+                         by non-arena DW store to same slot"
+                    );
+                }
+                self.arena_confirmed.remove(&key);
             }
         }
     }
