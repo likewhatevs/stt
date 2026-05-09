@@ -3110,10 +3110,10 @@ enum ChaseResolve<'a> {
 ///
 /// `kind_label` ("arena chase" / "kernel cast") flows into every
 /// skip reason so the caller-visible messages still distinguish
-/// the two arms; the test fixture in
-/// [`super::btf_render::tests`] asserts the prefix on each path.
+/// the two arms; the renderer's test module asserts the prefix on
+/// each path.
 ///
-/// On the success path, the [`Self::Ready`] payload carries
+/// On the success path, the [`ChaseResolve::Ready`] payload carries
 /// every value the per-arm read+recurse needs:
 /// [`ResolvedTarget::effective_type_id`],
 /// [`ResolvedTarget::current_btf`], [`ResolvedTarget::btf_size`],
@@ -3529,7 +3529,8 @@ fn try_cross_btf_fwd_resolve<'a>(
 /// the same four-field shape (`value`, optional `deref`, optional
 /// `deref_skipped_reason`, optional `cast_annotation`). The helper
 /// resolves the canonical annotation through [`cast_annotation_for`]
-/// — a 4-cell match over [`AddrSpace`] × [`Self::sdt_alloc_resolved`]
+/// — a 4-cell match over
+/// [`super::cast_analysis::AddrSpace`] × `sdt_alloc_resolved`
 /// returning a `&'static str` — so every annotation the renderer
 /// emits is a borrow into the binary's read-only string pool, not a
 /// per-chase heap allocation. Adding a new address-space variant
@@ -3567,16 +3568,18 @@ fn cast_ptr(
 /// Resolve the canonical cast annotation tag to a `&'static str`.
 ///
 /// The `(addr_space, sdt_alloc_resolved)` pair maps to one of four
-/// fixed strings — exhaustively enumerated below so [`AddrSpace`]'s
-/// closed variant set drives an exhaustive match. A new variant
-/// produces a compile error here, forcing the operator-visible tag
-/// to stay in lockstep with the analyzer enum.
+/// fixed strings — exhaustively enumerated below so
+/// [`super::cast_analysis::AddrSpace`]'s closed variant set drives
+/// an exhaustive match. A new variant produces a compile error
+/// here, forcing the operator-visible tag to stay in lockstep with
+/// the analyzer enum.
 ///
-/// The pre-existing [`AddrSpace`] [`Display`] impl is kept for
-/// other call sites (free-form formatting, error messages); the
-/// renderer side bypasses Display because the closed set lets us
-/// hand back static strings instead of allocating a new `String`
-/// per chase.
+/// The pre-existing [`super::cast_analysis::AddrSpace`]
+/// [`std::fmt::Display`] impl is kept for other call sites
+/// (free-form formatting, error messages); the renderer side
+/// bypasses `Display` because the closed set lets us hand back
+/// static strings instead of allocating a new `String` per
+/// chase.
 fn cast_annotation_for(
     addr_space: super::cast_analysis::AddrSpace,
     sdt_alloc_resolved: bool,
