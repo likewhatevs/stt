@@ -9165,6 +9165,33 @@
     }
 
     #[test]
+    fn empty_access_pattern_does_not_trigger_conflict_with_kptr() {
+        let (blob, t_id, q_id) = btf_with_source_and_target(8, 0);
+        let btf = Btf::from_bytes(&blob).unwrap();
+        let insns = vec![
+            ldx(BPF_SIZE_DW, 3, 1, 8),
+            stx(BPF_SIZE_DW, 1, 5, 8),
+            exit(),
+        ];
+        let map = analyze_casts(
+            &insns,
+            &btf,
+            &[
+                InitialReg { reg: 1, struct_type_id: t_id },
+                InitialReg { reg: 5, struct_type_id: q_id },
+            ],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            map.contains_key(&(t_id, 8)),
+            "kptr finding on slot with empty-access pattern (LDX without deref) \
+             must NOT be dropped by conflict detection: {map:?}"
+        );
+    }
+
+    #[test]
     fn only_ld_imm64_no_oob() {
         const N_PAIRS: usize = 50;
         let (blob, t_id, _q_id) = btf_with_source_and_target(8, 0);
