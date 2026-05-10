@@ -1228,7 +1228,7 @@ impl<'a> Analyzer<'a> {
                 if let Some(caller_args) = self.caller_arg_types.get(&pc) {
                     let args = *caller_args;
                     for (i, &caller_state) in args.iter().enumerate() {
-                        let reg_idx = i + 1;
+                        let reg_idx = i + 1; // R1..R5
                         if matches!(self.regs[reg_idx], RegState::Unknown) {
                             if let RegState::Pointer { struct_type_id } = caller_state {
                                 self.regs[reg_idx] = RegState::Pointer { struct_type_id };
@@ -1236,6 +1236,22 @@ impl<'a> Analyzer<'a> {
                             } else if matches!(caller_state, RegState::ArenaU64FromAlloc) {
                                 self.regs[reg_idx] = RegState::ArenaU64FromAlloc;
                             }
+                        }
+                    }
+                    // Mirror inherited args to callee-saved registers
+                    // (R1→R6, R2→R7, R3→R8, R4→R9). Models the
+                    // compiler's param-save pattern (`r6 = r1` etc.)
+                    // that seed_from_func_proto can't see because
+                    // the FuncProto declared the param as u64. The
+                    // linear walk clobbers R1-R5 on fall-through
+                    // error paths before the success-path code uses
+                    // the param; the callee-saved mirror survives.
+                    for (i, &caller_state) in args.iter().enumerate().take(4) {
+                        let callee_saved = i + 6; // R6..R9
+                        if matches!(self.regs[callee_saved], RegState::Unknown)
+                            && !matches!(caller_state, RegState::Unknown)
+                        {
+                            self.regs[callee_saved] = caller_state;
                         }
                     }
                 }
