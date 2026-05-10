@@ -2784,9 +2784,11 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // The per-map renderer's [`MemReader::is_already_rendered`]
     // consults this set to skip re-rendering the same allocation
     // when a TASK_STORAGE / HASH map's value pointer chases back
-    // into it; missing untyped slots would surface them twice in
-    // the dump (once under the typed-allocator surface, once
-    // embedded in the per-map render).
+    // into it. Only TYPED allocators (target_type_id != 0) enter
+    // the set — untyped pre-pass renders (hex fallback) must not
+    // suppress per-map chases because the cast analyzer's shape
+    // inference may resolve a concrete target type the heuristic
+    // missed.
     let header_size_by_allocator: std::collections::HashMap<&str, usize> = sdt_alloc_metas
         .iter()
         .map(|meta| (meta.allocator_name.as_str(), meta.header_size))
@@ -2794,17 +2796,22 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     let rendered_slot_addrs: std::collections::HashSet<u32> = report
         .sdt_allocations
         .iter()
-        .flat_map(|snap| {
-            let header_size = header_size_by_allocator
-                .get(snap.allocator_name.as_str())
-                .copied()
-                .unwrap_or(0);
-            snap.entries.iter().flat_map(move |e| {
+        .filter_map(|snap| {
+            // Only dedup slots from allocators with a resolved
+            // payload type. Untyped allocators (target_type_id == 0,
+            // rendered as hex in the pre-pass) must NOT suppress
+            // per-map chases — the cast analyzer's shape inference
+            // may resolve a concrete target type that the pre-pass
+            // heuristic missed.
+            let &header_size = header_size_by_allocator
+                .get(snap.allocator_name.as_str())?;
+            Some(snap.entries.iter().flat_map(move |e| {
                 let slot_start = e.user_addr as u32;
                 let payload_start = slot_start.wrapping_add(header_size as u32);
                 [slot_start, payload_start]
-            })
+            }))
         })
+        .flatten()
         .collect();
     let rendered_slot_addrs_ref = if rendered_slot_addrs.is_empty() {
         None
