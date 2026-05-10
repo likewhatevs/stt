@@ -1101,7 +1101,7 @@ fn build_full_bpf_object_elf(text: Vec<u8>, btf: Vec<u8>, btf_ext: Vec<u8>) -> V
 #[test]
 fn analyze_one_object_corrupt_elf_returns_empty() {
     let bytes = vec![0u8; 64]; // all zeros — bad ELF magic
-    let (map, btf) = analyze_one_object_with_btf(&bytes);
+    let (map, btf, _alloc_sizes) = analyze_one_object_with_btf(&bytes);
     assert!(map.is_empty());
     assert!(btf.is_none());
 }
@@ -1119,7 +1119,7 @@ fn analyze_one_object_no_btf_returns_empty() {
         h::EM_BPF,
         h::ET_REL,
     );
-    let (map, btf) = analyze_one_object_with_btf(&bytes);
+    let (map, btf, _alloc_sizes) = analyze_one_object_with_btf(&bytes);
     assert!(map.is_empty());
     assert!(btf.is_none());
 }
@@ -1138,7 +1138,7 @@ fn analyze_one_object_corrupt_btf_returns_empty() {
         h::EM_BPF,
         h::ET_REL,
     );
-    let (map, btf) = analyze_one_object_with_btf(&bytes);
+    let (map, btf, _alloc_sizes) = analyze_one_object_with_btf(&bytes);
     assert!(map.is_empty());
     assert!(btf.is_none());
 }
@@ -1154,7 +1154,7 @@ fn analyze_one_object_no_text_section_returns_empty() {
         h::EM_BPF,
         h::ET_REL,
     );
-    let (map, btf) = analyze_one_object_with_btf(&bytes);
+    let (map, btf, _alloc_sizes) = analyze_one_object_with_btf(&bytes);
     assert!(map.is_empty());
     assert!(btf.is_some());
 }
@@ -1174,7 +1174,7 @@ fn analyze_one_object_misaligned_text_skipped() {
         h::EM_BPF,
         h::ET_REL,
     );
-    let (map, btf) = analyze_one_object_with_btf(&bytes);
+    let (map, btf, _alloc_sizes) = analyze_one_object_with_btf(&bytes);
     assert!(map.is_empty());
     assert!(btf.is_some());
 }
@@ -1253,7 +1253,7 @@ fn analyze_one_object_recovers_arena_cast_end_to_end() {
     let btf_ext = build_btf_ext(n_text, &[(0, 5)], 8);
 
     let bytes = build_full_bpf_object_elf(text, btf_blob, btf_ext);
-    let (map, btf) = analyze_one_object_with_btf(&bytes);
+    let (map, btf, _alloc_sizes) = analyze_one_object_with_btf(&bytes);
     assert!(btf.is_some(), "valid BTF must be returned");
     let hit = map.get(&(2u32, 8u32)).copied();
     assert_eq!(

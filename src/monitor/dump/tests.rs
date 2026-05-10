@@ -4979,7 +4979,7 @@ fn render_map_struct_ops_no_offsets_returns_error() {
         cast_map: None,
         arena_type_index: None,
         cross_btf_fwd_index: None,
-        scx_static_index: None,
+        scx_static_index: None, captured_alloc_sizes: &[],
         rendered_slot_addrs: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
@@ -5048,7 +5048,7 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
         cast_map: None,
         arena_type_index: None,
         cross_btf_fwd_index: None,
-        scx_static_index: None,
+        scx_static_index: None, captured_alloc_sizes: &[],
         rendered_slot_addrs: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
