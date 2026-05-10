@@ -324,10 +324,26 @@ pub(crate) struct FuncEntry {
 /// seed inside its [`BPF_OP_CALL`] arm after the standard register
 /// clobber, mirroring how [`Self::handle_kfunc_call`] types R0 from
 /// the kfunc's FuncProto return type.
+///
+/// `alloc_size` is the value of the `size` argument (R1) at the call
+/// site, captured by the host-side loader for `scx_static_alloc_internal`
+/// call sites. The bump allocator emits no per-slot header that the
+/// renderer's [`super::btf_render::MemReader::resolve_arena_type`]
+/// bridge could index, so the analyzer threads the sizeof argument
+/// through to [`CastHit::alloc_size`] for size-based BTF matching at
+/// chase time via [`super::sdt_alloc::discover_payload_btf_id`]. `None`
+/// for allocators that DO emit a per-slot header (e.g.
+/// `scx_alloc_internal`, where the bridge resolves the payload type via
+/// the per-slot header) or when the loader could not find a matching
+/// `BPF_MOV64_IMM r1, <size>` instruction within the lookback window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SubprogReturn {
     /// Instruction index of the `BPF_PSEUDO_CALL` site.
     pub insn_offset: usize,
+    /// `sizeof` argument captured at the call site for
+    /// `scx_static_alloc_internal` calls. `None` for any other
+    /// allocator.
+    pub alloc_size: Option<u64>,
 }
 
 /// Caller-supplied annotation that ties a `BPF_LD_IMM64` instruction
@@ -416,11 +432,16 @@ impl std::fmt::Display for AddrSpace {
 /// arena vs kernel chasing.
 ///
 /// `Copy` so the renderer can hand it across helper boundaries
-/// without lifetime gymnastics; the type is two `Copy` fields and
-/// stays small.
+/// without lifetime gymnastics; the type is small.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CastHit {
-    /// BTF type id of the recovered target struct/union.
+    /// BTF type id of the recovered target struct/union. `0` means
+    /// the analyzer's STX-flow path tagged the slot as Arena WITHOUT
+    /// resolving the target type — the renderer's chase path
+    /// supplies the real payload BTF id via the
+    /// [`super::btf_render::MemReader::resolve_arena_type`] bridge,
+    /// or via the [`Self::alloc_size`]-driven static-alloc fallback
+    /// when the bridge has no entry.
     pub target_type_id: u32,
     /// Address-space hint from the analyzer (arena vs kernel).
     /// The renderer ignores this for dispatch — runtime
@@ -429,6 +450,28 @@ pub struct CastHit {
     /// see whether the analyzer's hint matched what the runtime
     /// chase resolved to.
     pub addr_space: AddrSpace,
+    /// Captured `sizeof` argument from the producing
+    /// `scx_static_alloc_internal` call site, recorded by the
+    /// host-side loader and threaded through the analyzer's
+    /// per-slot index (see
+    /// [`Analyzer::arena_alloc_size_index`]). Populated only on
+    /// arena STX-flow findings whose source register's
+    /// [`RegState::ArenaU64FromAlloc`] carried a captured size;
+    /// `None` for any other allocator path (kfunc allocator,
+    /// `scx_alloc_internal` per-slot-header path, shape-inference,
+    /// kernel kptr STX, heuristic-synthesized arena tags) AND for
+    /// slots where multiple STX writes recorded disagreeing sizes
+    /// (the per-slot index collapsed to `None`).
+    ///
+    /// At chase time the renderer's
+    /// [`super::btf_render::chase_arena_pointer`] consults this
+    /// field after the [`super::btf_render::MemReader::resolve_arena_type`]
+    /// bridge returns no entry: `Some(n)` triggers a size-based
+    /// BTF match via [`super::sdt_alloc::discover_payload_btf_id`],
+    /// which is the only resolution path for `scx_static_alloc_internal`
+    /// allocations whose bump-allocator emits no per-slot header
+    /// the bridge could index.
+    pub alloc_size: Option<u64>,
 }
 
 /// Output of [`analyze_casts`].
@@ -550,8 +593,25 @@ enum RegState {
     /// reseed of R1..R5) strips `source` to `None` so the callee
     /// retains the arena tag without inheriting a stale in-caller
     /// slot identity.
+    ///
+    /// `alloc_size` is the `sizeof` argument captured at the
+    /// `scx_static_alloc_internal` call site by the host-side loader.
+    /// `Some(n)` for those allocator-return seeds (and any state that
+    /// inherits from one via MOV / spill / alias-tracking from a slot
+    /// whose seed carried the size); `None` for `scx_alloc_internal`
+    /// and other allocators with a per-slot header that the renderer's
+    /// [`super::btf_render::MemReader::resolve_arena_type`] bridge
+    /// resolves directly. At STX time, the value rides into the
+    /// per-slot alloc-size index alongside `arena_stx_findings`, and at
+    /// finalize each emitted [`CastHit`] for the slot carries the
+    /// captured size so the renderer's chase path can size-match the
+    /// payload BTF type via [`super::sdt_alloc::discover_payload_btf_id`].
+    /// Cross-function propagation (caller_arg_types) preserves
+    /// `alloc_size` even after stripping `source` — the size is a
+    /// property of the producing call site, not the in-caller frame.
     ArenaU64FromAlloc {
         source: Option<(u32, u32)>,
+        alloc_size: Option<u64>,
     },
     /// Register holds a frame-pointer-relative address: `r10 + offset`.
     /// Produced by `MOV rX, r10` (offset = 0) and propagated through
@@ -692,12 +752,18 @@ pub fn analyze_casts(
     let targets = jump_targets(insns);
     let mut caller_args: CallerArgTypes = HashMap::new();
     let mut arena_stx: ArenaStxFindings = BTreeMap::new();
+    let mut alloc_size_idx: ArenaAllocSizeIndex = BTreeMap::new();
 
     for pass in 0..MAX_PASSES {
         let mut a = if pass == 0 {
             Analyzer::new(btf)
         } else {
-            Analyzer::with_carryover(btf, caller_args.clone(), arena_stx.clone())
+            Analyzer::with_carryover(
+                btf,
+                caller_args.clone(),
+                arena_stx.clone(),
+                alloc_size_idx.clone(),
+            )
         };
         a.seed(initial_regs);
         a.run(
@@ -707,7 +773,7 @@ pub fn analyze_casts(
             datasec_pointers,
             subprog_returns,
         );
-        let (next_args, next_stx) = a.into_carryover();
+        let (next_args, next_stx, next_alloc_size) = a.into_carryover();
         if next_stx == arena_stx && pass > 0 {
             // Converged: re-run one more time with the converged
             // carry-over so finalize() sees a fully populated
@@ -718,7 +784,8 @@ pub fn analyze_casts(
             // analyzer state — patterns, kptr_findings,
             // arena_confirmed — is rebuilt to the same shape it had
             // on the iteration that detected convergence).
-            let mut final_a = Analyzer::with_carryover(btf, next_args, next_stx);
+            let mut final_a =
+                Analyzer::with_carryover(btf, next_args, next_stx, next_alloc_size);
             final_a.seed(initial_regs);
             final_a.run(
                 insns,
@@ -731,12 +798,13 @@ pub fn analyze_casts(
         }
         caller_args = next_args;
         arena_stx = next_stx;
+        alloc_size_idx = next_alloc_size;
     }
 
     // Cap reached without convergence: finalize on the last
     // observed carry-over. False negatives on the still-changing
     // tail of the propagation are the safe direction.
-    let mut final_a = Analyzer::with_carryover(btf, caller_args, arena_stx);
+    let mut final_a = Analyzer::with_carryover(btf, caller_args, arena_stx, alloc_size_idx);
     final_a.seed(initial_regs);
     final_a.run(
         insns,
@@ -765,6 +833,14 @@ type CallerArgTypes = HashMap<usize, [RegState; 5]>;
 /// Per `(parent_struct_id, field_byte_offset)` slot, the arena-STX
 /// finding state. See [`Analyzer::arena_stx_findings`].
 type ArenaStxFindings = BTreeMap<(u32, u32), ArenaStxEntry>;
+
+/// Per `(parent_struct_id, field_byte_offset)` slot, the captured
+/// `sizeof` argument from the producing
+/// `scx_static_alloc_internal` call site. Carries across fixpoint
+/// passes alongside [`ArenaStxFindings`] so a slot tagged on a later
+/// pass still carries the size when it propagates back through
+/// alias-tracking. See [`Analyzer::arena_alloc_size_index`].
+type ArenaAllocSizeIndex = BTreeMap<(u32, u32), Option<u64>>;
 
 struct Analyzer<'a> {
     btf: &'a Btf,
@@ -824,6 +900,32 @@ struct Analyzer<'a> {
     /// to [`ArenaStxEntry::Pending`] (see the enum doc for the
     /// `Conflicting` variant's defensive role).
     arena_stx_findings: BTreeMap<(u32, u32), ArenaStxEntry>,
+    /// Captured `sizeof` argument per arena STX slot, populated by
+    /// the [`StxValueKind::Arena`] arm of [`Self::handle_stx`]
+    /// alongside [`Self::arena_stx_findings`]. Keyed identically:
+    /// `(parent_struct_id, field_byte_offset)`. Value `Some(n)` when
+    /// the storing register's [`RegState::ArenaU64FromAlloc`] carried
+    /// an `alloc_size` (i.e. the value originated at a
+    /// `scx_static_alloc_internal` call site captured by the
+    /// host-side loader); `None` for any other allocator (including
+    /// `scx_alloc_internal` whose payload type the renderer's
+    /// [`super::btf_render::MemReader::resolve_arena_type`] bridge
+    /// resolves via the per-slot header).
+    ///
+    /// At [`Self::finalize`] each emitted [`CastHit`] for an arena
+    /// STX slot carries the captured size in its
+    /// [`CastHit::alloc_size`] field. The chase path consults that
+    /// size via [`super::sdt_alloc::discover_payload_btf_id`] when
+    /// the bridge returns no entry for the slot — the `static_alloc`
+    /// fallback that resolves the payload BTF type by size match.
+    ///
+    /// Conflicting captures across multiple STX writes to the same
+    /// slot collapse to `None` rather than picking one — the slot's
+    /// observation became ambiguous and the renderer must fall back
+    /// to the bridge or skip with a clear reason. A keyed-but-`None`
+    /// entry is distinct from an absent key: absent means no arena
+    /// STX captured a size at all.
+    arena_alloc_size_index: BTreeMap<(u32, u32), Option<u64>>,
     /// Largest type id touched while resolving sources (struct
     /// pointer types and u64-field source structs). Used to bound
     /// the matcher's id walk below
@@ -965,8 +1067,14 @@ enum StxValueKind {
     /// [`Analyzer::kptr_findings`].
     Kptr { target: u32 },
     /// Source register held [`RegState::ArenaU64FromAlloc`]: record
-    /// into [`Analyzer::arena_stx_findings`].
-    Arena,
+    /// into [`Analyzer::arena_stx_findings`]. `alloc_size` carries
+    /// the captured `sizeof` argument from the producing
+    /// `scx_static_alloc_internal` call site (or `None` for kfunc /
+    /// `scx_alloc_internal` / heuristic-synthesized arena tags) so
+    /// the per-slot index in
+    /// [`Analyzer::arena_alloc_size_index`] can record the size for
+    /// the renderer's chase-time BTF size match.
+    Arena { alloc_size: Option<u64> },
     /// Source register held a non-pointer state (Unknown,
     /// LoadedU64Field, DatasecPointer). Invalidates any prior
     /// arena_stx_findings entry for the same slot — the slot is
@@ -985,6 +1093,7 @@ impl<'a> Analyzer<'a> {
             stack_slots: BTreeMap::new(),
             arena_confirmed: BTreeSet::new(),
             arena_stx_findings: BTreeMap::new(),
+            arena_alloc_size_index: BTreeMap::new(),
             max_seen_type_id: 0,
             alloc_seeds_applied: 0,
             caller_arg_types: HashMap::new(),
@@ -1026,6 +1135,7 @@ impl<'a> Analyzer<'a> {
         btf: &'a Btf,
         caller_arg_types: CallerArgTypes,
         arena_stx_findings: ArenaStxFindings,
+        arena_alloc_size_index: ArenaAllocSizeIndex,
     ) -> Self {
         // Seed `max_seen_type_id` from the largest parent struct id
         // present in `arena_stx_findings`. Without this seed, the
@@ -1047,6 +1157,7 @@ impl<'a> Analyzer<'a> {
             stack_slots: BTreeMap::new(),
             arena_confirmed: BTreeSet::new(),
             arena_stx_findings,
+            arena_alloc_size_index,
             max_seen_type_id,
             alloc_seeds_applied: 0,
             caller_arg_types,
@@ -1056,15 +1167,19 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// Extract the post-walk `caller_arg_types` and
-    /// `arena_stx_findings` maps for the fixpoint loop. Consumes the
-    /// analyzer because the maps are moved out rather than cloned;
-    /// the caller in [`analyze_casts`] either detects convergence
-    /// (and rebuilds a fresh analyzer to call finalize on) or feeds
-    /// the extracted maps into a successor pass via
-    /// [`Self::with_carryover`].
-    fn into_carryover(self) -> (CallerArgTypes, ArenaStxFindings) {
-        (self.caller_arg_types, self.arena_stx_findings)
+    /// Extract the post-walk `caller_arg_types`,
+    /// `arena_stx_findings`, and `arena_alloc_size_index` maps for
+    /// the fixpoint loop. Consumes the analyzer because the maps are
+    /// moved out rather than cloned; the caller in [`analyze_casts`]
+    /// either detects convergence (and rebuilds a fresh analyzer to
+    /// call finalize on) or feeds the extracted maps into a successor
+    /// pass via [`Self::with_carryover`].
+    fn into_carryover(self) -> (CallerArgTypes, ArenaStxFindings, ArenaAllocSizeIndex) {
+        (
+            self.caller_arg_types,
+            self.arena_stx_findings,
+            self.arena_alloc_size_index,
+        )
     }
 
     fn seed(&mut self, initial_regs: &[InitialReg]) {
@@ -1227,15 +1342,20 @@ impl<'a> Analyzer<'a> {
             datasec_by_pc.insert(dp.insn_offset, (dp.datasec_type_id, dp.base_offset));
         }
 
-        // Pre-build the subprog-return seed set so the `BPF_OP_CALL`
+        // Pre-build the subprog-return seed map so the `BPF_OP_CALL`
         // arm can decide whether to seed R0 to
-        // [`RegState::ArenaU64FromAlloc`] in O(1). Duplicates collapse
-        // (calling the same allocator at the same PC twice would be
-        // physically impossible — one PC is one instruction).
-        let mut subprog_returns_by_pc: std::collections::HashSet<usize> =
-            std::collections::HashSet::with_capacity(subprog_returns.len());
+        // [`RegState::ArenaU64FromAlloc`] in O(1) AND propagate the
+        // captured `alloc_size`. Duplicates collapse (calling the
+        // same allocator at the same PC twice would be physically
+        // impossible — one PC is one instruction). The map's value is
+        // the [`SubprogReturn::alloc_size`] payload — `Some(n)` for
+        // `scx_static_alloc_internal` calls whose `size` argument the
+        // host-side loader recovered, `None` for other allocators or
+        // when the lookback failed.
+        let mut subprog_returns_by_pc: std::collections::HashMap<usize, Option<u64>> =
+            std::collections::HashMap::with_capacity(subprog_returns.len());
         for sr in subprog_returns {
-            subprog_returns_by_pc.insert(sr.insn_offset);
+            subprog_returns_by_pc.insert(sr.insn_offset, sr.alloc_size);
         }
 
         for (pc, insn) in insns.iter().enumerate() {
@@ -1290,13 +1410,22 @@ impl<'a> Analyzer<'a> {
                             if let RegState::Pointer { struct_type_id } = caller_state {
                                 self.regs[reg_idx] = RegState::Pointer { struct_type_id };
                                 self.note_type_id(struct_type_id);
-                            } else if matches!(caller_state, RegState::ArenaU64FromAlloc { .. }) {
+                            } else if let RegState::ArenaU64FromAlloc { alloc_size, .. } =
+                                caller_state
+                            {
                                 // Cross-function: the caller's source
                                 // slot identity has no meaning in the
                                 // callee's frame, so reseed without
                                 // it. The callee retains the arena
-                                // tag for downstream STX recording.
-                                self.regs[reg_idx] = RegState::ArenaU64FromAlloc { source: None };
+                                // tag AND the captured alloc_size
+                                // (the size is a property of the
+                                // producing call site that survives
+                                // the call boundary) for downstream
+                                // STX recording.
+                                self.regs[reg_idx] = RegState::ArenaU64FromAlloc {
+                                    source: None,
+                                    alloc_size,
+                                };
                             }
                         }
                     }
@@ -1312,13 +1441,19 @@ impl<'a> Analyzer<'a> {
             let datasec_hit = datasec_by_pc.get(&pc).copied();
 
             // Allocator-return seed: the `BPF_OP_CALL` arm consults
-            // this flag and, AFTER the standard R0..=R5 clobber, sets
+            // this lookup and, AFTER the standard R0..=R5 clobber, sets
             // R0 to [`RegState::ArenaU64FromAlloc`] when the PC
             // matches a [`SubprogReturn::insn_offset`]. The subsequent
             // STX of R0 (or any propagated copy) into a typed `u64`
             // field of a `Pointer{P}` parent records `(P, off)` as an
-            // Arena cast finding.
-            let alloc_seed = subprog_returns_by_pc.contains(&pc);
+            // Arena cast finding. The optional `alloc_size` rides along
+            // for `scx_static_alloc_internal` so the renderer can
+            // size-match the payload BTF type at chase time.
+            // `Some(None)` means a seed applies but no `alloc_size` was
+            // captured (any allocator other than
+            // `scx_static_alloc_internal`, or a recovery failure);
+            // `Some(Some(n))` means seed AND captured size.
+            let alloc_seed = subprog_returns_by_pc.get(&pc).copied();
 
             if insn.code == (BPF_CLASS_JMP | BPF_OP_CALL) && insn.src_reg() == BPF_PSEUDO_CALL {
                 let callee_pc = (pc as i64 + 1 + insn.imm as i64) as usize;
@@ -1329,9 +1464,19 @@ impl<'a> Analyzer<'a> {
                 // it from disjoint slots, breaking fixpoint
                 // convergence on caller_arg_types. The callee inherits
                 // only the arena tag.
+                // Strip the source slot (in-caller frame identity has
+                // no meaning across the call boundary) but PRESERVE
+                // `alloc_size` — the captured `sizeof` argument is a
+                // property of the producing call site, not the
+                // caller's frame. The callee inherits it so a
+                // downstream STX inside the callee still records the
+                // size for the per-slot finding.
                 let strip = |s: RegState| match s {
-                    RegState::ArenaU64FromAlloc { .. } => {
-                        RegState::ArenaU64FromAlloc { source: None }
+                    RegState::ArenaU64FromAlloc { alloc_size, .. } => {
+                        RegState::ArenaU64FromAlloc {
+                            source: None,
+                            alloc_size,
+                        }
                     }
                     other => other,
                 };
@@ -1417,7 +1562,7 @@ impl<'a> Analyzer<'a> {
         insn: BpfInsn,
         skip_next: &mut bool,
         datasec_hit: Option<(u32, u32)>,
-        alloc_seed: bool,
+        alloc_seed: Option<Option<u64>>,
     ) {
         let class = insn.code & 0x07;
         let dst = insn.dst_reg() as usize;
@@ -1765,14 +1910,24 @@ impl<'a> Analyzer<'a> {
                     // resolve to the same call site — kfunc returns
                     // are stronger evidence than the allocator
                     // allowlist.
-                    if alloc_seed && matches!(self.regs[0], RegState::Unknown) {
+                    if let Some(captured_alloc_size) = alloc_seed
+                        && matches!(self.regs[0], RegState::Unknown)
+                    {
                         // Allocator-return seed has no source slot:
                         // the value was synthesized by the allocator,
                         // not loaded from a slot. The downstream STX
                         // of R0 records `(parent, off)` against the
                         // STORE site's slot via `handle_stx`, not
                         // through this register's source field.
-                        self.regs[0] = RegState::ArenaU64FromAlloc { source: None };
+                        // `captured_alloc_size` rides on the register
+                        // state: `Some(n)` for `scx_static_alloc_internal`
+                        // (no per-slot header → renderer needs the size
+                        // for BTF matching), `None` for allocators with
+                        // a per-slot header that the bridge resolves.
+                        self.regs[0] = RegState::ArenaU64FromAlloc {
+                            source: None,
+                            alloc_size: captured_alloc_size,
+                        };
                         // F4 telemetry: bump the seed-applied
                         // counter so [`Self::finalize`] can
                         // distinguish "we saw allocator call
@@ -1982,8 +2137,21 @@ impl<'a> Analyzer<'a> {
                                 .arena_stx_findings
                                 .contains_key(&(canonical_parent, canonical_field_off))
                             {
+                                // Inherit the slot's previously
+                                // captured `alloc_size` (when a STX
+                                // through the same key recorded one)
+                                // so a later STX of the LDXed value
+                                // into another slot can still
+                                // surface the size. Absent index
+                                // entry → `None`.
+                                let inherited_size = self
+                                    .arena_alloc_size_index
+                                    .get(&(canonical_parent, canonical_field_off))
+                                    .copied()
+                                    .flatten();
                                 RegState::ArenaU64FromAlloc {
                                     source: Some((canonical_parent, canonical_field_off)),
+                                    alloc_size: inherited_size,
                                 }
                             } else {
                                 RegState::LoadedU64Field {
@@ -2040,7 +2208,7 @@ impl<'a> Analyzer<'a> {
                 }
                 self.set_reg(dst, RegState::Unknown);
             }
-            RegState::ArenaU64FromAlloc { source } => {
+            RegState::ArenaU64FromAlloc { source, .. } => {
                 // LDX through an arena pointer reads payload bytes
                 // out of an allocator slot. When the value register
                 // carries the source slot identity (set at the
@@ -2177,7 +2345,7 @@ impl<'a> Analyzer<'a> {
             RegState::Pointer {
                 struct_type_id: tid,
             } => StxValueKind::Kptr { target: tid },
-            RegState::ArenaU64FromAlloc { .. } => StxValueKind::Arena,
+            RegState::ArenaU64FromAlloc { alloc_size, .. } => StxValueKind::Arena { alloc_size },
             RegState::Unknown => StxValueKind::Unknown,
             _ => return,
         };
@@ -2262,7 +2430,7 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
-            StxValueKind::Arena => {
+            StxValueKind::Arena { alloc_size } => {
                 // Allocator-return / alias-tracked arena pointer
                 // stored into a u64 slot. Record the slot in
                 // [`Self::arena_stx_findings`] so finalize emits
@@ -2288,12 +2456,67 @@ impl<'a> Analyzer<'a> {
                 // `arena_stx_findings` and `kptr_findings` are
                 // disjoint maps and this arm only sees prior arena
                 // STX state.
+                //
+                // `alloc_size` rides into [`Self::arena_alloc_size_index`]
+                // alongside the finding. When two STX writes record
+                // disagreeing sizes (one `Some(n)`, one `Some(m)`
+                // with n != m, or `Some(n)` after `None`), the
+                // index entry collapses to `None` — the slot is
+                // ambiguous on the size and the renderer must fall
+                // back to the bridge or skip cleanly. A repeated
+                // STX with the SAME `Some(n)` is a no-op; a repeated
+                // `None` is a no-op (size-less observation does not
+                // overwrite a prior captured size from a different
+                // path, since the size is monotonic evidence: a
+                // `Some(n)` is strictly more informative than `None`).
                 match self.arena_stx_findings.get(&key).copied() {
                     None => {
                         self.arena_stx_findings.insert(key, ArenaStxEntry::Pending);
+                        self.arena_alloc_size_index.insert(key, alloc_size);
                     }
                     Some(ArenaStxEntry::Pending) => {
-                        // Same arena observation — no-op dedup.
+                        // Same arena observation — dedup the
+                        // ArenaStxEntry but reconcile the captured
+                        // alloc_size:
+                        //   - `Some(n)` after absent → record
+                        //     `Some(n)` (the alloc-size index may
+                        //     not have an entry yet on cross-pass
+                        //     re-runs; treat as fresh insert).
+                        //   - `Some(n)` after `Some(n)` → no-op.
+                        //   - `Some(n)` after `Some(m)` with n != m
+                        //     → collapse to `None` (ambiguous).
+                        //   - `Some(n)` after `None` (cross-path
+                        //     ambiguity already recorded) → keep
+                        //     `None`; once dropped, dropped.
+                        //   - `None` after anything → keep prior
+                        //     entry; absence-of-capture does not
+                        //     overwrite a captured size, but DOES
+                        //     create an entry when none existed
+                        //     (so the index reflects "this slot
+                        //     saw an arena STX, no captured size").
+                        match (
+                            self.arena_alloc_size_index.get(&key).copied(),
+                            alloc_size,
+                        ) {
+                            (None, _) => {
+                                self.arena_alloc_size_index.insert(key, alloc_size);
+                            }
+                            (Some(None), _) => {
+                                // Already ambiguous or absent-of-
+                                // capture; leave at None.
+                            }
+                            (Some(Some(_)), None) => {
+                                // Captured size survives an absent
+                                // observation — no overwrite.
+                            }
+                            (Some(Some(prev)), Some(new)) if prev == new => {
+                                // Identical capture — no-op.
+                            }
+                            (Some(Some(_)), Some(_)) => {
+                                // Captured sizes disagree — collapse.
+                                self.arena_alloc_size_index.insert(key, None);
+                            }
+                        }
                     }
                     Some(ArenaStxEntry::Conflicting) => {
                         // Unreachable: the only insertion site for
@@ -2524,7 +2747,17 @@ impl<'a> Analyzer<'a> {
             && let Some(name) = func_name.as_deref()
             && ARENA_ALLOC_KFUNC_NAMES.contains(&name)
         {
-            self.regs[0] = RegState::ArenaU64FromAlloc { source: None };
+            // Kfunc allocators (e.g. `bpf_arena_alloc_pages`) carry no
+            // captured `sizeof` at this analyzer site — the call's R1
+            // is the page count, not a payload size, and the page-
+            // granularity allocation has its own resolution path
+            // (slab metadata or bridge entry) rather than the static-
+            // alloc size-match fallback. `alloc_size: None` selects
+            // the bridge or skips the chase rather than guessing.
+            self.regs[0] = RegState::ArenaU64FromAlloc {
+                source: None,
+                alloc_size: None,
+            };
             // F4 telemetry parity with the SubprogReturn arm:
             // count this as an applied allocator seed so the
             // finalize warn distinguishes "allocator was called
@@ -2587,7 +2820,20 @@ impl<'a> Analyzer<'a> {
             let ever_arena = self.func_has_alloc;
             let slot = match self.stack_slots.get(&slot_off).copied() {
                 Some(s) => s,
-                None if ever_arena => RegState::ArenaU64FromAlloc { source: None },
+                // Function-level "this function called an allocator"
+                // heuristic: when a stack slot has no recorded state
+                // but the function has seen an allocator-return seed,
+                // assume the slot might hold an arena pointer. The
+                // synthesized state has no captured `alloc_size` —
+                // the bridge fires for a typed allocator's per-slot
+                // header, and this heuristic is the fallback path
+                // when the linear walk lost track. `None` keeps the
+                // chase falling back to the bridge or skipping
+                // cleanly.
+                None if ever_arena => RegState::ArenaU64FromAlloc {
+                    source: None,
+                    alloc_size: None,
+                },
                 None => continue,
             };
             let key = (value_struct_id, member_off);
@@ -2598,6 +2844,21 @@ impl<'a> Analyzer<'a> {
                         self.arena_stx_findings.entry(key)
                     {
                         e.insert(ArenaStxEntry::Pending);
+                        // Record any captured alloc_size that came in
+                        // via the slot's RegState — a slot whose
+                        // recorded state is `ArenaU64FromAlloc { ..,
+                        // alloc_size: Some(n) }` (e.g. from a prior
+                        // STX of a `scx_static_alloc_internal` return
+                        // through this slot) propagates the size into
+                        // the per-slot index. Slots reaching this arm
+                        // via the `None if ever_arena` heuristic
+                        // synthesise `alloc_size: None`, which
+                        // records absence-of-capture in the index.
+                        let captured = match slot {
+                            RegState::ArenaU64FromAlloc { alloc_size, .. } => alloc_size,
+                            _ => None,
+                        };
+                        self.arena_alloc_size_index.insert(key, captured);
                         self.bridge_slot_origins.insert(slot_off, key);
                     }
                 }
@@ -2781,10 +3042,21 @@ impl<'a> Analyzer<'a> {
                 }
             });
             let target_type_id = inferred_target.unwrap_or(0);
+            // Pull the captured `sizeof` argument from the per-slot
+            // index. `Some(Some(n))` is a clean capture; `Some(None)`
+            // is "slot saw an arena STX but the size was either not
+            // captured (kfunc / scx_alloc_internal) or got collapsed
+            // due to disagreement"; absent means no STX from this
+            // path recorded a size — both flatten to `None`. The
+            // chase path uses the size only when the bridge fails,
+            // so a missing or ambiguous size silently selects the
+            // bridge or skips with a clear reason — never misrenders.
+            let alloc_size = self.arena_alloc_size_index.get(key).copied().flatten();
             tracing::debug!(
                 parent = key.0,
                 offset = key.1,
                 target = target_type_id,
+                alloc_size = ?alloc_size,
                 "cast_analysis: arena STX-flow hit emitted"
             );
             out.insert(
@@ -2792,6 +3064,7 @@ impl<'a> Analyzer<'a> {
                 CastHit {
                     target_type_id,
                     addr_space: AddrSpace::Arena,
+                    alloc_size,
                 },
             );
         }
@@ -2865,11 +3138,24 @@ impl<'a> Analyzer<'a> {
 
             if candidates.len() == 1 {
                 let target = candidates.into_iter().next().unwrap();
+                // Shape-inference hits inherit any captured size
+                // from the same slot's STX-flow observation — the
+                // shape inference resolved a concrete BTF id, but
+                // the renderer's chase still benefits from knowing
+                // the producing allocator's size for bridge-fallback
+                // diagnostics and future selection logic. Absent
+                // entry → `None`.
+                let alloc_size = self
+                    .arena_alloc_size_index
+                    .get(&(*source, *field_off))
+                    .copied()
+                    .flatten();
                 tracing::debug!(
                     parent = source,
                     offset = field_off,
                     target,
                     accesses = accesses.len(),
+                    alloc_size = ?alloc_size,
                     "cast_analysis: shape-inference hit emitted"
                 );
                 out.insert(
@@ -2877,6 +3163,7 @@ impl<'a> Analyzer<'a> {
                     CastHit {
                         target_type_id: target,
                         addr_space: AddrSpace::Arena,
+                        alloc_size,
                     },
                 );
             }
@@ -2939,11 +3226,17 @@ impl<'a> Analyzer<'a> {
             if conflicting.contains(&key) {
                 continue;
             }
+            // Kernel kptr findings carry no allocator-supplied size:
+            // the value is a typed kernel pointer, not an arena
+            // allocator return, so the size-match BTF resolution
+            // path does not apply. `None` keeps the chase using the
+            // analyzer's resolved `target_type_id`.
             out.insert(
                 key,
                 CastHit {
                     target_type_id: target,
                     addr_space: AddrSpace::Kernel,
+                    alloc_size: None,
                 },
             );
         }

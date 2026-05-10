@@ -1974,8 +1974,22 @@ fn render_value_inner(
                         // `pointee_type_id`, so the local
                         // peel/size resolution that follows runs
                         // only on the kptr path below.
-                        let outcome =
-                            chase_arena_pointer(btf, pointee_type_id, val, m, depth, visited);
+                        // BTF-typed pointer chase: no captured
+                        // `alloc_size` — the renderer arrives via the
+                        // [`Type::Ptr`] arm with a known pointee type
+                        // id, not via a cast finding. The size-match
+                        // fallback only fires when the analyzer's
+                        // STX-flow path emitted `target_type_id == 0`,
+                        // which is the cast-finding code path below.
+                        let outcome = chase_arena_pointer(
+                            btf,
+                            pointee_type_id,
+                            None,
+                            val,
+                            m,
+                            depth,
+                            visited,
+                        );
                         if outcome.reason.is_some() {
                             deref_skipped_reason = outcome.reason;
                         }
@@ -3416,6 +3430,7 @@ fn recurse_into_target(
 fn chase_arena_pointer(
     btf: &Btf,
     target_type_id: u32,
+    alloc_size: Option<u64>,
     val: u64,
     mem: &dyn MemReader,
     depth: u32,
@@ -3446,37 +3461,71 @@ fn chase_arena_pointer(
     // allocator-return seeds produce findings whose target shape
     // is determined entirely by the
     // [`MemReader::resolve_arena_type`] bridge at chase time).
-    // Skip the shared resolver and consult the bridge directly. If
-    // the bridge returns a hit, render against the recovered
-    // payload type id; otherwise skip with a clear reason so the
-    // operator sees why the chase did not land. The deferred path
-    // bypasses the cross-BTF probe — the bridge's resolved id is
+    // Consult the bridge first; on a miss, fall back to the
+    // analyzer-supplied `alloc_size` (captured at the
+    // `scx_static_alloc_internal` call site) and resolve the
+    // payload type by size match via
+    // [`super::sdt_alloc::discover_payload_btf_id`]. The bump
+    // allocator emits no per-slot header that the bridge could
+    // index, so the size-match fallback is the only resolution
+    // path for `scx_static_alloc_internal` allocations. Both
+    // paths bypass the cross-BTF probe — their resolved ids are
     // in the entry BTF — by synthesising a `ResolvedTarget` with
     // `cross_btf_hit = None`, which feeds directly into the
     // post-read recursion.
     let resolved = if target_type_id == 0 {
-        let Some(hit) = mem.resolve_arena_type(val) else {
-            return ArenaChaseOutcome {
-                deref: None,
-                reason: Some(format!(
-                    "arena chase: cast analyzer's STX-flow path tagged \
-                     slot as Arena (target_type_id=0, deferred resolve), \
-                     but [`MemReader::resolve_arena_type`] had no entry \
-                     for 0x{val:x}; allocator pre-pass may not have \
-                     populated the index for this allocator"
-                )),
-                sdt_alloc_resolved: false,
-            };
+        let bridge_hit = mem.resolve_arena_type(val);
+        let (effective_target_id, header_skip, resolution_source) = match bridge_hit {
+            Some(hit) => (hit.target_type_id, hit.header_skip, "bridge"),
+            None => {
+                // Bridge miss: try the analyzer-supplied
+                // `alloc_size` fallback. `Some(n)` means a
+                // `scx_static_alloc_internal` call captured the
+                // sizeof argument; consult
+                // [`super::sdt_alloc::discover_payload_btf_id`]
+                // to size-match against BTF. The bump allocator
+                // has no header so `header_skip == 0`. `None`
+                // means no captured size — surface the bridge
+                // miss as the chase reason.
+                let Some(size) = alloc_size else {
+                    return ArenaChaseOutcome {
+                        deref: None,
+                        reason: Some(format!(
+                            "arena chase: cast analyzer's STX-flow path tagged \
+                             slot as Arena (target_type_id=0, deferred resolve), \
+                             but [`MemReader::resolve_arena_type`] had no entry \
+                             for 0x{val:x}; allocator pre-pass may not have \
+                             populated the index for this allocator"
+                        )),
+                        sdt_alloc_resolved: false,
+                    };
+                };
+                let choice = super::sdt_alloc::discover_payload_btf_id(btf, size as usize);
+                if choice.target_type_id == 0 {
+                    return ArenaChaseOutcome {
+                        deref: None,
+                        reason: Some(format!(
+                            "arena chase: cast analyzer's STX-flow path tagged \
+                             slot as Arena (target_type_id=0, deferred resolve), \
+                             bridge returned no entry for 0x{val:x}, AND \
+                             alloc_size={size} fallback could not resolve a \
+                             unique BTF type ({reason})",
+                            reason = choice.reason
+                        )),
+                        sdt_alloc_resolved: false,
+                    };
+                }
+                (choice.target_type_id, 0usize, "alloc_size")
+            }
         };
         let Some((resolved_ty, resolved_id)) =
-            peel_modifiers_resolving_fwd(btf, hit.target_type_id)
+            peel_modifiers_resolving_fwd(btf, effective_target_id)
         else {
             return ArenaChaseOutcome {
                 deref: None,
                 reason: Some(format!(
-                    "arena chase: bridge returned target_type_id={} \
-                     but the type does not resolve in the program BTF",
-                    hit.target_type_id
+                    "arena chase: {resolution_source} returned target_type_id={effective_target_id} \
+                     but the type does not resolve in the program BTF"
                 )),
                 sdt_alloc_resolved: true,
             };
@@ -3487,7 +3536,7 @@ fn chase_arena_pointer(
                 reason: Some(unsizable_chase_reason(
                     btf,
                     "arena chase",
-                    hit.target_type_id,
+                    effective_target_id,
                     &resolved_ty,
                 )),
                 sdt_alloc_resolved: true,
@@ -3497,8 +3546,8 @@ fn chase_arena_pointer(
             return ArenaChaseOutcome {
                 deref: None,
                 reason: Some(format!(
-                    "arena chase target type id {} BTF size is 0 (incomplete type)",
-                    hit.target_type_id
+                    "arena chase target type id {effective_target_id} \
+                     BTF size is 0 (incomplete type)"
                 )),
                 sdt_alloc_resolved: true,
             };
@@ -3507,7 +3556,7 @@ fn chase_arena_pointer(
             effective_type_id: resolved_id,
             current_btf: btf,
             btf_size,
-            header_skip: hit.header_skip,
+            header_skip,
             sdt_alloc_resolved: true,
             cross_btf_hit: None,
         }
@@ -3777,7 +3826,20 @@ fn render_cast_pointer(
     // hint→runtime mismatch is visible; the renderer doesn't try
     // to reconcile them — the runtime decision wins.
     if mem.is_arena_addr(value) {
-        let outcome = chase_arena_pointer(btf, hit.target_type_id, value, mem, depth, visited);
+        // Thread the analyzer-captured `alloc_size` into the chase
+        // helper so the deferred-resolve path
+        // (`target_type_id == 0`) can fall back to size-based BTF
+        // matching when the bridge has no entry — the
+        // `scx_static_alloc_internal` resolution path.
+        let outcome = chase_arena_pointer(
+            btf,
+            hit.target_type_id,
+            hit.alloc_size,
+            value,
+            mem,
+            depth,
+            visited,
+        );
         return cast_ptr(
             value,
             outcome.deref,

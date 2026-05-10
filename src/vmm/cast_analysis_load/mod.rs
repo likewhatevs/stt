@@ -1147,11 +1147,106 @@ fn build_subprog_returns(
         if !ALLOC_SUBPROG_NAMES.contains(&name) {
             continue;
         }
+        // For `scx_static_alloc_internal` callers, recover the
+        // `size` argument from R1 by scanning backward from the call
+        // PC for the most recent `BPF_MOV64_IMM r1, <imm>`. The bump
+        // allocator emits no per-slot header, so the renderer's
+        // [`crate::monitor::btf_render::MemReader::resolve_arena_type`]
+        // bridge has no entry to resolve the payload type id from —
+        // size-based BTF matching via
+        // [`crate::monitor::sdt_alloc::discover_payload_btf_id`] is
+        // the only resolution path. The captured size threads from
+        // [`SubprogReturn::alloc_size`] all the way to
+        // [`crate::monitor::cast_analysis::CastHit::alloc_size`].
+        //
+        // For other allocators (e.g. `scx_alloc_internal`) the
+        // bridge handles resolution via the per-slot header, so
+        // the captured size is not needed and we leave
+        // `alloc_size: None` to keep the chase on the bridge path.
+        //
+        // The lookback is bounded at [`ALLOC_SIZE_LOOKBACK`]
+        // instructions: clang's allocator inlining emits the
+        // `mov r1, <imm>` immediately before the call in real
+        // schedulers, but a small budget tolerates conservative
+        // codegen (a constant rematerialized into a different
+        // register, then moved into r1) without opening the door
+        // to spurious matches from unrelated MOVs many
+        // instructions back. A failed lookback yields
+        // `alloc_size: None`, falling back to the bridge or the
+        // skip-with-reason chase outcome.
+        let alloc_size = if name == "scx_static_alloc_internal" {
+            recover_alloc_size_from_r1(text_concat, insn_idx)
+        } else {
+            None
+        };
         out.push(SubprogReturn {
             insn_offset: insn_idx,
+            alloc_size,
         });
     }
     out
+}
+
+/// Maximum instructions [`recover_alloc_size_from_r1`] scans backward
+/// from a `scx_static_alloc_internal` call site looking for the
+/// `BPF_MOV64_IMM r1, <imm>` that materialised R1. Real schedulers
+/// emit the MOV adjacent to the call (clang inlines the helper, so
+/// the call is preceded by `r1 = sizeof(...)`); 20 instructions is a
+/// generous budget that covers a few intervening setup ops without
+/// reaching back into unrelated control flow.
+const ALLOC_SIZE_LOOKBACK: usize = 20;
+
+/// `BPF_ALU64 | BPF_MOV | BPF_K` opcode byte (`= 0xb7`). Sets
+/// `dst_reg = imm` (sign-extended to 64 bits). See linux uapi
+/// `bpf.h` and `kernel/bpf/verifier.c` `check_alu_op`. The
+/// host-side loader uses this to recognize the
+/// `mov rN, <imm>` instructions that clang emits for
+/// argument-setup before a BPF-to-BPF subprog call.
+const BPF_MOV64_IMM_CODE: u8 = (libbpf_rs::libbpf_sys::BPF_ALU64
+    | libbpf_rs::libbpf_sys::BPF_MOV
+    | libbpf_rs::libbpf_sys::BPF_K) as u8;
+
+/// Scan backward from `call_pc` in `text` looking for the most recent
+/// `BPF_MOV64_IMM r1, <imm>` and return the immediate as a `u64`.
+/// Returns `None` when no matching instruction is found within
+/// [`ALLOC_SIZE_LOOKBACK`] instructions, when `call_pc` is `0`
+/// (no predecessors to scan), or when `call_pc` is out of bounds.
+///
+/// The scanner stops at the first match — the most recent write to
+/// R1 is the one that survived to the call site. Other instructions
+/// (ALU on R1, LDX into R1, helper-call clobbers) are NOT modeled
+/// here: the host-side loader is intentionally simpler than the
+/// analyzer's full register-state walk, and a complex sequence
+/// elides into `None` (lookback misses) rather than a wrong
+/// capture. False negatives surface as `alloc_size: None` — the
+/// chase falls back to the bridge (no static-alloc match), which
+/// is the safe direction.
+///
+/// `imm` is sign-extended to `u64` via the `i32 -> i64 -> u64`
+/// chain so a negative `i32` would surface as a very large `u64`.
+/// Real `sizeof` arguments are non-negative; the analyzer's
+/// downstream chase (`discover_payload_btf_id`) returns
+/// `target_type_id == 0` for impossible payload sizes, so a
+/// pathological negative `imm` cannot misrender — it falls back
+/// to the bridge or skips.
+fn recover_alloc_size_from_r1(text: &[BpfInsn], call_pc: usize) -> Option<u64> {
+    if call_pc == 0 {
+        return None;
+    }
+    let start = call_pc.saturating_sub(ALLOC_SIZE_LOOKBACK);
+    // Walk from `call_pc - 1` down to `start` (inclusive), stopping
+    // at the first MOV r1, imm.
+    let mut idx = call_pc;
+    while idx > start {
+        idx -= 1;
+        let Some(insn) = text.get(idx) else {
+            return None;
+        };
+        if insn.code == BPF_MOV64_IMM_CODE && insn.dst_reg() == 1 {
+            return Some(insn.imm as i64 as u64);
+        }
+    }
+    None
 }
 
 /// Walk every ELF relocation section in `elf` and emit a

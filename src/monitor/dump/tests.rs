@@ -2131,14 +2131,14 @@ fn accessor_mem_reader_cast_lookup_with_populated_map() {
     let mut map = CastMap::new();
     map.insert(
         (42, 8),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: 99,
             addr_space: AddrSpace::Arena,
         },
     );
     map.insert(
         (42, 16),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: 100,
             addr_space: AddrSpace::Kernel,
         },

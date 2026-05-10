@@ -2972,7 +2972,7 @@ fn cast_intercept_u64_renders_as_ptr_with_chase() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         },
@@ -3056,7 +3056,7 @@ fn cast_intercept_null_value_no_crash() {
     // guard fires first and neither is reached.
     let outer_bytes = 0u64.to_le_bytes().to_vec();
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -3103,7 +3103,7 @@ fn cast_intercept_non_u64_field_not_intercepted() {
     // Reader returns Some(hit) for any (parent, offset) — the
     // gate must reject before this is consulted.
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -3190,7 +3190,7 @@ fn cast_chase_cycle_detection() {
         // same shape and the inner u64 also gets the cast
         // intercept (cast_lookup returns the same hit
         // regardless of parent id).
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -3284,7 +3284,7 @@ fn cast_chase_kernel_plausibility_rejects_freed_slab() {
     let mut kva_bytes = std::collections::HashMap::new();
     kva_bytes.insert(KVA, stale_bytes);
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -3365,7 +3365,7 @@ fn cast_intercept_kernel_hint_arena_value_dispatches_to_arena_reader() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             // Kernel hint — but value is an arena address. Runtime
             // detection is_arena_addr(value) returns true → arena
@@ -3604,7 +3604,7 @@ fn cast_pipeline_analyzer_output_drives_renderer_intercept() {
     // Analyzer must produce exactly one finding: (T, 8) → (Q, Arena).
     assert_eq!(
         cast_map.get(&(t_id, 8)),
-        Some(&CastHit {
+        Some(&CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -3778,7 +3778,7 @@ fn cast_pipeline_modifier_chain_renderer_peels_to_analyzer_struct_id() {
     );
     assert_eq!(
         cast_map.get(&(t_id, 8)),
-        Some(&CastHit {
+        Some(&CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena
         }),
@@ -3917,14 +3917,14 @@ fn cast_pipeline_multi_field_only_flagged_offsets_render_as_ptr() {
     let mut cast_map: CastMap = std::collections::BTreeMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         },
     );
     cast_map.insert(
         (t_id, 8),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         },
@@ -4136,7 +4136,7 @@ fn cast_pipeline_wrong_struct_id_does_not_intercept() {
     let mut cast_map: CastMap = std::collections::BTreeMap::new();
     cast_map.insert(
         (u_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         },
@@ -4215,7 +4215,7 @@ fn cast_chase_arena_hint_with_non_arena_value_falls_through_to_kernel_arm() {
     let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         },
@@ -4298,7 +4298,7 @@ fn cast_chase_kernel_target_type_id_unresolvable() {
     const KVA: u64 = 0xffff_8000_0000_1000;
     let outer_bytes = KVA.to_le_bytes().to_vec();
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: UNRESOLVABLE,
             addr_space: AddrSpace::Kernel,
         }),
@@ -4394,7 +4394,7 @@ fn cast_chase_kernel_target_btf_size_zero() {
     const KVA: u64 = 0xffff_8000_0000_1000;
     let outer_bytes = KVA.to_le_bytes().to_vec();
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -4499,7 +4499,7 @@ fn cast_chase_kernel_target_fwd_struct() {
     const KVA: u64 = 0xffff_8000_0000_3000;
     let outer_bytes = KVA.to_le_bytes().to_vec();
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: fwd_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -4607,7 +4607,7 @@ fn cast_chase_kernel_target_fwd_union() {
     const KVA: u64 = 0xffff_8000_0000_4000;
     let outer_bytes = KVA.to_le_bytes().to_vec();
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: fwd_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -5097,7 +5097,7 @@ fn cast_chase_arena_target_fwd_resolves_to_complete_struct_sibling() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (parent_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: fwd_target_id,
             addr_space: AddrSpace::Arena,
         },
@@ -5224,7 +5224,7 @@ fn cast_chase_kernel_target_fwd_resolves_to_complete_struct_sibling() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (parent_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: fwd_target_id,
             addr_space: AddrSpace::Kernel,
         },
@@ -5577,7 +5577,7 @@ fn cast_chase_kernel_read_kva_failure() {
     const KVA: u64 = 0xffff_8000_0000_2000;
     let outer_bytes = KVA.to_le_bytes().to_vec();
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -5699,7 +5699,7 @@ fn cast_chase_kernel_page_edge_truncation() {
     let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Kernel,
         },
@@ -5815,7 +5815,7 @@ fn cast_chase_kernel_successful_chase_top_byte_non_ff() {
     let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Kernel,
         },
@@ -5948,7 +5948,7 @@ fn cast_chase_arena_pointee_exceeds_cap_wraps_in_truncated() {
     let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         },
@@ -6055,7 +6055,7 @@ fn cast_intercept_u64_at_parent_bytes_boundary_falls_through() {
     let mut arena_bytes = std::collections::HashMap::new();
     arena_bytes.insert(0xBEBA_FECAu64, vec![0u8; 8]);
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -6163,7 +6163,7 @@ fn cast_intercept_bool_field_not_intercepted() {
     // reject before this is consulted.
     let outer_bytes = 1u64.to_le_bytes().to_vec();
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -6243,7 +6243,7 @@ fn cast_intercept_signed_8byte_int_not_intercepted() {
     // — the gate must reject the intercept.
     let outer_bytes = (-1i64).to_le_bytes().to_vec();
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -6318,7 +6318,7 @@ fn cast_intercept_parent_type_id_none_does_not_crash() {
     let mut arena_bytes = std::collections::HashMap::new();
     arena_bytes.insert(TARGET_ADDR, 0xAAu64.to_le_bytes().to_vec());
     let reader = CastStubReader {
-        hit: Some(CastHit {
+        hit: Some(CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -6450,14 +6450,14 @@ fn cast_chase_recursive_target_with_inner_cast_field() {
     let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         },
     );
     cast_map.insert(
         (q_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: r_id,
             addr_space: AddrSpace::Arena,
         },
@@ -6639,7 +6639,7 @@ fn cast_intercept_modifier_chain_parent_uses_post_peel_id() {
     let mut cast_map: super::super::cast_analysis::CastMap = std::collections::BTreeMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         },
@@ -7260,7 +7260,7 @@ fn cast_chase_arena_fwd_target_resolved_via_bridge() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: local_fwd_id,
             addr_space: AddrSpace::Arena,
         },
@@ -7377,7 +7377,7 @@ fn cast_chase_arena_fwd_target_no_bridge_keeps_plain_annotation() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: fwd_id,
             addr_space: AddrSpace::Arena,
         },
@@ -7505,7 +7505,7 @@ fn cast_chase_kernel_fwd_target_resolved_via_bridge() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: fwd_id,
             addr_space: AddrSpace::Kernel,
         },
@@ -7607,7 +7607,7 @@ fn cast_chase_arena_target_type_id_zero_resolves_via_resolve_arena_type() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             // STX-flow sentinel: analyzer left the target id
             // unresolved, expecting the bridge to fill it in.
             target_type_id: 0,
@@ -7698,7 +7698,7 @@ fn cast_chase_arena_target_type_id_zero_no_bridge_entry_skips() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         },
@@ -7784,7 +7784,7 @@ fn cast_chase_already_rendered_short_circuits() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         },
@@ -7867,7 +7867,7 @@ fn cast_chase_already_rendered_miss_proceeds_with_normal_chase() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         },
@@ -7937,7 +7937,7 @@ fn cast_chase_default_is_already_rendered_returns_false() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         },
@@ -7995,7 +7995,7 @@ fn cast_chase_kernel_target_type_id_zero_falls_through_with_mismatch_reason() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             // STX-flow analyzer sentinel — intentionally `Arena`
             // since that is the only space the analyzer emits with
             // target_type_id=0. Runtime detection sees the value
@@ -8239,7 +8239,7 @@ fn cross_btf_fwd_resolve_renders_cgx_body_through_sibling_btf() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (outer_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: cgx_fwd_id,
             addr_space: AddrSpace::Arena,
         },
@@ -8302,7 +8302,7 @@ fn cross_btf_fwd_resolve_renders_cgx_body_through_sibling_btf() {
             let mut m = super::super::cast_analysis::CastMap::new();
             m.insert(
                 (outer_id, 0),
-                CastHit {
+                CastHit { alloc_size: None,
                     target_type_id: cgx_fwd_id,
                     addr_space: AddrSpace::Arena,
                 },
@@ -8454,7 +8454,7 @@ fn cast_chase_kernel_cross_btf_fwd_resolve_succeeds() {
     let mut cast_map = super::super::cast_analysis::CastMap::new();
     cast_map.insert(
         (t_id, 0),
-        CastHit {
+        CastHit { alloc_size: None,
             target_type_id: kern_fwd_id,
             addr_space: AddrSpace::Kernel,
         },

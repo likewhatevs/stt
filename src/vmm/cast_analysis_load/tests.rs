@@ -1185,7 +1185,7 @@ fn analyze_one_object_misaligned_text_skipped() {
 /// offset 8 and Q (id=3) with a u64 field at offset 0; .text
 /// contains a function entry that loads T.f then dereferences
 /// it as Q*; .BTF.ext seeds R1=*T at the entry. Expected:
-/// CastMap maps `(2, 8) → CastHit { 3, Arena }`.
+/// CastMap maps `(2, 8) → CastHit { alloc_size: None, 3, Arena }`.
 #[test]
 fn analyze_one_object_recovers_arena_cast_end_to_end() {
     let mut strings = vec![0u8];
@@ -1258,7 +1258,7 @@ fn analyze_one_object_recovers_arena_cast_end_to_end() {
     let hit = map.get(&(2u32, 8u32)).copied();
     assert_eq!(
         hit,
-        Some(CastHit {
+        Some(CastHit { alloc_size: None,
             target_type_id: 3,
             addr_space: AddrSpace::Arena,
         }),
@@ -1387,7 +1387,7 @@ fn cached_cast_analysis_recovers_arena_cast_end_to_end() {
     let hit = out.cast_maps[0].get(&(2u32, 8u32)).copied();
     assert_eq!(
         hit,
-        Some(CastHit {
+        Some(CastHit { alloc_size: None,
             target_type_id: 3,
             addr_space: AddrSpace::Arena,
         }),
@@ -1492,7 +1492,7 @@ fn cached_cast_analysis_returns_same_arc_for_same_content() {
     // Sanity: the cached output carries the recovered cast.
     assert_eq!(
         first.cast_maps[0].get(&(2u32, 8u32)).copied(),
-        Some(CastHit {
+        Some(CastHit { alloc_size: None,
             target_type_id: 3,
             addr_space: AddrSpace::Arena,
         }),
@@ -1538,7 +1538,7 @@ fn cached_cast_analysis_read_failure_does_not_pollute_cache() {
         .expect("post-creation read should succeed and produce a non-empty CastAnalysisOutput");
     assert_eq!(
         out.cast_maps[0].get(&(2u32, 8u32)).copied(),
-        Some(CastHit {
+        Some(CastHit { alloc_size: None,
             target_type_id: 3,
             addr_space: AddrSpace::Arena,
         }),

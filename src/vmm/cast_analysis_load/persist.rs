@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::FwdIndexEntry;
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedAddrSpace(u8);
@@ -33,6 +33,7 @@ impl PersistedAddrSpace {
 struct PersistedCastHit {
     target_type_id: u32,
     addr_space: PersistedAddrSpace,
+    alloc_size: Option<u64>,
 }
 
 impl From<CastHit> for PersistedCastHit {
@@ -40,6 +41,7 @@ impl From<CastHit> for PersistedCastHit {
         Self {
             target_type_id: h.target_type_id,
             addr_space: h.addr_space.into(),
+            alloc_size: h.alloc_size,
         }
     }
 }
@@ -49,6 +51,7 @@ impl PersistedCastHit {
         Some(CastHit {
             target_type_id: self.target_type_id,
             addr_space: self.addr_space.into_addr_space()?,
+            alloc_size: self.alloc_size,
         })
     }
 }
@@ -198,6 +201,7 @@ mod tests {
             CastHit {
                 target_type_id: 5,
                 addr_space: AddrSpace::Arena,
+                alloc_size: None,
             },
         );
         cast_map.insert(
@@ -205,6 +209,7 @@ mod tests {
             CastHit {
                 target_type_id: 7,
                 addr_space: AddrSpace::Kernel,
+                alloc_size: None,
             },
         );
         let mut fwd_index = HashMap::new();
