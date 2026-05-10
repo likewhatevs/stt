@@ -191,7 +191,7 @@ pub(super) struct ArenaSlotInfo {
 /// `lib/sdt_alloc.bpf.c`'s `scx_alloc_internal` and never re-uses a
 /// position while the bitmap still has it marked allocated). The
 /// dedup logic in [`super::dump_state`] keys on exact `slot_start`
-/// only and emits `tracing::debug!` on duplicates; an overlapping
+/// only and emits `tracing::warn!` on duplicates; an overlapping
 /// `(start_a, elem_a)`, `(start_b, elem_b)` pair where
 /// `start_a + elem_a > start_b > start_a` is structurally
 /// impossible.
