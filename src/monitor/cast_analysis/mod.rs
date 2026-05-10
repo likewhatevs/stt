@@ -839,6 +839,13 @@ struct Analyzer<'a> {
     /// findings when a non-arena value overwrites the originating
     /// stack slot.
     bridge_slot_origins: std::collections::HashMap<i16, (u32, u32)>,
+    /// Register state snapshots from conditional branch sources.
+    /// Keyed by branch target PC. At each conditional jump, the
+    /// current register state is saved for the target. When the
+    /// walker reaches the target, it merges: if the fall-through
+    /// path left a register Unknown but the branch source had it
+    /// typed, the typed value is restored.
+    branch_source_regs: std::collections::HashMap<usize, [RegState; 11]>,
 }
 
 /// Kptr finding state: a single `(parent, offset)` slot may be
@@ -950,6 +957,7 @@ impl<'a> Analyzer<'a> {
             alloc_seeds_applied: 0,
             caller_arg_types: HashMap::new(),
             bridge_slot_origins: HashMap::new(),
+            branch_source_regs: HashMap::new(),
         }
     }
 
@@ -1010,6 +1018,7 @@ impl<'a> Analyzer<'a> {
             alloc_seeds_applied: 0,
             caller_arg_types,
             bridge_slot_origins: HashMap::new(),
+            branch_source_regs: HashMap::new(),
         }
     }
 
@@ -1200,14 +1209,22 @@ impl<'a> Analyzer<'a> {
             // still clears stale state. Without this ordering,
             // pre-jump register state would survive past the
             // skip into the next valid instruction.
-            // Branch-target join: the linear walk is a
-            // may-analysis — typed state from any reaching path is
-            // a valid observation. Resetting registers here would
-            // destroy real typed state (arena tags, Pointer
-            // provenance) that survived across the branch in
-            // callee-saved registers or stack spills. Finalize's
-            // conflict-drop gate catches disagreements between
-            // paths (arena vs kptr on the same slot).
+            // Branch-source merge: when a conditional branch saved
+            // register state for this target PC, merge with the
+            // current state (which reflects the fall-through path).
+            // For each register: if the fall-through left it Unknown
+            // but the branch source had it typed, restore the typed
+            // value. If both are typed but disagree, drop to Unknown.
+            if let Some(src_regs) = self.branch_source_regs.get(&pc) {
+                for i in 0..11 {
+                    match (self.regs[i], src_regs[i]) {
+                        (RegState::Unknown, typed) => self.regs[i] = typed,
+                        (_, RegState::Unknown) => {}
+                        (a, b) if a == b => {}
+                        _ => self.regs[i] = RegState::Unknown,
+                    }
+                }
+            }
 
             if skip_next {
                 skip_next = false;
@@ -1299,6 +1316,34 @@ impl<'a> Analyzer<'a> {
             }
 
             self.step(*insn, &mut skip_next, datasec_hit, alloc_seed);
+
+            // Save register state at conditional branch sources so
+            // the target can merge with the fall-through state. The
+            // branch guarantees the tested register holds its pre-
+            // branch value on the taken path; the fall-through may
+            // clobber it.
+            let class = insn.code & 0x07;
+            let op = insn.code & 0xf0;
+            if (class == BPF_CLASS_JMP || class == BPF_CLASS_JMP32)
+                && op != BPF_OP_CALL
+                && op != 0x00 // JA (unconditional)
+                && insn.code != 0x06 // goto32 (unconditional)
+            {
+                let target = (pc as i64 + 1 + insn.off as i64) as usize;
+                self.branch_source_regs
+                    .entry(target)
+                    .and_modify(|existing| {
+                        for (i, new) in existing.iter_mut().zip(self.regs.iter()) {
+                            match (*i, *new) {
+                                (RegState::Unknown, typed) => *i = typed,
+                                (_, RegState::Unknown) => {}
+                                (a, b) if a == b => {}
+                                _ => *i = RegState::Unknown,
+                            }
+                        }
+                    })
+                    .or_insert(self.regs);
+            }
 
             // Dead-code disambiguation barrier: after an EXIT or
             // unconditional JA/gotol, the NEXT linear PC is
