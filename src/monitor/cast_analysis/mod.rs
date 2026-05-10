@@ -1284,6 +1284,12 @@ impl<'a> Analyzer<'a> {
                                         self.arena_confirmed
                                             .insert((source_struct_id, field_offset));
                                         self.regs[dst] = self.regs[src];
+                                    } else if matches!(
+                                        self.regs[src],
+                                        RegState::Pointer { .. }
+                                            | RegState::ArenaU64FromAlloc
+                                    ) {
+                                        self.regs[dst] = self.regs[src];
                                     } else {
                                         self.set_reg(dst, RegState::Unknown);
                                     }

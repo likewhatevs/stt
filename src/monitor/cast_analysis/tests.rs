@@ -5763,15 +5763,19 @@ fn addr_space_cast_arena_imm1_on_pointer_propagates() {
 /// A subsequent kptr STX through the destination must NOT record.
 ///
 /// Sibling test `addr_space_cast_kernel_to_arena_drops_dst`
-/// covers the `LoadedU64Field` source case; this test extends
-/// coverage to the `Pointer{T}` source case.
+/// covers the `LoadedU64Field` source case; this test verifies
+/// that `Pointer{T}` survives `addr_space_cast(imm=0x10000)` so
+/// subsequent field loads through the cast destination produce
+/// `LoadedU64Field` entries (needed for cross-subprog arena
+/// pointer detection where a callee casts a forwarded Pointer
+/// parameter).
 #[test]
-fn addr_space_cast_kernel_arena_drops_pointer_source() {
+fn addr_space_cast_kernel_arena_preserves_pointer_source() {
     let slot_off: u32 = 16;
     let (blob, t_id, p_id, _t_ptr_id) = btf_kptr_base(slot_off);
     let btf = Btf::from_bytes(&blob).unwrap();
-    // r4 = (cast imm=0x10000) r3   -- r3 = Pointer{T}, r4 = Unknown
-    // STX *(r6+slot_off) = r4      -- r4 Unknown, no record
+    // r4 = (cast imm=0x10000) r3   -- r3 = Pointer{T}, r4 = Pointer{T}
+    // STX *(r6+slot_off) = r4      -- r4 Pointer{T}, kptr record
     let cast = mk_insn(BPF_CLASS_ALU64 | BPF_OP_MOV | BPF_SRC_X, 4, 3, 1, 0x10000);
     let insns = vec![cast, stx(BPF_SIZE_DW, 6, 4, slot_off as i16), exit()];
     let map = analyze_casts(
@@ -5791,9 +5795,10 @@ fn addr_space_cast_kernel_arena_drops_pointer_source() {
         &[],
         &[],
     );
-    assert!(
-        map.is_empty(),
-        "ADDR_SPACE_CAST imm=0x10000 must drop Pointer source: {map:?}"
+    assert_eq!(
+        map.len(),
+        1,
+        "Pointer through addr_space_cast should produce a kptr CastHit: {map:?}"
     );
 }
 
