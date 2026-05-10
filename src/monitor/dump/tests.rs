@@ -4981,6 +4981,7 @@ fn render_map_struct_ops_no_offsets_returns_error() {
         cross_btf_fwd_index: None,
         scx_static_index: None,
         rendered_slot_addrs: None,
+        base_btf: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered
@@ -5050,6 +5051,7 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
         cross_btf_fwd_index: None,
         scx_static_index: None,
         rendered_slot_addrs: None,
+        base_btf: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered

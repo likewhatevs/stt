@@ -2650,6 +2650,13 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // being assembled. The per-map renders below pass the
             // built set where it matters.
             None,
+            // Host-resolved vmlinux BTF. The leaf payload renders
+            // need it as a base-BTF filter for any chase that hits
+            // the `discover_payload_btf_id` size-match fallback —
+            // without it a vmlinux struct of the same size as the
+            // payload could win. Threaded straight from
+            // [`DumpContext::btf`].
+            Some(btf),
         );
         // Locate every sdt_alloc allocator instance declared in
         // `.bss`. The Datasec walk gives us each variable's name and
@@ -2688,7 +2695,13 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             };
             let payload_size =
                 elem_size.saturating_sub(sdt_offsets.data_header_size as u64) as usize;
-            let choice = discover_payload_btf_id(prog_btf, payload_size);
+            // Pass the vmlinux base BTF so the heuristic excludes
+            // base-BTF type ids (kernel `*_ctx` structs of the same
+            // size as the scheduler's payload) from the candidate
+            // set. Without this filter the size-match arm could win
+            // on a vmlinux struct whose layout has nothing to do
+            // with the scheduler's allocator slot.
+            let choice = discover_payload_btf_id(prog_btf, Some(btf), payload_size);
 
             let snap = walk_sdt_allocator(
                 accessor.kernel(),
@@ -3036,6 +3049,13 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // duplicate payload in the dump. `None` when no
                 // allocator pre-pass produced any rendered slot.
                 rendered_slot_addrs: rendered_slot_addrs_ref,
+                // Host-resolved vmlinux BTF — the base of every
+                // split program BTF. Threaded straight from
+                // [`DumpContext::btf`] so the chase path's
+                // `alloc_size` fallback can pass it as the
+                // base-BTF filter to
+                // [`super::super::sdt_alloc::discover_payload_btf_id`].
+                base_btf: Some(btf),
             },
             &info,
         );

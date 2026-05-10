@@ -1773,6 +1773,29 @@ pub trait MemReader {
     fn is_already_rendered(&self, _addr: u64) -> bool {
         false
     }
+
+    /// Host-resolved vmlinux BTF that the program BTF was split from.
+    /// `None` (the default) when the reader doesn't have a base BTF
+    /// to expose — test stubs, or readers built against a
+    /// non-split program BTF.
+    ///
+    /// Consumed by [`chase_arena_pointer`]'s `target_type_id == 0`
+    /// fallback: when the [`Self::resolve_arena_type`] bridge has no
+    /// entry for the chased address AND the analyzer captured an
+    /// `alloc_size` from a `scx_static_alloc_internal` call site,
+    /// the chase calls
+    /// [`super::sdt_alloc::discover_payload_btf_id`] with the
+    /// program BTF AND this base BTF. Passing the base BTF lets the
+    /// heuristic exclude vmlinux structs from the candidate set —
+    /// kernel `*_ctx` types of the same byte size as the
+    /// scheduler's payload would otherwise win the size-match step
+    /// and propagate the wrong layout. Default `None` keeps every
+    /// existing impl correct without an explicit override (the
+    /// heuristic falls back to walking every id, which is what the
+    /// pre-filter version did).
+    fn base_btf(&self) -> Option<&Btf> {
+        None
+    }
 }
 
 /// Render a BTF type's bytes into a [`RenderedValue`] without an
@@ -3413,6 +3436,18 @@ fn recurse_into_target(
 /// `sdt_alloc`-flavoured `cast_annotation` so the recovered chase is
 /// distinguishable from a native BTF chase.
 ///
+/// `target_type_id == 0` selects the deferred-resolve arena path:
+/// the [`MemReader::resolve_arena_type`] bridge fires first; on a
+/// miss the analyzer-supplied `alloc_size` (captured at the
+/// `scx_static_alloc_internal` call site) drives a size-based BTF
+/// match via [`super::sdt_alloc::discover_payload_btf_id`]. Both
+/// paths bypass the cross-BTF probe — their resolved ids are in
+/// the entry BTF — so they synthesise a `ResolvedTarget` with
+/// `cross_btf_hit = None`. `alloc_size` is `None` for any caller
+/// that arrived via [`Type::Ptr`] (BTF-typed pointer chase) or
+/// for cast findings whose source allocator did not capture a
+/// size (kfunc / `scx_alloc_internal`).
+///
 /// Preconditions the caller must satisfy:
 ///   * The [`chase_gate`] outcome was [`ChaseGate::Proceed`] for
 ///     `val` at this `depth` (i.e. `val != 0`, not in `visited`,
@@ -3500,7 +3535,16 @@ fn chase_arena_pointer(
                         sdt_alloc_resolved: false,
                     };
                 };
-                let choice = super::sdt_alloc::discover_payload_btf_id(btf, size as usize);
+                // Pass the reader's base BTF so the size-match
+                // heuristic excludes vmlinux struct ids from the
+                // candidate set. Readers without a base BTF (test
+                // stubs, non-split programs) get the default `None`
+                // and fall back to walking every id.
+                let choice = super::sdt_alloc::discover_payload_btf_id(
+                    btf,
+                    mem.base_btf(),
+                    size as usize,
+                );
                 if choice.target_type_id == 0 {
                     return ArenaChaseOutcome {
                         deref: None,

@@ -774,7 +774,15 @@ pub fn analyze_casts(
             subprog_returns,
         );
         let (next_args, next_stx, next_alloc_size) = a.into_carryover();
-        if next_stx == arena_stx && pass > 0 {
+        // Convergence: both `arena_stx_findings` AND
+        // `arena_alloc_size_index` must stabilise. The index is
+        // populated alongside the findings map at every STX site, so
+        // in practice they converge together — but a STX writing the
+        // same slot twice with disagreeing sizes flips the index from
+        // `Some(n)` to `None` without affecting `arena_stx_findings`,
+        // and we want that flip to trigger another pass so the
+        // finalize emits the conservative `None`.
+        if next_stx == arena_stx && next_alloc_size == alloc_size_idx && pass > 0 {
             // Converged: re-run one more time with the converged
             // carry-over so finalize() sees a fully populated
             // analyzer. `into_carryover` consumed `a` above, so a
@@ -1104,10 +1112,11 @@ impl<'a> Analyzer<'a> {
     }
 
     /// Construct an analyzer pre-populated with a prior iteration's
-    /// `caller_arg_types` and `arena_stx_findings` snapshots, used by
-    /// [`analyze_casts`]'s fixpoint loop. The remaining analyzer state
-    /// is reset to its [`Self::new`] default. Only these two maps
-    /// carry across passes:
+    /// `caller_arg_types`, `arena_stx_findings`, and
+    /// `arena_alloc_size_index` snapshots, used by [`analyze_casts`]'s
+    /// fixpoint loop. The remaining analyzer state is reset to its
+    /// [`Self::new`] default. Only these three maps carry across
+    /// passes:
     ///
     /// - `caller_arg_types` propagates the caller's tracked register
     ///   state at every BPF_PSEUDO_CALL site so that on a subsequent
@@ -1131,6 +1140,17 @@ impl<'a> Analyzer<'a> {
     ///   sites never erase a `Pending` entry), so it converges
     ///   bounded by the number of distinct `(parent_struct_id, field_offset)`
     ///   slots in the program BTF.
+    /// - `arena_alloc_size_index` propagates the captured `sizeof`
+    ///   argument per arena STX slot. Carries alongside
+    ///   `arena_stx_findings` so the alias-tracking LDX arm can
+    ///   inherit a previously captured size when the LDXed value
+    ///   propagates further. The index keys are a subset of the
+    ///   findings keys; on a fresh insert the value is the size
+    ///   captured at the producing STX, on subsequent disagreeing
+    ///   STXs the index entry collapses to `None` (cleanup of
+    ///   ambiguous evidence). Carrying the index across passes is
+    ///   safe for the same monotonic-evidence reasons that apply to
+    ///   `arena_stx_findings`.
     fn with_carryover(
         btf: &'a Btf,
         caller_arg_types: CallerArgTypes,

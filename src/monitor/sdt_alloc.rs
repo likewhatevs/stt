@@ -573,13 +573,32 @@ pub struct PayloadTypeChoice {
 ///   3. No match or still ambiguous → return 0 to fall back to a hex
 ///      dump.
 ///
+/// `base_btf` is the optional base BTF (vmlinux for split program
+/// BTFs) used to filter out base-BTF type ids from the candidate set.
+/// The program BTF the renderer threads in is built via
+/// [`btf_rs::Btf::from_split_bytes`] with vmlinux as base; the base's
+/// type ids occupy the low end of the id space (1..base_nr_types),
+/// and `Btf::resolve_type_by_id` walks them first. Without filtering,
+/// a vmlinux struct of the same byte size as the scheduler's payload
+/// (e.g. some `*_ctx` of size 16) can win the size-match step and
+/// then propagate the wrong layout into the renderer. btf-rs 1.1.1
+/// does not expose `base_nr_types()` directly, so the filter resolves
+/// each candidate id in `base_btf` and excludes it when the
+/// resolution succeeds — base-resolvable ids are by definition base
+/// types. `None` skips the filter (test BTFs without a base, or
+/// callers that genuinely want every match).
+///
 /// The function is intentionally conservative: a wrong type id renders
 /// nonsense field names; falling back to hex always shows the operator
 /// raw bytes they can decode by hand. The returned reason string is
 /// surfaced to the operator via [`SdtAllocatorSnapshot::payload_type_reason`]
 /// so the fallback paths are distinguishable without re-running the
 /// heuristic.
-pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeChoice {
+pub fn discover_payload_btf_id(
+    btf: &Btf,
+    base_btf: Option<&Btf>,
+    payload_size: usize,
+) -> PayloadTypeChoice {
     if payload_size == 0 {
         return PayloadTypeChoice {
             target_type_id: 0,
@@ -615,7 +634,19 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeCho
                     && let Ok(name) = btf.resolve_name(&s)
                     && !name.is_empty()
                 {
-                    size_matches.push((tid, name));
+                    // Base-BTF filter: exclude vmlinux structs from
+                    // the candidate set. `Btf::resolve_type_by_id`
+                    // walks base first when present, so a successful
+                    // base resolve at this id proves the type lives
+                    // in base BTF — drop it. `None` (test fixtures
+                    // without a base, or production callers that
+                    // pass `None`) keeps the full id range.
+                    let from_base = base_btf
+                        .map(|b| b.resolve_type_by_id(tid).is_ok())
+                        .unwrap_or(false);
+                    if !from_base {
+                        size_matches.push((tid, name));
+                    }
                 }
             }
             Err(_) => {
@@ -1162,7 +1193,7 @@ mod tests {
                 return;
             }
         };
-        let choice = discover_payload_btf_id(&btf, 0);
+        let choice = discover_payload_btf_id(&btf, None, 0);
         assert_eq!(
             choice.target_type_id, 0,
             "zero-size must yield target_type_id=0"
@@ -1199,7 +1230,7 @@ mod tests {
             }
         };
         let impossible_size = usize::MAX / 2;
-        let choice = discover_payload_btf_id(&btf, impossible_size);
+        let choice = discover_payload_btf_id(&btf, None, impossible_size);
         assert_eq!(choice.target_type_id, 0);
         let expected = format!("no candidate of size {impossible_size}");
         assert_eq!(
@@ -1871,9 +1902,9 @@ mod tests {
 
     /// G1.1: Single size-match resolves cleanly. A BTF with one
     /// 16-byte struct named `cgrp_ctx` and one 8-byte int. Calling
-    /// `discover_payload_btf_id(&btf, 16)` finds `cgrp_ctx` as the
-    /// unique size-match; size_matches.len() == 1 routes to the
-    /// "single match" arm and returns the id with empty reason.
+    /// `discover_payload_btf_id(&btf, None, 16)` finds `cgrp_ctx`
+    /// as the unique size-match; size_matches.len() == 1 routes to
+    /// the "single match" arm and returns the id with empty reason.
     /// Pin the contract that a single-match path bypasses the
     /// pattern-priority dispatch entirely.
     #[test]
@@ -1912,7 +1943,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, None, 16);
         assert_eq!(
             choice.target_type_id, 2,
             "single 16-byte struct cgrp_ctx must be picked unambiguously"
@@ -1968,7 +1999,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, None, 16);
         assert_eq!(
             choice.target_type_id, 2,
             "scx_cgroup_ctx (single 16-byte size-match) must resolve via the \
@@ -2035,7 +2066,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, None, 16);
         assert_eq!(
             choice.target_type_id, 2,
             "exact `task_ctx` arm (priority 1) must win over `*_ctx` suffix \
@@ -2107,7 +2138,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, None, 16);
         assert_eq!(
             choice.target_type_id, 0,
             "ambiguous `*_ctx` matches must fall through every arm and \
@@ -2211,7 +2242,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, None, 16);
         // Arm 1 (`task_ctx` exact): no hit. Arm 2 (`*_arena_ctx`):
         // 2 hits → continue. Arm 3 (`*_task_ctx`): 1 hit → return
         // id 4. Arm 4 (`*_ctx`): never reached.

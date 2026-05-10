@@ -610,6 +610,20 @@ struct AccessorMemReader<'a> {
     /// caller chose not to dedup for this reader instance) keeps
     /// the chase pipeline's existing behaviour intact.
     rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
+    /// Host-resolved vmlinux BTF (the base of every split program
+    /// BTF the dump consumes). Returned by
+    /// [`MemReader::base_btf`] so
+    /// [`super::super::btf_render::chase_arena_pointer`]'s
+    /// `alloc_size` fallback can thread it into
+    /// [`super::super::sdt_alloc::discover_payload_btf_id`] as the
+    /// base-BTF filter — vmlinux struct ids are excluded from the
+    /// candidate set so a kernel `*_ctx` of the same byte size as
+    /// the scheduler's payload cannot win the size match.
+    /// `None` skips the filter (test stubs without a vmlinux BTF
+    /// in scope); production always passes the resolved vmlinux
+    /// BTF threaded through from
+    /// [`super::DumpContext::btf`].
+    base_btf: Option<&'a Btf>,
 }
 
 impl MemReader for AccessorMemReader<'_> {
@@ -747,6 +761,14 @@ impl MemReader for AccessorMemReader<'_> {
         };
         set.contains(&(addr as u32))
     }
+    fn base_btf(&self) -> Option<&Btf> {
+        // Forward the host vmlinux BTF threaded in at construction.
+        // Production callers pass `Some(&vmlinux_btf)`; test stubs
+        // pass `None` to skip the base-BTF filter (synthetic BTFs
+        // in tests have no base — every type id is "program-BTF" by
+        // definition).
+        self.base_btf
+    }
 }
 
 /// Free helper: resolve a `BTF_KIND_FWD` name to a complete
@@ -875,6 +897,7 @@ impl<'a> GuestMemMapAccessor<'a> {
         cross_btf_fwd_index: Option<&'a CrossBtfFwdIndex<'a>>,
         scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
         rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
+        base_btf: Option<&'a Btf>,
     ) -> impl MemReader + 'a {
         AccessorMemReader {
             kernel: self.kernel(),
@@ -887,6 +910,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             cross_btf_fwd_index,
             scx_static_index,
             rendered_slot_addrs,
+            base_btf,
         }
     }
 }
@@ -1069,6 +1093,15 @@ pub(super) struct RenderMapCtx<'a> {
     /// `None` (no allocator pre-pass produced any rendered slot)
     /// keeps the chase pipeline's existing behaviour intact.
     pub(super) rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
+    /// Host-resolved vmlinux BTF — the base of every split program
+    /// BTF the dump consumes. Threaded into every per-map
+    /// [`AccessorMemReader`] so the chase path's `alloc_size`
+    /// fallback can pass it as the base-BTF filter to
+    /// [`super::super::sdt_alloc::discover_payload_btf_id`].
+    /// `Some(&vmlinux_btf)` in production (always populated from
+    /// [`super::DumpContext::btf`]); `None` in test stubs that
+    /// don't have a vmlinux BTF in scope.
+    pub(super) base_btf: Option<&'a Btf>,
 }
 
 /// Render `bytes` via BTF when both a `Btf` is available AND the
@@ -1510,6 +1543,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         cross_btf_fwd_index,
         scx_static_index,
         rendered_slot_addrs,
+        base_btf,
     } = ctx;
     let mem_reader = accessor.mem_reader(
         shared_arena.map(|(snap, _map_kva)| snap),
@@ -1521,6 +1555,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         cross_btf_fwd_index,
         scx_static_index,
         rendered_slot_addrs,
+        base_btf,
     );
     // Per-map allocator selection. The TASK_STORAGE / HASH chase
     // arms consult this to pick the matching allocator metadata when
