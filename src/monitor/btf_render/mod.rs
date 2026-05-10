@@ -3512,26 +3512,28 @@ fn chase_arena_pointer(
                     Some(s) => s,
                     None => {
                         // No per-slot alloc_size. Try every
-                        // captured alloc_size from the CastMap:
-                        // for each, check if discover_payload_btf_id
-                        // resolves AND the arena has readable bytes
-                        // at that size. First match wins (scx_static
-                        // allocations pack contiguously — a wrong
-                        // size reads into adjacent allocations but
-                        // the BTF match prevents misrendering).
-                        let mut resolved_size = None;
-                        for &candidate in mem.captured_alloc_sizes() {
-                            let c = super::sdt_alloc::discover_payload_btf_id(
-                                btf,
-                                candidate as usize,
-                            );
-                            if c.target_type_id != 0
-                                && mem.read_arena(val, candidate as usize).is_some()
-                            {
-                                resolved_size = Some(candidate);
-                                break;
-                            }
-                        }
+                        // captured alloc_size from the CastMap.
+                        // ONLY use the fallback when exactly ONE
+                        // captured size resolves uniquely in BTF —
+                        // multiple resolving sizes means we can't
+                        // tell which applies to THIS pointer, and
+                        // guessing wrong renders garbage (reads
+                        // past the allocation into adjacent data).
+                        let resolving: Vec<u64> = mem
+                            .captured_alloc_sizes()
+                            .iter()
+                            .copied()
+                            .filter(|&sz| {
+                                super::sdt_alloc::discover_payload_btf_id(btf, sz as usize)
+                                    .target_type_id
+                                    != 0
+                            })
+                            .collect();
+                        let resolved_size = if resolving.len() == 1 {
+                            Some(resolving[0])
+                        } else {
+                            None
+                        };
                         match resolved_size {
                             Some(s) => s,
                             None => {
