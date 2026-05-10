@@ -1774,6 +1774,14 @@ pub trait MemReader {
         false
     }
 
+    /// All unique alloc_sizes captured across the CastMap's Arena
+    /// findings. Used as a last-resort fallback when a deferred-
+    /// resolve chase has alloc_size=None: try each captured size
+    /// with discover_payload_btf_id and use it if exactly one
+    /// produces a unique BTF match. Default returns empty.
+    fn captured_alloc_sizes(&self) -> &[u64] {
+        &[]
+    }
 }
 
 /// Render a BTF type's bytes into a [`RenderedValue`] without an
@@ -3500,18 +3508,47 @@ fn chase_arena_pointer(
                 // has no header so `header_skip == 0`. `None`
                 // means no captured size — surface the bridge
                 // miss as the chase reason.
-                let Some(size) = alloc_size else {
-                    return ArenaChaseOutcome {
-                        deref: None,
-                        reason: Some(format!(
-                            "arena chase: cast analyzer's STX-flow path tagged \
-                             slot as Arena (target_type_id=0, deferred resolve), \
-                             but [`MemReader::resolve_arena_type`] had no entry \
-                             for 0x{val:x}; allocator pre-pass may not have \
-                             populated the index for this allocator"
-                        )),
-                        sdt_alloc_resolved: false,
-                    };
+                let size = match alloc_size {
+                    Some(s) => s,
+                    None => {
+                        // No per-slot alloc_size. Try every
+                        // captured alloc_size from the CastMap:
+                        // for each, check if discover_payload_btf_id
+                        // resolves AND the arena has readable bytes
+                        // at that size. First match wins (scx_static
+                        // allocations pack contiguously — a wrong
+                        // size reads into adjacent allocations but
+                        // the BTF match prevents misrendering).
+                        let mut resolved_size = None;
+                        for &candidate in mem.captured_alloc_sizes() {
+                            let c = super::sdt_alloc::discover_payload_btf_id(
+                                btf,
+                                candidate as usize,
+                            );
+                            if c.target_type_id != 0
+                                && mem.read_arena(val, candidate as usize).is_some()
+                            {
+                                resolved_size = Some(candidate);
+                                break;
+                            }
+                        }
+                        match resolved_size {
+                            Some(s) => s,
+                            None => {
+                                return ArenaChaseOutcome {
+                                    deref: None,
+                                    reason: Some(format!(
+                                        "arena chase: cast analyzer's STX-flow path tagged \
+                                         slot as Arena (target_type_id=0, deferred resolve), \
+                                         but [`MemReader::resolve_arena_type`] had no entry \
+                                         for 0x{val:x}; allocator pre-pass may not have \
+                                         populated the index for this allocator"
+                                    )),
+                                    sdt_alloc_resolved: false,
+                                };
+                            }
+                        }
+                    }
                 };
                 // Pass the reader's base BTF so the size-match
                 // heuristic excludes vmlinux struct ids from the

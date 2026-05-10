@@ -610,6 +610,9 @@ struct AccessorMemReader<'a> {
     /// caller chose not to dedup for this reader instance) keeps
     /// the chase pipeline's existing behaviour intact.
     rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
+    /// Unique alloc_sizes from all Arena CastHits in the CastMap.
+    /// Fallback for deferred-resolve chases with alloc_size=None.
+    captured_alloc_sizes: Vec<u64>,
 }
 
 impl MemReader for AccessorMemReader<'_> {
@@ -746,6 +749,9 @@ impl MemReader for AccessorMemReader<'_> {
             return false;
         };
         set.contains(&(addr as u32))
+    }
+    fn captured_alloc_sizes(&self) -> &[u64] {
+        &self.captured_alloc_sizes
     }
 }
 
@@ -887,6 +893,17 @@ impl<'a> GuestMemMapAccessor<'a> {
             cross_btf_fwd_index,
             scx_static_index,
             rendered_slot_addrs,
+            captured_alloc_sizes: cast_map
+                .map(|m| {
+                    let mut sizes: Vec<u64> = m
+                        .values()
+                        .filter_map(|hit| hit.alloc_size)
+                        .collect();
+                    sizes.sort_unstable();
+                    sizes.dedup();
+                    sizes
+                })
+                .unwrap_or_default(),
         }
     }
 }

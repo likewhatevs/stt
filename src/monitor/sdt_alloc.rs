@@ -1188,7 +1188,7 @@ mod tests {
                 return;
             }
         };
-        let choice = discover_payload_btf_id(&btf, None, 0);
+        let choice = discover_payload_btf_id(&btf, 0);
         assert_eq!(
             choice.target_type_id, 0,
             "zero-size must yield target_type_id=0"
@@ -1225,7 +1225,7 @@ mod tests {
             }
         };
         let impossible_size = usize::MAX / 2;
-        let choice = discover_payload_btf_id(&btf, None, impossible_size);
+        let choice = discover_payload_btf_id(&btf, impossible_size);
         assert_eq!(choice.target_type_id, 0);
         let expected = format!("no candidate of size {impossible_size}");
         assert_eq!(
@@ -1897,7 +1897,7 @@ mod tests {
 
     /// G1.1: Single size-match resolves cleanly. A BTF with one
     /// 16-byte struct named `cgrp_ctx` and one 8-byte int. Calling
-    /// `discover_payload_btf_id(&btf, None, 16)` finds `cgrp_ctx`
+    /// `discover_payload_btf_id(&btf, 16)` finds `cgrp_ctx`
     /// as the unique size-match; size_matches.len() == 1 routes to
     /// the "single match" arm and returns the id with empty reason.
     /// Pin the contract that a single-match path bypasses the
@@ -1938,7 +1938,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, None, 16);
+        let choice = discover_payload_btf_id(&btf, 16);
         assert_eq!(
             choice.target_type_id, 2,
             "single 16-byte struct cgrp_ctx must be picked unambiguously"
@@ -1994,7 +1994,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, None, 16);
+        let choice = discover_payload_btf_id(&btf, 16);
         assert_eq!(
             choice.target_type_id, 2,
             "scx_cgroup_ctx (single 16-byte size-match) must resolve via the \
@@ -2061,7 +2061,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, None, 16);
+        let choice = discover_payload_btf_id(&btf, 16);
         assert_eq!(
             choice.target_type_id, 2,
             "exact `task_ctx` arm (priority 1) must win over `*_ctx` suffix \
@@ -2133,7 +2133,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, None, 16);
+        let choice = discover_payload_btf_id(&btf, 16);
         assert_eq!(
             choice.target_type_id, 0,
             "ambiguous `*_ctx` matches must fall through every arm and \
@@ -2237,7 +2237,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, None, 16);
+        let choice = discover_payload_btf_id(&btf, 16);
         // Arm 1 (`task_ctx` exact): no hit. Arm 2 (`*_arena_ctx`):
         // 2 hits → continue. Arm 3 (`*_task_ctx`): 1 hit → return
         // id 4. Arm 4 (`*_ctx`): never reached.
