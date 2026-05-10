@@ -2169,7 +2169,6 @@ impl<'a> Analyzer<'a> {
                                     .get(&(canonical_parent, canonical_field_off))
                                     .copied()
                                     .flatten();
-                                eprintln!("[ALIAS-TRACK] LDX from arena-tagged slot ({canonical_parent}, {canonical_field_off}) inherited_alloc_size={inherited_size:?}");
                                 RegState::ArenaU64FromAlloc {
                                     source: Some((canonical_parent, canonical_field_off)),
                                     alloc_size: inherited_size,
@@ -2522,9 +2521,16 @@ impl<'a> Analyzer<'a> {
                             (None, _) => {
                                 self.arena_alloc_size_index.insert(key, alloc_size);
                             }
-                            (Some(None), _) => {
-                                // Already ambiguous or absent-of-
-                                // capture; leave at None.
+                            (Some(None), Some(_)) => {
+                                // Prior pass recorded absent-of-
+                                // capture; this pass brings new
+                                // evidence (e.g. LoadedU64Field
+                                // inheritance resolved on a later
+                                // fixpoint iteration). Upgrade.
+                                self.arena_alloc_size_index.insert(key, alloc_size);
+                            }
+                            (Some(None), None) => {
+                                // Both absent — no-op.
                             }
                             (Some(Some(_)), None) => {
                                 // Captured size survives an absent
@@ -2877,6 +2883,12 @@ impl<'a> Analyzer<'a> {
                         // records absence-of-capture in the index.
                         let captured = match slot {
                             RegState::ArenaU64FromAlloc { alloc_size, .. } => alloc_size,
+                            RegState::LoadedU64Field { source_struct_id, field_offset } => {
+                                self.arena_alloc_size_index
+                                    .get(&(source_struct_id, field_offset))
+                                    .copied()
+                                    .flatten()
+                            }
                             _ => None,
                         };
                         self.arena_alloc_size_index.insert(key, captured);
