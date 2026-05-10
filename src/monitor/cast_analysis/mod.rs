@@ -682,7 +682,7 @@ pub fn analyze_casts(
             subprog_returns,
         );
         let (next_args, next_stx) = a.into_carryover();
-        if next_args == caller_args && next_stx == arena_stx {
+        if next_stx == arena_stx && pass > 0 {
             // Converged: re-run one more time with the converged
             // carry-over so finalize() sees a fully populated
             // analyzer. `into_carryover` consumed `a` above, so a
