@@ -5649,7 +5649,14 @@ fn append_arena_type_index_for_allocator_multi_allocator_merge() {
         mk_alloc_entry(0, 0, 0x0000_3000),
         mk_alloc_entry(1, 0, 0x0000_4000),
     ];
-    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &[0x3000u64, 0x4000u64]);
+    append_arena_type_index_for_allocator(
+        &mut index,
+        "alloc_b",
+        11,
+        8,
+        16,
+        &[0x3000u64, 0x4000u64],
+    );
     let info_a = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
