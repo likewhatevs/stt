@@ -10045,3 +10045,140 @@ fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
          LDX V.field -> STX into P.field: {map:?}"
     );
 }
+
+/// Cross-subprog fixpoint: callee at LOWER PC than caller. Single-pass
+/// misses this because caller_arg_types isn't populated when the callee's
+/// FuncEntry runs. The fixpoint carries caller_arg_types from pass 1 into
+/// pass 2 so the callee inherits the caller's typed arguments.
+///
+/// Pattern mirrors scx_cgroup_bw_consume (callee, PC 8064) called from
+/// account_task_runtime (caller, PC 18292) in lavd — the exact chain
+/// that required the fixpoint to detect cgx_raw as an arena pointer.
+#[test]
+fn cross_function_fixpoint_callee_before_caller() {
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = push_name(&mut strings, "u64");
+    let n_parent = push_name(&mut strings, "Parent");
+    let n_field = push_name(&mut strings, "arena_field");
+    let n_caller = push_name(&mut strings, "caller");
+    let n_callee = push_name(&mut strings, "callee");
+    let n_p1 = push_name(&mut strings, "parent_raw");
+    let n_p2 = push_name(&mut strings, "val_raw");
+
+    let types = vec![
+        // id 1: u64
+        SynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct Parent { u64 arena_field @ offset 8 }
+        SynType::Struct {
+            name_off: n_parent,
+            size: 16,
+            members: vec![SynMember {
+                name_off: n_field,
+                type_id: 1,
+                byte_offset: 8,
+            }],
+        },
+        // id 3: Ptr -> Parent
+        SynType::Ptr { type_id: 2 },
+        // id 4: callee FuncProto: (u64 parent_raw, u64 val_raw)
+        SynType::FuncProto {
+            return_type_id: 0,
+            params: vec![
+                SynParam {
+                    name_off: n_p1,
+                    type_id: 1,
+                },
+                SynParam {
+                    name_off: n_p2,
+                    type_id: 1,
+                },
+            ],
+        },
+        // id 5: Func "callee" -> proto 4
+        SynType::Func {
+            name_off: n_callee,
+            type_id: 4,
+            linkage: 1,
+        },
+        // id 6: caller FuncProto: (Ptr->Parent)
+        SynType::FuncProto {
+            return_type_id: 0,
+            params: vec![SynParam {
+                name_off: n_p1,
+                type_id: 3,
+            }],
+        },
+        // id 7: Func "caller" -> proto 6
+        SynType::Func {
+            name_off: n_caller,
+            type_id: 6,
+            linkage: 1,
+        },
+    ];
+    let blob = build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    let parent_id: u32 = 2;
+
+    // Callee at PC 0..1 (BEFORE caller — exercises fixpoint):
+    //   PC 0: STX [R1 + 8] = R2
+    //         R1 = Pointer{Parent} (from caller_arg_types, pass 2)
+    //         R2 = ArenaU64FromAlloc (from caller_arg_types, pass 2)
+    //   PC 1: EXIT
+    //
+    // Caller at PC 2..5 (AFTER callee):
+    //   PC 2: FuncEntry. R1 = Pointer{Parent} from FuncProto.
+    //   PC 2: allocator call → R0 = ArenaU64FromAlloc
+    //   PC 3: R2 = R0 (move arena result to R2 for callee arg)
+    //   PC 4: BPF_PSEUDO_CALL to callee (PC 0). imm = -5.
+    //         caller_arg_types[0] = [Pointer{Parent}, ArenaU64FromAlloc, ...]
+    //   PC 5: EXIT
+    let alloc_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+    let callee_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, -7);
+
+    let insns = vec![
+        // --- callee at PC 0..1 ---
+        stx(BPF_SIZE_DW, 1, 2, 8), // PC 0: STX [R1+8] = R2
+        exit(),                      // PC 1
+        // --- caller at PC 2..7 ---
+        mov_x(6, 1),                // PC 2: save R1 to callee-saved R6
+        alloc_call,                  // PC 3: allocator → R0=ArenaU64FromAlloc
+        mov_x(2, 0),                // PC 4: R2 = R0 (arena result)
+        mov_x(1, 6),                // PC 5: R1 = R6 (restore parent ptr)
+        callee_call,                 // PC 6: call callee at PC 0
+        exit(),                      // PC 7
+    ];
+
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[],
+        &[
+            FuncEntry {
+                insn_offset: 0,
+                func_proto_id: 4,
+            }, // callee (u64, u64)
+            FuncEntry {
+                insn_offset: 2,
+                func_proto_id: 6,
+            }, // caller (Ptr->Parent)
+        ],
+        &[],
+        &[SubprogReturn { insn_offset: 3 }], // allocator at PC 3
+    );
+
+    assert_eq!(
+        map.get(&(parent_id, 8)),
+        Some(&CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        }),
+        "fixpoint must propagate caller's [Pointer{{Parent}}, ArenaU64FromAlloc] \
+         into callee at lower PC, producing (Parent, 8) -> Arena: {map:?}"
+    );
+}
