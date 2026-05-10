@@ -396,7 +396,15 @@ pub(super) fn resolve_arena_type_in_index(
         return None;
     }
     let key = (addr & 0xFFFF_FFFF) as u32;
-    let (&slot_start, info) = index.range(..=key).next_back()?;
+    let Some((&slot_start, info)) = index.range(..=key).next_back() else {
+        tracing::debug!(
+            addr = format_args!("{:#x}", addr),
+            key = format_args!("{:#x}", key),
+            index_len = index.len(),
+            "resolve_arena_type: no slot found in ArenaTypeIndex for key"
+        );
+        return None;
+    };
     let slot_end_u64 = (slot_start as u64) + (info.elem_size as u64);
     if (key as u64) >= slot_end_u64 {
         return None;
