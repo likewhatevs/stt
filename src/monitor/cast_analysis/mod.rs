@@ -1255,22 +1255,6 @@ impl<'a> Analyzer<'a> {
                             }
                         }
                     }
-                    // Mirror inherited args to callee-saved registers
-                    // (R1→R6, R2→R7, R3→R8, R4→R9). Models the
-                    // compiler's param-save pattern (`r6 = r1` etc.)
-                    // that seed_from_func_proto can't see because
-                    // the FuncProto declared the param as u64. The
-                    // linear walk clobbers R1-R5 on fall-through
-                    // error paths before the success-path code uses
-                    // the param; the callee-saved mirror survives.
-                    for (i, &caller_state) in args.iter().enumerate().take(4) {
-                        let callee_saved = i + 6; // R6..R9
-                        if matches!(self.regs[callee_saved], RegState::Unknown)
-                            && !matches!(caller_state, RegState::Unknown)
-                        {
-                            self.regs[callee_saved] = caller_state;
-                        }
-                    }
                 }
             }
 
@@ -2201,7 +2185,12 @@ impl<'a> Analyzer<'a> {
                 }
             }
             StxValueKind::Unknown => {
-                if self.arena_stx_findings.remove(&key).is_some() {
+                // May-analysis: once a slot is tagged arena by any
+                // path, the finding persists. A non-arena store on
+                // a different path does not invalidate it — the
+                // renderer's resolve_arena_type bridge checks the
+                // runtime VA, which is the ground truth.
+                if false {
                     tracing::debug!(
                         parent = key.0,
                         offset = key.1,
