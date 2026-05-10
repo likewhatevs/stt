@@ -173,6 +173,7 @@ fn report_serde_roundtrip() {
         }],
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -251,6 +252,7 @@ fn report_display_one_map_with_value() {
         maps: vec![make_simple_map()],
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -289,6 +291,7 @@ fn report_display_multiple_maps_separated() {
         maps: vec![make_simple_map(), make_simple_map()],
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -408,6 +411,7 @@ fn report_display_includes_vcpu_regs_section() {
             }),
         ],
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -451,6 +455,7 @@ fn report_display_pairs_maps_and_vcpu_regs_with_blank_line() {
             tcr_el1: None,
         })],
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -483,6 +488,7 @@ fn report_display_empty_with_only_vcpu_regs_does_not_say_empty_dump() {
         maps: Vec::new(),
         vcpu_regs: vec![None],
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -530,6 +536,7 @@ fn report_display_partial_with_populated_regs_and_empty_maps() {
             tcr_el1: None,
         })],
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -593,6 +600,7 @@ fn dual_report_serde_roundtrip_with_early() {
         maps: Vec::new(),
         vcpu_regs: vec![None],
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -616,6 +624,7 @@ fn dual_report_serde_roundtrip_with_early() {
         maps: Vec::new(),
         vcpu_regs: vec![None, None],
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: Vec::new(),
         prog_runtime_stats_unavailable: None,
         per_cpu_time: Vec::new(),
@@ -952,6 +961,7 @@ fn prog_runtime_stats_serde_roundtrip_with_saturation() {
         maps: Vec::new(),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: vec![
             super::super::bpf_prog::ProgRuntimeStats {
                 name: "dispatch".to_string(),
@@ -1023,6 +1033,7 @@ fn report_display_renders_prog_runtime_stats() {
         maps: Vec::new(),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: vec![
             super::super::bpf_prog::ProgRuntimeStats {
                 name: "dispatch".to_string(),
@@ -1081,6 +1092,7 @@ fn report_display_only_prog_runtime_stats_does_not_say_empty_dump() {
         maps: Vec::new(),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats: vec![super::super::bpf_prog::ProgRuntimeStats {
             name: "lone".to_string(),
             cnt: 1,
@@ -2223,7 +2235,7 @@ fn accessor_mem_reader_cast_lookup_with_none_map() {
 // `AccessorMemReader::resolve_arena_type` (render_map.rs) gates on
 // `is_arena_addr` (snapshot's [user_vm_start, user_vm_start + 4 GiB)),
 // masks the chased address with `0xFFFF_FFFF`, then runs a range
-// lookup against the per-pass [`ArenaTypeIndex`] keyed on
+// lookup against the per-pass [`ArenaSlotIndex`] keyed on
 // slot-start to find the slot containing the address.
 // `AccessorMemReader` itself is private to render_map.rs, but the
 // gate / range / dispatch logic lives in the free helper
@@ -2251,12 +2263,12 @@ fn accessor_mem_reader_cast_lookup_with_none_map() {
 /// cover the wrapper's scx_static fall-through.
 ///
 /// The stub itself only carries the two borrows the helper needs
-/// (`arena_snapshot`, `arena_type_index`); `is_arena_addr` is also
+/// (`arena_snapshot`, `arena_slot_index`); `is_arena_addr` is also
 /// implemented for parity with the production reader's surface,
 /// though the tests below only assert against `resolve_arena_type`.
 struct ResolveArenaTypeStub<'a> {
     arena_snapshot: Option<&'a super::super::arena::ArenaSnapshot>,
-    arena_type_index: Option<&'a super::render_map::ArenaTypeIndex>,
+    arena_slot_index: Option<&'a super::render_map::ArenaSlotIndex>,
 }
 
 impl super::super::btf_render::MemReader for ResolveArenaTypeStub<'_> {
@@ -2269,8 +2281,9 @@ impl super::super::btf_render::MemReader for ResolveArenaTypeStub<'_> {
     fn resolve_arena_type(&self, addr: u64) -> Option<super::super::btf_render::ArenaResolveHit> {
         super::render_map::resolve_arena_type_in_index(
             self.arena_snapshot,
-            self.arena_type_index,
+            self.arena_slot_index,
             addr,
+            0,
         )
     }
 }
@@ -2284,25 +2297,26 @@ impl super::super::btf_render::MemReader for ResolveArenaTypeStub<'_> {
 #[test]
 fn accessor_mem_reader_resolve_arena_type_slot_start_returns_header_skip() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut index = ArenaTypeIndex::new();
+    let mut index = ArenaSlotIndex::new();
     index.insert(
         0x0000_1000,
         ArenaSlotInfo {
             elem_size: 24, // 8-byte header + 16-byte payload
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
 
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     // Slot-start chase: full 64-bit address whose low 32 bits
@@ -2326,25 +2340,26 @@ fn accessor_mem_reader_resolve_arena_type_slot_start_returns_header_skip() {
 #[test]
 fn accessor_mem_reader_resolve_arena_type_payload_start_returns_zero_skip() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut index = ArenaTypeIndex::new();
+    let mut index = ArenaSlotIndex::new();
     index.insert(
         0x0000_1000,
         ArenaSlotInfo {
             elem_size: 24,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
 
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     // Payload-start chase: address = slot_start + header_size.
@@ -2365,25 +2380,26 @@ fn accessor_mem_reader_resolve_arena_type_payload_start_returns_zero_skip() {
 #[test]
 fn accessor_mem_reader_resolve_arena_type_interior_returns_none() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut index = ArenaTypeIndex::new();
+    let mut index = ArenaSlotIndex::new();
     index.insert(
         0x0000_1000,
         ArenaSlotInfo {
             elem_size: 24,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
 
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     // Mid-header (offset 4 < header_size 8): no payload render.
@@ -2407,13 +2423,13 @@ fn accessor_mem_reader_resolve_arena_type_interior_returns_none() {
 #[test]
 fn accessor_mem_reader_resolve_arena_type_range_picks_correct_slot() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut index = ArenaTypeIndex::new();
+    let mut index = ArenaSlotIndex::new();
     // Two non-overlapping slots, distinct payload type ids.
     index.insert(
         0x0000_1000,
@@ -2421,6 +2437,7 @@ fn accessor_mem_reader_resolve_arena_type_range_picks_correct_slot() {
             elem_size: 16,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
     index.insert(
@@ -2429,12 +2446,13 @@ fn accessor_mem_reader_resolve_arena_type_range_picks_correct_slot() {
             elem_size: 16,
             header_size: 8,
             target_type_id: 11,
+            source_btf_kva: 0,
         },
     );
 
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     use super::super::btf_render::ArenaResolveHit;
@@ -2493,25 +2511,26 @@ fn accessor_mem_reader_resolve_arena_type_range_picks_correct_slot() {
 #[test]
 fn accessor_mem_reader_resolve_arena_type_rejects_out_of_window() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut index = ArenaTypeIndex::new();
+    let mut index = ArenaSlotIndex::new();
     index.insert(
         0x0000_1000,
         ArenaSlotInfo {
             elem_size: 16,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
 
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     // Below the window: low-32 maps inside the seeded slot but
@@ -2528,7 +2547,7 @@ fn accessor_mem_reader_resolve_arena_type_rejects_out_of_window() {
 }
 
 /// `resolve_arena_type` returns `None` when the index is absent
-/// (`arena_type_index = None`): the `?` short-circuit fires before
+/// (`arena_slot_index = None`): the `?` short-circuit fires before
 /// the gate. Production path: a scheduler that does not link
 /// sdt_alloc leaves the index empty; the renderer falls back to
 /// the trait default's "no bridge" behaviour.
@@ -2542,11 +2561,11 @@ fn accessor_mem_reader_resolve_arena_type_none_index_short_circuits() {
     };
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: None,
+        arena_slot_index: None,
     };
 
     // Even an in-window address returns None when the index is
-    // absent — the `?` operator on `self.arena_type_index` fires
+    // absent — the `?` operator on `self.arena_slot_index` fires
     // before the gate runs.
     assert!(
         r.resolve_arena_type(0x10_0000_1008).is_none(),
@@ -2561,13 +2580,13 @@ fn accessor_mem_reader_resolve_arena_type_none_index_short_circuits() {
 #[test]
 fn accessor_mem_reader_resolve_arena_type_slot_end_boundary_excluded() {
     use super::super::arena::ArenaSnapshot;
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut index = ArenaTypeIndex::new();
+    let mut index = ArenaSlotIndex::new();
     // One slot at 0x1000 with elem_size=16 → range
     // [0x1000, 0x1010). 0x100F is the last byte; 0x1010 is the
     // first byte of the next (uninstalled) slot.
@@ -2577,12 +2596,13 @@ fn accessor_mem_reader_resolve_arena_type_slot_end_boundary_excluded() {
             elem_size: 16,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
 
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     // Last byte of the slot (offset = 15 = elem_size - 1): inside
@@ -2610,13 +2630,13 @@ fn accessor_mem_reader_resolve_arena_type_slot_end_boundary_excluded() {
 fn accessor_mem_reader_resolve_arena_type_adjacent_slots_picked_correctly() {
     use super::super::arena::ArenaSnapshot;
     use super::super::btf_render::ArenaResolveHit;
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut index = ArenaTypeIndex::new();
+    let mut index = ArenaSlotIndex::new();
     // Slot A at 0x1000, elem_size=16 → range [0x1000, 0x1010).
     index.insert(
         0x0000_1000,
@@ -2624,6 +2644,7 @@ fn accessor_mem_reader_resolve_arena_type_adjacent_slots_picked_correctly() {
             elem_size: 16,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
     // Slot B at 0x1010, elem_size=16 → range [0x1010, 0x1020).
@@ -2634,12 +2655,13 @@ fn accessor_mem_reader_resolve_arena_type_adjacent_slots_picked_correctly() {
             elem_size: 16,
             header_size: 8,
             target_type_id: 11,
+            source_btf_kva: 0,
         },
     );
 
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     // Slot A start (offset 0): payload type 7 with
@@ -2688,13 +2710,13 @@ fn accessor_mem_reader_resolve_arena_type_adjacent_slots_picked_correctly() {
 fn accessor_mem_reader_resolve_arena_type_high_edge_slot_resolves() {
     use super::super::arena::ArenaSnapshot;
     use super::super::btf_render::ArenaResolveHit;
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut index = ArenaTypeIndex::new();
+    let mut index = ArenaSlotIndex::new();
     // Slot near the top of the 4 GiB window. slot_start +
     // elem_size = 0xFFFF_F000 + 4096 = 0x1_0000_0000, which
     // overflows u32. The widened bound resolves both endpoints
@@ -2705,12 +2727,13 @@ fn accessor_mem_reader_resolve_arena_type_high_edge_slot_resolves() {
             elem_size: 4096,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
 
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     // Slot start: full 64-bit address re-attaches the high 32 bits
@@ -2756,19 +2779,20 @@ fn resolve_arena_type_with_static_fallback_returns_sdt_alloc_hit() {
     use super::super::arena::ArenaSnapshot;
     use super::super::btf_render::ArenaResolveHit;
     use super::super::scx_static_alloc::{ScxStaticRangeIndex, ScxStaticSnapshot};
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
-    let mut sdt_index = ArenaTypeIndex::new();
+    let mut sdt_index = ArenaSlotIndex::new();
     sdt_index.insert(
         0x0000_1000,
         ArenaSlotInfo {
             elem_size: 24,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
     // scx_static index intentionally empty for this test; the
@@ -2781,7 +2805,8 @@ fn resolve_arena_type_with_static_fallback_returns_sdt_alloc_hit() {
         Some(&sdt_index),
         Some(&static_index),
         0x10_0000_1000, // slot start
-    );
+    0,
+            );
     assert_eq!(
         hit,
         Some(ArenaResolveHit {
@@ -2825,7 +2850,8 @@ fn resolve_arena_type_with_static_fallback_scx_static_hit_returns_none() {
         None,
         Some(&static_index),
         0x10_0000_2010,
-    );
+    0,
+            );
     assert!(
         hit.is_none(),
         "scx_static-only hit must return None — bridge cannot recover \
@@ -2843,20 +2869,21 @@ fn resolve_arena_type_with_static_fallback_scx_static_hit_returns_none() {
 fn resolve_arena_type_with_static_fallback_out_of_window_returns_none() {
     use super::super::arena::ArenaSnapshot;
     use super::super::scx_static_alloc::{ScxStaticRange, ScxStaticSnapshot};
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex};
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex};
 
     let snap = ArenaSnapshot {
         user_vm_start: 0x10_0000_0000,
         ..ArenaSnapshot::default()
     };
     // Both indexes have entries.
-    let mut sdt_index = ArenaTypeIndex::new();
+    let mut sdt_index = ArenaSlotIndex::new();
     sdt_index.insert(
         0x0000_1000,
         ArenaSlotInfo {
             elem_size: 24,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         },
     );
     let scx_static_snap = ScxStaticSnapshot {
@@ -2878,7 +2905,8 @@ fn resolve_arena_type_with_static_fallback_out_of_window_returns_none() {
         Some(&sdt_index),
         Some(&static_index),
         0x05_0000_1000,
-    );
+    0,
+            );
     assert!(
         hit.is_none(),
         "out-of-window address must NOT hit sdt_alloc even with low-32 collision",
@@ -2890,7 +2918,8 @@ fn resolve_arena_type_with_static_fallback_out_of_window_returns_none() {
         Some(&sdt_index),
         Some(&static_index),
         0x05_0000_2010,
-    );
+    0,
+            );
     assert!(
         hit.is_none(),
         "out-of-window address must NOT hit scx_static even with low-32 collision",
@@ -2913,7 +2942,8 @@ fn resolve_arena_type_with_static_fallback_both_none_returns_none() {
         None,
         None,
         0x10_0000_1000,
-    );
+    0,
+            );
     assert!(
         hit.is_none(),
         "both-None must return None — same as trait default",
@@ -4977,7 +5007,7 @@ fn render_map_struct_ops_no_offsets_returns_error() {
         arena_page_index: &arena_page_index,
         sdt_alloc_metas: &sdt_alloc_metas,
         cast_map: None,
-        arena_type_index: None,
+        arena_slot_index: None,
         cross_btf_fwd_index: None,
         scx_static_index: None, alloc_size_types: &[],
         rendered_slot_addrs: None,
@@ -5046,7 +5076,7 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
         arena_page_index: &arena_page_index,
         sdt_alloc_metas: &sdt_alloc_metas,
         cast_map: None,
-        arena_type_index: None,
+        arena_slot_index: None,
         cross_btf_fwd_index: None,
         scx_static_index: None, alloc_size_types: &[],
         rendered_slot_addrs: None,
@@ -5589,7 +5619,7 @@ fn map_display_skips_table_when_entry_has_no_btf_render() {
     );
 }
 
-// -- append_arena_type_index_for_allocator -----------------------
+// -- append_arena_slot_index_for_allocator -----------------------
 //
 // Coverage for the index-build helper that the dump pre-pass calls
 // per allocator. The helper handles size-fits-u32 conversion, the
@@ -5615,18 +5645,19 @@ fn mk_alloc_entry(idx: i32, genn: i32, user_addr: u64) -> super::super::sdt_allo
 /// them as "no payload type" anyway. Pinning the early bail keeps
 /// callers from accidentally polluting the index with zero ids.
 #[test]
-fn append_arena_type_index_for_allocator_zero_target_type_id_skips() {
-    use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
-    let mut index = ArenaTypeIndex::new();
+fn append_arena_slot_index_for_allocator_zero_target_type_id_skips() {
+    use super::render_map::{ArenaSlotIndex, append_arena_slot_index_for_allocator};
+    let mut index = ArenaSlotIndex::new();
     let addrs: Vec<u64> = vec![0x0000_1000];
-    append_arena_type_index_for_allocator(
+    append_arena_slot_index_for_allocator(
         &mut index,
         "test_allocator",
         0, // target_type_id == 0 ⇒ short-circuit
         8,
         16,
         &addrs,
-    );
+    0,
+            );
     assert!(
         index.is_empty(),
         "zero target_type_id must skip every entry; got {} index entries",
@@ -5639,19 +5670,20 @@ fn append_arena_type_index_for_allocator_zero_target_type_id_skips() {
 /// below `u32::MAX`) skips silently. Pinning the no-panic behaviour
 /// keeps a torn read from aborting the whole dump.
 #[test]
-fn append_arena_type_index_for_allocator_oversized_skips() {
-    use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
-    let mut index = ArenaTypeIndex::new();
+fn append_arena_slot_index_for_allocator_oversized_skips() {
+    use super::render_map::{ArenaSlotIndex, append_arena_slot_index_for_allocator};
+    let mut index = ArenaSlotIndex::new();
     let _entries = [mk_alloc_entry(0, 0, 0x0000_1000)];
     // elem_size > u32::MAX ⇒ try_from fails, helper bails.
-    append_arena_type_index_for_allocator(
+    append_arena_slot_index_for_allocator(
         &mut index,
         "test_allocator",
         7,
         8,
         u64::from(u32::MAX) + 1,
         &[0x1000u64],
-    );
+    0,
+            );
     assert!(
         index.is_empty(),
         "elem_size > u32::MAX must skip every entry; got {} entries",
@@ -5664,26 +5696,28 @@ fn append_arena_type_index_for_allocator_oversized_skips() {
 /// Pinning the per-allocator append shape so a future inner-loop
 /// rewrite can't silently drop entries.
 #[test]
-fn append_arena_type_index_for_allocator_multi_entry_insert() {
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
-    let mut index = ArenaTypeIndex::new();
+fn append_arena_slot_index_for_allocator_multi_entry_insert() {
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex, append_arena_slot_index_for_allocator};
+    let mut index = ArenaSlotIndex::new();
     let _entries = [
         mk_alloc_entry(0, 0, 0x0000_1000),
         mk_alloc_entry(1, 0, 0x0000_2000),
         mk_alloc_entry(2, 0, 0x0000_3000),
     ];
-    append_arena_type_index_for_allocator(
+    append_arena_slot_index_for_allocator(
         &mut index,
         "test_allocator",
         7,
         8,
         16,
         &[0x1000, 0x2000, 0x3000],
+        0,
     );
     let expected_info = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
         target_type_id: 7,
+        source_btf_kva: 0,
     };
     assert_eq!(index.len(), 3);
     assert_eq!(index.get(&0x0000_1000), Some(&expected_info));
@@ -5698,17 +5732,17 @@ fn append_arena_type_index_for_allocator_multi_entry_insert() {
 /// silently overwrite a live slot's metadata with a stale one when
 /// a freed allocation racing the freeze surfaces in two passes).
 #[test]
-fn append_arena_type_index_for_allocator_duplicate_slot_keeps_first() {
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
-    let mut index = ArenaTypeIndex::new();
+fn append_arena_slot_index_for_allocator_duplicate_slot_keeps_first() {
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex, append_arena_slot_index_for_allocator};
+    let mut index = ArenaSlotIndex::new();
     // First call seeds slot 0x1000 with payload type 7.
     let _entries_first = [mk_alloc_entry(0, 0, 0x0000_1000)];
-    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &[0x1000u64]);
+    append_arena_slot_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &[0x1000u64], 0);
     // Second call tries to insert the same slot start with a
     // distinct payload type 11 (e.g. a stale snapshot after free
     // racing the freeze). Helper must keep the first entry.
     let _entries_second = [mk_alloc_entry(0, 0, 0x0000_1000)];
-    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &[0x1000u64]);
+    append_arena_slot_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &[0x1000u64], 0);
     assert_eq!(index.len(), 1);
     assert_eq!(
         index.get(&0x0000_1000),
@@ -5716,6 +5750,7 @@ fn append_arena_type_index_for_allocator_duplicate_slot_keeps_first() {
             elem_size: 16,
             header_size: 8,
             target_type_id: 7,
+            source_btf_kva: 0,
         }),
         "duplicate slot_start must keep first entry's payload type",
     );
@@ -5727,37 +5762,40 @@ fn append_arena_type_index_for_allocator_duplicate_slot_keeps_first() {
 /// overwrite another's because both used the same low-32 windowed
 /// keys.
 #[test]
-fn append_arena_type_index_for_allocator_multi_allocator_merge() {
-    use super::render_map::{ArenaSlotInfo, ArenaTypeIndex, append_arena_type_index_for_allocator};
-    let mut index = ArenaTypeIndex::new();
+fn append_arena_slot_index_for_allocator_multi_allocator_merge() {
+    use super::render_map::{ArenaSlotInfo, ArenaSlotIndex, append_arena_slot_index_for_allocator};
+    let mut index = ArenaSlotIndex::new();
     // Allocator A — payload type 7, two slots.
     let _entries_a = [
         mk_alloc_entry(0, 0, 0x0000_1000),
         mk_alloc_entry(1, 0, 0x0000_2000),
     ];
-    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &[0x1000u64, 0x2000u64]);
+    append_arena_slot_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &[0x1000u64, 0x2000u64], 0);
     // Allocator B — payload type 11, two distinct slots.
     let _entries_b = [
         mk_alloc_entry(0, 0, 0x0000_3000),
         mk_alloc_entry(1, 0, 0x0000_4000),
     ];
-    append_arena_type_index_for_allocator(
+    append_arena_slot_index_for_allocator(
         &mut index,
         "alloc_b",
         11,
         8,
         16,
         &[0x3000u64, 0x4000u64],
+        0,
     );
     let info_a = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
         target_type_id: 7,
+        source_btf_kva: 0,
     };
     let info_b = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
         target_type_id: 11,
+        source_btf_kva: 0,
     };
     assert_eq!(index.len(), 4);
     assert_eq!(index.get(&0x0000_1000), Some(&info_a));
@@ -5768,10 +5806,10 @@ fn append_arena_type_index_for_allocator_multi_allocator_merge() {
 
 // -- multi-allocator resolve through resolve_arena_type_in_index --
 //
-// Pins the end-to-end chain `append_arena_type_index_for_allocator`
+// Pins the end-to-end chain `append_arena_slot_index_for_allocator`
 // (per allocator) → `resolve_arena_type_in_index` (per chase) when
 // TWO distinct allocators contribute slots to the same per-pass
-// `ArenaTypeIndex`. The bug surface for #89 is that per-cgroup
+// `ArenaSlotIndex`. The bug surface for #89 is that per-cgroup
 // arena pointers (`cgx_raw`, `llcx_raw`) chase through `resolve_arena_type`
 // against an index that holds slots from BOTH the per-task allocator
 // AND the per-cgroup allocator. If the merge drops the second
@@ -5795,7 +5833,7 @@ fn append_arena_type_index_for_allocator_multi_allocator_merge() {
 fn resolve_arena_type_picks_correct_payload_when_multiple_allocators_in_index() {
     use super::super::arena::ArenaSnapshot;
     use super::super::btf_render::ArenaResolveHit;
-    use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
+    use super::render_map::{ArenaSlotIndex, append_arena_slot_index_for_allocator};
 
     // Per-task allocator: payload type 7 (e.g. `task_ctx`),
     // header_size=8, elem_size=24. Two slots at 0x1000 and 0x2000.
@@ -5812,23 +5850,25 @@ fn resolve_arena_type_picks_correct_payload_when_multiple_allocators_in_index() 
     const TASK_ELEM: u64 = 24;
     const CGRP_ELEM: u64 = 32;
 
-    let mut index = ArenaTypeIndex::new();
-    append_arena_type_index_for_allocator(
+    let mut index = ArenaSlotIndex::new();
+    append_arena_slot_index_for_allocator(
         &mut index,
         "scx_task_allocator",
         TASK_TYPE_ID,
         TASK_HEADER,
         TASK_ELEM,
         &[0x1000u64, 0x2000u64],
-    );
-    append_arena_type_index_for_allocator(
+    0,
+            );
+    append_arena_slot_index_for_allocator(
         &mut index,
         "scx_cgroup_allocator",
         CGRP_TYPE_ID,
         CGRP_HEADER,
         CGRP_ELEM,
         &[0x3000u64, 0x4000u64],
-    );
+    0,
+            );
     assert_eq!(
         index.len(),
         4,
@@ -5841,7 +5881,7 @@ fn resolve_arena_type_picks_correct_payload_when_multiple_allocators_in_index() 
     };
     let r = ResolveArenaTypeStub {
         arena_snapshot: Some(&snap),
-        arena_type_index: Some(&index),
+        arena_slot_index: Some(&index),
     };
 
     // Task allocator slot 0x1000 — slot-start chase.

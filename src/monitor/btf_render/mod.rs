@@ -3052,7 +3052,7 @@ fn apply_header_skip(raw_bytes: &[u8], header_skip: usize) -> Option<&[u8]> {
 ///   only meaningful in the entry BTF.
 ///
 /// - [`MemReader::resolve_arena_type`][]: the
-///   [`super::dump::render_map::ArenaTypeIndex`] populates
+///   [`super::dump::render_map::ArenaSlotIndex`] populates
 ///   [`ArenaResolveHit::target_type_id`] with BTF type ids resolved
 ///   against the **entry BTF** at index-build time (the sdt_alloc
 ///   pre-pass runs against the program BTF, which is the entry BTF
@@ -3306,11 +3306,15 @@ fn resolve_chase_target<'a>(
             target_ty = match hit.btf.resolve_type_by_id(hit.type_id) {
                 Ok(ty) => ty,
                 Err(_) => {
+                    tracing::debug!(
+                        kind_label,
+                        hit_type_id = hit.type_id,
+                        "cross-BTF Fwd resolve returned a type_id that does not resolve \
+                         in the sibling BTF",
+                    );
                     return ChaseResolve::Skip {
                         reason: format!(
-                            "{kind_label}: cross-BTF Fwd resolve returned \
-                             type_id {} but the type does not resolve in \
-                             the sibling BTF",
+                            "{kind_label}: cross-BTF Fwd type id {} unresolved in sibling BTF",
                             hit.type_id
                         ),
                         sdt_alloc_resolved,
@@ -3603,14 +3607,18 @@ fn chase_arena_pointer(
                                 }
                             }
                         }
+                        tracing::debug!(
+                            val = format_args!("{:#x}", val),
+                            "arena chase: STX-flow tagged slot as Arena (target_type_id=0, \
+                             deferred resolve), but resolve_arena_type had no entry and \
+                             no alloc_size was supplied; allocator pre-pass may not have \
+                             populated the index for this allocator",
+                        );
                         return ArenaChaseOutcome {
                             deref: None,
                             reason: Some(format!(
-                                "arena chase: cast analyzer's STX-flow path tagged \
-                                 slot as Arena (target_type_id=0, deferred resolve), \
-                                 but [`MemReader::resolve_arena_type`] had no entry \
-                                 for 0x{val:x}; allocator pre-pass may not have \
-                                 populated the index for this allocator"
+                                "arena chase: STX-flow path tagged slot as Arena with \
+                                 deferred resolve; bridge had no entry for 0x{val:x}"
                             )),
                             sdt_alloc_resolved: false,
                         };
@@ -3670,14 +3678,20 @@ fn chase_arena_pointer(
                             }
                         }
                     }
+                    tracing::debug!(
+                        val = format_args!("{:#x}", val),
+                        alloc_size = size,
+                        reason = %choice.reason,
+                        "arena chase: STX-flow tagged slot as Arena (target_type_id=0, \
+                         deferred resolve), bridge returned no entry, and alloc_size \
+                         fallback could not resolve a unique BTF type",
+                    );
                     return ArenaChaseOutcome {
                         deref: None,
                         reason: Some(format!(
-                            "arena chase: cast analyzer's STX-flow path tagged \
-                             slot as Arena (target_type_id=0, deferred resolve), \
-                             bridge returned no entry for 0x{val:x}, AND \
-                             alloc_size={size} fallback could not resolve a \
-                             unique BTF type ({reason})",
+                            "arena chase: STX-flow path tagged slot as Arena with \
+                             deferred resolve; alloc_size={size} fallback unresolved \
+                             ({reason})",
                             reason = choice.reason
                         )),
                         sdt_alloc_resolved: false,
@@ -3688,11 +3702,16 @@ fn chase_arena_pointer(
         let Some((resolved_ty, resolved_id)) =
             peel_modifiers_resolving_fwd(btf, effective_target_id)
         else {
+            tracing::debug!(
+                source = resolution_source,
+                effective_target_id,
+                "arena chase: resolution source returned target_type_id but the type \
+                 does not resolve in the program BTF",
+            );
             return ArenaChaseOutcome {
                 deref: None,
                 reason: Some(format!(
-                    "arena chase: {resolution_source} returned target_type_id={effective_target_id} \
-                     but the type does not resolve in the program BTF"
+                    "arena chase: type id {effective_target_id} unresolved in BTF"
                 )),
                 sdt_alloc_resolved: true,
             };

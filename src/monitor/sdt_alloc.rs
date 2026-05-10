@@ -826,7 +826,18 @@ impl<'a> TreeWalker<'a> {
                         // captured between the bit set and the
                         // pointer store sees this transient state.
                         // Skip without counting as a skipped subtree
-                        // — it's a legitimate transient.
+                        // — it's a legitimate transient. Surface a
+                        // `tracing::debug!` so an operator
+                        // diagnosing missing slots can see the race
+                        // without re-deriving "where did the live
+                        // bit go?".
+                        tracing::debug!(
+                            allocator = %self.out.allocator_name,
+                            pos,
+                            "sdt_alloc walker: leaf data[pos] == 0 (bit set, \
+                             pointer store not yet committed — scx_alloc_internal \
+                             populates the pointer after the bitmap bit)",
+                        );
                         continue;
                     }
 
@@ -845,7 +856,17 @@ impl<'a> TreeWalker<'a> {
                     // a new chunk for a previously empty slot. A
                     // NULL pointer is a legitimate gap, not an
                     // anomaly; skip without counting as a skipped
-                    // subtree.
+                    // subtree. `trace!` (not `debug!`) because
+                    // a full tree has up to 512 NULL slots per
+                    // internal node — a sparse allocator would
+                    // flood the debug log otherwise.
+                    tracing::trace!(
+                        allocator = %self.out.allocator_name,
+                        level,
+                        pos,
+                        "sdt_alloc walker: internal desc[pos] == 0 \
+                         (never-created subtree)",
+                    );
                     continue;
                 }
                 self.descend(entry_ptr, level + 1);
@@ -893,6 +914,29 @@ impl<'a> TreeWalker<'a> {
                 },
             });
             return;
+        }
+
+        // Zeroed-slot race: `scx_alloc_free_idx` writes zeros to the
+        // payload BEFORE clearing the bitmap (see the module-level
+        // "Race window" doc). A frozen snapshot captured between
+        // those two writes sees a live bitmap bit but an all-zero
+        // payload. Surface a `tracing::debug!` so an operator
+        // triaging "this slot's payload looks empty" can correlate
+        // it with the mid-free race rather than chasing a phantom
+        // bug in the renderer. The render itself still proceeds —
+        // the consumer can decide whether to interpret an all-zero
+        // entry as a real "freshly-allocated zero-init" allocation
+        // or as a mid-free residue.
+        if payload_bytes.iter().all(|&b| b == 0) {
+            tracing::debug!(
+                allocator = %self.out.allocator_name,
+                idx,
+                genn,
+                user_addr = format_args!("{:#x}", data_ptr & 0xFFFF_FFFF),
+                payload_len = payload_bytes.len(),
+                "sdt_alloc walker: all-zero payload (mid-free race? scx_alloc_free_idx \
+                 zeros payload before clearing the bitmap)",
+            );
         }
 
         let payload = if self.target_type_id != 0 {

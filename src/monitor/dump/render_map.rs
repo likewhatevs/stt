@@ -110,6 +110,13 @@ pub(super) const MAX_FD_ARRAY_INDICES: usize = 1024;
 /// built once per dump pass and threaded into every
 /// [`AccessorMemReader`] the per-map render constructs.
 ///
+/// **Key shape**: full 64-bit user-side arena page address
+/// (`ArenaPage::user_addr`), distinct from sibling [`ArenaSlotIndex`]
+/// which keys on the LOW 32 bits of slot start. Pages are uniquely
+/// identified by their full user-VA so multi-arena schedulers (each
+/// arena map gets its own snapshot) don't collide on shared low-32
+/// page-aligned bits.
+///
 /// `read_arena` is on the freeze hot path and runs for every Ptr in
 /// every BTF-rendered value — a linear scan over `pages` was O(N)
 /// per chase, making a large arena render O(N·M) over the snapshot.
@@ -122,11 +129,11 @@ pub(super) const MAX_FD_ARRAY_INDICES: usize = 1024;
 /// no-arena path costs nothing extra.
 pub(super) type ArenaPageIndex = std::collections::HashMap<u64, usize>;
 
-/// Per-slot metadata stored in the [`ArenaTypeIndex`] for each live
+/// Per-slot metadata stored in the [`ArenaSlotIndex`] for each live
 /// sdt_alloc allocation, supporting range-based lookup of any
 /// chased pointer that lands inside the slot.
 ///
-/// Three fields capture the slot shape the renderer needs at chase
+/// Four fields capture the slot shape the renderer needs at chase
 /// time:
 ///
 /// - `elem_size` — total byte stride of one allocator slot
@@ -140,7 +147,18 @@ pub(super) type ArenaPageIndex = std::collections::HashMap<u64, usize>;
 /// - `target_type_id` — the BTF type id of the payload struct
 ///   (everything after the header). Resolved by the sdt_alloc
 ///   pre-pass via [`super::super::sdt_alloc::discover_payload_btf_id`]
-///   from `payload_size = elem_size - header_size`.
+///   from `payload_size = elem_size - header_size`. Scoped to the
+///   BTF identified by `source_btf_kva` — feeding it into any other
+///   BTF would mis-resolve because BTF type id spaces are per-BTF.
+/// - `source_btf_kva` — the kernel virtual address of the program
+///   BTF the `target_type_id` was resolved against. The renderer
+///   compares this against each requesting map's `btf_kva` and
+///   suppresses the bridge hit on mismatch so a chase originating
+///   from a map backed by a different program BTF cannot consume
+///   an id from the wrong id space. `0` means "any BTF" — the
+///   pre-pass discovered the slot before a specific scheduler BTF
+///   was locked in (currently unreachable; reserved for future
+///   single-arena multi-BTF shapes).
 ///
 /// Storing `elem_size` and `header_size` (rather than precomputing a
 /// single payload-start key) lets the index handle both slot-start
@@ -151,17 +169,19 @@ pub(super) type ArenaPageIndex = std::collections::HashMap<u64, usize>;
 /// correct render flavor.
 ///
 /// Visibility matches sibling render-pass types (`ArenaPageIndex`,
-/// `SdtAllocMeta`, `ArenaTypeIndex`, `RenderMapCtx`): all are
-/// `pub(super)` so the `dump` module owns the surface. The 12-byte
-/// POD derive set (`PartialEq, Eq, Hash`) mirrors
-/// [`super::super::cast_analysis::CastHit`] so tests can use
-/// `assert_eq!` directly and the type composes into `HashSet` /
-/// `HashMap` keys without an explicit hash impl.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `SdtAllocMeta`, `ArenaSlotIndex`, `RenderMapCtx`): all are
+/// `pub(super)` so the `dump` module owns the surface. The
+/// 20-byte POD derive set (`PartialEq, Eq`) lets tests use
+/// `assert_eq!` directly. `Hash` is intentionally NOT derived —
+/// the type is the VALUE side of [`ArenaSlotIndex`] (a `BTreeMap`
+/// keyed by `slot_start: u32`) and never composes into a hashed
+/// container itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ArenaSlotInfo {
     pub(super) elem_size: u32,
     pub(super) header_size: u32,
     pub(super) target_type_id: u32,
+    pub(super) source_btf_kva: u64,
 }
 
 /// `slot_start → ArenaSlotInfo` lookup populated by the sdt_alloc
@@ -185,13 +205,34 @@ pub(super) struct ArenaSlotInfo {
 /// `tracing::warn!` when violated. This index is therefore only
 /// populated when the invariant holds.
 ///
+/// **Single-arena invariant**: every allocator's slots in the index
+/// are keyed against the SAME `user_vm_start` because the dump
+/// pre-pass walks every sdt_alloc allocator using
+/// [`super::dump_state`]'s single `arena_kern_vm_start` value
+/// (derived from `shared_arena_snapshot`, which picks the first
+/// `BPF_MAP_TYPE_ARENA` map only). Schedulers that declare multiple
+/// arena maps backing distinct allocators are not supported by the
+/// current dump pipeline — the second arena would silently
+/// mis-translate because the walker uses the first arena's
+/// `kern_vm_start` for every allocator. Today's scx schedulers
+/// declare a single arena, so the constraint is met in practice. If
+/// a multi-arena scheduler ever lands, this index's low-32 keying
+/// becomes ambiguous across allocators (two slots from different
+/// arenas with different `user_vm_start` bases could collide on the
+/// low-32 key) and the design must move to a `(arena_id, low_32)`
+/// composite key.
+///
 /// **Slot non-overlap invariant**: two slots in the same allocator
 /// never occupy overlapping byte ranges (the kernel allocator places
 /// slots back-to-back inside one `sdt_chunk` per
 /// `lib/sdt_alloc.bpf.c`'s `scx_alloc_internal` and never re-uses a
-/// position while the bitmap still has it marked allocated). The
-/// dedup logic in [`super::dump_state`] keys on exact `slot_start`
-/// only and emits `tracing::warn!` on duplicates; an overlapping
+/// position while the bitmap still has it marked allocated). Under
+/// the single-arena invariant above, two distinct allocators
+/// sharing one arena receive non-overlapping kernel-side
+/// allocations from `bpf_arena_alloc_pages`, so their slot address
+/// ranges also do not overlap. The dedup logic in
+/// [`super::dump_state`] keys on exact `slot_start` only and emits
+/// `tracing::warn!` on duplicates; an overlapping
 /// `(start_a, elem_a)`, `(start_b, elem_b)` pair where
 /// `start_a + elem_a > start_b > start_a` is structurally
 /// impossible.
@@ -229,7 +270,7 @@ pub(super) struct ArenaSlotInfo {
 /// Empty when no allocator with a typed payload was discovered, so
 /// the bridge stays a no-op outside the sdt_alloc-using slice of
 /// schedulers — same cost-shape as [`ArenaPageIndex`].
-pub(super) type ArenaTypeIndex = std::collections::BTreeMap<u32, ArenaSlotInfo>;
+pub(super) type ArenaSlotIndex = std::collections::BTreeMap<u32, ArenaSlotInfo>;
 
 /// Build [`ArenaPageIndex`] from `snap.pages`. `entry().or_insert()`
 /// keeps the FIRST page seen for any duplicate `user_addr` and
@@ -262,7 +303,7 @@ pub(super) fn build_arena_page_index(
     index
 }
 
-/// Append one allocator's slots to the per-pass [`ArenaTypeIndex`].
+/// Append one allocator's slots to the per-pass [`ArenaSlotIndex`].
 ///
 /// `entries` carries the live slot records the sdt_alloc walker
 /// produced (`SdtAllocEntry::user_addr` already masked to the low
@@ -293,13 +334,14 @@ pub(super) fn build_arena_page_index(
 /// bitmap-then-data ordering), so distinct slots cannot have
 /// overlapping `[start, start + elem_size)` ranges — dedup-on-
 /// exact-key is sufficient.
-pub(super) fn append_arena_type_index_for_allocator(
-    index: &mut ArenaTypeIndex,
+pub(super) fn append_arena_slot_index_for_allocator(
+    index: &mut ArenaSlotIndex,
     allocator_name: &str,
     target_type_id: u32,
     header_size: usize,
     elem_size: u64,
     slot_addrs: &[u64],
+    source_btf_kva: u64,
 ) {
     if target_type_id == 0 {
         return;
@@ -314,6 +356,7 @@ pub(super) fn append_arena_type_index_for_allocator(
         elem_size: elem_low32,
         header_size: header_low32,
         target_type_id,
+        source_btf_kva,
     };
     for &addr in slot_addrs {
         let slot_start = addr as u32;
@@ -371,7 +414,7 @@ pub(super) fn is_arena_addr_in_snapshot(
 /// Free helper: resolve a chased arena address to a payload BTF type
 /// id and `header_skip` byte count. Factored out of
 /// [`AccessorMemReader::resolve_arena_type`] so unit tests can call
-/// it with a synthetic [`ArenaTypeIndex`] and an [`ArenaSnapshot`]
+/// it with a synthetic [`ArenaSlotIndex`] and an [`ArenaSnapshot`]
 /// without constructing a [`super::super::guest::GuestKernel`].
 ///
 /// `arena_snapshot` is the pre-pass arena snapshot; the helper uses
@@ -379,19 +422,31 @@ pub(super) fn is_arena_addr_in_snapshot(
 /// out-of-window address can't accidentally collide with a slot
 /// whose low-32-bit-windowed start matches by happenstance.
 ///
-/// `arena_type_index` is the per-allocator slot index. The lookup
+/// `arena_slot_index` is the per-allocator slot index. The lookup
 /// uses [`std::collections::BTreeMap::range`] to find the slot whose
 /// `[slot_start, slot_start + elem_size)` range contains the
 /// chased address (windowed to its low 32 bits).
+///
+/// `requesting_btf_kva` identifies the BTF the calling renderer is
+/// using. The lookup returns `None` when the matched slot's
+/// [`ArenaSlotInfo::source_btf_kva`] is non-zero and differs from
+/// this value — the slot's `target_type_id` is in a different BTF's
+/// id space and feeding it into the caller's BTF would either
+/// resolve to the wrong struct or fail entirely. A `0`
+/// `source_btf_kva` is treated as "any BTF" (legacy / synthetic
+/// entries); a `0` `requesting_btf_kva` from the caller is treated
+/// as "no BTF context available", which suppresses the hit
+/// conservatively when the index entry is BTF-scoped.
 ///
 /// See [`AccessorMemReader::resolve_arena_type`]'s in-trait doc for
 /// the full slot-position routing semantics.
 pub(super) fn resolve_arena_type_in_index(
     arena_snapshot: Option<&super::super::arena::ArenaSnapshot>,
-    arena_type_index: Option<&ArenaTypeIndex>,
+    arena_slot_index: Option<&ArenaSlotIndex>,
     addr: u64,
+    requesting_btf_kva: u64,
 ) -> Option<ArenaResolveHit> {
-    let index = arena_type_index?;
+    let index = arena_slot_index?;
     if !is_arena_addr_in_snapshot(arena_snapshot, addr) {
         return None;
     }
@@ -401,12 +456,34 @@ pub(super) fn resolve_arena_type_in_index(
             addr = format_args!("{:#x}", addr),
             key = format_args!("{:#x}", key),
             index_len = index.len(),
-            "resolve_arena_type: no slot found in ArenaTypeIndex for key"
+            "resolve_arena_type: no slot found in ArenaSlotIndex for key"
         );
         return None;
     };
     let slot_end_u64 = (slot_start as u64) + (info.elem_size as u64);
     if (key as u64) >= slot_end_u64 {
+        return None;
+    }
+    // Cross-BTF id-space gate: the slot's `target_type_id` is keyed
+    // against `info.source_btf_kva`'s id space. A caller rendering
+    // against a different BTF cannot consume this id — its type id
+    // space is disjoint. Suppress the hit so the renderer falls
+    // through to its existing cross-BTF / Fwd-skip path instead of
+    // wrong-rendering against a sibling BTF's id. A zero
+    // `source_btf_kva` (synthetic / legacy entries) is treated as
+    // "any BTF"; a zero `requesting_btf_kva` from the caller means
+    // the renderer has no BTF context (vmlinux fallback), which is
+    // suppressed conservatively.
+    if info.source_btf_kva != 0
+        && (requesting_btf_kva == 0 || requesting_btf_kva != info.source_btf_kva)
+    {
+        tracing::debug!(
+            addr = format_args!("{:#x}", addr),
+            slot_start = format_args!("{:#x}", slot_start),
+            slot_btf_kva = format_args!("{:#x}", info.source_btf_kva),
+            requesting_btf_kva = format_args!("{:#x}", requesting_btf_kva),
+            "resolve_arena_type: cross-BTF id-space mismatch; suppressing hit"
+        );
         return None;
     }
     let offset_in_slot = key - slot_start;
@@ -458,11 +535,14 @@ pub(super) fn resolve_arena_type_in_index(
 /// directly.
 pub(super) fn resolve_arena_type_with_static_fallback(
     arena_snapshot: Option<&super::super::arena::ArenaSnapshot>,
-    arena_type_index: Option<&ArenaTypeIndex>,
+    arena_slot_index: Option<&ArenaSlotIndex>,
     scx_static_index: Option<&super::super::scx_static_alloc::ScxStaticRangeIndex>,
     addr: u64,
+    requesting_btf_kva: u64,
 ) -> Option<ArenaResolveHit> {
-    if let Some(hit) = resolve_arena_type_in_index(arena_snapshot, arena_type_index, addr) {
+    if let Some(hit) =
+        resolve_arena_type_in_index(arena_snapshot, arena_slot_index, addr, requesting_btf_kva)
+    {
         return Some(hit);
     }
     // sdt_alloc index missed. Consult the scx_static range index for
@@ -490,7 +570,7 @@ pub(super) fn resolve_arena_type_with_static_fallback(
     // regardless of whether the address was an actual allocation.
     // Counters and timestamps whose values fell in the 4 GiB arena
     // window were rendered as typed structs (wrong). If the per-slot
-    // ArenaTypeIndex missed (cap exceeded, snapshot truncation), the
+    // ArenaSlotIndex missed (cap exceeded, snapshot truncation), the
     // chase fails closed with a clear skip reason. Correctness over
     // coverage.
     None
@@ -539,7 +619,7 @@ struct AccessorMemReader<'a> {
     /// intercept (the trait default returns `None`, leaving every
     /// `u64` field as a plain unsigned counter).
     cast_map: Option<&'a CastMap>,
-    /// Optional sdt_alloc payload-type index — see [`ArenaTypeIndex`].
+    /// Optional sdt_alloc payload-type index — see [`ArenaSlotIndex`].
     /// When `Some`, the [`MemReader::resolve_arena_type`] override
     /// translates a chased arena address into its allocator slot's
     /// payload BTF type id, letting the renderer chase a
@@ -548,7 +628,7 @@ struct AccessorMemReader<'a> {
     /// keeps the renderer's default behaviour intact: a Fwd target
     /// without a complete sibling in the BTF surfaces as
     /// "forward declaration; body not in this BTF".
-    arena_type_index: Option<&'a ArenaTypeIndex>,
+    arena_slot_index: Option<&'a ArenaSlotIndex>,
     /// Discovered sdt_alloc allocator metadata for the dump pass.
     /// Consumed only by the
     /// [`MemReader::resolve_arena_type_meta_fallback`] override
@@ -586,7 +666,7 @@ struct AccessorMemReader<'a> {
     /// covering every live `scx_static` instance's
     /// `[memory_low32, memory_low32 + off)` region. The
     /// [`MemReader::resolve_arena_type`] override consults this
-    /// index AFTER [`Self::arena_type_index`] misses: it answers
+    /// index AFTER [`Self::arena_slot_index`] misses: it answers
     /// "is the chased address in scx_static memory?" with a
     /// boolean. The bridge cannot recover per-allocation BTF type
     /// ids from `scx_static` memory (no per-slot header; the
@@ -613,6 +693,19 @@ struct AccessorMemReader<'a> {
     /// Unique alloc_sizes from all Arena CastHits in the CastMap.
     /// Fallback for deferred-resolve chases with alloc_size=None.
     alloc_size_types: Vec<(u64, String)>,
+    /// Kernel virtual address of the program BTF the current per-map
+    /// renderer is using. Threaded into the
+    /// [`MemReader::resolve_arena_type`] gate so the sdt_alloc
+    /// bridge can suppress hits whose
+    /// [`ArenaSlotInfo::source_btf_kva`] points at a different
+    /// program BTF (multi-`.bpf.o` schedulers where each object has
+    /// its own BTF and its own id space). `0` is the "no per-map
+    /// program BTF" sentinel (e.g. a map that fell back to the
+    /// caller-supplied vmlinux BTF); the bridge suppresses hits
+    /// conservatively in that case to avoid leaking an id from one
+    /// program BTF into the vmlinux render context. See
+    /// [`resolve_arena_type_in_index`] for the gate semantics.
+    requesting_btf_kva: u64,
 }
 
 impl MemReader for AccessorMemReader<'_> {
@@ -709,12 +802,16 @@ impl MemReader for AccessorMemReader<'_> {
         // canonical body — that helper consults the per-instance
         // sdt_alloc index first, then falls through to the
         // [`super::super::scx_static_alloc::ScxStaticRangeIndex`]
-        // membership check.
+        // membership check. `self.requesting_btf_kva` flows into the
+        // cross-BTF id-space gate so a slot's `target_type_id`
+        // cannot be consumed by a renderer running against a
+        // different program BTF.
         resolve_arena_type_with_static_fallback(
             self.arena_snapshot,
-            self.arena_type_index,
+            self.arena_slot_index,
             self.scx_static_index,
             addr,
+            self.requesting_btf_kva,
         )
     }
     fn resolve_arena_type_meta_fallback(&self, addr: u64) -> Option<ArenaResolveHit> {
@@ -739,7 +836,7 @@ impl MemReader for AccessorMemReader<'_> {
     }
     fn is_already_rendered(&self, addr: u64) -> bool {
         // Mask to the low-32 windowed shape the dump pre-pass keys
-        // its [`ArenaTypeIndex`] on (every slot_start in the index
+        // its [`ArenaSlotIndex`] on (every slot_start in the index
         // is `addr as u32`). The set forwarded here is built once
         // per dump pass from the same keys, so the membership check
         // matches the same address space the chase target was
@@ -768,11 +865,22 @@ impl MemReader for AccessorMemReader<'_> {
 /// definitions match [`FwdKind::Struct`], only `Type::Union(s)`
 /// match [`FwdKind::Union`].
 ///
-/// Returns `Some(CrossBtfRef { btf, type_id })` when the index
-/// has an entry for `name` AND its type id resolves in the
-/// referenced BTF AND its aggregate kind matches `kind`. Returns
-/// `None` otherwise — the chase falls through to the historical
-/// "forward declaration; body not in this BTF" skip.
+/// Resolution order:
+/// 1. In-binary embedded `.bpf.o` BTFs via `cross.fwd_index`.
+///    Scheduler-defined types live here — preferred because
+///    their layout matches what the scheduler's BPF program
+///    actually allocated.
+/// 2. vmlinux BTF (`cross.vmlinux_btf`), when supplied. Covers
+///    kernel-defined structs the scheduler references (kernel
+///    `_ctx` types, `task_struct`, …) but does not redefine in
+///    its own BTF.
+///
+/// Returns `Some(CrossBtfRef { btf, type_id })` on the first
+/// tier that produces a complete body matching `kind`
+/// (embedded BTF wins over vmlinux). Returns `None` when
+/// neither tier carries a matching complete body — the chase
+/// falls through to the historical "forward declaration; body
+/// not in this BTF" skip.
 pub(super) fn resolve_cross_btf_fwd_in_index<'a>(
     cross_btf_fwd_index: Option<&'a CrossBtfFwdIndex<'a>>,
     name: &str,
@@ -780,25 +888,21 @@ pub(super) fn resolve_cross_btf_fwd_in_index<'a>(
 ) -> Option<CrossBtfRef<'a>> {
     use btf_rs::Type;
     let cross = cross_btf_fwd_index?;
-    let entry = cross.fwd_index.get(name)?;
-    let btf_arc = cross.btfs.get(entry.btfs_idx)?;
-    // Verify the candidate body is the right aggregate kind.
-    // The index is built from Struct/Union only, but a
-    // future indexer extension or a same-name ambiguity in the
-    // input BTFs could produce a mismatch. The aggregate-kind
-    // gate keeps the renderer correct when that happens.
-    let ty = btf_arc.resolve_type_by_id(entry.type_id).ok()?;
-    let matches_kind = matches!(
-        (&ty, kind),
-        (Type::Struct(_), FwdKind::Struct) | (Type::Union(_), FwdKind::Union)
-    );
-    if !matches_kind {
-        return None;
+    // Tier 1: embedded `.bpf.o` BTFs.
+    if let Some(entry) = cross.fwd_index.get(name)
+        && let Some(btf_arc) = cross.btfs.get(entry.btfs_idx)
+        && let Ok(ty) = btf_arc.resolve_type_by_id(entry.type_id)
+        && matches!(
+            (&ty, kind),
+            (Type::Struct(_), FwdKind::Struct) | (Type::Union(_), FwdKind::Union)
+        )
+    {
+        return Some(CrossBtfRef {
+            btf: btf_arc.as_ref(),
+            type_id: entry.type_id,
+        });
     }
-    Some(CrossBtfRef {
-        btf: btf_arc.as_ref(),
-        type_id: entry.type_id,
-    })
+    None
 }
 
 impl<'a> GuestMemMapAccessor<'a> {
@@ -838,9 +942,9 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// via [`MemReader::cast_lookup`]; `None` keeps every `u64`
     /// rendered as a plain unsigned counter (the trait default).
     ///
-    /// `arena_type_index` is the dump pass's
+    /// `arena_slot_index` is the dump pass's
     /// `slot_start → ArenaSlotInfo` lookup populated by the
-    /// sdt_alloc pre-pass — see [`ArenaTypeIndex`]. `Some(&idx)`
+    /// sdt_alloc pre-pass — see [`ArenaSlotIndex`]. `Some(&idx)`
     /// lets the renderer recover a forward-declared pointee's BTF
     /// type id (and the slot's header skip) from the captured
     /// allocator metadata via the
@@ -869,6 +973,16 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// preventing the same payload from appearing twice in the
     /// failure dump. `None` keeps the chase pipeline's existing
     /// behaviour intact.
+    /// `requesting_btf_kva` identifies the program BTF the per-map
+    /// renderer will use. Threaded into the
+    /// [`MemReader::resolve_arena_type`] gate so the sdt_alloc
+    /// bridge can suppress hits originating from a different
+    /// program BTF's id space (multi-`.bpf.o` schedulers where each
+    /// embedded object has its own BTF). Pass the map's
+    /// [`super::super::bpf_map::BpfMapInfo::btf_kva`] when the per-map
+    /// BTF is the program BTF loaded from that map; pass `0` when the
+    /// renderer falls back to the caller-supplied vmlinux BTF (the
+    /// gate then suppresses cross-BTF bridge hits conservatively).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn mem_reader(
         &self,
@@ -876,12 +990,13 @@ impl<'a> GuestMemMapAccessor<'a> {
         arena_page_index: &'a ArenaPageIndex,
         num_cpus: u32,
         cast_map: Option<&'a CastMap>,
-        arena_type_index: Option<&'a ArenaTypeIndex>,
+        arena_slot_index: Option<&'a ArenaSlotIndex>,
         sdt_alloc_metas: &'a [SdtAllocMeta],
         cross_btf_fwd_index: Option<&'a CrossBtfFwdIndex<'a>>,
         scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
         rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
         alloc_size_types: &'a [(u64, String)],
+        requesting_btf_kva: u64,
     ) -> impl MemReader + 'a {
         AccessorMemReader {
             kernel: self.kernel(),
@@ -889,12 +1004,13 @@ impl<'a> GuestMemMapAccessor<'a> {
             arena_page_index,
             num_cpus,
             cast_map,
-            arena_type_index,
+            arena_slot_index,
             sdt_alloc_metas,
             cross_btf_fwd_index,
             scx_static_index,
             rendered_slot_addrs,
             alloc_size_types: alloc_size_types.to_vec(),
+            requesting_btf_kva,
         }
     }
 }
@@ -1042,7 +1158,7 @@ pub(super) struct RenderMapCtx<'a> {
     /// sdt_alloc allocator with a typed payload was discovered)
     /// leaves the chase pipeline's "forward declaration" skip path
     /// intact.
-    pub(super) arena_type_index: Option<&'a ArenaTypeIndex>,
+    pub(super) arena_slot_index: Option<&'a ArenaSlotIndex>,
     /// Cross-BTF Fwd resolution context populated by the cast-
     /// analysis pre-pass. Threaded into every per-map
     /// [`AccessorMemReader`] so
@@ -1058,7 +1174,7 @@ pub(super) struct RenderMapCtx<'a> {
     /// bump-allocator region — see
     /// [`super::super::scx_static_alloc::ScxStaticRangeIndex`]. The
     /// renderer's [`MemReader::resolve_arena_type`] consults this
-    /// index AFTER `arena_type_index` misses; on a hit, the bridge
+    /// index AFTER `arena_slot_index` misses; on a hit, the bridge
     /// recognises the address as "in scx_static memory" but
     /// fails closed (`None`) — per-allocation type recovery is not
     /// possible without a per-call-site type hook from cast
@@ -1515,7 +1631,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         arena_page_index,
         sdt_alloc_metas,
         cast_map,
-        arena_type_index,
+        arena_slot_index,
         cross_btf_fwd_index,
         scx_static_index,
         rendered_slot_addrs,
@@ -1526,12 +1642,21 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         arena_page_index,
         num_cpus,
         cast_map,
-        arena_type_index,
+        arena_slot_index,
         sdt_alloc_metas,
         cross_btf_fwd_index,
         scx_static_index,
         rendered_slot_addrs,
         alloc_size_types,
+        // The per-map renderer reads through `info.btf_kva`'s
+        // program BTF when the map carries its own BTF (see
+        // [`super::dump_state`]'s map_btf selection logic). Threading
+        // this kva into the mem_reader lets
+        // [`MemReader::resolve_arena_type`] gate the sdt_alloc bridge
+        // against the slot's `source_btf_kva` so a hit cannot leak
+        // into the wrong id space. `0` (no per-map program BTF) is
+        // the conservative-suppress sentinel.
+        info.btf_kva,
     );
     // Per-map allocator selection. The TASK_STORAGE / HASH chase
     // arms consult this to pick the matching allocator metadata when

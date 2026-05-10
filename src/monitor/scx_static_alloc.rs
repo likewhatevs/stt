@@ -14,7 +14,7 @@
 //!
 //! The renderer's deferred-resolve arena cast path
 //! ([`crate::monitor::dump::render_map::resolve_arena_type_in_index`])
-//! is backed by an [`crate::monitor::dump::render_map::ArenaTypeIndex`]
+//! is backed by an [`crate::monitor::dump::render_map::ArenaSlotIndex`]
 //! built from the per-instance sdt_alloc walk. That walk produces one
 //! entry per allocator slot keyed on slot start. `scx_static` slots
 //! have no per-slot metadata the host can recover at freeze time —
@@ -215,7 +215,7 @@ impl ScxStaticOffsets {
 /// - `start_low32` — the low 32 bits of the user-side arena address
 ///   of the region's first byte (`scx_static.memory`'s low 32 bits;
 ///   the high 32 bits are constant inside one arena window so the
-///   low-32 keying matches the per-pass `ArenaTypeIndex` convention
+///   low-32 keying matches the per-pass `ArenaSlotIndex` convention
 ///   in [`crate::monitor::dump::render_map::ArenaSlotInfo`]).
 /// - `size` — the high-water mark `off`. Bytes in
 ///   `[start_low32, start_low32 + size)` are the live-allocated span;
@@ -310,7 +310,7 @@ impl std::fmt::Display for ScxStaticSnapshot {
 /// `scx_static` region.
 ///
 /// Mirrors the `BTreeMap` keying convention of the per-instance
-/// allocator's [`crate::monitor::dump::render_map::ArenaTypeIndex`]:
+/// allocator's [`crate::monitor::dump::render_map::ArenaSlotIndex`]:
 /// `start_low32` is the low 32 bits of the region's user-side base
 /// address (4 GiB-alignment of the arena window keeps the high 32
 /// bits constant), and `size` is the live-allocated span (`off`).
@@ -346,7 +346,7 @@ pub type ScxStaticRangeIndex = BTreeMap<u32, u64>;
 /// keep the FIRST entry seen and emit a `tracing::warn!` line so an
 /// operator can diagnose the collision. The first-write-wins policy
 /// matches the per-instance allocator index's collision policy in
-/// [`crate::monitor::dump::render_map::append_arena_type_index_for_allocator`].
+/// [`crate::monitor::dump::render_map::append_arena_slot_index_for_allocator`].
 pub fn build_scx_static_range_index(snapshot: &ScxStaticSnapshot) -> ScxStaticRangeIndex {
     let mut index = ScxStaticRangeIndex::new();
     for range in &snapshot.ranges {

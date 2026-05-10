@@ -633,6 +633,53 @@ pub const REASON_SCX_WALKER_NO_STATE: &str = "scx walker reached no state";
 /// because no capture was supplied.
 pub const REASON_NO_SCX_WALKER: &str = "no scx walker capture";
 
+/// Reason string written into [`FailureDumpReport::sdt_alloc_unavailable`]
+/// when the sdt_alloc pre-pass could not run because the scheduler's
+/// arena `user_vm_start` was not 4 GiB-aligned. See the gate in
+/// [`dump_state`]: low-32 keying of the per-pass
+/// [`crate::monitor::dump::render_map::ArenaSlotIndex`] is only
+/// correct when `user_vm_start & 0xFFFF_FFFF == 0`.
+pub const REASON_SDT_ALLOC_UNALIGNED_USER_VM: &str =
+    "user_vm_start is not 4 GiB-aligned; low-32 keying disabled";
+
+/// Reason string written into [`FailureDumpReport::sdt_alloc_unavailable`]
+/// when the dump enumerated no `*.bss` ARRAY map with a non-zero
+/// `btf_kva`. Without the scheduler's `.bss` bytes the pre-pass cannot
+/// read any allocator's in-memory state, and without `btf_kva` the
+/// program BTF that names `struct scx_allocator` is not loadable.
+pub const REASON_SDT_ALLOC_NO_BSS: &str = "no scheduler .bss map (or .bss has no program BTF)";
+
+/// Reason string written into [`FailureDumpReport::sdt_alloc_unavailable`]
+/// when no `BPF_MAP_TYPE_ARENA` map snapshot was captured: the
+/// pre-pass has no `kern_vm_start` to translate arena pointers
+/// against, so no allocator slot can be walked.
+pub const REASON_SDT_ALLOC_NO_ARENA: &str = "no arena map captured (kern_vm_start unavailable)";
+
+/// Reason string written into [`FailureDumpReport::sdt_alloc_unavailable`]
+/// when the scheduler's program BTF does not carry `struct scx_allocator`
+/// or its peer types (`sdt_pool`, `sdt_desc`, `sdt_chunk`) — the scheduler
+/// does not link `lib/sdt_alloc.bpf.c` and there are no allocator slots
+/// to walk. [`crate::monitor::sdt_alloc::SdtAllocOffsets::from_btf`]
+/// returns the underlying `anyhow::Error` describing which struct was
+/// missing; the dump caller folds that into this reason string.
+pub const REASON_SDT_ALLOC_NO_TYPE: &str = "scheduler BTF does not declare struct scx_allocator";
+
+/// Reason string written into [`FailureDumpReport::sdt_alloc_unavailable`]
+/// when every prerequisite resolved but no `.bss` variable of type
+/// `struct scx_allocator` was discovered. The scheduler links
+/// `lib/sdt_alloc.bpf.c` for its types but has not declared a typed
+/// allocator instance.
+pub const REASON_SDT_ALLOC_NO_INSTANCE: &str = "no scx_allocator instance in .bss";
+
+/// Reason string written into [`FailureDumpReport::sdt_alloc_unavailable`]
+/// when the per-map dump deadline was exhausted before the pre-pass
+/// could run. The `dump_truncated_at_us` field also surfaces the
+/// truncation; this string disambiguates "deadline" from the other
+/// no-data causes when a consumer is scanning sdt_alloc-related
+/// diagnostics specifically.
+pub const REASON_SDT_ALLOC_DEADLINE_EXCEEDED: &str =
+    "dump deadline exceeded before sdt_alloc pre-pass could run";
+
 /// Cross-CPU sum of every per-CPU diagnostic counter slot in the
 /// probe BPF program's `.bss` `ktstr_pcpu_counters` array.
 ///
@@ -781,6 +828,27 @@ pub struct FailureDumpReport {
         skip_serializing_if = "super::scx_static_alloc::ScxStaticSnapshot::is_empty"
     )]
     pub scx_static_ranges: super::scx_static_alloc::ScxStaticSnapshot,
+    /// Diagnostic reason for `sdt_allocations` being empty.
+    ///
+    /// - `None` → either the pre-pass ran and produced records (the vec
+    ///   is non-empty), or the pre-pass ran cleanly but the scheduler
+    ///   simply has no live allocations (the vec is empty for legitimate
+    ///   reasons that aren't worth a diagnostic). Default.
+    /// - `Some(REASON_SDT_ALLOC_*)` → the pre-pass skipped before it
+    ///   could surface any allocator state. The string identifies which
+    ///   prerequisite was missing: deadline exhaustion, unaligned
+    ///   `user_vm_start`, missing scheduler `.bss`, missing arena
+    ///   snapshot, scheduler BTF without `struct scx_allocator`, or no
+    ///   `.bss` `scx_allocator` instance.
+    ///
+    /// Distinct from `dump_truncated_at_us` (which records deadline
+    /// truncation across the whole dump) and from
+    /// [`Self::scx_static_ranges`] (which has its own walker independent
+    /// of the typed-allocator pre-pass). Mirrors the
+    /// `prog_runtime_stats_unavailable` / `task_enrichments_unavailable`
+    /// pattern.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdt_alloc_unavailable: Option<String>,
     /// Per-program BPF runtime stats summed across CPUs at freeze
     /// time (cnt, nsecs, misses). One entry per discovered
     /// struct_ops BPF program. Empty when no struct_ops programs are
@@ -1004,6 +1072,7 @@ impl Default for FailureDumpReport {
             vcpu_regs: Vec::new(),
             sdt_allocations: Vec::new(),
             scx_static_ranges: super::scx_static_alloc::ScxStaticSnapshot::default(),
+            sdt_alloc_unavailable: None,
             prog_runtime_stats: Vec::new(),
             prog_runtime_stats_unavailable: None,
             per_cpu_time: Vec::new(),
@@ -1045,7 +1114,8 @@ impl FailureDumpReport {
             prog_runtime_stats_unavailable: Some(reason.clone()),
             per_node_numa_unavailable: Some(reason.clone()),
             task_enrichments_unavailable: Some(reason.clone()),
-            scx_walker_unavailable: Some(reason),
+            scx_walker_unavailable: Some(reason.clone()),
+            sdt_alloc_unavailable: Some(reason),
             is_placeholder: true,
             ..Self::default()
         }
@@ -2351,6 +2421,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         maps: Vec::with_capacity(maps.len()),
         vcpu_regs: Vec::new(),
         sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: None,
         prog_runtime_stats,
         prog_runtime_stats_unavailable,
         per_cpu_time,
@@ -2546,7 +2617,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // [`build_arena_page_index`] policy on duplicate user_addr
     // pages and emits a `tracing::warn!` line so an operator
     // diagnosing a wrong-render can spot the collision.
-    let mut arena_type_index = crate::monitor::dump::render_map::ArenaTypeIndex::new();
+    let mut arena_slot_index = crate::monitor::dump::render_map::ArenaSlotIndex::new();
     // 4 GiB-alignment invariant: the bridge keys on the low 32
     // bits of slot start. That is correct iff `user_vm_start` is
     // 4 GiB-aligned — `slot_full_addr - slot_low32 == user_vm_start`
@@ -2589,6 +2660,41 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
              `is_arena_addr` = false",
         );
     }
+    // Resolve the unavailable reason in the order the gate checks
+    // run. The first failing prerequisite wins — subsequent reasons
+    // (which would all surface for the same missing prerequisite) are
+    // suppressed. `None` here means the pre-pass actually runs; the
+    // sdt_alloc_unavailable field is then populated post-loop based
+    // on whether any allocator was discovered.
+    let sdt_alloc_skip_reason: Option<&'static str> = if deadline_exceeded(&mut truncated_at_us) {
+        Some(REASON_SDT_ALLOC_DEADLINE_EXCEEDED)
+    } else if !user_vm_aligned {
+        Some(REASON_SDT_ALLOC_UNALIGNED_USER_VM)
+    } else if sched_bss_bytes.is_none() {
+        Some(REASON_SDT_ALLOC_NO_BSS)
+    } else if arena_kern_vm_start == 0 {
+        Some(REASON_SDT_ALLOC_NO_ARENA)
+    } else if let Some((_, btf_kva)) = sched_bss_bytes.as_ref()
+        && !program_btfs.contains_key(btf_kva)
+    {
+        Some(REASON_SDT_ALLOC_NO_BSS)
+    } else if let Some((_, btf_kva)) = sched_bss_bytes.as_ref()
+        && let Some(prog_btf) = program_btfs.get(btf_kva)
+        && SdtAllocOffsets::from_btf(prog_btf).is_err()
+    {
+        Some(REASON_SDT_ALLOC_NO_TYPE)
+    } else {
+        None
+    };
+    if let Some(reason) = sdt_alloc_skip_reason {
+        report.sdt_alloc_unavailable = Some(reason.to_string());
+    }
+    // Track whether the pre-pass body ran (every prerequisite
+    // satisfied). Distinct from `sdt_alloc_skip_reason`: if the
+    // body runs but discovers no `.bss` instance of
+    // `struct scx_allocator`, the unavailable reason flips to
+    // [`REASON_SDT_ALLOC_NO_INSTANCE`] AFTER the loop.
+    let mut sdt_alloc_pre_pass_ran = false;
     if !deadline_exceeded(&mut truncated_at_us)
         && user_vm_aligned
         && let Some((bss_bytes, btf_kva)) = sched_bss_bytes
@@ -2596,6 +2702,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         && let Some(prog_btf) = program_btfs.get(&btf_kva)
         && let Ok(sdt_offsets) = SdtAllocOffsets::from_btf(prog_btf)
     {
+        sdt_alloc_pre_pass_ran = true;
         // One MemReader for every leaf payload render, so an
         // arena pointer embedded in a per-task / per-cgroup
         // sdt_alloc payload chases into typed contents instead
@@ -2655,6 +2762,16 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // built set where it matters.
             None,
             alloc_size_types,
+            // The sdt_alloc pre-pass walks against the scheduler's
+            // program BTF identified by `btf_kva` (the same BTF the
+            // allocator metadata was resolved against — see
+            // `append_arena_slot_index_for_allocator` below). Pass
+            // this kva as the requesting-BTF identifier so the
+            // pre-pass's own leaf renders compare against it
+            // (currently the index is still being built so the gate
+            // never fires here, but the threading keeps the contract
+            // consistent across all `mem_reader` call sites).
+            btf_kva,
         );
         // Locate every sdt_alloc allocator instance declared in
         // `.bss`. The Datasec walk gives us each variable's name and
@@ -2738,18 +2855,27 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // The helper handles the size-fits-u32 check, the
                 // dedup-on-duplicate-slot-start, and the
                 // `tracing::warn!` collision diagnostic — see
-                // [`append_arena_type_index_for_allocator`] for the
+                // [`append_arena_slot_index_for_allocator`] for the
                 // full contract. Bridge gate (`target_type_id
                 // != 0`) is encoded inside the helper as well; the
                 // outer guard here is a fast-path bail before we
                 // even allocate metadata for the allocator.
-                crate::monitor::dump::render_map::append_arena_type_index_for_allocator(
-                    &mut arena_type_index,
+                crate::monitor::dump::render_map::append_arena_slot_index_for_allocator(
+                    &mut arena_slot_index,
                     &var_name,
                     choice.target_type_id,
                     sdt_offsets.data_header_size,
                     elem_size,
                     &snap.all_slot_addrs,
+                    // Stamp the slot with the program BTF the
+                    // `target_type_id` was resolved against. The
+                    // per-map renderer's
+                    // [`MemReader::resolve_arena_type`] gate
+                    // compares this against each requesting map's
+                    // `btf_kva` and suppresses the hit on mismatch
+                    // so the BTF id cannot leak into a sibling
+                    // BTF's id space (multi-`.bpf.o` schedulers).
+                    btf_kva,
                 );
             }
             // Surface only allocators with a non-empty result OR a
@@ -2760,10 +2886,21 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             }
         }
     }
-    let arena_type_index_ref = if arena_type_index.is_empty() {
+    // Post-loop: if the pre-pass ran but discovered nothing, the
+    // scheduler has program BTF + arena + bss but no `struct
+    // scx_allocator` declared in `.bss`. Surface a distinct
+    // diagnostic so an operator can tell the schedule-doesn't-link
+    // case from the link-but-no-instance case.
+    if sdt_alloc_pre_pass_ran
+        && report.sdt_allocations.is_empty()
+        && report.sdt_alloc_unavailable.is_none()
+    {
+        report.sdt_alloc_unavailable = Some(REASON_SDT_ALLOC_NO_INSTANCE.to_string());
+    }
+    let arena_slot_index_ref = if arena_slot_index.is_empty() {
         None
     } else {
-        Some(&arena_type_index)
+        Some(&arena_slot_index)
     };
     // Build the rendered-slot set for arena chase dedup. Keys on
     // every slot that is actually rendered under
@@ -2771,9 +2908,9 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // contribute via [`SdtAllocEntry::user_addr`] (emit_leaf records
     // an entry on every leaf it visits, regardless of whether
     // payload BTF resolution succeeded). Keying on
-    // `arena_type_index.keys()` alone would have missed slots from
+    // `arena_slot_index.keys()` alone would have missed slots from
     // allocators whose `target_type_id == 0` — those allocators
-    // never reach `append_arena_type_index_for_allocator` (the
+    // never reach `append_arena_slot_index_for_allocator` (the
     // helper short-circuits on a zero target id) yet their slots
     // ARE rendered in `report.sdt_allocations`.
     //
@@ -2832,7 +2969,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     tracing::debug!(
         elapsed_us = sdt_alloc_t0.elapsed().as_micros() as u64,
         allocations = report.sdt_allocations.len(),
-        index_entries = arena_type_index.len(),
+        index_entries = arena_slot_index.len(),
         "dump_state phase: sdt_alloc"
     );
 
@@ -3011,7 +3148,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // skipping with "forward declaration; body not
                 // in this BTF". `None` when no allocator with a
                 // typed payload was discovered.
-                arena_type_index: arena_type_index_ref,
+                arena_slot_index: arena_slot_index_ref,
                 // Threaded in from
                 // [`DumpContext::cross_btf_fwd_index`]: the
                 // cross-BTF Fwd resolution context populated by

@@ -3067,7 +3067,7 @@ impl<'a> Analyzer<'a> {
         // time
         //
         // The bridge is backed by
-        // [`super::dump::render_map::ArenaTypeIndex`], which the
+        // [`super::dump::render_map::ArenaSlotIndex`], which the
         // sdt_alloc pre-pass populates by walking
         // [`super::sdt_alloc::SdtAllocatorSnapshot`] for every
         // **per-instance** allocator (`scx_alloc_internal` and

@@ -4312,6 +4312,9 @@ impl KtstrVm {
                                     probe_counters: None,
                                     scx_static_ranges: Default::default(),
                                     is_placeholder: false,
+                                    sdt_alloc_unavailable: Some(
+                                        "dump prerequisites unavailable".to_string(),
+                                    ),
                                 };
                                 tracing::warn!(
                                     owned_accessor = owned_accessor.is_some(),

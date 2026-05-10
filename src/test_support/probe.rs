@@ -114,108 +114,140 @@ fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
     Some(format!("--- {header} ---\n{}", lines[start..].join("\n")))
 }
 
+/// The literal tracepoint-output marker for `sched_ext_dump` lines in
+/// both wire formats the host captures. The trailing colon is part of
+/// the marker:
+///
+/// - trace_pipe (ftrace): `<task>-<pid>  [<cpu>]  <ts>: sched_ext_dump: <body>`
+/// - dmesg printk:        `[<ts>] sched_ext_dump: <body>`
+///
+/// Both formats place `: ` immediately after the event name, so the
+/// colon anchors the marker against unrelated printk content that
+/// merely mentions the substring `sched_ext_dump` (e.g. a future
+/// kernel message documenting the tracepoint by name).
+pub(crate) const SCHED_EXT_DUMP_MARKER: &str = "sched_ext_dump:";
+
+/// Render the repro VM's stderr as a `--- repro VM dmesg ---` tail
+/// after stripping `sched_ext_dump` lines (those land in their own
+/// section via [`extract_sched_ext_dump`]). Always returns a string —
+/// every input path produces some operator-readable output: the
+/// pointer diagnostic, the corruption diagnostic, or the
+/// `format_tail` rendering of remaining content. An empty stderr
+/// surfaces the "scheduler crashed before kernel printk" diagnostic;
+/// a stderr containing only `sched_ext_dump` lines surfaces the
+/// pointer to the dump section.
+///
+/// Three cases distinguished:
+///
+/// 1. The filter dropped one or more `sched_ext_dump` lines AND the
+///    post-filter text is empty or matches a corruption shape. The
+///    VM produced real dump output that is already rendered in the
+///    `--- repro VM sched_ext dump ---` section above; the dmesg
+///    section emits a pointer-to-that diagnostic. This covers two
+///    sub-cases:
+///    a. every non-dump byte was whitespace (clean run, dump lines
+///       only);
+///    b. non-dump bytes existed but matched
+///       [`classify_dmesg_corruption`] (0xFF / U+FFFD / control
+///       chars) — surfacing the classifier's "scheduler crashed
+///       before kernel printk" message here would contradict the
+///       proven-real dump section above. Point at the dump section
+///       so the operator does not chase a phantom crash.
+/// 2. The filter dropped nothing and the post-filter text matches
+///    a corruption shape — surface [`classify_dmesg_corruption`]'s
+///    diagnostic.
+/// 3. The post-filter text has real content — defer to
+///    [`format_tail`] for the standard `n`-line tail render.
+fn render_dmesg_tail(stderr: &str, tail_lines: usize) -> String {
+    let mut filter_dropped_any = false;
+    let filtered: String = stderr
+        .lines()
+        .filter(|l| {
+            let drop = l.contains(SCHED_EXT_DUMP_MARKER);
+            filter_dropped_any |= drop;
+            !drop
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let post_filter_corrupt = classify_dmesg_corruption(&filtered);
+    if filter_dropped_any && post_filter_corrupt.is_some() {
+        // Filter saw real dump lines — never surface a "scheduler
+        // crashed before kernel printk" diagnostic against the
+        // residue of those lines. Point at the dump section above.
+        return "--- repro VM dmesg ---\n(no kernel printk other than \
+                sched_ext_dump — full dump in section above)"
+            .to_string();
+    }
+    if let Some(diag) = post_filter_corrupt {
+        return format!("--- repro VM dmesg ---\n{diag}");
+    }
+    // `filtered` is non-empty (classify returns Some for empty input)
+    // so `format_tail` is guaranteed to return Some — unwrap with a
+    // sentinel header rather than an `unwrap()` to preserve the
+    // single-string return contract.
+    format_tail(&filtered, tail_lines, "repro VM dmesg")
+        .unwrap_or_else(|| "--- repro VM dmesg ---\n(unavailable)".to_string())
+}
+
 /// Detect dmesg corruption shapes that would render as opaque garbage
 /// in a `format_tail` block, and return a single-line operator-readable
 /// diagnostic instead.
 ///
 /// Returns:
-/// - `Some(diagnostic)` when `text` is empty, contains only 0xFF bytes,
-///   contains only U+FFFD replacement characters, or contains only
-///   whitespace + 0xFF + U+FFFD. Each shape maps to a distinct
-///   diagnostic so the operator can tell "no kernel printk fired"
-///   apart from "UART buffer trimmed/uninitialized".
-/// - `None` when the text contains at least one ordinary character —
-///   in that case the caller falls through to the standard
-///   `format_tail` rendering.
+/// - `Some("empty ...")` when the input is empty or contains only
+///   whitespace — no kernel printk reached the buffer.
+/// - `Some("corrupt ...")` when every non-whitespace char is a
+///   U+FFFD replacement character or a non-whitespace control
+///   character ([`char::is_control`] — C0 range U+0000..=U+001F
+///   excluding whitespace, DEL U+007F, and C1 range U+0080..=U+009F).
+///   The UART buffer was uninitialized / trimmed / filled with NUL
+///   or other control bytes — the scheduler likely crashed before
+///   any kernel printk was written.
+/// - `None` when at least one ordinary printable / extended-ASCII
+///   character is present — the caller falls through to the
+///   standard `format_tail` rendering.
 ///
 /// The 0xFF byte is `vm-superio`'s convention for uninitialized read
-/// positions in the UART ring buffer (see
-/// vm-superio/src/serial.rs); a stream of 0xFF means the scheduler
-/// crashed before any kernel printk reached the buffer, OR the COM1
-/// capture buffer overflowed and trimmed the relevant bytes.
-/// U+FFFD (decoded `\u{fffd}`) is what
-/// [`String::from_utf8_lossy`] (the conversion used by the host
-/// COM1 capture path) emits for non-UTF-8 input, including the raw
-/// 0xFF byte.
-/// Render the repro VM's stderr as a `--- repro VM dmesg ---` tail
-/// after stripping `sched_ext_dump` lines (those land in their own
-/// section via [`extract_sched_ext_dump`]). Returns `None` only when
-/// `format_tail` itself returns `None` (i.e. nothing to surface).
-///
-/// Three cases distinguished:
-///
-/// 1. The filter empties non-empty stderr (every line was a
-///    `sched_ext_dump` record). The VM ran cleanly and produced
-///    real output that is already rendered in the
-///    `--- repro VM sched_ext dump ---` section above; the dmesg
-///    section emits a pointer-to-that diagnostic instead of running
-///    the post-filter empty string through
-///    [`classify_dmesg_corruption`] which would falsely report
-///    "scheduler crashed before kernel printk reached the UART
-///    buffer".
-/// 2. The post-filter text matches a corruption shape recognised
-///    by [`classify_dmesg_corruption`] (genuinely-empty stderr,
-///    all-0xFF, all-U+FFFD, whitespace-only). Surface that
-///    classifier's diagnostic.
-/// 3. The post-filter text has real content — defer to
-///    [`format_tail`] for the standard `n`-line tail render.
-fn render_dmesg_tail(stderr: &str, tail_lines: usize) -> Option<String> {
-    let filtered: String = stderr
-        .lines()
-        .filter(|l| !l.contains("sched_ext_dump"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    // Distinguish "filter consumed every non-empty line" from
-    // "VM produced no kernel printk." `chars().any(non-whitespace)`
-    // mirrors the `classify_dmesg_corruption` whitespace-only check
-    // so the same input space triggers the same precondition.
-    let pre_filter_had_content = stderr.chars().any(|c| !c.is_whitespace());
-    if filtered.is_empty() && pre_filter_had_content {
-        return Some(
-            "--- repro VM dmesg ---\n(no kernel printk other than \
-             sched_ext_dump — full dump in section above)"
-                .to_string(),
-        );
-    }
-    if let Some(diag) = classify_dmesg_corruption(&filtered) {
-        return Some(format!("--- repro VM dmesg ---\n{diag}"));
-    }
-    format_tail(&filtered, tail_lines, "repro VM dmesg")
-}
-
+/// positions in the UART ring buffer (see vm-superio/src/serial.rs);
+/// a stream of 0xFF means the scheduler crashed before any kernel
+/// printk reached the buffer, OR the COM1 capture buffer overflowed
+/// and trimmed the relevant bytes. The host captures stderr via
+/// [`String::from_utf8_lossy`] (see `vmm::console::output`), which
+/// decodes every invalid UTF-8 byte (including a raw 0xFF) to U+FFFD.
+/// Raw 0xFF bytes therefore arrive at this classifier as U+FFFD
+/// chars, never as the Unicode codepoint U+00FF (which is the
+/// legitimate Latin-1 letter `ÿ` — checking for U+00FF would false-
+/// positive on valid printk content). The U+0000 NUL byte by
+/// contrast is valid UTF-8 and arrives as the U+0000 char; covering
+/// it (and other C0 control chars) keeps an uninitialized-NUL-byte
+/// UART buffer from rendering as silent garbage.
 fn classify_dmesg_corruption(text: &str) -> Option<&'static str> {
     if text.is_empty() {
         return Some("empty (scheduler crashed before kernel printk reached the UART buffer)");
     }
     // Walk every char. If we ever see something other than
-    // whitespace / 0xFF (raw) / U+FFFD (lossy-decoded 0xFF), the
-    // text has real content and we let format_tail render it.
-    let mut saw_ff = false;
-    let mut saw_replacement = false;
+    // whitespace / U+FFFD / non-whitespace control char, the text
+    // has real content and we let format_tail render it.
+    let mut saw_corrupt = false;
     for c in text.chars() {
         if c.is_whitespace() {
             continue;
         }
-        if c == '\u{fffd}' {
-            saw_replacement = true;
-            continue;
-        }
-        if c == '\u{ff}' {
-            saw_ff = true;
+        if c == '\u{fffd}' || c.is_control() {
+            saw_corrupt = true;
             continue;
         }
         return None;
     }
-    match (saw_ff, saw_replacement) {
-        (false, false) => {
-            // Whitespace only — same outcome as empty for the
-            // operator: the kernel never wrote anything readable.
-            Some("empty (scheduler crashed before kernel printk reached the UART buffer)")
-        }
-        _ => Some(
+    if saw_corrupt {
+        Some(
             "corrupt or no readable text (UART buffer uninitialized or \
                  trimmed — scheduler likely crashed before any kernel printk)",
-        ),
+        )
+    } else {
+        // Whitespace only — same outcome as empty for the
+        // operator: the kernel never wrote anything readable.
+        Some("empty (scheduler crashed before kernel printk reached the UART buffer)")
     }
 }
 
@@ -708,8 +740,10 @@ pub(crate) fn attempt_auto_repro(
     // Filter sched_ext_dump lines from dmesg tail to avoid duplicating
     // the dump section. Only non-dump kernel console lines are shown.
     // See [`render_dmesg_tail`] for the corruption / filter-empty
-    // disambiguation policy.
-    let dmesg_tail = render_dmesg_tail(&repro_result.stderr, REPRO_TAIL_LINES);
+    // disambiguation policy. The helper always returns a populated
+    // string — wrap in `Some` so the `tails` array stays homogeneous
+    // with the other tail builders that legitimately return `None`.
+    let dmesg_tail = Some(render_dmesg_tail(&repro_result.stderr, REPRO_TAIL_LINES));
 
     // Inline-render the freeze coordinator's failure-dump JSON when
     // present. The freeze-coord writes a `FailureDumpReport` /
@@ -3861,13 +3895,56 @@ mod tests {
     }
 
     #[test]
-    fn classify_dmesg_corruption_only_raw_0xff() {
-        // Raw 0xFF bytes (i.e. char value U+00FF, which is what
-        // a literal 0xff in a String would decode to before lossy
-        // conversion) also signal an uninitialised UART buffer.
-        let diag = classify_dmesg_corruption("\u{ff}\u{ff}\u{ff}");
+    fn classify_dmesg_corruption_only_control_chars() {
+        // NUL bytes (0x00) and other C0 controls are valid UTF-8 and
+        // arrive at the classifier as their Unicode codepoints (not
+        // U+FFFD). An uninitialised UART buffer of zero bytes used to
+        // slip past the classifier and render as silent garbage; the
+        // control-char branch catches it.
+        let diag = classify_dmesg_corruption("\0\0\0");
         assert!(diag.is_some());
         assert!(diag.unwrap().contains("corrupt"));
+
+        // Mix of NUL + other C0 controls (0x01..0x08) — same outcome.
+        let diag = classify_dmesg_corruption("\0\x01\x02\x07\x08");
+        assert!(diag.is_some());
+        assert!(diag.unwrap().contains("corrupt"));
+
+        // DEL (U+007F) is also a non-whitespace control char per
+        // [`char::is_control`].
+        let diag = classify_dmesg_corruption("\x7f\x7f");
+        assert!(diag.is_some());
+        assert!(diag.unwrap().contains("corrupt"));
+    }
+
+    #[test]
+    fn classify_dmesg_corruption_only_replacement_and_control_mix() {
+        // Mixed U+FFFD (lossy-decoded raw 0xFF from the UART) and
+        // C0 control chars (uninitialised NUL bytes): still corrupt,
+        // single diagnostic.
+        let diag = classify_dmesg_corruption("\u{fffd}\0\u{fffd}");
+        assert!(diag.is_some());
+        assert!(diag.unwrap().contains("corrupt"));
+    }
+
+    #[test]
+    fn classify_dmesg_corruption_latin1_text_passes_through() {
+        // Legitimate Latin-1 supplement characters (U+00A0..=U+00FF)
+        // are valid kernel printk content — e.g. a hardware vendor
+        // string that the firmware tagged with a Latin-1 letter.
+        // MUST NOT be classified as corrupt. The historic check
+        // for `c == '\u{ff}'` was a false-positive trap: raw 0xFF
+        // bytes from an uninitialised UART arrive as U+FFFD after
+        // `String::from_utf8_lossy`, never as U+00FF.
+        for ch in ['\u{c0}', '\u{e9}', '\u{f1}', '\u{ff}'] {
+            let s: String = std::iter::repeat(ch).take(5).collect();
+            let diag = classify_dmesg_corruption(&s);
+            assert!(
+                diag.is_none(),
+                "Latin-1 char U+{:04X} must NOT be classified as corrupt: {diag:?}",
+                ch as u32,
+            );
+        }
     }
 
     #[test]
@@ -3879,6 +3956,20 @@ mod tests {
         assert!(
             diag.is_none(),
             "real kernel text must not be classified as corrupt: {diag:?}"
+        );
+    }
+
+    #[test]
+    fn classify_dmesg_corruption_one_control_amid_text_passes_through() {
+        // A single control char buried in legitimate kernel printk
+        // text does NOT trigger the classifier — there is still real
+        // content for the operator to read. The classifier short-
+        // circuits to None on the first non-corrupt, non-whitespace
+        // char.
+        let diag = classify_dmesg_corruption("[0.1] Linux\u{1}version");
+        assert!(
+            diag.is_none(),
+            "one control char amid real text is not corruption: {diag:?}"
         );
     }
 
@@ -3912,7 +4003,7 @@ mod tests {
         let stderr = "[  0.5] sched_ext_dump: header\n\
                       [  0.6] sched_ext_dump: body line A\n\
                       [  0.7] sched_ext_dump: body line B\n";
-        let tail = render_dmesg_tail(stderr, 40).expect("must produce a tail");
+        let tail = render_dmesg_tail(stderr, 40);
         assert!(
             tail.contains("--- repro VM dmesg ---"),
             "tail must carry the section header: {tail}",
@@ -3934,7 +4025,7 @@ mod tests {
         // Pre-filter stderr really is empty — VM crashed before any
         // kernel printk fired. The crash classifier's "empty
         // (scheduler crashed...)" diagnostic must still surface.
-        let tail = render_dmesg_tail("", 40).expect("must produce a tail");
+        let tail = render_dmesg_tail("", 40);
         assert!(
             tail.contains("scheduler crashed before kernel printk"),
             "genuinely-empty stderr must surface the crash diagnostic: {tail}",
@@ -3950,7 +4041,7 @@ mod tests {
                       [  0.5] sched_ext_dump: header\n\
                       [  0.6] sched_ext_dump: body\n\
                       [  0.9] systemd: starting\n";
-        let tail = render_dmesg_tail(stderr, 40).expect("must produce a tail");
+        let tail = render_dmesg_tail(stderr, 40);
         assert!(
             tail.contains("Linux version 6.16.0"),
             "real kernel text must survive the filter: {tail}",
@@ -3972,13 +4063,154 @@ mod tests {
     #[test]
     fn render_dmesg_tail_only_whitespace_emits_crash_diagnostic() {
         // Whitespace-only stderr — same operator outcome as empty.
-        // The crash classifier's diagnostic must surface (pre-filter
-        // had_content gates on `!is_whitespace()`, so all-whitespace
-        // hits the `classify_dmesg_corruption` branch).
-        let tail = render_dmesg_tail("   \n\n\t  \n", 40).expect("must produce a tail");
+        // The crash classifier's diagnostic must surface; the filter
+        // dropped no lines so the corruption branch wins.
+        let tail = render_dmesg_tail("   \n\n\t  \n", 40);
         assert!(
             tail.contains("scheduler crashed before kernel printk"),
             "whitespace-only stderr must surface the crash diagnostic: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_dump_plus_replacement_noise_emits_pointer_diag() {
+        // F1: stderr contains sched_ext_dump lines plus U+FFFD
+        // corruption residue (lossy-decoded raw 0xFF bytes from the
+        // UART). The filter strips dump lines; the residue triggers
+        // `classify_dmesg_corruption`. The "scheduler crashed before
+        // kernel printk" framing would be misleading because the
+        // VM clearly DID produce real dump output. Point at the dump
+        // section instead.
+        let stderr = "[1] sched_ext_dump: header\n\u{fffd}\u{fffd}\u{fffd}\n";
+        let tail = render_dmesg_tail(stderr, 40);
+        assert!(
+            tail.contains("no kernel printk other than sched_ext_dump"),
+            "filter-dropped-real-lines + U+FFFD residue must point at \
+             the dump section, not surface the crash diagnostic: {tail}",
+        );
+        assert!(
+            !tail.contains("scheduler crashed"),
+            "must NOT misclassify residue as a crash when real dump lines \
+             were filtered: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_dump_plus_control_noise_emits_pointer_diag() {
+        // F1 variant: residue is C0 control chars (uninitialised NUL
+        // bytes — valid UTF-8 arriving as U+0000) instead of U+FFFD.
+        // Same outcome: point at the dump section.
+        let stderr = "[  0.5] sched_ext_dump: header\n\0\0\0\n";
+        let tail = render_dmesg_tail(stderr, 40);
+        assert!(
+            tail.contains("no kernel printk other than sched_ext_dump"),
+            "control-char residue with dump lines must point at the dump \
+             section: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_dump_plus_whitespace_emits_pointer_diag() {
+        // F2: stderr like `"[1.0] sched_ext_dump: dump\n   \n\t\n"`
+        // filters to whitespace-only residue, which the classifier
+        // labels "empty (scheduler crashed...)". Surfacing that
+        // diagnostic against real dump lines would be misleading.
+        // Point at the dump section.
+        let stderr = "[1.0] sched_ext_dump: dump\n   \n\t\n";
+        let tail = render_dmesg_tail(stderr, 40);
+        assert!(
+            tail.contains("no kernel printk other than sched_ext_dump"),
+            "whitespace residue with dump lines must point at the dump \
+             section, not surface the crash diagnostic: {tail}",
+        );
+        assert!(
+            !tail.contains("scheduler crashed"),
+            "must NOT report a crash when real dump lines were filtered: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_pure_corruption_no_dump_emits_corrupt_diag() {
+        // Regression guard: stderr is pure corruption with NO
+        // sched_ext_dump lines — the filter drops nothing, the
+        // corruption branch surfaces the crash diagnostic. The
+        // pointer-diag tightening must NOT regress this.
+        let tail = render_dmesg_tail("\u{fffd}\u{fffd}\u{fffd}", 40);
+        assert!(
+            tail.contains("scheduler crashed") || tail.contains("UART buffer"),
+            "pure-corruption stderr must surface the corruption diagnostic: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_pure_whitespace_no_dump_emits_empty_diag() {
+        // Regression guard for the whitespace path without dump line —
+        // the empty/whitespace classifier branch must still surface.
+        let tail = render_dmesg_tail("  \n\t\n", 40);
+        assert!(
+            tail.contains("scheduler crashed before kernel printk"),
+            "whitespace-only stderr (no dump line) must surface the \
+             crash diagnostic: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_latin1_residue_no_dump_passes_through() {
+        // Post-#20 audit: legitimate Latin-1 bytes (U+00A0..=U+00FF
+        // outside the C1 control range U+0080..=U+009F) are NOT
+        // corruption. A kernel printk that mentions a Latin-1 letter
+        // (e.g. an NLS-translated filename, a hardware vendor string,
+        // a USB descriptor) must format-tail-render unchanged, not
+        // surface a crash diagnostic.
+        let stderr = "[0.1] hw vendor: foo\u{ff}bar\n";
+        let tail = render_dmesg_tail(stderr, 40);
+        assert!(
+            tail.contains("foo\u{ff}bar"),
+            "Latin-1 residue must format-tail-render unchanged: {tail}"
+        );
+        assert!(
+            !tail.contains("scheduler crashed"),
+            "Latin-1 residue must NOT trigger the corruption diag: {tail}"
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_uses_tightened_marker() {
+        // A printk that contains the substring "sched_ext_dump" WITHOUT
+        // the trailing colon must NOT be stripped by the filter. The
+        // tightened marker is `sched_ext_dump:` (colon required) — see
+        // [`SCHED_EXT_DUMP_MARKER`]. A regression that loosens this to
+        // a substring match would pull kernel BUG / systemd unit
+        // references into the dump section.
+        let stderr = "[  0.1] BUG in sched_ext_dump_disable callback\n";
+        let tail = render_dmesg_tail(stderr, 40);
+        assert!(
+            tail.contains("BUG in sched_ext_dump_disable callback"),
+            "non-marker line (no colon after) must survive the filter: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_bug_line_and_real_dump_split_correctly() {
+        // Combined stderr: a kernel BUG line that mentions
+        // `sched_ext_dump_disable` (bare-word) AND a real
+        // `sched_ext_dump:` tracepoint line. The tightened marker
+        // splits them correctly:
+        //   - the dump line is filtered (goes to the dump section
+        //     rendered separately via extract_sched_ext_dump);
+        //   - the BUG line survives the filter and lands in the
+        //     dmesg tail.
+        let stderr = "[  0.1] BUG in sched_ext_dump_disable callback\n\
+                      ktstr-0 [001] 0.5: sched_ext_dump: scheduler state\n";
+        let tail = render_dmesg_tail(stderr, 40);
+        assert!(
+            tail.contains("BUG in sched_ext_dump_disable callback"),
+            "BUG line must survive the filter and land in dmesg: {tail}",
+        );
+        assert!(
+            !tail.contains("scheduler state"),
+            "real dump line must be stripped from dmesg (it goes to \
+             the dump section rendered separately): {tail}",
         );
     }
 

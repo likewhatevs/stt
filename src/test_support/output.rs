@@ -93,10 +93,16 @@ pub(crate) fn sched_log_fingerprint(output: &str) -> Option<&str> {
 /// The trace_pipe stream contains lines with `sched_ext_dump:` prefixes when
 /// a SysRq-D dump is triggered. Collects all such lines into a single string.
 /// Returns `None` if no dump lines are present.
+///
+/// Matches the literal `sched_ext_dump:` marker (the trailing colon is part
+/// of the ftrace event format `<event_name>: <body>` and the dmesg printk
+/// format `[<ts>] sched_ext_dump: <body>`). The colon anchors the match so
+/// an unrelated kernel printk that mentions the substring `sched_ext_dump`
+/// without the trailing colon does not get pulled into the dump section.
 pub(crate) fn extract_sched_ext_dump(output: &str) -> Option<String> {
     let lines: Vec<&str> = output
         .lines()
-        .filter(|l| l.contains("sched_ext_dump"))
+        .filter(|l| l.contains(super::probe::SCHED_EXT_DUMP_MARKER))
         .collect();
     if lines.is_empty() {
         return None;
@@ -517,6 +523,23 @@ mod tests {
     #[test]
     fn extract_sched_ext_dump_empty_output() {
         assert!(extract_sched_ext_dump("").is_none());
+    }
+
+    #[test]
+    fn extract_sched_ext_dump_requires_colon_after_marker() {
+        // A printk that mentions the bare substring `sched_ext_dump`
+        // without the trailing colon is NOT a dump-tracepoint output
+        // line. The extractor must filter on the literal marker
+        // `sched_ext_dump:` (with colon) so unrelated kernel printks
+        // — e.g. `"BUG in sched_ext_dump_disable callback"` or a
+        // systemd unit reference like `"sched_ext_dump.service"` —
+        // do not get pulled into the dump section.
+        let output = "[  0.1] BUG in sched_ext_dump_disable callback\n\
+                      systemd[1]: Started sched_ext_dump.service.\n";
+        assert!(
+            extract_sched_ext_dump(output).is_none(),
+            "non-marker lines must not surface as dump lines"
+        );
     }
 
     /// E2E expectation: when scx-ktstr's ops.dump / dump_cpu /
