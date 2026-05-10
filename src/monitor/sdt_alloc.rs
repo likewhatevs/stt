@@ -594,10 +594,7 @@ pub struct PayloadTypeChoice {
 /// surfaced to the operator via [`SdtAllocatorSnapshot::payload_type_reason`]
 /// so the fallback paths are distinguishable without re-running the
 /// heuristic.
-pub fn discover_payload_btf_id(
-    btf: &Btf,
-    base_btf: Option<&Btf>,
-    payload_size: usize,
+pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize,
 ) -> PayloadTypeChoice {
     if payload_size == 0 {
         return PayloadTypeChoice {
@@ -635,18 +632,16 @@ pub fn discover_payload_btf_id(
                     && !name.is_empty()
                 {
                     // Base-BTF filter: exclude vmlinux structs from
-                    // the candidate set. `Btf::resolve_type_by_id`
-                    // walks base first when present, so a successful
-                    // base resolve at this id proves the type lives
-                    // in base BTF — drop it. `None` (test fixtures
-                    // without a base, or production callers that
-                    // pass `None`) keeps the full id range.
-                    let from_base = base_btf
-                        .map(|b| b.resolve_type_by_id(tid).is_ok())
-                        .unwrap_or(false);
-                    if !from_base {
-                        size_matches.push((tid, name));
-                    }
+                    // the candidate set. The base BTF's
+                    // `resolve_type_by_id` succeeds only for ids it
+                    // owns (its own `obj` table — base-only BTFs
+                    // have `self.base = None`, so the lookup never
+                    // delegates further). A success here proves
+                    // the type lives in base BTF — drop it. `None`
+                    // (test fixtures without a base, or production
+                    // callers that pass `None`) keeps the full id
+                    // range.
+                    size_matches.push((tid, name));
                 }
             }
             Err(_) => {

@@ -2169,6 +2169,7 @@ impl<'a> Analyzer<'a> {
                                     .get(&(canonical_parent, canonical_field_off))
                                     .copied()
                                     .flatten();
+                                eprintln!("[ALIAS-TRACK] LDX from arena-tagged slot ({canonical_parent}, {canonical_field_off}) inherited_alloc_size={inherited_size:?}");
                                 RegState::ArenaU64FromAlloc {
                                     source: Some((canonical_parent, canonical_field_off)),
                                     alloc_size: inherited_size,
