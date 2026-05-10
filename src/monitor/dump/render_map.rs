@@ -612,7 +612,7 @@ struct AccessorMemReader<'a> {
     rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
     /// Unique alloc_sizes from all Arena CastHits in the CastMap.
     /// Fallback for deferred-resolve chases with alloc_size=None.
-    captured_alloc_sizes: Vec<u64>,
+    alloc_size_types: Vec<(u64, String)>,
 }
 
 impl MemReader for AccessorMemReader<'_> {
@@ -750,8 +750,8 @@ impl MemReader for AccessorMemReader<'_> {
         };
         set.contains(&(addr as u32))
     }
-    fn captured_alloc_sizes(&self) -> &[u64] {
-        &self.captured_alloc_sizes
+    fn alloc_size_types(&self) -> &[(u64, String)] {
+        &self.alloc_size_types
     }
 }
 
@@ -881,7 +881,7 @@ impl<'a> GuestMemMapAccessor<'a> {
         cross_btf_fwd_index: Option<&'a CrossBtfFwdIndex<'a>>,
         scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
         rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
-        captured_alloc_sizes: &'a [u64],
+        alloc_size_types: &'a [(u64, String)],
     ) -> impl MemReader + 'a {
         AccessorMemReader {
             kernel: self.kernel(),
@@ -894,7 +894,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             cross_btf_fwd_index,
             scx_static_index,
             rendered_slot_addrs,
-            captured_alloc_sizes: captured_alloc_sizes.to_vec(),
+            alloc_size_types: alloc_size_types.to_vec(),
         }
     }
 }
@@ -1077,7 +1077,7 @@ pub(super) struct RenderMapCtx<'a> {
     /// `None` (no allocator pre-pass produced any rendered slot)
     /// keeps the chase pipeline's existing behaviour intact.
     pub(super) rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
-    pub(super) captured_alloc_sizes: &'a [u64],
+    pub(super) alloc_size_types: &'a [(u64, String)],
 }
 
 /// Render `bytes` via BTF when both a `Btf` is available AND the
@@ -1519,7 +1519,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         cross_btf_fwd_index,
         scx_static_index,
         rendered_slot_addrs,
-        captured_alloc_sizes,
+        alloc_size_types,
     } = ctx;
     let mem_reader = accessor.mem_reader(
         shared_arena.map(|(snap, _map_kva)| snap),
@@ -1531,7 +1531,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         cross_btf_fwd_index,
         scx_static_index,
         rendered_slot_addrs,
-        captured_alloc_sizes,
+        alloc_size_types,
     );
     // Per-map allocator selection. The TASK_STORAGE / HASH chase
     // arms consult this to pick the matching allocator metadata when

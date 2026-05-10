@@ -197,7 +197,13 @@ pub(crate) struct CastAnalysisOutput {
     /// call sites via [`build_subprog_returns`]. Threaded to the
     /// renderer as a last-resort fallback for deferred-resolve
     /// arena chases whose CastHit has `alloc_size: None`.
-    pub(crate) captured_alloc_sizes: Vec<u64>,
+    /// `(alloc_size, struct_name)` pairs: for each captured alloc_size
+    /// from `scx_static_alloc_internal`, the struct name that
+    /// `discover_payload_btf_id` resolved uniquely in the embedded
+    /// `.bpf.o` BTF. The renderer uses the name with
+    /// `cross_btf_resolve_fwd` to find the struct body at chase time.
+    /// Empty when no sizes resolved or no embedded BTF was available.
+    pub(crate) alloc_size_types: Vec<(u64, String)>,
 }
 
 /// Per-`KtstrVm` lazy on-demand BPF cast-analysis handle.
@@ -387,7 +393,7 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
                     cast_maps: vec![Arc::new(cast_map)],
                     btfs,
                     fwd_index,
-                    captured_alloc_sizes: Vec::new(), // TODO: persist alloc_sizes in cache
+                    alloc_size_types: Vec::new(), // TODO: persist alloc_sizes in cache
                 };
                 let total: usize = out.cast_maps.iter().map(|m| m.len()).sum();
                 return if total == 0 && out.fwd_index.is_empty() {
@@ -475,7 +481,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
                 cast_maps: vec![Arc::new(CastMap::new())],
                 btfs: Vec::new(),
                 fwd_index: HashMap::new(),
-                captured_alloc_sizes: Vec::new(),
+                alloc_size_types: Vec::new(),
             };
         }
     };
@@ -490,7 +496,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
                 cast_maps: vec![Arc::new(CastMap::new())],
                 btfs: Vec::new(),
                 fwd_index: HashMap::new(),
-                captured_alloc_sizes: Vec::new(),
+                alloc_size_types: Vec::new(),
             };
         }
     };
@@ -559,11 +565,36 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
     }
     all_alloc_sizes.sort_unstable();
     all_alloc_sizes.dedup();
+    // For each captured alloc_size, try discover_payload_btf_id
+    // against every embedded BTF. The embedded BTFs carry full
+    // struct bodies that may be Fwd-only in the kernel's split BTF.
+    // Store (size, struct_name) so the renderer can cross-BTF-resolve
+    // by name at chase time.
+    let mut alloc_size_types: Vec<(u64, String)> = Vec::new();
+    for &size in &all_alloc_sizes {
+        for ebtf in &btfs {
+            let choice = super::super::monitor::sdt_alloc::discover_payload_btf_id(
+                ebtf,
+                size as usize,
+            );
+            if choice.target_type_id != 0 {
+                if let Ok(ty) = ebtf.resolve_type_by_id(choice.target_type_id)
+                    && let Ok(name) = ebtf.resolve_name(
+                        ty.as_btf_type().expect("struct has btf_type"),
+                    )
+                    && !name.is_empty()
+                {
+                    alloc_size_types.push((size, name));
+                    break;
+                }
+            }
+        }
+    }
     CastAnalysisOutput {
         cast_maps,
         btfs,
         fwd_index,
-        captured_alloc_sizes: all_alloc_sizes,
+        alloc_size_types,
     }
 }
 

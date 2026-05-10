@@ -1779,7 +1779,7 @@ pub trait MemReader {
     /// resolve chase has alloc_size=None: try each captured size
     /// with discover_payload_btf_id and use it if exactly one
     /// produces a unique BTF match. Default returns empty.
-    fn captured_alloc_sizes(&self) -> &[u64] {
+    fn alloc_size_types(&self) -> &[(u64, String)] {
         &[]
     }
 }
@@ -3511,52 +3511,84 @@ fn chase_arena_pointer(
                 let size = match alloc_size {
                     Some(s) => s,
                     None => {
-                        // No per-slot alloc_size. Try every
-                        // captured alloc_size from the CastMap.
-                        // ONLY use the fallback when exactly ONE
-                        // captured size resolves uniquely in BTF —
-                        // multiple resolving sizes means we can't
-                        // tell which applies to THIS pointer, and
-                        // guessing wrong renders garbage (reads
-                        // past the allocation into adjacent data).
-                        let resolving: Vec<u64> = mem
-                            .captured_alloc_sizes()
-                            .iter()
-                            .copied()
-                            .filter(|&sz| {
-                                super::sdt_alloc::discover_payload_btf_id(btf, sz as usize)
-                                    .target_type_id
-                                    != 0
-                            })
-                            .collect();
-                        let resolved_size = if resolving.len() == 1 {
-                            Some(resolving[0])
-                        } else {
-                            None
-                        };
-                        match resolved_size {
-                            Some(s) => s,
-                            None => {
-                                return ArenaChaseOutcome {
-                                    deref: None,
-                                    reason: Some(format!(
-                                        "arena chase: cast analyzer's STX-flow path tagged \
-                                         slot as Arena (target_type_id=0, deferred resolve), \
-                                         but [`MemReader::resolve_arena_type`] had no entry \
-                                         for 0x{val:x}; allocator pre-pass may not have \
-                                         populated the index for this allocator"
-                                    )),
-                                    sdt_alloc_resolved: false,
-                                };
+                        // No per-slot alloc_size. Use the pre-resolved
+                        // (size, struct_name) pairs from embedded BTFs
+                        // to find a type via cross-BTF Fwd resolution.
+                        // Each entry was resolved at analysis time by
+                        // running discover_payload_btf_id against the
+                        // full embedded BTF (which carries struct bodies
+                        // the kernel's split BTF may have dropped to Fwd).
+                        // Try each: read `size` bytes from the arena,
+                        // resolve the name via cross_btf_resolve_fwd,
+                        // and use the FIRST that succeeds. The read-size
+                        // gate ensures we only render bytes that belong
+                        // to THIS allocation (no overread into adjacent).
+                        for (candidate_size, struct_name) in mem.alloc_size_types() {
+                            if mem.read_arena(val, *candidate_size as usize).is_none() {
+                                continue;
+                            }
+                            if let Some(cross_ref) = mem.cross_btf_resolve_fwd(
+                                struct_name,
+                                FwdKind::Struct,
+                            ) {
+                                if let Some(btf_size) = type_size(cross_ref.btf, &cross_ref.btf.resolve_type_by_id(cross_ref.type_id).unwrap()) {
+                                    if btf_size > 0 && btf_size <= *candidate_size as usize {
+                                        let read_size = btf_size.min(POINTER_CHASE_CAP);
+                                        let truncated = btf_size > POINTER_CHASE_CAP;
+                                        if let Some(raw_bytes) = mem.read_arena(val, read_size) {
+                                            let payload = recurse_into_target(
+                                                &ResolvedTarget {
+                                                    effective_type_id: cross_ref.type_id,
+                                                    current_btf: cross_ref.btf,
+                                                    btf_size,
+                                                    header_skip: 0,
+                                                    sdt_alloc_resolved: false,
+                                                    cross_btf_hit: Some(CrossBtfRef {
+                                                        btf: cross_ref.btf,
+                                                        type_id: cross_ref.type_id,
+                                                    }),
+                                                },
+                                                &raw_bytes,
+                                                val,
+                                                depth,
+                                                mem,
+                                                visited,
+                                                truncated,
+                                            );
+                                            return ArenaChaseOutcome {
+                                                deref: Some(payload),
+                                                reason: None,
+                                                sdt_alloc_resolved: false,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            // Also try direct resolution in the entry BTF
+                            let choice = super::sdt_alloc::discover_payload_btf_id(
+                                btf,
+                                *candidate_size as usize,
+                            );
+                            if choice.target_type_id != 0 {
+                                // Resolved in entry BTF — use the normal
+                                // target resolution path (same as the
+                                // per-CastHit alloc_size arm below).
+                                break; // fall through to the entry-BTF path below
                             }
                         }
+                        return ArenaChaseOutcome {
+                            deref: None,
+                            reason: Some(format!(
+                                "arena chase: cast analyzer's STX-flow path tagged \
+                                 slot as Arena (target_type_id=0, deferred resolve), \
+                                 but [`MemReader::resolve_arena_type`] had no entry \
+                                 for 0x{val:x}; allocator pre-pass may not have \
+                                 populated the index for this allocator"
+                            )),
+                            sdt_alloc_resolved: false,
+                        };
                     }
                 };
-                // Pass the reader's base BTF so the size-match
-                // heuristic excludes vmlinux struct ids from the
-                // candidate set. Readers without a base BTF (test
-                // stubs, non-split programs) get the default `None`
-                // and fall back to walking every id.
                 let choice = super::sdt_alloc::discover_payload_btf_id(btf, size as usize);
                 if choice.target_type_id == 0 {
                     return ArenaChaseOutcome {
