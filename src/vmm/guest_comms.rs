@@ -144,11 +144,16 @@ static BULK_PORT_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>
 /// port 1 and the kernel's `find_port_by_id` resolves the
 /// `/sys/class/virtio-ports/vport0p1` entry.
 ///
-/// Open mode: write-only, blocking. The kernel's `port_fops_write`
-/// path blocks the writer when the host's `add_used` rate lags;
-/// that's the backpressure mechanism that replaces drop semantics.
+/// Open mode: read+write, blocking. O_RDWR is required because the
+/// kernel's `port_fops_open` (drivers/char/virtio_console.c) sets
+/// `guest_connected = true` on the first open and returns EBUSY on
+/// any subsequent open of the same port. A write-only open would
+/// block a later read-only open needed by `request_snapshot`'s
+/// reply reader. The port-2 stats relay already uses O_RDWR
+/// (rust_init.rs `start_sched_stats_relay`).
 fn try_open_bulk_port() -> Option<std::fs::File> {
     std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .open("/dev/vport0p1")
         .ok()
@@ -653,19 +658,6 @@ static SNAPSHOT_REQUEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// guest process. `OnceLock<Option<File>>` so a not-yet-ready open
 /// (multiport handshake still in flight) does not pin the slot to
 /// None — the next call retries.
-static BULK_PORT_READ_FD: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
-    std::sync::OnceLock::new();
-
-/// Try to open `/dev/vport0p1` for reading (read-only, blocking).
-/// Returns `None` when the device is not yet present; the multiport
-/// handshake completes asynchronously so the read-side handle may
-/// not be available on the first `request_snapshot`.
-fn try_open_bulk_port_read() -> Option<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .open("/dev/vport0p1")
-        .ok()
-}
 
 /// Number of fast-poll iterations at the start of
 /// [`bounded_read_exact`] before escalating to the slow-poll cadence.
@@ -892,19 +884,20 @@ pub fn request_snapshot(
     // every other guest TLV producer.
     let bytes = payload.as_bytes();
     write_msg(MsgType::SnapshotRequest.wire_value(), bytes);
-    // Open the read side of the bulk port. Lazy because the
-    // multiport handshake completes asynchronously; the first
-    // `request_snapshot` may arrive before `/dev/vport0p1` is
-    // creatable.
-    let read_slot = BULK_PORT_READ_FD.get_or_init(|| std::sync::Mutex::new(None));
+    // Read replies from the same O_RDWR fd used for writes.
+    // The kernel's port_fops_open allows only one concurrent open
+    // per port (EBUSY on second open), so a separate read-only
+    // open would fail. The write fd is opened O_RDWR by
+    // try_open_bulk_port.
+    let read_slot = BULK_PORT_FD.get_or_init(|| std::sync::Mutex::new(None));
     let mut read_guard = read_slot.lock().unwrap_or_else(|e| e.into_inner());
     if read_guard.is_none() {
-        match try_open_bulk_port_read() {
+        match try_open_bulk_port() {
             Some(f) => *read_guard = Some(f),
             None => {
                 return SnapshotRequestResult::TransportError {
-                    reason: "/dev/vport0p1 not yet readable on this guest \
-                             (multiport handshake still in flight); retry shortly"
+                    reason: "/dev/vport0p1 not yet open \
+                             (multiport handshake still in flight)"
                         .into(),
                 };
             }
@@ -912,7 +905,7 @@ pub fn request_snapshot(
     }
     let f = read_guard
         .as_mut()
-        .expect("bulk port read handle just installed");
+        .expect("bulk port handle just installed");
     // Read TLV reply frames until we observe one whose payload
     // request_id matches ours. Frames addressed to other request ids
     // (none in current protocol — the host only writes replies in

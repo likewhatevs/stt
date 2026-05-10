@@ -123,9 +123,10 @@ impl VmlinuxSymbolCache {
     /// diagnostic instead of being silently absent).
     pub(super) fn from_path(path: &std::path::Path) -> std::result::Result<Self, String> {
         const SHN_UNDEF: usize = 0;
-        let data =
-            std::fs::read(path).map_err(|e| format!("read vmlinux at {}: {e}", path.display()))?;
-        let elf = goblin::elf::Elf::parse(&data).map_err(|e| format!("parse vmlinux ELF: {e}"))?;
+        let data_arc = super::super::vmlinux::cached_vmlinux_bytes(path)
+            .ok_or_else(|| format!("read vmlinux at {}", path.display()))?;
+        let data = &*data_arc;
+        let elf = goblin::elf::Elf::parse(data).map_err(|e| format!("parse vmlinux ELF: {e}"))?;
         let mut symbols = std::collections::HashMap::new();
         for s in elf.syms.iter() {
             if s.st_shndx == SHN_UNDEF {
@@ -205,6 +206,7 @@ pub(super) fn arm_user_watchpoint(
     watchpoint: &Arc<WatchpointArm>,
     symbol_cache: &VmlinuxSymbolCache,
     symbol: &str,
+    kaslr_offset: u64,
     ap_pthreads: &[libc::pthread_t],
     ap_ies: &[Option<ImmediateExitHandle>],
     ap_alive: &[Arc<AtomicBool>],
@@ -230,9 +232,10 @@ pub(super) fn arm_user_watchpoint(
     // Resolve the symbol via the cached vmlinux symbol table.
     // The cache is built once at coord init; per-call lookups are
     // O(1) HashMap reads instead of 50MB+ file reads + ELF parses.
-    let kva = symbol_cache
+    let link_kva = symbol_cache
         .lookup(symbol)
         .ok_or_else(|| format!("symbol '{symbol}' not found in vmlinux symtab"))?;
+    let kva = link_kva.wrapping_add(kaslr_offset);
     // `request_kva == 0` is the slot's "free" sentinel — the per-vCPU
     // `self_arm_watchpoint` short-circuits on a zero request_kva, and
     // the free-slot scan above treats kva == 0 as available. Arming
@@ -749,6 +752,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "misaligned_sym",
+            0,
             &[],
             &[],
             &[],
@@ -786,6 +790,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "absent_sym",
+            0,
             &[],
             &[],
             &[],
@@ -823,6 +828,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "zero_sym",
+            0,
             &[],
             &[],
             &[],
@@ -859,6 +865,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "scx_root",
+            0,
             &[],
             &[],
             &[],
@@ -907,6 +914,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "sym_a",
+            0,
             &[],
             &[],
             &[],
@@ -919,6 +927,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "sym_b",
+            0,
             &[],
             &[],
             &[],
@@ -965,6 +974,7 @@ mod arm_user_watchpoint_tests {
                 &wp,
                 &cache,
                 sym,
+                0,
                 &[],
                 &[],
                 &[],
@@ -978,6 +988,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "sym_d",
+            0,
             &[],
             &[],
             &[],
@@ -1030,6 +1041,7 @@ mod arm_user_watchpoint_tests {
                 &wp,
                 &cache,
                 sym,
+                0,
                 &[],
                 &[],
                 &[],
@@ -1050,6 +1062,7 @@ mod arm_user_watchpoint_tests {
             &wp,
             &cache,
             "sym_d",
+            0,
             &[],
             &[],
             &[],

@@ -1336,6 +1336,178 @@ fn scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd(
     Ok(result)
 }
 
+/// Asserts that the cross-subprog arena pointer propagation
+/// (fixpoint iteration) correctly tags `ktstr_arena_ctx.stashed_arena_ptr`
+/// as an arena pointer in the rendered failure dump.
+///
+/// Path under test:
+///   1. `ktstr_cross_btf_publish` (subprog) calls `scx_static_alloc`
+///      → R0 is `ArenaU64FromAlloc`. STXs into hash map value's
+///      `cached_ptr` field → `arena_stx_findings` records
+///      `(ktstr_cross_btf_value, 0) → Arena`.
+///   2. `ktstr_cross_btf_chase` (subprog, defined AFTER publish in
+///      source) loads from hash map value's `cached_ptr` →
+///      `handle_ldx` checks `arena_stx_findings` and promotes the
+///      register to `ArenaU64FromAlloc`. STXs into
+///      `taskc->stashed_arena_ptr` → cast map records
+///      `(ktstr_arena_ctx, 24) → Arena`.
+///   3. Because the callee (`scx_static_alloc_internal`) appears
+///      before the caller in the ELF, the fixpoint iteration must
+///      propagate the allocator-return typing across passes.
+///
+/// The assertion: `stashed_arena_ptr` renders as `ptr` (not `uint`)
+/// with a `cast_annotation` containing "arena". If the fixpoint
+/// fails to propagate, the field renders as a plain u64.
+fn scenario_cast_analysis_cross_subprog_arena_chase(
+    ctx: &ktstr::scenario::Ctx,
+) -> Result<AssertResult> {
+    let dump_path = failure_dump_path("cast_analysis_cross_subprog_arena_chase");
+
+    let steps = vec![Step {
+        setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
+        ops: vec![],
+        hold: HoldSpec::FULL,
+    }];
+    let mut result = execute_steps(ctx, steps)?;
+
+    let json = match std::fs::read_to_string(&dump_path) {
+        Ok(s) => s,
+        Err(e) => {
+            result.passed = false;
+            result.details.push(ktstr::assert::AssertDetail::new(
+                ktstr::assert::DetailKind::Other,
+                format!(
+                    "failure dump file missing at {}: {e} (freeze coordinator did \
+                     not write -- either SCX_EXIT_ERROR_STALL never latched, the \
+                     dump path failed silently, or the run was torn down before \
+                     the dump completed)",
+                    dump_path.display()
+                ),
+            ));
+            anyhow::bail!("failure dump file missing at {}", dump_path.display());
+        }
+    };
+
+    let dump: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| anyhow::anyhow!("dump JSON parse: {e}"))?;
+
+    let task_storage = find_task_storage_map(&dump)?;
+    let entries = task_storage
+        .get("entries")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| {
+            anyhow::anyhow!("scx_task_map has no `entries` array; task_storage: {task_storage}")
+        })?;
+    if entries.is_empty() {
+        anyhow::bail!(
+            "scx_task_map.entries is empty -- no per-task arena context was \
+             allocated before freeze. task_storage: {task_storage}"
+        );
+    }
+
+    let payloads: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter_map(|e| e.get("payload"))
+        .filter(|p| !p.is_null())
+        .filter(|p| {
+            p.get("kind").and_then(|k| k.as_str()) == Some("struct")
+                && p.get("type_name").and_then(|n| n.as_str()) == Some("ktstr_arena_ctx")
+        })
+        .collect();
+    if payloads.is_empty() {
+        anyhow::bail!(
+            "no scx_task_map entry has a Struct(type_name=\"ktstr_arena_ctx\") \
+             payload -- chase_sdt_data_payload did not resolve any per-task \
+             arena context. entries: {}",
+            entries.len()
+        );
+    }
+
+    let mut any_arena_chase = false;
+    for payload in &payloads {
+        let stashed = match struct_member(payload, "stashed_arena_ptr") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = stashed
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("<no-kind>");
+        if kind == "ptr" {
+            any_arena_chase = true;
+            if let Some(ann) = stashed.get("cast_annotation").and_then(|a| a.as_str()) {
+                if !ann.contains("arena") {
+                    anyhow::bail!(
+                        "stashed_arena_ptr rendered as Ptr but cast_annotation \
+                         does not contain 'arena': got {ann:?}. The cast \
+                         analyzer tagged the field but with the wrong domain. \
+                         stashed: {stashed}"
+                    );
+                }
+            }
+            break;
+        }
+        if kind == "uint" {
+            let value = stashed.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
+            if value != 0 {
+                anyhow::bail!(
+                    "FIXPOINT REGRESSION: stashed_arena_ptr is a non-zero u64 \
+                     (0x{value:x}) that rendered as plain Uint instead of Ptr. \
+                     The cross-subprog arena typing did NOT propagate through \
+                     the fixpoint -- the publish helper's STX into the hash \
+                     map value's cached_ptr was not carried to the chase \
+                     helper's LDX site across passes. stashed: {stashed}; \
+                     payload: {payload}"
+                );
+            }
+        }
+    }
+
+    if !any_arena_chase {
+        anyhow::bail!(
+            "no ktstr_arena_ctx payload rendered stashed_arena_ptr as Ptr -- \
+             the cross-subprog fixpoint did not produce a cast finding for \
+             (ktstr_arena_ctx, 24). Either the publish helper's allocator \
+             return was not tagged as ArenaU64FromAlloc, or the chase \
+             helper's LDX through the hash map value did not inherit the \
+             tag, or the final STX into the per-task field was not recorded. \
+             Checked {} payloads.",
+            payloads.len()
+        );
+    }
+
+    result.details.push(ktstr::assert::AssertDetail::new(
+        ktstr::assert::DetailKind::Other,
+        format!(
+            "cross-subprog arena chase E2E: dump at {} carries scx_task_map \
+             with {} entries, {} ktstr_arena_ctx payloads. Located \
+             stashed_arena_ptr rendered as Ptr with arena annotation -- \
+             fixpoint propagation across publish→map→chase subprog boundary \
+             is working.",
+            dump_path.display(),
+            entries.len(),
+            payloads.len(),
+        ),
+    ));
+
+    Ok(result)
+}
+
+#[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
+#[linkme(crate = ktstr::__private::linkme)]
+static __KTSTR_ENTRY_CAST_ANALYSIS_CROSS_SUBPROG: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "cast_analysis_cross_subprog_arena_chase",
+        func: scenario_cast_analysis_cross_subprog_arena_chase,
+        scheduler: &KTSTR_SCHED_PAYLOAD,
+        extra_sched_args: &["--stall-after=1"],
+        watchdog_timeout: std::time::Duration::from_secs(3),
+        duration: std::time::Duration::from_secs(10),
+        workers_per_cgroup: 2,
+        expect_err: true,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
+
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
 static __KTSTR_ENTRY_CAST_ANALYSIS_SDT_ALLOC_BRIDGE: ktstr::test_support::KtstrTestEntry =

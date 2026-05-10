@@ -70,6 +70,8 @@ pub(super) struct BulkDispatchSinks<'a> {
     /// Guest-reported `phys_base + 1`. Stored by the KERN_ADDRS arm
     /// so the monitor thread can pick it up via Acquire load.
     pub kern_phys_base: &'a Arc<std::sync::atomic::AtomicU64>,
+    /// Fires when `kern_phys_base` transitions from 0 to non-zero.
+    pub kern_phys_base_evt: &'a EventFd,
     /// Watchdog reset atomic + workload duration. SCENARIO_START
     /// stores `(now - run_start + duration).as_nanos()` so the
     /// watchdog starts the workload clock from scenario start, not
@@ -235,6 +237,7 @@ pub(super) fn dispatch_bulk_message(
                     sinks
                         .kern_phys_base
                         .store(biased, std::sync::atomic::Ordering::Release);
+                    let _ = sinks.kern_phys_base_evt.write(1);
                 }
             }
             None

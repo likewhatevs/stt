@@ -46,7 +46,7 @@ pub struct GuestKernel {
     /// adds the `'static`-shape lifetime contract that lets the
     /// owned accessor types cross thread boundaries.
     mem: Arc<GuestMem>,
-    symbols: HashMap<String, u64>,
+    symbols: Arc<HashMap<String, u64>>,
     page_offset: u64,
     cr3_pa: u64,
     /// 5-level paging flag — true when the guest uses 5-level page tables (LA57).
@@ -199,6 +199,47 @@ impl GuestKernel {
     /// the hint directly. The guest-reported `phys_base` (from
     /// `/proc/iomem`) includes `kaslr_offset`, which is what
     /// `text_kva_to_pa_with_base` needs for link-time KVAs.
+    pub fn from_elf_with_symbols(
+        mem: Arc<GuestMem>,
+        symbols: Arc<HashMap<String, u64>>,
+        elf: &goblin::elf::Elf<'_>,
+        tcr_el1: u64,
+        cr3_pa: u64,
+        phys_base_hint: u64,
+    ) -> Result<Self> {
+        let start_kernel_map = start_kernel_map_for_tcr(tcr_el1).ok_or_else(|| {
+            anyhow::anyhow!("could not derive kernel image base from tcr_el1=0x{tcr_el1:x}")
+        })?;
+        let kern_syms = super::symbols::KernelSymbols::from_elf(elf)?;
+        let l5_bootstrap = resolve_pgtable_l5(&mem, &kern_syms, start_kernel_map, 0);
+        let walk_cr3 = cr3_pa & !0xFFFu64;
+        let phys_base = if phys_base_hint != 0 {
+            phys_base_hint
+        } else {
+            resolve_phys_base(&mem, &kern_syms, walk_cr3, l5_bootstrap, tcr_el1).unwrap_or(0)
+        };
+        let l5 = if phys_base == 0 {
+            l5_bootstrap
+        } else {
+            resolve_pgtable_l5(&mem, &kern_syms, start_kernel_map, phys_base)
+        };
+        let page_offset = resolve_page_offset_with_tcr(
+            &mem, &kern_syms, start_kernel_map, tcr_el1, phys_base,
+        );
+        let aarch64_params = decode_aarch64_params(tcr_el1);
+        Ok(Self {
+            mem,
+            symbols,
+            page_offset,
+            cr3_pa: walk_cr3,
+            l5,
+            tcr_el1,
+            aarch64_params,
+            start_kernel_map,
+            phys_base,
+        })
+    }
+
     pub fn from_elf_with_hint(
         mem: Arc<GuestMem>,
         elf: &goblin::elf::Elf<'_>,
@@ -298,6 +339,7 @@ impl GuestKernel {
         // with the per-call path (both bail).
         let aarch64_params = decode_aarch64_params(tcr_el1);
 
+        let symbols = Arc::new(symbols);
         Ok(Self {
             mem,
             symbols,
@@ -341,7 +383,7 @@ impl GuestKernel {
     ) -> Self {
         Self {
             mem,
-            symbols,
+            symbols: Arc::new(symbols),
             page_offset,
             cr3_pa,
             l5,
@@ -376,6 +418,10 @@ impl GuestKernel {
     /// [`super::reader::GuestMem::from_layout`].
     pub fn mem_arc(&self) -> Arc<GuestMem> {
         self.mem.clone()
+    }
+
+    pub fn symbols_arc(&self) -> Arc<HashMap<String, u64>> {
+        self.symbols.clone()
     }
 
     /// Runtime PAGE_OFFSET (resolved from guest memory).
@@ -748,7 +794,7 @@ mod tests {
         symbols.insert("test_sym".to_string(), 0xFFFF_FFFF_8000_1000u64);
         let kernel = GuestKernel {
             mem: Arc::new(mem),
-            symbols,
+            symbols: Arc::new(symbols),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
@@ -778,7 +824,7 @@ mod tests {
         symbols.insert("my_counter".to_string(), sym_kva);
         let kernel = GuestKernel {
             mem: Arc::new(mem),
-            symbols,
+            symbols: Arc::new(symbols),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
@@ -804,7 +850,7 @@ mod tests {
         symbols.insert("my_u64".to_string(), sym_kva);
         let kernel = GuestKernel {
             mem: Arc::new(mem),
-            symbols,
+            symbols: Arc::new(symbols),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
@@ -833,7 +879,7 @@ mod tests {
         symbols.insert("my_bytes".to_string(), sym_kva);
         let kernel = GuestKernel {
             mem: Arc::new(mem),
-            symbols,
+            symbols: Arc::new(symbols),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
@@ -856,7 +902,7 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kernel = GuestKernel {
             mem: Arc::new(mem),
-            symbols: HashMap::new(),
+            symbols: Arc::new(HashMap::new()),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
@@ -883,7 +929,7 @@ mod tests {
         symbols.insert("my_var".to_string(), sym_kva);
         let kernel = GuestKernel {
             mem: Arc::new(mem),
-            symbols,
+            symbols: Arc::new(symbols),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: 0,
             l5: false,
@@ -913,7 +959,7 @@ mod tests {
         let mem = unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) };
         let kernel = GuestKernel {
             mem: Arc::new(mem),
-            symbols: HashMap::new(),
+            symbols: Arc::new(HashMap::new()),
             page_offset,
             cr3_pa: 0,
             l5: false,
@@ -935,7 +981,7 @@ mod tests {
         let mem = Arc::new(unsafe { GuestMem::new(buf.as_ptr() as *mut u8, buf.len() as u64) });
         let kernel = GuestKernel {
             mem: mem.clone(),
-            symbols: HashMap::new(),
+            symbols: Arc::new(HashMap::new()),
             page_offset: 0x1234,
             cr3_pa: 0x5678,
             l5: true,
@@ -1074,7 +1120,7 @@ mod tests {
 
         let kernel = GuestKernel {
             mem: Arc::new(mem),
-            symbols: HashMap::new(),
+            symbols: Arc::new(HashMap::new()),
             page_offset: 0xFFFF_8880_0000_0000,
             cr3_pa: pml4_pa,
             l5: false,
