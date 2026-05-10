@@ -399,28 +399,38 @@ pub(crate) fn attempt_auto_repro(
     };
     let func_names: Vec<String> = stack_funcs.iter().map(|f| f.raw_name.clone()).collect();
 
+    // Stall exits have no causal task — the probe event chain is
+    // always empty after stitch. Skip probe attachment entirely to
+    // avoid the BPF discovery + kprobe/fentry attach overhead. The
+    // repro VM still boots for the failure dump and diagnostic tails.
+    let is_stall = console_output.contains("runnable task stall");
+
     // When no stack functions were extracted (e.g. BPF text error with no
     // backtrace), still boot the repro VM. The guest-side discover_bpf_symbols()
     // dynamically finds the scheduler's BPF programs. Pass a sentinel value
     // so extract_probe_stack_arg returns Some and the guest probe path activates.
-    let probe_arg = if func_names.is_empty() {
-        eprintln!("ktstr_test: auto-repro: no stack functions, using BPF discovery in repro VM");
-        format!("--ktstr-probe-stack={DISCOVER_SENTINEL}")
-    } else {
-        eprintln!(
-            "ktstr_test: auto-repro: probing {} functions in second VM",
-            func_names.len()
-        );
-        format!("--ktstr-probe-stack={}", func_names.join(","))
-    };
-
-    // Build guest args for the repro VM.
-    let guest_args = vec![
+    let mut guest_args = vec![
         "run".to_string(),
         "--ktstr-test-fn".to_string(),
         entry.name.to_string(),
-        probe_arg,
     ];
+    if !is_stall {
+        let probe_arg = if func_names.is_empty() {
+            eprintln!(
+                "ktstr_test: auto-repro: no stack functions, using BPF discovery in repro VM"
+            );
+            format!("--ktstr-probe-stack={DISCOVER_SENTINEL}")
+        } else {
+            eprintln!(
+                "ktstr_test: auto-repro: probing {} functions in second VM",
+                func_names.len()
+            );
+            format!("--ktstr-probe-stack={}", func_names.join(","))
+        };
+        guest_args.push(probe_arg);
+    } else {
+        eprintln!("ktstr_test: auto-repro: stall exit — skipping probe attachment");
+    }
 
     let cmdline_extra = super::runtime::build_cmdline_extra(entry);
 
