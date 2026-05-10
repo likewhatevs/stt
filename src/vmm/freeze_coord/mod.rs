@@ -4066,7 +4066,7 @@ impl KtstrVm {
                                 let cast_analysis = freeze_coord_cast_map.get_full();
                                 let cast_map_ref = cast_analysis
                                     .as_ref()
-                                    .map(|out| out.cast_map.as_ref());
+                                    .and_then(|out| out.cast_maps.first().map(|m| m.as_ref()));
                                 let cross_btf_fwd_index_owned = cast_analysis.as_ref().map(|out| {
                                     crate::monitor::dump::CrossBtfFwdIndex {
                                         btfs: &out.btfs,

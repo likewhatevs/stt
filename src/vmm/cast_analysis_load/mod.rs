@@ -165,7 +165,7 @@ pub(crate) struct CastAnalysisOutput {
     /// useful — a scheduler whose Fwd pointers all live in
     /// non-typed-pointer-bearing maps still benefits from the index
     /// when the renderer chases those maps' [`Type::Ptr`] arms.
-    pub(crate) cast_map: Arc<CastMap>,
+    pub(crate) cast_maps: Vec<Arc<CastMap>>,
     /// Every embedded BPF object's parsed program BTF, in the same
     /// order [`iter_embedded_bpf_objects`] yielded the slices. Index
     /// 0 is the first symbol-driven slice (or the fallback whole-
@@ -379,11 +379,12 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
             if let Some((cast_map, fwd_index)) = persist::try_load(hash, btfs.len()) {
                 tracing::debug!("cast_analysis: disk cache hit");
                 let out = CastAnalysisOutput {
-                    cast_map: Arc::new(cast_map),
+                    cast_maps: vec![Arc::new(cast_map)],
                     btfs,
                     fwd_index,
                 };
-                return if out.cast_map.is_empty() && out.fwd_index.is_empty() {
+                let total: usize = out.cast_maps.iter().map(|m| m.len()).sum();
+                return if total == 0 && out.fwd_index.is_empty() {
                     None
                 } else {
                     Some(Arc::new(out))
@@ -394,13 +395,20 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
             let out = build_cast_analysis_from_bytes(&bytes);
             tracing::debug!(
                 elapsed_ms = analyze_t0.elapsed().as_millis() as u64,
-                casts = out.cast_map.len(),
+                casts = out.cast_maps.iter().map(|m| m.len()).sum::<usize>(),
                 btfs = out.btfs.len(),
                 fwd_index = out.fwd_index.len(),
                 "cast_analysis: on-demand analysis finished"
             );
-            persist::try_save(hash, &out.cast_map, &out.fwd_index, out.btfs.len());
-            if out.cast_map.is_empty() && out.fwd_index.is_empty() {
+            let merged_for_cache: CastMap = out
+                .cast_maps
+                .iter()
+                .flat_map(|m| m.iter())
+                .map(|(&k, &v)| (k, v))
+                .collect();
+            persist::try_save(hash, &merged_for_cache, &out.fwd_index, out.btfs.len());
+            let total_casts: usize = out.cast_maps.iter().map(|m| m.len()).sum();
+            if total_casts == 0 && out.fwd_index.is_empty() {
                 None
             } else {
                 Some(Arc::new(out))
@@ -458,7 +466,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
                  dump renderer will fall back to plain u64 counters"
             );
             return CastAnalysisOutput {
-                cast_map: Arc::new(CastMap::new()),
+                cast_maps: vec![Arc::new(CastMap::new())],
                 btfs: Vec::new(),
                 fwd_index: HashMap::new(),
             };
@@ -472,7 +480,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
                  typed-pointer rendering disabled"
             );
             return CastAnalysisOutput {
-                cast_map: Arc::new(CastMap::new()),
+                cast_maps: vec![Arc::new(CastMap::new())],
                 btfs: Vec::new(),
                 fwd_index: HashMap::new(),
             };
@@ -483,7 +491,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
         "cast_analysis: outer ELF parse + .bpf.objs lookup finished"
     );
 
-    let mut merged = CastMap::new();
+    let mut cast_maps: Vec<Arc<CastMap>> = Vec::new();
     let mut btfs: Vec<Arc<Btf>> = Vec::new();
     let started = std::time::Instant::now();
     tracing::debug!("cast_analysis: starting analyze_casts pipeline");
@@ -495,15 +503,17 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
             casts = one.len(),
             "cast_analysis: analyze_one_object_with_btf finished"
         );
-        merge_into(&mut merged, one);
+        cast_maps.push(Arc::new(one));
         if let Some(btf) = btf_for_obj {
             btfs.push(btf);
         }
     }
+    let total_casts: usize = cast_maps.iter().map(|m| m.len()).sum();
     tracing::debug!(
         elapsed_ms = started.elapsed().as_millis() as u64,
-        casts = merged.len(),
+        casts = total_casts,
         btfs = btfs.len(),
+        objects = cast_maps.len(),
         "cast_analysis: analyze_casts pipeline finished"
     );
 
@@ -526,19 +536,19 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
     // (which would surface as a startup line on every test run).
     // Non-empty results stay at info! so the operator sees the
     // recovery count when it matters.
-    if merged.is_empty() {
+    if total_casts == 0 {
         tracing::debug!(
             casts = 0,
             "cast_analysis: recovered 0 typed pointers from scheduler"
         );
     } else {
         tracing::info!(
-            casts = merged.len(),
+            casts = total_casts,
             "cast_analysis: recovered typed pointers from scheduler"
         );
     }
     CastAnalysisOutput {
-        cast_map: Arc::new(merged),
+        cast_maps,
         btfs,
         fwd_index,
     }
@@ -1660,39 +1670,6 @@ fn parse_btf_ext_func_entries(
 }
 
 /// Merge `from` into `into`. Coalesces conflicting `(source, offset)`
-/// keys by dropping the entry — same conservative stance as
-/// [`crate::monitor::cast_analysis`]'s own `KptrEntry::Conflicting`
-/// rule. Self-consistent merges (same `(target, AddrSpace)` from two
-/// program objects, e.g. a shared library type both reference) keep
-/// the entry.
-fn merge_into(into: &mut CastMap, from: CastMap) {
-    use std::collections::btree_map::Entry;
-    for (key, val) in from {
-        match into.entry(key) {
-            Entry::Vacant(v) => {
-                v.insert(val);
-            }
-            Entry::Occupied(o) => {
-                if *o.get() != val {
-                    // Disagreement across objects: drop the entry.
-                    // The renderer falls back to plain u64 for that
-                    // slot, which is the original (pre-integration)
-                    // behavior.
-                    let prev = *o.get();
-                    tracing::debug!(
-                        parent_type_id = key.0,
-                        member_offset = key.1,
-                        prev_target = prev.target_type_id,
-                        new_target = val.target_type_id,
-                        "cast_analysis: dropping conflicting merge entry"
-                    );
-                    o.remove();
-                }
-            }
-        }
-    }
-}
-
 /// Find a section by exact name. Returns the section index, or `None`
 /// if no section matches. Uses `shdr_strtab.get_at` directly to avoid
 /// pulling section data when only the index is needed.

@@ -604,85 +604,6 @@ fn section_data_overflow_returns_none() {
     assert!(section_data(&elf, &blob, idx).is_none());
 }
 
-// ----- Tests for merge_into --------------------------------------
-
-/// 17. Conflicting entries (same key, different value) collapse
-///     to "drop the key" — false negatives are the safe direction.
-#[test]
-fn merge_into_conflicting_entries_drop_key() {
-    let mut into = CastMap::new();
-    into.insert(
-        (10, 0),
-        CastHit {
-            target_type_id: 100,
-            addr_space: AddrSpace::Arena,
-        },
-    );
-    into.insert(
-        (10, 8),
-        CastHit {
-            target_type_id: 200,
-            addr_space: AddrSpace::Kernel,
-        },
-    );
-
-    let mut from = CastMap::new();
-    // Same (parent, offset) but different target id → drop.
-    from.insert(
-        (10, 0),
-        CastHit {
-            target_type_id: 101,
-            addr_space: AddrSpace::Arena,
-        },
-    );
-    // Same (parent, offset) but different AddrSpace → drop.
-    from.insert(
-        (10, 8),
-        CastHit {
-            target_type_id: 200,
-            addr_space: AddrSpace::Arena,
-        },
-    );
-    // Disjoint key → kept.
-    from.insert(
-        (10, 16),
-        CastHit {
-            target_type_id: 300,
-            addr_space: AddrSpace::Kernel,
-        },
-    );
-    // Identical key+value → kept.
-    from.insert(
-        (20, 0),
-        CastHit {
-            target_type_id: 400,
-            addr_space: AddrSpace::Arena,
-        },
-    );
-
-    merge_into(&mut into, from);
-
-    // Conflicting keys are gone.
-    assert!(!into.contains_key(&(10, 0)));
-    assert!(!into.contains_key(&(10, 8)));
-    // Disjoint key from `from` is now in `into`.
-    assert_eq!(
-        into.get(&(10, 16)),
-        Some(&CastHit {
-            target_type_id: 300,
-            addr_space: AddrSpace::Kernel,
-        })
-    );
-    // Identical merge keeps the value.
-    assert_eq!(
-        into.get(&(20, 0)),
-        Some(&CastHit {
-            target_type_id: 400,
-            addr_space: AddrSpace::Arena,
-        })
-    );
-}
-
 /// Sanity: the unused-helper escape valves (`elf64_sym`,
 /// `st_info`) are exercised by a smoke build of a symbol table
 /// to keep them from rotting if a future test wants them. The
@@ -1463,7 +1384,7 @@ fn cached_cast_analysis_recovers_arena_cast_end_to_end() {
     std::fs::write(&p, &outer).expect("write");
 
     let out = cached_cast_analysis_for_scheduler(&p).expect("non-empty fixture must produce Some");
-    let hit = out.cast_map.get(&(2u32, 8u32)).copied();
+    let hit = out.cast_maps[0].get(&(2u32, 8u32)).copied();
     assert_eq!(
         hit,
         Some(CastHit {
@@ -1471,7 +1392,7 @@ fn cached_cast_analysis_recovers_arena_cast_end_to_end() {
             addr_space: AddrSpace::Arena,
         }),
         "expected arena cast T.f → Q*, got {:?}",
-        out.cast_map
+        out.cast_maps[0]
     );
 }
 
@@ -1570,7 +1491,7 @@ fn cached_cast_analysis_returns_same_arc_for_same_content() {
     );
     // Sanity: the cached output carries the recovered cast.
     assert_eq!(
-        first.cast_map.get(&(2u32, 8u32)).copied(),
+        first.cast_maps[0].get(&(2u32, 8u32)).copied(),
         Some(CastHit {
             target_type_id: 3,
             addr_space: AddrSpace::Arena,
@@ -1616,7 +1537,7 @@ fn cached_cast_analysis_read_failure_does_not_pollute_cache() {
     let out = cached_cast_analysis_for_scheduler(&p)
         .expect("post-creation read should succeed and produce a non-empty CastAnalysisOutput");
     assert_eq!(
-        out.cast_map.get(&(2u32, 8u32)).copied(),
+        out.cast_maps[0].get(&(2u32, 8u32)).copied(),
         Some(CastHit {
             target_type_id: 3,
             addr_space: AddrSpace::Arena,
