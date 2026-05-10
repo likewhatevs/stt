@@ -2097,8 +2097,8 @@ pub(crate) fn format_monitor_section(
 
     let mut lines = vec![
         format!(
-            "samples={} max_imbalance={:.2} max_dsq_depth={} stall={}",
-            s.total_samples, s.max_imbalance_ratio, s.max_local_dsq_depth, s.stall_detected,
+            "samples={} max_imbalance={:.2} max_dsq_depth={} stuck={}",
+            s.total_samples, s.max_imbalance_ratio, s.max_local_dsq_depth, s.stuck_detected,
         ),
         format!(
             "avg: imbalance={:.2} nr_running/cpu={:.1} dsq/cpu={:.1}",
@@ -4261,7 +4261,7 @@ mod tests {
                     total_samples: 5,
                     max_imbalance_ratio: 3.0,
                     max_local_dsq_depth: 2,
-                    stall_detected: false,
+                    stuck_detected: false,
                     event_deltas: None,
                     schedstat_deltas: None,
                     prog_stats_deltas: None,

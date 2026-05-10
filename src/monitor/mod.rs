@@ -655,7 +655,7 @@ pub struct MonitorSummary {
     pub max_local_dsq_depth: u32,
     /// Whether any CPU's `rq_clock` failed to advance between consecutive
     /// samples. Idle CPUs (`nr_running == 0` in both samples) are exempt.
-    pub stall_detected: bool,
+    pub stuck_detected: bool,
     /// Average imbalance ratio across valid samples.
     pub avg_imbalance_ratio: f64,
     /// Average nr_running per CPU across valid samples.
@@ -818,7 +818,7 @@ impl MonitorSummary {
             0.0
         };
 
-        // Stall detection: any CPU whose rq_clock did not advance between
+        // Stuck detection: any CPU whose rq_clock did not advance between
         // consecutive samples. Skip invalid samples.
         // Exempt idle CPUs: nr_running==0 in both samples means the tick
         // is stopped (NOHZ) and rq_clock legitimately does not advance.
@@ -829,7 +829,7 @@ impl MonitorSummary {
         } else {
             vcpu_preemption_threshold_ns(None)
         };
-        let mut stall_detected = false;
+        let mut stuck_detected = false;
         let valid_samples: Vec<&MonitorSample> = samples
             .iter()
             .filter(|s| !s.cpus.is_empty() && sample_looks_valid(s))
@@ -839,12 +839,12 @@ impl MonitorSummary {
             let curr = w[1];
             let cpu_count = prev.cpus.len().min(curr.cpus.len());
             for cpu in 0..cpu_count {
-                if reader::is_cpu_stalled(&prev.cpus[cpu], &curr.cpus[cpu], threshold) {
-                    stall_detected = true;
+                if reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold) {
+                    stuck_detected = true;
                     break;
                 }
             }
-            if stall_detected {
+            if stuck_detected {
                 break;
             }
         }
@@ -857,7 +857,7 @@ impl MonitorSummary {
             total_samples: samples.len(),
             max_imbalance_ratio,
             max_local_dsq_depth,
-            stall_detected,
+            stuck_detected,
             avg_imbalance_ratio,
             avg_nr_running,
             avg_local_dsq_depth,
@@ -1203,12 +1203,12 @@ impl MonitorThresholds {
             ));
         }
 
-        // Stall detection: any CPU whose rq_clock did not advance between
+        // Stuck detection: any CPU whose rq_clock did not advance between
         // consecutive samples. Uses the sustained_samples window like
         // imbalance and DSQ checks. Exempt idle CPUs (NOHZ stopped the
         // tick so rq_clock legitimately doesn't advance) and preempted
         // vCPUs (host stole the core, so the vCPU couldn't tick the
-        // clock). See `reader::is_cpu_stalled` for the predicate.
+        // clock). See `reader::is_cpu_stuck` for the predicate.
         if self.fail_on_stall {
             let threshold = if report.preemption_threshold_ns > 0 {
                 report.preemption_threshold_ns
@@ -1233,7 +1233,7 @@ impl MonitorThresholds {
                 // indexes stall[cpu], prev.cpus[cpu], curr.cpus[cpu]
                 for cpu in 0..cpu_count {
                     let is_stall =
-                        reader::is_cpu_stalled(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
+                        reader::is_cpu_stuck(&prev.cpus[cpu], &curr.cpus[cpu], threshold);
                     stall[cpu].record(is_stall, curr.cpus[cpu].rq_clock as f64, i);
                 }
             }

@@ -257,7 +257,7 @@ impl MetricDef {
 /// | `worst_migration_ratio` | `migration_ratio` | `migration_ratio` |
 /// | `max_imbalance_ratio` | `imbalance_ratio` | `imbalance` |
 /// | `max_dsq_depth` | `max_dsq_depth` | `dsq_depth` |
-/// | `stall_count` | `stall_count` | `stalls` |
+/// | `stuck_count` | `stuck_count` | `stuck` |
 /// | `total_fallback` | `fallback_count` | `fallback` |
 /// | `total_keep_last` | `keep_last_count` | `keep_last` |
 /// | `worst_page_locality` | `page_locality` | `page_locality` |
@@ -350,13 +350,13 @@ pub static METRICS: &[MetricDef] = &[
         accessor: |r| Some(r.max_dsq_depth as f64),
     },
     MetricDef {
-        name: "stall_count",
+        name: "stuck_count",
         polarity: crate::test_support::Polarity::LowerBetter,
         kind: MetricKind::Counter,
         default_abs: 1.0,
         default_rel: 0.50,
         display_unit: "",
-        accessor: |r| Some(r.stall_count as f64),
+        accessor: |r| Some(r.stuck_count as f64),
     },
     MetricDef {
         name: "total_fallback",
@@ -367,7 +367,7 @@ pub static METRICS: &[MetricDef] = &[
         // Integer event count, not a rate — the source field on
         // `MonitorSummary::event_deltas.total_fallback` is a cumulative
         // delta across the run, not per-second. Empty unit matches the
-        // other counter metrics (`stall_count`, `total_iterations`,
+        // other counter metrics (`stuck_count`, `total_iterations`,
         // `total_migrations`).
         display_unit: "",
         accessor: |r| Some(r.fallback_count as f64),
@@ -598,13 +598,16 @@ pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
 ///   like `jobs.0.read.iops` from the schbench LlmExtract path
 ///   should fold the same way.
 /// - Tokens that signal LowerBetter (returned `true`):
-///   `latency`, `delay`, `gap`, `stall`, `cv`, `error`, `fail`,
-///   `drop`, `spread`, `_us`, `_ms`, `_ns`, `migration_ratio`,
+///   `latency`, `delay`, `gap`, `stall`, `stuck`, `cv`, `error`,
+///   `fail`, `drop`, `spread`, `_us`, `_ms`, `_ns`, `migration_ratio`,
 ///   `imbalance`. These are the polarity signals from the existing
 ///   registered LowerBetter entries (`worst_p99_wake_latency_us`,
-///   `worst_run_delay_us`, `worst_gap_ms`, `stall_count`,
+///   `worst_run_delay_us`, `worst_gap_ms`, `stuck_count`,
 ///   `worst_wake_latency_cv`, `worst_spread`, `worst_migration_ratio`,
-///   `max_imbalance_ratio`).
+///   `max_imbalance_ratio`). `stall` covers payload-author metrics
+///   that surface the sched_ext watchdog stall (`SCX_EXIT_ERROR_STALL`)
+///   while `stuck` covers `stuck_count` (CPU's `rq_clock` not
+///   advancing) — distinct conditions but both higher-is-worse.
 ///
 /// When a name matches no token (e.g. `bogo_ops`, `read_kb`,
 /// `jobs.0.runtime`), returns `true` (LowerBetter). The fallback
@@ -631,6 +634,7 @@ pub fn infer_higher_is_worse(name: &str) -> bool {
         "delay",
         "_gap",
         "stall",
+        "stuck",
         "_cv",
         "error",
         "fail",
@@ -931,11 +935,16 @@ pub struct GauntletRow {
     /// `dsq_depth`; see the triples table on [`METRICS`] for the
     /// column-level rename rationale.
     pub max_dsq_depth: u32,
-    /// Stalled-sample count across the run. Registry and field
-    /// names match (`stall_count`) but the DataFrame column is
-    /// `stalls`; see the triples table on [`METRICS`] for the
+    /// Stuck-sample count across the run (CPUs whose `rq_clock`
+    /// failed to advance between consecutive samples). Distinct from
+    /// the sched_ext watchdog stall (`SCX_EXIT_ERROR_STALL`):
+    /// "stuck" tracks rq_clock not advancing on a CPU, while a
+    /// watchdog stall describes a runnable task that hasn't been
+    /// scheduled within the watchdog timeout. Registry and field
+    /// names match (`stuck_count`) but the DataFrame column is
+    /// `stuck`; see the triples table on [`METRICS`] for the
     /// column-level rename rationale.
-    pub stall_count: usize,
+    pub stuck_count: usize,
     /// Fallback-dispatch count across the run. Carried as-is from
     /// `MonitorSummary::event_deltas.total_fallback` — an integer
     /// event count, NOT a rate. Surfaced in [`METRICS`] under
@@ -1781,7 +1790,7 @@ fn render_mixed_dirty(
 /// - `u64` / `i64` fields take the rounded mean
 ///   (`(sum / count).round() as u64`). The 0.5-unit rounding error
 ///   is well below every integer metric's `default_abs` gate (the
-///   smallest is `stall_count = 1.0`).
+///   smallest is `stuck_count = 1.0`).
 /// - `ext_metrics` keys are unioned across passing contributors;
 ///   each key's mean is computed only across contributors that
 ///   carried it. A key present in some passing rows and absent
@@ -1866,7 +1875,7 @@ pub fn group_and_average_by(
         sum_migration_ratio: f64,
         sum_imbalance_ratio: f64,
         sum_max_dsq_depth: u64,
-        sum_stall_count: usize,
+        sum_stuck_count: usize,
         sum_fallback_count: i64,
         sum_keep_last_count: i64,
         sum_p99_wake: f64,
@@ -1909,7 +1918,7 @@ pub fn group_and_average_by(
                 sum_migration_ratio: 0.0,
                 sum_imbalance_ratio: 0.0,
                 sum_max_dsq_depth: 0,
-                sum_stall_count: 0,
+                sum_stuck_count: 0,
                 sum_fallback_count: 0,
                 sum_keep_last_count: 0,
                 sum_p99_wake: 0.0,
@@ -1959,7 +1968,7 @@ pub fn group_and_average_by(
         acc.sum_migration_ratio += row.migration_ratio;
         acc.sum_imbalance_ratio += row.imbalance_ratio;
         acc.sum_max_dsq_depth += u64::from(row.max_dsq_depth);
-        acc.sum_stall_count += row.stall_count;
+        acc.sum_stuck_count += row.stuck_count;
         acc.sum_fallback_count += row.fallback_count;
         acc.sum_keep_last_count += row.keep_last_count;
         acc.sum_p99_wake += row.worst_p99_wake_latency_us;
@@ -2047,7 +2056,7 @@ pub fn group_and_average_by(
             migration_ratio: acc.sum_migration_ratio / denom,
             imbalance_ratio: acc.sum_imbalance_ratio / denom,
             max_dsq_depth: round_u32(acc.sum_max_dsq_depth),
-            stall_count: round_usize(acc.sum_stall_count),
+            stuck_count: round_usize(acc.sum_stuck_count),
             fallback_count: round_i64(acc.sum_fallback_count),
             keep_last_count: round_i64(acc.sum_keep_last_count),
             worst_p99_wake_latency_us: acc.sum_p99_wake / denom,
@@ -2159,7 +2168,7 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
             .as_ref()
             .map(|m| m.max_local_dsq_depth)
             .unwrap_or(0),
-        stall_count: if sc.monitor.as_ref().is_some_and(|m| m.stall_detected) {
+        stuck_count: if sc.monitor.as_ref().is_some_and(|m| m.stuck_detected) {
             1
         } else {
             0
@@ -2255,7 +2264,7 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
     let migration_ratio: Vec<f64> = rows.iter().map(|r| r.migration_ratio).collect();
     let imbalance: Vec<f64> = rows.iter().map(|r| r.imbalance_ratio).collect();
     let dsq_depth: Vec<f64> = rows.iter().map(|r| r.max_dsq_depth as f64).collect();
-    let stalls: Vec<f64> = rows.iter().map(|r| r.stall_count as f64).collect();
+    let stuck: Vec<f64> = rows.iter().map(|r| r.stuck_count as f64).collect();
     let fallback: Vec<f64> = rows.iter().map(|r| r.fallback_count as f64).collect();
     let keep_last: Vec<f64> = rows.iter().map(|r| r.keep_last_count as f64).collect();
     let p99_wake_lat: Vec<f64> = rows.iter().map(|r| r.worst_p99_wake_latency_us).collect();
@@ -2287,7 +2296,7 @@ fn build_dataframe(rows: &[GauntletRow]) -> PolarsResult<DataFrame> {
         "migration_ratio" => &migration_ratio,
         "imbalance" => &imbalance,
         "dsq_depth" => &dsq_depth,
-        "stalls" => &stalls,
+        "stuck" => &stuck,
         "fallback" => &fallback,
         "keep_last" => &keep_last,
         "worst_p99_wake_latency_us" => &p99_wake_lat,
@@ -2378,7 +2387,7 @@ fn find_outliers(df: &DataFrame) -> Vec<Outlier> {
         "migration_ratio",
         "imbalance",
         "dsq_depth",
-        "stalls",
+        "stuck",
         "fallback",
         "keep_last",
         "worst_p99_wake_latency_us",
@@ -2526,7 +2535,7 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
             col("gap_ms").mean().alias("avg_gap_ms"),
             col("imbalance").mean().alias("avg_imbalance"),
             col("dsq_depth").mean().alias("avg_dsq_depth"),
-            col("stalls").sum().alias("total_stalls"),
+            col("stuck").sum().alias("total_stuck"),
             col("fallback").mean().alias("avg_fallback"),
         ])
         .sort(
@@ -2550,7 +2559,7 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
 
     let imbalances = col_f64(&grouped, "avg_imbalance");
     let dsq_depths = col_f64(&grouped, "avg_dsq_depth");
-    let stall_totals = col_f64(&grouped, "total_stalls");
+    let stuck_totals = col_f64(&grouped, "total_stuck");
     let fallbacks = col_f64(&grouped, "avg_fallback");
 
     let (names, pass_counts, totals, spreads, gaps) =
@@ -2583,10 +2592,10 @@ fn format_dimension_summary(df: &DataFrame, group_col: &str) -> String {
                 line.push_str(&format!("  dsq={:.0}", v));
             }
         }
-        if let Some(ref st) = stall_totals {
+        if let Some(ref st) = stuck_totals {
             let v = st.get(i).unwrap_or(0.0) as u64;
             if v > 0 {
-                line.push_str(&format!("  stalls={}", v));
+                line.push_str(&format!("  stuck={}", v));
             }
         }
         if let Some(ref fb) = fallbacks {
@@ -4191,13 +4200,13 @@ mod tests {
     /// Pinned via the registry walk so a future entry that forgot
     /// to specify `kind` fails to compile (struct-literal
     /// non_exhaustive forces it), and a registry entry whose kind
-    /// is `Counter` matches one of the well-known total/stall_count
+    /// is `Counter` matches one of the well-known total/stuck_count
     /// names — drift either direction trips here.
     #[test]
     fn every_metric_has_kind_consistent_with_naming() {
         for m in METRICS {
             // Counter metrics must be named with `total_` / `_count` /
-            // `total_iterations` / `stall_count` per the established
+            // `total_iterations` / `stuck_count` per the established
             // convention.
             if matches!(m.kind, MetricKind::Counter) {
                 assert!(
@@ -4262,7 +4271,7 @@ mod tests {
             migration_ratio: 0.0,
             imbalance_ratio: 1.0,
             max_dsq_depth: 2,
-            stall_count: 0,
+            stuck_count: 0,
             fallback_count: 0,
             keep_last_count: 0,
             worst_p99_wake_latency_us: 0.0,
@@ -4289,7 +4298,7 @@ mod tests {
         r1.gap_ms = 200;
         r1.imbalance_ratio = 2.5; // > 1.0, should show imbal=2.5
         r1.max_dsq_depth = 8; // > 0, should show dsq=8
-        r1.stall_count = 2; // > 0, should show stalls=2
+        r1.stuck_count = 2; // > 0, should show stuck=2
         r1.fallback_count = 15; // > 0, should show fallback=15
         let r2 = make_row("fast", "tiny-1llc", true, 4.0);
         let rows = vec![r1, r2];
@@ -4314,7 +4323,7 @@ mod tests {
         );
         assert!(out.contains("imbal=2.5"), "slow: imbal=2.5, got:\n{out}");
         assert!(out.contains("dsq=8"), "slow: dsq=8, got:\n{out}");
-        assert!(out.contains("stalls=2"), "slow: stalls=2, got:\n{out}");
+        assert!(out.contains("stuck=2"), "slow: stuck=2, got:\n{out}");
         assert!(
             out.contains("fallback=15"),
             "slow: fallback=15, got:\n{out}"
@@ -4384,7 +4393,7 @@ mod tests {
                 total_samples: 10,
                 max_imbalance_ratio: 2.5,
                 max_local_dsq_depth: 4,
-                stall_detected: true,
+                stuck_detected: true,
                 event_deltas: Some(monitor::ScxEventDeltas {
                     total_fallback: 7,
                     fallback_rate: 0.5,
@@ -4411,7 +4420,7 @@ mod tests {
         assert_eq!(row.migrations, 12);
         assert_eq!(row.imbalance_ratio, 2.5);
         assert_eq!(row.max_dsq_depth, 4);
-        assert_eq!(row.stall_count, 1);
+        assert_eq!(row.stuck_count, 1);
         assert_eq!(row.fallback_count, 7);
         assert_eq!(row.keep_last_count, 3);
     }
@@ -4430,7 +4439,7 @@ mod tests {
         assert!(!row.passed);
         assert_eq!(row.imbalance_ratio, 0.0);
         assert_eq!(row.max_dsq_depth, 0);
-        assert_eq!(row.stall_count, 0);
+        assert_eq!(row.stuck_count, 0);
         assert_eq!(row.fallback_count, 0);
         assert_eq!(row.keep_last_count, 0);
     }
@@ -4673,7 +4682,7 @@ mod tests {
                 total_samples: 5,
                 max_imbalance_ratio: 1.0,
                 max_local_dsq_depth: 0,
-                stall_detected: false,
+                stuck_detected: false,
                 event_deltas: None,
                 schedstat_deltas: None,
                 ..Default::default()
@@ -4681,7 +4690,7 @@ mod tests {
             ..test_support::SidecarResult::test_fixture()
         };
         let row = sidecar_to_row(&sc);
-        assert_eq!(row.stall_count, 0);
+        assert_eq!(row.stuck_count, 0);
         assert_eq!(row.fallback_count, 0);
         assert_eq!(row.keep_last_count, 0);
     }
@@ -4997,6 +5006,7 @@ mod tests {
             "task_run_delay_ns",
             "io_completion_ms",
             "stall_count",
+            "stuck_count",
             "schedule_jitter_cv",
             "max_gap_us",
             "spread",
@@ -5541,7 +5551,7 @@ mod tests {
         row.migration_ratio = 0.3;
         row.imbalance_ratio = 2.0;
         row.max_dsq_depth = 5;
-        row.stall_count = 3;
+        row.stuck_count = 3;
         row.fallback_count = 11;
         row.keep_last_count = 4;
         row.worst_p99_wake_latency_us = 99.0;
@@ -5558,7 +5568,7 @@ mod tests {
         assert_eq!(read_metric(&row, "worst_migration_ratio"), Some(0.3));
         assert_eq!(read_metric(&row, "max_imbalance_ratio"), Some(2.0));
         assert_eq!(read_metric(&row, "max_dsq_depth"), Some(5.0));
-        assert_eq!(read_metric(&row, "stall_count"), Some(3.0));
+        assert_eq!(read_metric(&row, "stuck_count"), Some(3.0));
         assert_eq!(read_metric(&row, "total_fallback"), Some(11.0));
         assert_eq!(read_metric(&row, "total_keep_last"), Some(4.0));
         assert_eq!(read_metric(&row, "worst_p99_wake_latency_us"), Some(99.0));
@@ -7214,7 +7224,7 @@ mod tests {
             migration_ratio: 0.0,
             imbalance_ratio: 0.0,
             max_dsq_depth: 0,
-            stall_count: 0,
+            stuck_count: 0,
             fallback_count: 0,
             keep_last_count: 0,
             worst_p99_wake_latency_us: 0.0,
@@ -7860,7 +7870,7 @@ mod tests {
         row.migration_ratio = spread / 100.0;
         row.imbalance_ratio = spread / 10.0;
         row.max_dsq_depth = (gap_ms / 10) as u32;
-        row.stall_count = (migrations / 10) as usize;
+        row.stuck_count = (migrations / 10) as usize;
         row.fallback_count = migrations as i64;
         row.keep_last_count = -(migrations as i64);
         row.worst_p99_wake_latency_us = spread * 2.0;

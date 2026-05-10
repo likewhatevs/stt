@@ -1702,9 +1702,9 @@ impl VcpuTiming {
 /// Returns `true` only when BOTH samples produced a valid reading
 /// (`Some`) and the delta falls strictly below `threshold_ns`. Any
 /// missing reading (`None` on either side) is treated as "no data" and
-/// returns `false` — the stall path must NEVER infer preemption from
+/// returns `false` — the stuck path must NEVER infer preemption from
 /// absent data, otherwise a clock-read failure would silently suppress
-/// every subsequent stall (the original bug).
+/// every subsequent stuck reading (the original bug).
 ///
 /// Uses `saturating_sub` to tolerate non-monotonic reads across clock
 /// resolution edges; a non-monotonic sample yields delta=0, which is
@@ -1717,26 +1717,33 @@ pub(crate) fn evaluate_preempted(prev: Option<u64>, curr: Option<u64>, threshold
     }
 }
 
-/// Decide whether a CPU stalled between two consecutive samples.
+/// Decide whether a CPU is stuck between two consecutive samples.
 ///
-/// A stall means the scheduler made no progress on this CPU: `rq_clock`
+/// "Stuck" means the scheduler made no progress on this CPU: `rq_clock`
 /// did not advance AND the CPU was not legitimately quiescent. The two
 /// legitimate exemptions — NOHZ idle (both samples show `nr_running==0`)
 /// and vCPU preemption (host scheduled the vCPU thread off-CPU, so the
 /// vCPU couldn't tick the clock) — are recognized here so callers don't
 /// re-derive the predicate.
 ///
+/// Distinct from sched_ext's watchdog stall (`SCX_EXIT_ERROR_STALL`,
+/// emitted by the kernel when a runnable task hasn't been scheduled
+/// within the watchdog timeout): "stuck" describes a CPU whose
+/// rq_clock isn't advancing, while watchdog "stall" describes a
+/// task that hasn't run. The two conditions can co-occur but have
+/// different root causes and detection paths.
+///
 /// This helper exists to keep the post-hoc `MonitorSummary::from_samples`
 /// path and the reactive `MonitorThresholds::evaluate` path in lock-step:
 /// previously each site re-implemented the same four-condition conjunction
 /// and drifting one half would let the SysRq-D trigger fire on conditions
 /// the post-hoc verdict accepted (or vice versa). Both callers now agree
-/// on a single definition of "stall" by construction.
+/// on a single definition of "stuck" by construction.
 ///
 /// `rq_clock == 0` is treated as "never sampled" and returns false —
 /// the first sample interval typically reads zero before the kernel
-/// writes rq_clock, and a zero-to-zero comparison must not fire a stall.
-pub(crate) fn is_cpu_stalled(
+/// writes rq_clock, and a zero-to-zero comparison must not fire a stuck.
+pub(crate) fn is_cpu_stuck(
     prev: &super::CpuSnapshot,
     curr: &super::CpuSnapshot,
     preemption_threshold_ns: u64,
@@ -2649,7 +2656,7 @@ pub(crate) fn monitor_loop(
             }
 
             // Stamp vCPU CPU times into the per-CPU snapshots. Reactive
-            // stall detection below reads these via `is_cpu_stalled`; the
+            // stuck detection below reads these via `is_cpu_stuck`; the
             // post-hoc `MonitorThresholds::evaluate` path reads them off
             // the pushed samples.
             if let Some(vt) = vcpu_timing {
@@ -2689,7 +2696,7 @@ pub(crate) fn monitor_loop(
 
         // Inline threshold evaluation for reactive dump. Each check
         // mirrors `MonitorThresholds::evaluate`: the same
-        // `SustainedViolationTracker`, the same `is_cpu_stalled`
+        // `SustainedViolationTracker`, the same `is_cpu_stuck`
         // predicate, the same `imbalance_ratio`/`local_dsq_depth`
         // reads. Any drift would let the reactive SysRq-D trigger
         // fire on conditions the post-hoc verdict accepts (or vice
@@ -2719,8 +2726,8 @@ pub(crate) fn monitor_loop(
                 sample_idx,
             );
 
-            // Stall check: per-CPU sustained window. Delegate to
-            // `is_cpu_stalled` so reactive and post-hoc stall paths
+            // Stuck check: per-CPU sustained window. Delegate to
+            // `is_cpu_stuck` so reactive and post-hoc stuck paths
             // cannot drift — the predicate owns the idle + preempted
             // exemptions. `vcpu_cpu_time_ns` is already stamped into
             // `cpus[i]` (and into the last pushed sample) above, so the
@@ -2730,7 +2737,7 @@ pub(crate) fn monitor_loop(
             {
                 let n = prev.cpus.len().min(cpus.len()).min(stall_trackers.len());
                 for i in 0..n {
-                    let is_stall = is_cpu_stalled(&prev.cpus[i], &cpus[i], preemption_threshold_ns);
+                    let is_stall = is_cpu_stuck(&prev.cpus[i], &cpus[i], preemption_threshold_ns);
                     stall_trackers[i].record(is_stall, cpus[i].rq_clock as f64, sample_idx);
                 }
             }
@@ -4498,11 +4505,11 @@ mod tests {
             "reactive: idle CPU should not queue SIGNAL_VC_DUMP; pending RX: {pending:?}"
         );
 
-        // Evaluate: from_samples should not detect stall.
+        // Evaluate: from_samples should not detect stuck.
         let summary = super::super::MonitorSummary::from_samples(&samples);
         assert!(
-            !summary.stall_detected,
-            "from_samples: idle CPU should not flag stall"
+            !summary.stuck_detected,
+            "from_samples: idle CPU should not flag stuck"
         );
 
         // Evaluate verdict: should pass (no stall on idle CPU).

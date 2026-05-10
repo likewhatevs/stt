@@ -168,7 +168,7 @@ fn empty_samples_default_summary() {
     assert_eq!(summary.total_samples, 0);
     assert_eq!(summary.max_imbalance_ratio, 0.0);
     assert_eq!(summary.max_local_dsq_depth, 0);
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
     assert_eq!(summary.avg_local_dsq_depth, 0.0);
@@ -198,7 +198,7 @@ fn single_sample_imbalanced_cpus() {
     assert_eq!(summary.total_samples, 1);
     assert!((summary.max_imbalance_ratio - 4.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 3);
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
     // avg fields: single sample with cpus [nr_running=1, nr_running=4]
     assert!((summary.avg_imbalance_ratio - 4.0).abs() < f64::EPSILON);
     assert!((summary.avg_nr_running - 2.5).abs() < f64::EPSILON);
@@ -206,7 +206,7 @@ fn single_sample_imbalanced_cpus() {
 }
 
 #[test]
-fn stall_detected_when_clock_stuck() {
+fn stuck_detected_when_clock_stuck() {
     let s1 = MonitorSample {
         prog_stats: None,
         elapsed_ms: 100,
@@ -240,7 +240,7 @@ fn stall_detected_when_clock_stuck() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2]);
-    assert!(summary.stall_detected);
+    assert!(summary.stuck_detected);
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn balanced_cpus_ratio_one() {
     };
     let summary = MonitorSummary::from_samples(&[sample]);
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
     assert!((summary.avg_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert!((summary.avg_nr_running - 3.0).abs() < f64::EPSILON);
     assert!((summary.avg_local_dsq_depth - 0.0).abs() < f64::EPSILON);
@@ -286,7 +286,7 @@ fn single_cpu_no_division_by_zero() {
     // Single CPU: min == max, ratio = 1.0
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 2);
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
 }
 
 #[test]
@@ -303,7 +303,7 @@ fn all_zero_snapshots() {
     assert!((summary.max_imbalance_ratio - 1.0).abs() < f64::EPSILON);
     assert_eq!(summary.max_local_dsq_depth, 0);
     // rq_clock=0 is excluded from stall detection
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
     // avg: valid sample with 2 all-zero CPUs
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
@@ -377,7 +377,7 @@ fn min_nr_zero_max_nr_nonzero() {
 }
 
 #[test]
-fn advancing_clocks_no_stall() {
+fn advancing_clocks_no_stuck() {
     let s1 = MonitorSample {
         prog_stats: None,
         elapsed_ms: 100,
@@ -427,7 +427,7 @@ fn advancing_clocks_no_stall() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2, s3]);
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
     assert_eq!(summary.total_samples, 3);
 }
 
@@ -473,7 +473,7 @@ fn different_length_cpu_vecs() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2]);
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
     assert_eq!(summary.total_samples, 2);
     // max_local_dsq_depth comes from all CPUs in all samples.
     assert_eq!(summary.max_local_dsq_depth, 0);
@@ -742,9 +742,9 @@ fn thresholds_dsq_depth_below_sustained_passes() {
 }
 
 #[test]
-fn thresholds_stall_detected_fails() {
-    // Stalls use the sustained_samples window. With sustained_samples=1,
-    // a single stall pair triggers failure.
+fn thresholds_stuck_detected_fails() {
+    // Stuck checks use the sustained_samples window. With sustained_samples=1,
+    // a single stuck pair triggers failure.
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
@@ -796,7 +796,7 @@ fn thresholds_stall_detected_fails() {
 }
 
 #[test]
-fn thresholds_stall_disabled_passes() {
+fn thresholds_stuck_disabled_passes() {
     let t = MonitorThresholds {
         fail_on_stall: false,
         sustained_samples: 100,
@@ -1835,10 +1835,10 @@ fn from_samples_fields_sane_values() {
         "dsq depth must be small in this controlled test: {}",
         summary.max_local_dsq_depth
     );
-    // stall_detected: rq_clock advances each sample, so no stall
+    // stuck_detected: rq_clock advances each sample, so no stuck
     assert!(
-        !summary.stall_detected,
-        "no stall expected with advancing rq_clock"
+        !summary.stuck_detected,
+        "no stuck expected with advancing rq_clock"
     );
     // event_deltas: should be computed
     let deltas = summary
@@ -1887,7 +1887,7 @@ fn from_samples_empty_all_defaults() {
     assert_eq!(summary.total_samples, 0);
     assert_eq!(summary.max_imbalance_ratio, 0.0);
     assert_eq!(summary.max_local_dsq_depth, 0);
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
     assert_eq!(summary.avg_imbalance_ratio, 0.0);
     assert_eq!(summary.avg_nr_running, 0.0);
     assert_eq!(summary.avg_local_dsq_depth, 0.0);
@@ -1932,7 +1932,7 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
         summary.max_imbalance_ratio >= 1.5,
         "summary must capture ratio"
     );
-    assert!(!summary.stall_detected, "no stall in this scenario");
+    assert!(!summary.stuck_detected, "no stall in this scenario");
     assert_eq!(summary.total_samples, 3);
     let report = MonitorReport {
         samples,
@@ -2026,9 +2026,9 @@ fn neg_tight_dsq_threshold_catches_small_depth() {
 }
 
 #[test]
-fn neg_stall_detection_catches_frozen_rq_clock() {
-    // Stalls use sustained_samples window. sustained_samples=1 means
-    // a single stall pair triggers failure.
+fn neg_stuck_detection_catches_frozen_rq_clock() {
+    // Stuck checks use sustained_samples window. sustained_samples=1 means
+    // a single stuck pair triggers failure.
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
@@ -2070,8 +2070,8 @@ fn neg_stall_detection_catches_frozen_rq_clock() {
     ];
     let summary = MonitorSummary::from_samples(&samples);
     assert!(
-        summary.stall_detected,
-        "summary.stall_detected must be true"
+        summary.stuck_detected,
+        "summary.stuck_detected must be true"
     );
     let report = MonitorReport {
         samples,
@@ -2097,7 +2097,7 @@ fn neg_stall_detection_catches_frozen_rq_clock() {
 }
 
 #[test]
-fn neg_combined_imbalance_and_stall_both_reported() {
+fn neg_combined_imbalance_and_stuck_both_reported() {
     let t = MonitorThresholds {
         max_imbalance_ratio: 2.0,
         sustained_samples: 1,
@@ -2139,7 +2139,7 @@ fn neg_combined_imbalance_and_stall_both_reported() {
         },
     ];
     let summary = MonitorSummary::from_samples(&samples);
-    assert!(summary.stall_detected);
+    assert!(summary.stuck_detected);
     assert!(summary.max_imbalance_ratio >= 10.0);
     let report = MonitorReport {
         samples,
@@ -2168,7 +2168,7 @@ fn neg_combined_imbalance_and_stall_both_reported() {
 }
 
 #[test]
-fn stall_idle_cpu_exempt() {
+fn stuck_idle_cpu_exempt() {
     // nr_running==0 on both samples: idle CPU, NOHZ tick stopped.
     // rq_clock not advancing is expected, not a stall.
     let t = MonitorThresholds {
@@ -2212,7 +2212,7 @@ fn stall_idle_cpu_exempt() {
     ];
     let summary = MonitorSummary::from_samples(&samples);
     assert!(
-        !summary.stall_detected,
+        !summary.stuck_detected,
         "idle CPU should not trigger stall in summary"
     );
     let report = MonitorReport {
@@ -2229,7 +2229,7 @@ fn stall_idle_cpu_exempt() {
 }
 
 #[test]
-fn stall_idle_to_busy_not_exempt() {
+fn stuck_idle_to_busy_not_exempt() {
     // nr_running transitions from 0 to 1 — the CPU woke up but
     // rq_clock didn't advance. This IS a stall (the CPU is now
     // busy but the scheduler tick hasn't fired).
@@ -2275,7 +2275,7 @@ fn stall_idle_to_busy_not_exempt() {
     ];
     let summary = MonitorSummary::from_samples(&samples);
     assert!(
-        summary.stall_detected,
+        summary.stuck_detected,
         "busy CPU with frozen clock is a stall"
     );
     let report = MonitorReport {
@@ -2292,7 +2292,7 @@ fn stall_idle_to_busy_not_exempt() {
 }
 
 #[test]
-fn stall_sustained_window_filters_transient() {
+fn stuck_sustained_window_filters_transient() {
     // With sustained_samples=3, a 2-sample stall doesn't trigger.
     // Second CPU has a different clock value so data_looks_valid passes.
     let t = MonitorThresholds {
@@ -2349,7 +2349,7 @@ fn stall_sustained_window_filters_transient() {
 }
 
 #[test]
-fn stall_sustained_window_catches_real_stall() {
+fn stuck_sustained_window_catches_real_stuck() {
     // With sustained_samples=3, 3+ consecutive stall pairs trigger.
     // Second CPU has a different clock value so data_looks_valid passes.
     let t = MonitorThresholds {
@@ -2388,7 +2388,7 @@ fn stall_sustained_window_catches_real_stall() {
 }
 
 #[test]
-fn from_samples_idle_cpu_no_stall() {
+fn from_samples_idle_cpu_no_stuck() {
     // from_samples should not flag stall when both samples have
     // nr_running==0 on the stuck CPU.
     let s1 = MonitorSample {
@@ -2424,11 +2424,11 @@ fn from_samples_idle_cpu_no_stall() {
         ],
     };
     let summary = MonitorSummary::from_samples(&[s1, s2]);
-    assert!(!summary.stall_detected);
+    assert!(!summary.stuck_detected);
 }
 
 #[test]
-fn stall_below_sustained_passes() {
+fn stuck_below_sustained_passes() {
     // 1 stall pair with sustained_samples=5 should pass.
     // Second CPU has a different clock value so data_looks_valid passes.
     let t = MonitorThresholds {
@@ -2581,7 +2581,7 @@ fn neg_keep_last_rate_threshold_fires() {
 // -- vCPU CPU time gating tests --
 
 #[test]
-fn evaluate_suppresses_stall_when_vcpu_preempted() {
+fn evaluate_suppresses_stuck_when_vcpu_preempted() {
     // vcpu_cpu_time_ns shows < threshold advancement -> vCPU was
     // preempted, stall should be suppressed. Use explicit threshold
     // (10ms) to avoid host CONFIG_HZ dependency.
@@ -2630,7 +2630,7 @@ fn evaluate_suppresses_stall_when_vcpu_preempted() {
     ];
     let summary = MonitorSummary::from_samples_with_threshold(&samples, 10_000_000);
     assert!(
-        !summary.stall_detected,
+        !summary.stuck_detected,
         "preempted vCPU should not flag stall in summary"
     );
     let report = MonitorReport {
@@ -2649,7 +2649,7 @@ fn evaluate_suppresses_stall_when_vcpu_preempted() {
 }
 
 #[test]
-fn evaluate_catches_stall_when_vcpu_running() {
+fn evaluate_catches_stuck_when_vcpu_running() {
     // vcpu_cpu_time_ns shows advancement >= threshold -> vCPU was
     // running, stall is real. Use explicit threshold (10ms) to avoid
     // host CONFIG_HZ dependency (DEFAULT_HZ=250 gives 40ms threshold,
@@ -2699,7 +2699,7 @@ fn evaluate_catches_stall_when_vcpu_running() {
     ];
     let summary = MonitorSummary::from_samples_with_threshold(&samples, 10_000_000);
     assert!(
-        summary.stall_detected,
+        summary.stuck_detected,
         "running vCPU with stuck clock is a stall"
     );
     let report = MonitorReport {
@@ -2715,7 +2715,7 @@ fn evaluate_catches_stall_when_vcpu_running() {
 }
 
 #[test]
-fn evaluate_stall_none_vcpu_time_falls_back_to_current_behavior() {
+fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
     // vcpu_cpu_time_ns is None -> assume vCPU was running (don't suppress).
     let t = MonitorThresholds {
         fail_on_stall: true,
@@ -2758,7 +2758,7 @@ fn evaluate_stall_none_vcpu_time_falls_back_to_current_behavior() {
     ];
     let summary = MonitorSummary::from_samples(&samples);
     assert!(
-        summary.stall_detected,
+        summary.stuck_detected,
         "None vcpu time should not suppress stall"
     );
     let report = MonitorReport {
@@ -2775,7 +2775,7 @@ fn evaluate_stall_none_vcpu_time_falls_back_to_current_behavior() {
 }
 
 #[test]
-fn from_samples_suppresses_stall_when_vcpu_preempted() {
+fn from_samples_suppresses_stuck_when_vcpu_preempted() {
     // from_samples_with_threshold should respect vcpu_cpu_time_ns
     // gating. Use explicit threshold to avoid host CONFIG_HZ dependency.
     let s1 = MonitorSample {
@@ -2816,7 +2816,7 @@ fn from_samples_suppresses_stall_when_vcpu_preempted() {
     };
     let summary = MonitorSummary::from_samples_with_threshold(&[s1, s2], 10_000_000);
     assert!(
-        !summary.stall_detected,
+        !summary.stuck_detected,
         "preempted vCPU should not flag stall"
     );
 }
