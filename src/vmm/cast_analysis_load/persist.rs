@@ -225,11 +225,11 @@ mod tests {
         );
 
         let hash = 0xDEAD_BEEF_CAFE_1234u64;
-        try_save(hash, &cast_map, &fwd_index, 2);
+        try_save(hash, &cast_map, &fwd_index, 2, &[]);
 
         let loaded = try_load(hash, 2);
         assert!(loaded.is_some(), "roundtrip must succeed");
-        let (loaded_map, loaded_fwd) = loaded.unwrap();
+        let (loaded_map, loaded_fwd, _alloc_types) = loaded.unwrap();
         assert_eq!(loaded_map.len(), 2);
         assert_eq!(loaded_map.get(&(2, 8)).unwrap().target_type_id, 5);
         assert_eq!(
@@ -256,7 +256,7 @@ mod tests {
         let cast_map = BTreeMap::new();
         let fwd_index = HashMap::new();
         let hash = 0x1234_5678_9ABC_DEF0u64;
-        try_save(hash, &cast_map, &fwd_index, 3);
+        try_save(hash, &cast_map, &fwd_index, 3, &[]);
 
         assert!(
             try_load(hash, 5).is_none(),
