@@ -1759,15 +1759,17 @@ pub trait MemReader {
     }
 
     /// True when `addr` points at an allocator slot the dump pre-pass
-    /// has already rendered into `report.sdt_allocations` (the slot's
-    /// payload appears in the failure dump under that surface — typed
-    /// render when shape inference resolved a concrete BTF id, hex
-    /// fallback otherwise). The arena chase short-circuits on `true`
-    /// so the per-map renderer doesn't re-render the same allocation a
-    /// second time when it follows an entry pointer through a
-    /// TASK_STORAGE / HASH map into the same arena slot. Default
-    /// returns `false` — readers without a rendered-slot index
-    /// proceed with the chase.
+    /// has rendered with a resolved payload type into
+    /// `report.sdt_allocations`. The arena chase short-circuits on
+    /// `true` so the per-map renderer doesn't re-render the same
+    /// allocation a second time when it follows an entry pointer
+    /// through a TASK_STORAGE / HASH map into the same arena slot.
+    /// Implementations restrict the underlying set to slots from
+    /// typed allocators (resolved `target_type_id != 0`); untyped
+    /// pre-pass renders (hex fallback) must NOT suppress per-map
+    /// chases because the cast analyzer's shape inference may resolve
+    /// a target type the heuristic missed. Default returns `false` —
+    /// readers without a rendered-slot index proceed with the chase.
     fn is_already_rendered(&self, _addr: u64) -> bool {
         false
     }
@@ -3421,12 +3423,16 @@ fn chase_arena_pointer(
 ) -> ArenaChaseOutcome {
     // Dedup: when the chased address points at a slot the dump
     // pre-pass has already rendered into `report.sdt_allocations`,
-    // skip the per-map chase so the slot's payload appears in the
-    // failure dump (typed render or hex fallback) under the
-    // sdt_alloc surface only — not also embedded inside whichever
-    // TASK_STORAGE / HASH map's value pointed back at it. The
-    // default trait impl returns `false`, so readers without a
-    // rendered-slot index proceed with the chase as before.
+    // skip the per-map chase so the slot's typed payload already
+    // appears in the failure dump under the sdt_alloc surface — not
+    // also embedded inside whichever TASK_STORAGE / HASH map's value
+    // pointed back at it. The dedup set is restricted to slots from
+    // typed allocators (resolved `target_type_id != 0`); untyped
+    // pre-pass renders (hex fallback) must NOT suppress per-map
+    // chases because the cast analyzer's shape inference may resolve
+    // a target type the heuristic missed. The default trait impl
+    // returns `false`, so readers without a rendered-slot index
+    // proceed with the chase as before.
     if mem.is_already_rendered(val) {
         return ArenaChaseOutcome {
             deref: None,
