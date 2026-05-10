@@ -1998,9 +1998,6 @@ impl<'a> Analyzer<'a> {
     ///    renderer's [`MemReader::resolve_arena_type`] bridge
     ///    resolves the payload type at chase time.
     fn handle_stx(&mut self, dst: usize, src: usize, size: u8, off: i16) {
-        // Bounds: BPF reg indices are 0..=10. The decoded fields are
-        // 4-bit (0..=15) so a malformed instruction stream could put
-        // 11..=15 here; reject without indexing into the array.
         if dst >= self.regs.len() || src >= self.regs.len() {
             return;
         }
@@ -2025,11 +2022,6 @@ impl<'a> Analyzer<'a> {
             // gives an Unknown register. Pointer / LoadedU64Field
             // round-trip preserved.
             self.stack_slots.insert(off, self.regs[src]);
-            if !matches!(self.regs[src], RegState::ArenaU64FromAlloc)
-                && let Some(bridge_key) = self.bridge_slot_origins.remove(&off)
-            {
-                self.arena_stx_findings.remove(&bridge_key);
-            }
             return;
         }
 
