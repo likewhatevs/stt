@@ -30,17 +30,17 @@
 //! guest, untranslatable page, corrupted blob), the renderer falls
 //! back to the caller-supplied vmlinux BTF.
 //!
-//! # sdt_alloc post-pass
+//! # sdt_alloc pre-pass
 //!
-//! After the per-map walk completes, [`dump_state`] runs a post-pass
+//! Before the per-map walk runs, [`dump_state`] runs a pre-pass
 //! that locates `sdt_alloc`-backed allocator instances inside the
 //! scheduler's `.bss` and surfaces every live per-task / per-cgroup
 //! allocation as structured records under
 //! [`FailureDumpReport::sdt_allocations`]. The walk runs only when
 //! every prerequisite is present:
 //!   - the per-map dump deadline has not been exceeded (the
-//!     post-pass runs after every map render, and an earlier
-//!     render exhausting the budget skips the walk to keep the
+//!     pre-pass runs before every map render, and an earlier
+//!     phase exhausting the budget skips the walk to keep the
 //!     dump bounded),
 //!   - the arena's `user_vm_start` is 4 GiB-aligned (low 32 bits
 //!     zero — the bridge's address arithmetic treats slot starts as
@@ -54,7 +54,7 @@
 //!   - the program BTF carries `struct scx_allocator` (the scheduler
 //!     links `lib/sdt_alloc.bpf.c`).
 //!
-//! When any prerequisite is missing, the post-pass leaves
+//! When any prerequisite is missing, the pre-pass leaves
 //! `sdt_allocations` empty rather than failing the dump — the
 //! per-map page-granular [`super::arena::ArenaSnapshot`] still
 //! captures raw arena content for callers that don't need
@@ -2540,7 +2540,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     // indicating a stale snapshot from a freed allocation racing
     // with the freeze) keep the FIRST entry; this matches the
     // [`build_arena_page_index`] policy on duplicate user_addr
-    // pages and emits a `tracing::debug!` line so an operator
+    // pages and emits a `tracing::warn!` line so an operator
     // diagnosing a wrong-render can spot the collision.
     let mut arena_type_index = crate::monitor::dump::render_map::ArenaTypeIndex::new();
     // 4 GiB-alignment invariant: the bridge keys on the low 32
@@ -2726,7 +2726,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // Append this allocator's slots to the bridge index.
                 // The helper handles the size-fits-u32 check, the
                 // dedup-on-duplicate-slot-start, and the
-                // `tracing::debug!` collision diagnostic — see
+                // `tracing::warn!` collision diagnostic — see
                 // [`append_arena_type_index_for_allocator`] for the
                 // full contract. Bridge gate (`target_type_id
                 // != 0`) is encoded inside the helper as well; the
@@ -2754,27 +2754,57 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
     } else {
         Some(&arena_type_index)
     };
-    // Build the rendered-slot set for arena chase dedup. Includes
-    // every live slot the sdt_alloc walker surfaced under any
-    // `report.sdt_allocations` entry — typed AND untyped allocators
-    // both populate `SdtAllocatorSnapshot::all_slot_addrs` via
-    // [`super::sdt_alloc::TreeWalker::emit_leaf`]'s unconditional
-    // push (the field is keyed on the live-slot wire shape, not on
-    // payload type resolution). Keying on `arena_type_index.keys()`
-    // alone would have missed slots from allocators whose
-    // `target_type_id == 0` — those allocators never reach
-    // `append_arena_type_index_for_allocator` (the helper short-
-    // circuits on a zero target id) yet their slots ARE rendered in
-    // `report.sdt_allocations`. The per-map renderer's
-    // [`MemReader::is_already_rendered`] consults this set to skip
-    // re-rendering the same allocation when a TASK_STORAGE / HASH
-    // map's value pointer chases back into it; missing untyped slots
-    // would surface them twice in the dump (once under the typed-
-    // allocator surface, once embedded in the per-map render).
+    // Build the rendered-slot set for arena chase dedup. Keys on
+    // every slot that is actually rendered under
+    // `report.sdt_allocations` — typed AND untyped allocators both
+    // contribute via [`SdtAllocEntry::user_addr`] (emit_leaf records
+    // an entry on every leaf it visits, regardless of whether
+    // payload BTF resolution succeeded). Keying on
+    // `arena_type_index.keys()` alone would have missed slots from
+    // allocators whose `target_type_id == 0` — those allocators
+    // never reach `append_arena_type_index_for_allocator` (the
+    // helper short-circuits on a zero target id) yet their slots
+    // ARE rendered in `report.sdt_allocations`.
+    //
+    // Two address keys per entry: the slot start (`user_addr`) and
+    // the payload start (`user_addr + header_size`). Chase targets
+    // resolved via `scx_task_data(p)` and similar helpers point at
+    // the payload, not the slot start; without the payload-start
+    // key the dedup misses every chase that uses the helper-
+    // computed pointer.
+    //
+    // Slots past [`super::sdt_alloc::MAX_SDT_ALLOC_ENTRIES`] are
+    // intentionally excluded — they are NOT rendered in
+    // `snap.entries`, so the per-map renderer must surface their
+    // payload (otherwise the truncated tail would appear nowhere
+    // in the dump). The walker's `truncated` flag is the operator-
+    // visible signal that some slots are only available via the
+    // per-map render path.
+    //
+    // The per-map renderer's [`MemReader::is_already_rendered`]
+    // consults this set to skip re-rendering the same allocation
+    // when a TASK_STORAGE / HASH map's value pointer chases back
+    // into it; missing untyped slots would surface them twice in
+    // the dump (once under the typed-allocator surface, once
+    // embedded in the per-map render).
+    let header_size_by_allocator: std::collections::HashMap<&str, usize> = sdt_alloc_metas
+        .iter()
+        .map(|meta| (meta.allocator_name.as_str(), meta.header_size))
+        .collect();
     let rendered_slot_addrs: std::collections::HashSet<u32> = report
         .sdt_allocations
         .iter()
-        .flat_map(|snap| snap.all_slot_addrs.iter().map(|&a| a as u32))
+        .flat_map(|snap| {
+            let header_size = header_size_by_allocator
+                .get(snap.allocator_name.as_str())
+                .copied()
+                .unwrap_or(0);
+            snap.entries.iter().flat_map(move |e| {
+                let slot_start = e.user_addr as u32;
+                let payload_start = slot_start.wrapping_add(header_size as u32);
+                [slot_start, payload_start]
+            })
+        })
         .collect();
     let rendered_slot_addrs_ref = if rendered_slot_addrs.is_empty() {
         None
