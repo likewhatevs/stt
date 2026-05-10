@@ -1276,16 +1276,26 @@ impl<'a> Analyzer<'a> {
 
             if insn.code == (BPF_CLASS_JMP | BPF_OP_CALL) && insn.src_reg() == BPF_PSEUDO_CALL {
                 let callee_pc = (pc as i64 + 1 + insn.imm as i64) as usize;
-                self.caller_arg_types.insert(
-                    callee_pc,
-                    [
-                        self.regs[1],
-                        self.regs[2],
-                        self.regs[3],
-                        self.regs[4],
-                        self.regs[5],
-                    ],
-                );
+                let new_args = [
+                    self.regs[1],
+                    self.regs[2],
+                    self.regs[3],
+                    self.regs[4],
+                    self.regs[5],
+                ];
+                self.caller_arg_types
+                    .entry(callee_pc)
+                    .and_modify(|existing| {
+                        for (slot, new) in existing.iter_mut().zip(new_args.iter()) {
+                            match (*slot, *new) {
+                                (RegState::Unknown, _) => *slot = *new,
+                                (_, RegState::Unknown) => {}
+                                (a, b) if a == b => {}
+                                _ => *slot = RegState::Unknown,
+                            }
+                        }
+                    })
+                    .or_insert(new_args);
             }
 
             self.step(*insn, &mut skip_next, datasec_hit, alloc_seed);
