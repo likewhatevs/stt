@@ -2174,9 +2174,7 @@ fn addr_space_cast_arena_alone_does_not_emit() {
     // and the kptr finding emits. Establishes the baseline
     // "STX would have recorded" so that (2)'s empty result is
     // attributable to the conflict, not to a non-functional
-    // STX path. Without this baseline (2)'s empty result could
-    // be explained by either "conflict dropped" or "STX never
-    // recorded for some other reason".
+    // STX path.
     let insns_kptr_only = vec![stx(BPF_SIZE_DW, 1, 5, 8), exit()];
     let map_kptr_only = analyze_casts(
         &insns_kptr_only,
@@ -3880,9 +3878,6 @@ fn finalize_arena_confirmed_conflicts_with_kptr() {
         &[],
         &[],
     );
-    // Both observations must drop. Specifically: the kptr finding
-    // for (T, 8) -> Q must NOT appear, and no arena entry can
-    // appear either (the access set was empty anyway).
     assert!(
         !map.contains_key(&(t_id, 8)),
         "arena_confirmed + kptr conflict on (T, 8) must drop both: {map:?}"

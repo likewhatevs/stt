@@ -1267,7 +1267,22 @@ impl<'a> Analyzer<'a> {
         // (false negative), which is the safe direction. Even if
         // proto resolution fails below, stale typed-pointer state
         // from a prior function must not survive past this entry.
+        // Preserve R0 across FuncEntry when it holds a fresh
+        // allocator-return seed. In BPF's concatenated text layout,
+        // a call at the end of subprogram A is immediately followed
+        // by subprogram B's FuncEntry at PC+1. The SubprogReturn
+        // seed sets R0 = ArenaU64FromAlloc{alloc_size} at the call
+        // PC; without preservation, the FuncEntry reset at PC+1
+        // destroys it before any subsequent instruction can
+        // propagate the alloc_size to an STX finding.
+        let saved_r0 = match self.regs[0] {
+            r0 @ RegState::ArenaU64FromAlloc { alloc_size: Some(_), .. } => Some(r0),
+            _ => None,
+        };
         self.regs = [RegState::Unknown; 11];
+        if let Some(r0) = saved_r0 {
+            self.regs[0] = r0;
+        }
         self.stack_slots.clear();
         self.bridge_slot_origins.clear();
         self.func_has_alloc = false;
@@ -2867,32 +2882,38 @@ impl<'a> Analyzer<'a> {
             match slot {
                 _ if ever_arena => {
                     self.note_type_id(value_struct_id);
+                    let captured = match slot {
+                        RegState::ArenaU64FromAlloc { alloc_size, .. } => alloc_size,
+                        RegState::LoadedU64Field { source_struct_id, field_offset } => {
+                            self.arena_alloc_size_index
+                                .get(&(source_struct_id, field_offset))
+                                .copied()
+                                .flatten()
+                        }
+                        _ => None,
+                    };
                     if let std::collections::btree_map::Entry::Vacant(e) =
                         self.arena_stx_findings.entry(key)
                     {
                         e.insert(ArenaStxEntry::Pending);
-                        // Record any captured alloc_size that came in
-                        // via the slot's RegState — a slot whose
-                        // recorded state is `ArenaU64FromAlloc { ..,
-                        // alloc_size: Some(n) }` (e.g. from a prior
-                        // STX of a `scx_static_alloc_internal` return
-                        // through this slot) propagates the size into
-                        // the per-slot index. Slots reaching this arm
-                        // via the `None if ever_arena` heuristic
-                        // synthesise `alloc_size: None`, which
-                        // records absence-of-capture in the index.
-                        let captured = match slot {
-                            RegState::ArenaU64FromAlloc { alloc_size, .. } => alloc_size,
-                            RegState::LoadedU64Field { source_struct_id, field_offset } => {
-                                self.arena_alloc_size_index
-                                    .get(&(source_struct_id, field_offset))
-                                    .copied()
-                                    .flatten()
-                            }
-                            _ => None,
-                        };
                         self.arena_alloc_size_index.insert(key, captured);
                         self.bridge_slot_origins.insert(slot_off, key);
+                    } else {
+                        match (
+                            self.arena_alloc_size_index.get(&key).copied(),
+                            captured,
+                        ) {
+                            (None, _) => {
+                                self.arena_alloc_size_index.insert(key, captured);
+                            }
+                            (Some(None), Some(_)) => {
+                                self.arena_alloc_size_index.insert(key, captured);
+                            }
+                            (Some(Some(prev)), Some(new)) if prev != new => {
+                                self.arena_alloc_size_index.insert(key, None);
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 RegState::Pointer {
@@ -2991,9 +3012,6 @@ impl<'a> Analyzer<'a> {
             .chain(self.arena_stx_findings.keys().copied())
             .filter(|k| self.kptr_findings.contains_key(k))
             .filter(|k| {
-                // If the slot is arena_confirmed (addr_space_cast
-                // observed), the kptr and arena findings AGREE.
-                // Merge instead of dropping.
                 // Merge when the kptr's target is Fwd in the
                 // entry BTF — a scheduler-specific arena struct
                 // whose body was dropped by split-BTF dedup. A
@@ -3006,14 +3024,6 @@ impl<'a> Analyzer<'a> {
                             return false;
                         }
                     }
-                }
-                // Also check arena_confirmed (addr_space_cast
-                // evidence at the SAME key).
-                if self.arena_confirmed.contains(k) {
-                    if let Some(KptrEntry::Single(tid)) = self.kptr_findings.get(k) {
-                        arena_kptr_merged.insert(*k, *tid);
-                    }
-                    return false;
                 }
                 true // genuine conflict
             })
@@ -3314,6 +3324,9 @@ impl<'a> Analyzer<'a> {
                 continue;
             };
             if conflicting.contains(&key) {
+                continue;
+            }
+            if arena_kptr_merged.contains_key(&key) {
                 continue;
             }
             // Kernel kptr findings carry no allocator-supplied size:

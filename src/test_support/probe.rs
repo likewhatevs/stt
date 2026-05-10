@@ -137,6 +137,52 @@ fn format_tail(text: &str, n: usize, header: &str) -> Option<String> {
 /// [`String::from_utf8_lossy`] (the conversion used by the host
 /// COM1 capture path) emits for non-UTF-8 input, including the raw
 /// 0xFF byte.
+/// Render the repro VM's stderr as a `--- repro VM dmesg ---` tail
+/// after stripping `sched_ext_dump` lines (those land in their own
+/// section via [`extract_sched_ext_dump`]). Returns `None` only when
+/// `format_tail` itself returns `None` (i.e. nothing to surface).
+///
+/// Three cases distinguished:
+///
+/// 1. The filter empties non-empty stderr (every line was a
+///    `sched_ext_dump` record). The VM ran cleanly and produced
+///    real output that is already rendered in the
+///    `--- repro VM sched_ext dump ---` section above; the dmesg
+///    section emits a pointer-to-that diagnostic instead of running
+///    the post-filter empty string through
+///    [`classify_dmesg_corruption`] which would falsely report
+///    "scheduler crashed before kernel printk reached the UART
+///    buffer".
+/// 2. The post-filter text matches a corruption shape recognised
+///    by [`classify_dmesg_corruption`] (genuinely-empty stderr,
+///    all-0xFF, all-U+FFFD, whitespace-only). Surface that
+///    classifier's diagnostic.
+/// 3. The post-filter text has real content — defer to
+///    [`format_tail`] for the standard `n`-line tail render.
+fn render_dmesg_tail(stderr: &str, tail_lines: usize) -> Option<String> {
+    let filtered: String = stderr
+        .lines()
+        .filter(|l| !l.contains("sched_ext_dump"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Distinguish "filter consumed every non-empty line" from
+    // "VM produced no kernel printk." `chars().any(non-whitespace)`
+    // mirrors the `classify_dmesg_corruption` whitespace-only check
+    // so the same input space triggers the same precondition.
+    let pre_filter_had_content = stderr.chars().any(|c| !c.is_whitespace());
+    if filtered.is_empty() && pre_filter_had_content {
+        return Some(
+            "--- repro VM dmesg ---\n(no kernel printk other than \
+             sched_ext_dump — full dump in section above)"
+                .to_string(),
+        );
+    }
+    if let Some(diag) = classify_dmesg_corruption(&filtered) {
+        return Some(format!("--- repro VM dmesg ---\n{diag}"));
+    }
+    format_tail(&filtered, tail_lines, "repro VM dmesg")
+}
+
 fn classify_dmesg_corruption(text: &str) -> Option<&'static str> {
     if text.is_empty() {
         return Some("empty (scheduler crashed before kernel printk reached the UART buffer)");
@@ -661,28 +707,9 @@ pub(crate) fn attempt_auto_repro(
 
     // Filter sched_ext_dump lines from dmesg tail to avoid duplicating
     // the dump section. Only non-dump kernel console lines are shown.
-    //
-    // When the captured stderr is all-empty / all-0xff / all-replacement
-    // (U+FFFD) characters, render an explicit diagnostic instead of an
-    // empty or garbage tail block. 0xff bytes are vm-superio's
-    // uninitialized-read default; a single 0xff or a stream of them
-    // means the scheduler crashed before the kernel printk path
-    // initialised the UART buffer. format_tail's output for such
-    // input is either a header with a blank body (empty stderr) or a
-    // header followed by U+FFFD characters — both confuse operators
-    // who expect a parseable kernel console excerpt. Distinguishing
-    // the cases up-front keeps the rendered section actionable.
-    let dmesg_filtered: String = repro_result
-        .stderr
-        .lines()
-        .filter(|l| !l.contains("sched_ext_dump"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let dmesg_tail = if let Some(diag) = classify_dmesg_corruption(&dmesg_filtered) {
-        Some(format!("--- repro VM dmesg ---\n{diag}"))
-    } else {
-        format_tail(&dmesg_filtered, REPRO_TAIL_LINES, "repro VM dmesg")
-    };
+    // See [`render_dmesg_tail`] for the corruption / filter-empty
+    // disambiguation policy.
+    let dmesg_tail = render_dmesg_tail(&repro_result.stderr, REPRO_TAIL_LINES);
 
     // Inline-render the freeze coordinator's failure-dump JSON when
     // present. The freeze-coord writes a `FailureDumpReport` /
@@ -3861,6 +3888,98 @@ mod tests {
         // SOMETHING for the operator to read. Don't suppress it.
         let diag = classify_dmesg_corruption("\u{fffd}A\u{fffd}");
         assert!(diag.is_none());
+    }
+
+    // -- render_dmesg_tail: filter-empty disambiguation --
+    //
+    // The wrapper around `classify_dmesg_corruption` must distinguish
+    // "VM produced no kernel printk" (genuinely-empty stderr — VM
+    // crashed before any boot line landed) from "VM ran cleanly and
+    // every stderr line is a sched_ext_dump record that's already
+    // rendered in its own tail section above" (the filter empties
+    // non-empty stderr). Without the disambiguation, the second case
+    // surfaces the misleading "scheduler crashed before kernel
+    // printk reached the UART buffer" diagnostic against a clean
+    // run — the bug the cleaner caught.
+
+    #[test]
+    fn render_dmesg_tail_filter_empties_non_empty_stderr_emits_pointer_diag() {
+        // Symptom: clean repro VM whose stderr contains only
+        // sched_ext_dump records. The filter strips every line →
+        // empty `filtered`, but pre_filter content is non-trivial.
+        // Must emit the "no kernel printk other than sched_ext_dump"
+        // pointer diagnostic, NOT the crash classifier's output.
+        let stderr = "[  0.5] sched_ext_dump: header\n\
+                      [  0.6] sched_ext_dump: body line A\n\
+                      [  0.7] sched_ext_dump: body line B\n";
+        let tail = render_dmesg_tail(stderr, 40).expect("must produce a tail");
+        assert!(
+            tail.contains("--- repro VM dmesg ---"),
+            "tail must carry the section header: {tail}",
+        );
+        assert!(
+            tail.contains("no kernel printk other than sched_ext_dump"),
+            "tail must point operators at the sched_ext_dump section, \
+             not falsely report a crash: {tail}",
+        );
+        assert!(
+            !tail.contains("scheduler crashed"),
+            "filter-emptied real output must NOT surface the crash \
+             classifier's diagnostic: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_truly_empty_stderr_emits_crash_diagnostic() {
+        // Pre-filter stderr really is empty — VM crashed before any
+        // kernel printk fired. The crash classifier's "empty
+        // (scheduler crashed...)" diagnostic must still surface.
+        let tail = render_dmesg_tail("", 40).expect("must produce a tail");
+        assert!(
+            tail.contains("scheduler crashed before kernel printk"),
+            "genuinely-empty stderr must surface the crash diagnostic: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_real_kernel_text_passes_through_to_format_tail() {
+        // Mixed stderr with both sched_ext_dump and real kernel
+        // printks. The filter strips dump lines but the remaining
+        // text has content — falls through to format_tail.
+        let stderr = "[  0.1] Linux version 6.16.0\n\
+                      [  0.5] sched_ext_dump: header\n\
+                      [  0.6] sched_ext_dump: body\n\
+                      [  0.9] systemd: starting\n";
+        let tail = render_dmesg_tail(stderr, 40).expect("must produce a tail");
+        assert!(
+            tail.contains("Linux version 6.16.0"),
+            "real kernel text must survive the filter: {tail}",
+        );
+        assert!(
+            tail.contains("systemd: starting"),
+            "non-dump lines must survive the filter: {tail}",
+        );
+        assert!(
+            !tail.contains("sched_ext_dump"),
+            "dump lines must be stripped (rendered separately): {tail}",
+        );
+        assert!(
+            !tail.contains("scheduler crashed"),
+            "real kernel text must NOT surface the crash diagnostic: {tail}",
+        );
+    }
+
+    #[test]
+    fn render_dmesg_tail_only_whitespace_emits_crash_diagnostic() {
+        // Whitespace-only stderr — same operator outcome as empty.
+        // The crash classifier's diagnostic must surface (pre-filter
+        // had_content gates on `!is_whitespace()`, so all-whitespace
+        // hits the `classify_dmesg_corruption` branch).
+        let tail = render_dmesg_tail("   \n\n\t  \n", 40).expect("must produce a tail");
+        assert!(
+            tail.contains("scheduler crashed before kernel printk"),
+            "whitespace-only stderr must surface the crash diagnostic: {tail}",
+        );
     }
 
     // -- end-to-end: extract_probe_output carries the new diagnostics --

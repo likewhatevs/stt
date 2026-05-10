@@ -571,7 +571,11 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
     // Store (size, struct_name) so the renderer can cross-BTF-resolve
     // by name at chase time.
     let mut alloc_size_types: Vec<(u64, String)> = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for &size in &all_alloc_sizes {
+        if size == 0 {
+            continue;
+        }
         for ebtf in &btfs {
             let choice = super::super::monitor::sdt_alloc::discover_payload_btf_id(
                 ebtf,
@@ -583,9 +587,39 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
                         ty.as_btf_type().expect("struct has btf_type"),
                     )
                     && !name.is_empty()
+                    && seen_names.insert(name.to_string())
                 {
-                    alloc_size_types.push((size, name));
-                    break;
+                    alloc_size_types.push((size, name.to_string()));
+                }
+                break;
+            }
+            // For ambiguous sizes, collect all scheduler-
+            // convention candidates (names ending in _ctx,
+            // _arena_ctx, or exact task_ctx). The cross-BTF
+            // resolution at chase time disambiguates by name.
+            let max_id = (0u32..)
+                .take_while(|id| ebtf.resolve_type_by_id(*id).is_ok())
+                .last()
+                .unwrap_or(0);
+            for tid in 1..=max_id {
+                let Ok(ty) = ebtf.resolve_type_by_id(tid) else {
+                    continue;
+                };
+                let Type::Struct(s) = &ty else { continue };
+                if s.size() as u64 != size {
+                    continue;
+                }
+                let Ok(name) = ebtf.resolve_name(s) else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                let dominated = name == "task_ctx"
+                    || name.ends_with("_ctx")
+                    || name.ends_with("_arena_ctx");
+                if dominated && seen_names.insert(name.to_string()) {
+                    alloc_size_types.push((size, name.to_string()));
                 }
             }
         }
