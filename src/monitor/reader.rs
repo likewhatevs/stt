@@ -2539,7 +2539,7 @@ pub(crate) fn monitor_loop(
                     ..
                 } => (Some(*watchdog_timeout_pa), 0, *jiffies),
             };
-            let (interval_pa, timestamp_pa, jiffies_64_pa) = match wd {
+            let (interval_pa, _timestamp_pa, _jiffies_64_pa) = match wd {
                 WatchdogOverride::ScxSched {
                     interval_pa, timestamp_pa, jiffies_64_pa, ..
                 }

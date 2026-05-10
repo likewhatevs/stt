@@ -2780,7 +2780,6 @@ fn resolve_arena_type_with_static_fallback_returns_sdt_alloc_hit() {
         Some(&snap),
         Some(&sdt_index),
         Some(&static_index),
-        &[],
         0x10_0000_1000, // slot start
     );
     assert_eq!(
@@ -2825,7 +2824,6 @@ fn resolve_arena_type_with_static_fallback_scx_static_hit_returns_none() {
         Some(&snap),
         None,
         Some(&static_index),
-        &[],
         0x10_0000_2010,
     );
     assert!(
@@ -2879,7 +2877,6 @@ fn resolve_arena_type_with_static_fallback_out_of_window_returns_none() {
         Some(&snap),
         Some(&sdt_index),
         Some(&static_index),
-        &[],
         0x05_0000_1000,
     );
     assert!(
@@ -2892,7 +2889,6 @@ fn resolve_arena_type_with_static_fallback_out_of_window_returns_none() {
         Some(&snap),
         Some(&sdt_index),
         Some(&static_index),
-        &[],
         0x05_0000_2010,
     );
     assert!(
@@ -2916,7 +2912,6 @@ fn resolve_arena_type_with_static_fallback_both_none_returns_none() {
         Some(&snap),
         None,
         None,
-        &[],
         0x10_0000_1000,
     );
     assert!(
@@ -3138,6 +3133,101 @@ fn find_sdt_data_field_offset_zero_type_id_short_circuits() {
         super::render_map::find_sdt_data_field_offset(&btf, 0),
         None,
         "type_id=0 must short-circuit to None",
+    );
+}
+
+/// `find_sdt_data_field_offset` happy path: a synthetic value-type
+/// struct that DOES carry a `struct sdt_data __arena *` member at a
+/// known byte offset must return `Some(offset)`. The pointee is
+/// declared as `BTF_KIND_FWD struct sdt_data` (the lavd-and-similar
+/// shape per render_map.rs:1127-1132). Without this test, every
+/// existing test only pins None-paths — an implementation that
+/// always returns None silently passes them all.
+#[test]
+fn find_sdt_data_field_offset_returns_offset_for_fwd_pointee() {
+    use std::io::Write;
+    // BTF layout:
+    //   id 1: Int u64 (8 bytes)
+    //   id 2: Fwd struct sdt_data
+    //   id 3: Ptr -> id 2
+    //   id 4: Struct value_t { u64 a @ 0; sdt_data __arena * data @ 8 }
+    //         (size = 16)
+    //
+    // Wire format constants (kernel uapi linux/btf.h).
+    const BTF_KIND_INT: u32 = 1;
+    const BTF_KIND_PTR: u32 = 2;
+    const BTF_KIND_STRUCT: u32 = 4;
+    const BTF_KIND_FWD: u32 = 7;
+    let mut strings: Vec<u8> = vec![0];
+    let push = |s: &mut Vec<u8>, name: &str| -> u32 {
+        let off = s.len() as u32;
+        s.extend_from_slice(name.as_bytes());
+        s.push(0);
+        off
+    };
+    let n_u64 = push(&mut strings, "u64");
+    let n_sdt_data = push(&mut strings, "sdt_data");
+    let n_value = push(&mut strings, "value_t");
+    let n_a = push(&mut strings, "a");
+    let n_data = push(&mut strings, "data");
+
+    let mut types: Vec<u8> = Vec::new();
+    // id 1: Int u64.
+    types.extend_from_slice(&n_u64.to_le_bytes());
+    let int_info = (BTF_KIND_INT << 24) & 0x1f00_0000;
+    types.extend_from_slice(&int_info.to_le_bytes());
+    types.extend_from_slice(&8u32.to_le_bytes()); // size
+    types.extend_from_slice(&64u32.to_le_bytes()); // encoding=0,offset=0,bits=64
+    // id 2: Fwd struct sdt_data (kind_flag=0 → struct flavour).
+    types.extend_from_slice(&n_sdt_data.to_le_bytes());
+    let fwd_info = (BTF_KIND_FWD << 24) & 0x1f00_0000;
+    types.extend_from_slice(&fwd_info.to_le_bytes());
+    types.extend_from_slice(&0u32.to_le_bytes()); // size_type unused for Fwd
+    // id 3: Ptr -> id 2 (sdt_data Fwd).
+    types.extend_from_slice(&0u32.to_le_bytes()); // name_off (anonymous)
+    let ptr_info = (BTF_KIND_PTR << 24) & 0x1f00_0000;
+    types.extend_from_slice(&ptr_info.to_le_bytes());
+    types.extend_from_slice(&2u32.to_le_bytes()); // type id of pointee
+    // id 4: Struct value_t { u64 a @ 0; sdt_data __arena * data @ 8 }
+    //                 size = 16, vlen = 2.
+    types.extend_from_slice(&n_value.to_le_bytes());
+    let struct_info = ((BTF_KIND_STRUCT << 24) & 0x1f00_0000) | 2u32; // vlen=2
+    types.extend_from_slice(&struct_info.to_le_bytes());
+    types.extend_from_slice(&16u32.to_le_bytes()); // size
+    // member 0: a @ bit 0 (byte 0), type id 1 (u64).
+    types.extend_from_slice(&n_a.to_le_bytes());
+    types.extend_from_slice(&1u32.to_le_bytes());
+    types.extend_from_slice(&0u32.to_le_bytes());
+    // member 1: data @ bit 64 (byte 8), type id 3 (Ptr).
+    types.extend_from_slice(&n_data.to_le_bytes());
+    types.extend_from_slice(&3u32.to_le_bytes());
+    types.extend_from_slice(&64u32.to_le_bytes());
+
+    let type_len = types.len() as u32;
+    let str_len = strings.len() as u32;
+    let mut blob: Vec<u8> = Vec::new();
+    blob.write_all(&0xEB9F_u16.to_le_bytes()).unwrap(); // magic
+    blob.push(1); // version
+    blob.push(0); // flags
+    blob.write_all(&24u32.to_le_bytes()).unwrap(); // hdr_len
+    blob.write_all(&0u32.to_le_bytes()).unwrap(); // type_off
+    blob.write_all(&type_len.to_le_bytes()).unwrap();
+    blob.write_all(&type_len.to_le_bytes()).unwrap(); // str_off = type_len
+    blob.write_all(&str_len.to_le_bytes()).unwrap();
+    blob.extend_from_slice(&types);
+    blob.extend_from_slice(&strings);
+
+    let btf = btf_rs::Btf::from_bytes(&blob).expect("synthetic BTF parses");
+    // Value type id is 4. The helper must walk to member `data`,
+    // peel modifiers, find Ptr → Fwd "sdt_data", and return byte 8.
+    let value_type_id: u32 = 4;
+    assert_eq!(
+        super::render_map::find_sdt_data_field_offset(&btf, value_type_id),
+        Some(8),
+        "value_t struct carrying `struct sdt_data __arena * data @ 8` \
+         must resolve to Some(8); the helper has only None-path tests \
+         today, so an implementation that always returns None silently \
+         passes the existing suite without this test",
     );
 }
 
@@ -4890,6 +4980,7 @@ fn render_map_struct_ops_no_offsets_returns_error() {
         arena_type_index: None,
         cross_btf_fwd_index: None,
         scx_static_index: None,
+        rendered_slot_addrs: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered
@@ -4958,6 +5049,7 @@ fn render_map_struct_ops_unmapped_value_returns_error() {
         arena_type_index: None,
         cross_btf_fwd_index: None,
         scx_static_index: None,
+        rendered_slot_addrs: None,
     };
     let rendered = super::render_map::render_map(&ctx, &info);
     let err = rendered
@@ -5672,6 +5764,170 @@ fn append_arena_type_index_for_allocator_multi_allocator_merge() {
     assert_eq!(index.get(&0x0000_2000), Some(&info_a));
     assert_eq!(index.get(&0x0000_3000), Some(&info_b));
     assert_eq!(index.get(&0x0000_4000), Some(&info_b));
+}
+
+// -- multi-allocator resolve through resolve_arena_type_in_index --
+//
+// Pins the end-to-end chain `append_arena_type_index_for_allocator`
+// (per allocator) → `resolve_arena_type_in_index` (per chase) when
+// TWO distinct allocators contribute slots to the same per-pass
+// `ArenaTypeIndex`. The bug surface for #89 is that per-cgroup
+// arena pointers (`cgx_raw`, `llcx_raw`) chase through `resolve_arena_type`
+// against an index that holds slots from BOTH the per-task allocator
+// AND the per-cgroup allocator. If the merge drops the second
+// allocator's payload type id (e.g. the dedup logic flattens to a
+// global "first wins" across allocators rather than per-slot-start),
+// `resolve_arena_type_in_index` returns the wrong type id at the
+// per-cgroup slot start — silent miscoding rather than a clean None.
+//
+// The existing `multi_allocator_merge` test pins the index BUILD
+// shape (each allocator's slots present); this test pins the
+// LOOKUP shape (each allocator's slots resolve to the right
+// payload).
+
+/// Two allocators contribute non-overlapping slots to one index.
+/// `resolve_arena_type` at each allocator's slot start returns
+/// that allocator's payload type id with `header_skip = header_size`,
+/// AND at each allocator's payload start returns the same id with
+/// `header_skip = 0`. Pinning the per-allocator distinction across
+/// the full index lookup, not just the index storage shape.
+#[test]
+fn resolve_arena_type_picks_correct_payload_when_multiple_allocators_in_index() {
+    use super::super::arena::ArenaSnapshot;
+    use super::super::btf_render::ArenaResolveHit;
+    use super::render_map::{ArenaTypeIndex, append_arena_type_index_for_allocator};
+
+    // Per-task allocator: payload type 7 (e.g. `task_ctx`),
+    // header_size=8, elem_size=24. Two slots at 0x1000 and 0x2000.
+    // Per-cgroup allocator: payload type 11 (e.g. `scx_cgroup_ctx`),
+    // header_size=8, elem_size=32. Two slots at 0x3000 and 0x4000.
+    // Distinct elem_size pins that per-allocator metadata survives
+    // the merge — a bug that flattened would surface as the wrong
+    // elem_size in `ArenaSlotInfo`, which `resolve_arena_type_in_index`
+    // uses to bound the slot's range.
+    const TASK_TYPE_ID: u32 = 7;
+    const CGRP_TYPE_ID: u32 = 11;
+    const TASK_HEADER: usize = 8;
+    const CGRP_HEADER: usize = 8;
+    const TASK_ELEM: u64 = 24;
+    const CGRP_ELEM: u64 = 32;
+
+    let mut index = ArenaTypeIndex::new();
+    append_arena_type_index_for_allocator(
+        &mut index,
+        "scx_task_allocator",
+        TASK_TYPE_ID,
+        TASK_HEADER,
+        TASK_ELEM,
+        &[0x1000u64, 0x2000u64],
+    );
+    append_arena_type_index_for_allocator(
+        &mut index,
+        "scx_cgroup_allocator",
+        CGRP_TYPE_ID,
+        CGRP_HEADER,
+        CGRP_ELEM,
+        &[0x3000u64, 0x4000u64],
+    );
+    assert_eq!(
+        index.len(),
+        4,
+        "all four slots from two allocators must merge: {index:?}"
+    );
+
+    let snap = ArenaSnapshot {
+        user_vm_start: 0x10_0000_0000,
+        ..ArenaSnapshot::default()
+    };
+    let r = ResolveArenaTypeStub {
+        arena_snapshot: Some(&snap),
+        arena_type_index: Some(&index),
+    };
+
+    // Task allocator slot 0x1000 — slot-start chase.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1000),
+        Some(ArenaResolveHit {
+            target_type_id: TASK_TYPE_ID,
+            header_skip: TASK_HEADER,
+        }),
+        "slot-start chase at task allocator's 0x1000 must resolve to TASK_TYPE_ID",
+    );
+    // Task allocator slot 0x1000 — payload-start chase.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_1008),
+        Some(ArenaResolveHit {
+            target_type_id: TASK_TYPE_ID,
+            header_skip: 0,
+        }),
+        "payload-start chase at task allocator's 0x1008 must resolve to TASK_TYPE_ID",
+    );
+    // Cgroup allocator slot 0x3000 — slot-start chase. The bug
+    // surface for #89: if the merge collapses cgrp payload to
+    // task payload, this returns TASK_TYPE_ID instead of CGRP_TYPE_ID.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_3000),
+        Some(ArenaResolveHit {
+            target_type_id: CGRP_TYPE_ID,
+            header_skip: CGRP_HEADER,
+        }),
+        "slot-start chase at cgroup allocator's 0x3000 must resolve to CGRP_TYPE_ID, \
+         not TASK_TYPE_ID — pins per-allocator distinction across the full index",
+    );
+    // Cgroup allocator slot 0x3000 — payload-start chase.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_3008),
+        Some(ArenaResolveHit {
+            target_type_id: CGRP_TYPE_ID,
+            header_skip: 0,
+        }),
+        "payload-start chase at cgroup allocator's 0x3008 must resolve to CGRP_TYPE_ID",
+    );
+    // Cgroup allocator slot 0x4000 — slot-start chase.
+    assert_eq!(
+        r.resolve_arena_type(0x10_0000_4000),
+        Some(ArenaResolveHit {
+            target_type_id: CGRP_TYPE_ID,
+            header_skip: CGRP_HEADER,
+        }),
+    );
+    // Cgroup allocator slot 0x4000 — last byte INSIDE the slot range.
+    // CGRP_ELEM=32 → range [0x4000, 0x4020). 0x401F is the last
+    // byte; it's mid-payload (offset_in_slot=31, > header_size 8 and
+    // != header_size) so the lookup falls to the mid-payload branch
+    // and returns None. The critical property: the bound check uses
+    // CGRP_ELEM (32), not TASK_ELEM (24) — a regression that
+    // overwrote ArenaSlotInfo across allocators would use the wrong
+    // elem_size and either accept this address (under TASK_ELEM=24,
+    // 0x401F > 0x4000+24=0x4018, so out-of-range → None) or accept
+    // earlier addresses spuriously.
+    assert!(
+        r.resolve_arena_type(0x10_0000_401F).is_none(),
+        "last byte of cgroup slot must reach mid-payload (None), proving \
+         the bound check used CGRP_ELEM=32 (not the task allocator's 24)",
+    );
+    // Address at 0x10_0000_4019 — past TASK_ELEM (24) but within
+    // CGRP_ELEM (32). Confirms per-allocator elem_size honored:
+    // under task elem_size this address would NOT belong to slot
+    // 0x4000; under cgroup elem_size it does (mid-payload → None).
+    // If the merge silently used the task elem_size for cgroup
+    // slots, this address would NOT be in any range and we'd hit
+    // the `key < slot_start` early reject. The current production
+    // code returns None either way (mid-payload reject vs out-of-range
+    // reject), so this assertion is just `is_none()`. The diagnostic
+    // value is: when this test fails, the implementer knows the
+    // merge dropped per-slot elem_size.
+    assert!(
+        r.resolve_arena_type(0x10_0000_4019).is_none(),
+        "mid-payload address inside cgroup slot's elem_size range must \
+         resolve via the cgroup slot's metadata (mid-payload branch returns None)",
+    );
+    // Out-of-window: same gates fire regardless of how many
+    // allocators populated the index.
+    assert!(
+        r.resolve_arena_type(0x05_0000_3000).is_none(),
+        "below-window cgroup-slot collision must be rejected by is_arena_addr",
+    );
 }
 
 // -- resolve_cross_btf_fwd_in_index --------------------------------

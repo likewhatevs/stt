@@ -2876,6 +2876,16 @@ struct CastStubReader {
     /// stored entry only fires when the query's `kind`
     /// matches.
     cross_btf_index: std::collections::HashMap<String, (usize, u32, bool)>,
+    /// Set of low-32 windowed slot starts the dump pre-pass would
+    /// have already rendered. The
+    /// [`MemReader::is_already_rendered`] override returns `true`
+    /// when `addr as u32` lies in this set so the chase
+    /// short-circuits to a `deref: None` Ptr with the "already
+    /// rendered" reason — mirrors the production
+    /// `AccessorMemReader` dedup wired through the
+    /// `rendered_slot_addrs` field. Empty by default so existing
+    /// tests stay untouched.
+    rendered_slot_addrs: std::collections::HashSet<u32>,
 }
 
 impl MemReader for CastStubReader {
@@ -2929,6 +2939,9 @@ impl MemReader for CastStubReader {
             btf: btf.as_ref(),
             type_id,
         })
+    }
+    fn is_already_rendered(&self, addr: u64) -> bool {
+        self.rendered_slot_addrs.contains(&(addr as u32))
     }
 }
 
@@ -7736,6 +7749,220 @@ fn cast_chase_arena_target_type_id_zero_no_bridge_entry_skips() {
         Some("cast→arena"),
         "no-bridge deferred-resolve must NOT include '(sdt_alloc)' suffix; \
          got {cast_annotation:?}",
+    );
+}
+
+/// G6.1: Dedup short-circuit. When `is_already_rendered` returns
+/// true for the chased arena address, `chase_arena_pointer`
+/// surfaces a `Ptr` with `deref: None` and the
+/// `"already rendered in sdt_allocations"` skip reason — no
+/// arena read, no bridge query, no recursive render. The dedup
+/// fires BEFORE the deferred-resolve special case so an address
+/// pointing at a slot the sdt_alloc pre-pass already rendered
+/// short-circuits even when the analyzer would otherwise have
+/// supplied a bridge hit.
+#[test]
+fn cast_chase_already_rendered_short_circuits() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let inner_bytes = 0x42u64.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, inner_bytes);
+    let mut arena_types = std::collections::HashMap::new();
+    arena_types.insert(
+        TARGET_ADDR,
+        ArenaResolveHit {
+            target_type_id: q_id,
+            header_skip: 0,
+        },
+    );
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    // Seed the dedup set with TARGET_ADDR's low-32 bits — the
+    // production [`AccessorMemReader::is_already_rendered`] keys
+    // on `addr as u32` (low-32 windowed slot start). Even though
+    // arena_type_at would have resolved the address, the dedup
+    // takes precedence and skips the chase.
+    let mut rendered = std::collections::HashSet::new();
+    rendered.insert(TARGET_ADDR as u32);
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        arena_type_at: arena_types,
+        rendered_slot_addrs: rendered,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr {
+        value,
+        ref deref,
+        ref deref_skipped_reason,
+        ..
+    } = members[0].value
+    else {
+        panic!(
+            "dedup must still produce Ptr (only the deref is suppressed); \
+             got {:?}",
+            members[0].value
+        );
+    };
+    assert_eq!(value, TARGET_ADDR);
+    assert!(
+        deref.is_none(),
+        "dedup short-circuit must suppress the deref"
+    );
+    let reason = deref_skipped_reason
+        .as_deref()
+        .expect("dedup must populate the skip reason");
+    assert_eq!(
+        reason, "already rendered in sdt_allocations",
+        "dedup skip reason is wire-stable (operator reads it from \
+         RenderedValue::Ptr::deref_skipped_reason); the exact format \
+         is part of the dump's machine-checkable contract: got '{reason}'"
+    );
+}
+
+/// G6.2: Dedup with miss falls through to normal chase. An
+/// address NOT in `rendered_slot_addrs` proceeds with the
+/// existing chase pipeline (bridge query, peel, read, render).
+/// Pins that the dedup gate is per-address and does not blank
+/// the chase wholesale when a different slot was rendered.
+#[test]
+fn cast_chase_already_rendered_miss_proceeds_with_normal_chase() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    const RENDERED_OTHER_ADDR: u64 = 0x10_0000_2000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let inner_bytes = 0x42u64.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, inner_bytes);
+    let mut arena_types = std::collections::HashMap::new();
+    arena_types.insert(
+        TARGET_ADDR,
+        ArenaResolveHit {
+            target_type_id: q_id,
+            header_skip: 0,
+        },
+    );
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    // Dedup set has a different slot start. The chase target
+    // (TARGET_ADDR) is NOT in the set, so dedup misses and the
+    // chase proceeds normally through the bridge.
+    let mut rendered = std::collections::HashSet::new();
+    rendered.insert(RENDERED_OTHER_ADDR as u32);
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        arena_type_at: arena_types,
+        rendered_slot_addrs: rendered,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr { ref deref, .. } = members[0].value else {
+        panic!("expected Ptr, got {:?}", members[0].value);
+    };
+    let inner = deref
+        .as_deref()
+        .expect("dedup-miss path must still produce a deref via the bridge");
+    let RenderedValue::Struct {
+        type_name: ref inner_name,
+        ..
+    } = *inner
+    else {
+        panic!("deref payload must be the resolved Q Struct, got {inner:?}");
+    };
+    assert_eq!(
+        inner_name.as_deref(),
+        Some("Q"),
+        "dedup-miss path must land on Q via the normal chase pipeline",
+    );
+}
+
+/// G6.3: Default `is_already_rendered` returns false. Readers
+/// without a rendered-slot index (the trait default impl)
+/// proceed with the chase — pins the no-regression case for
+/// every existing renderer that doesn't wire the dedup set.
+#[test]
+fn cast_chase_default_is_already_rendered_returns_false() {
+    let (blob, t_id, q_id) = cast_btf_t_and_q();
+    let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+
+    const ARENA_LO: u64 = 0x10_0000_0000;
+    const ARENA_HI: u64 = 0x10_0001_0000;
+    const TARGET_ADDR: u64 = 0x10_0000_1000;
+    let outer_bytes = TARGET_ADDR.to_le_bytes().to_vec();
+    let inner_bytes = 0x42u64.to_le_bytes().to_vec();
+    let mut arena_bytes = std::collections::HashMap::new();
+    arena_bytes.insert(TARGET_ADDR, inner_bytes);
+    let mut arena_types = std::collections::HashMap::new();
+    arena_types.insert(
+        TARGET_ADDR,
+        ArenaResolveHit {
+            target_type_id: q_id,
+            header_skip: 0,
+        },
+    );
+    let mut cast_map = super::super::cast_analysis::CastMap::new();
+    cast_map.insert(
+        (t_id, 0),
+        CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        },
+    );
+    // No rendered_slot_addrs — the field defaults to an empty
+    // HashSet, so `is_already_rendered` returns false for every
+    // address. The chase must proceed without the short-circuit.
+    let reader = CastStubReader {
+        cast_map: Some(cast_map),
+        arena_window: Some((ARENA_LO, ARENA_HI)),
+        arena_bytes_at: arena_bytes,
+        arena_type_at: arena_types,
+        ..Default::default()
+    };
+
+    let v = render_value_with_mem(&btf, t_id, &outer_bytes, &reader);
+    let RenderedValue::Struct { ref members, .. } = v else {
+        panic!("expected Struct render, got {v:?}");
+    };
+    let RenderedValue::Ptr { ref deref, .. } = members[0].value else {
+        panic!("expected Ptr, got {:?}", members[0].value);
+    };
+    assert!(
+        deref.is_some(),
+        "empty rendered_slot_addrs must NOT short-circuit the chase",
     );
 }
 

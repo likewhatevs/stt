@@ -566,9 +566,10 @@ pub struct PayloadTypeChoice {
 ///      patterns: `task_ctx` (exact), then `*_arena_ctx`,
 ///      `*_task_ctx`, `*_ctx` (suffix). scx schedulers consistently
 ///      use these suffixes; ktstr's own test fixture struct is
-///      `ktstr_arena_ctx`. If 2+ structs match the *same* pattern
-///      (e.g. two `*_arena_ctx` of the same size), we fall back to
-///      hex rather than guess between them.
+///      `ktstr_arena_ctx`. If 2+ structs match the same pattern arm,
+///      the heuristic continues to lower-priority arms — a collision
+///      at a higher-specificity level does not prevent a lower-
+///      specificity unambiguous match from resolving.
 ///   3. No match or still ambiguous → return 0 to fall back to a hex
 ///      dump.
 ///
@@ -640,8 +641,10 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize) -> PayloadTypeCho
             // Multiple size-match candidates; prefer conventional
             // names. Order is most-specific first so a struct named
             // exactly `task_ctx` wins over `foo_task_ctx`. If 2+
-            // structs share the SAME pattern arm, we cannot pick
-            // between them and fall back to hex.
+            // structs share the SAME pattern arm, the loop continues
+            // to lower-priority arms — a higher-specificity collision
+            // does not prevent a lower-specificity unambiguous match
+            // from resolving.
             type Pat = fn(&str) -> bool;
             let patterns: &[Pat] = &[
                 |n: &str| n == "task_ctx",
@@ -1837,6 +1840,393 @@ mod tests {
         assert_eq!(
             offsets.data_header_size, 8,
             "literal-8 cross-check: the Fwd fallback must equal exactly 8 bytes (kernel-header-fixed)"
+        );
+    }
+
+    // -- discover_payload_btf_id heuristic branches ---------------
+    //
+    // The existing tests (`discover_payload_btf_id_zero_size_short_circuits`,
+    // `discover_payload_btf_id_no_candidate_path`) cover only the
+    // payload_size=0 short-circuit and the empty-size_matches path.
+    // The heuristic's actual branching logic — single-match returns
+    // id, multi-match falls through pattern arms (task_ctx exact →
+    // *_arena_ctx → *_task_ctx → *_ctx suffix), per-arm ambiguity,
+    // anonymous-struct rejection — is entirely uncovered. Without
+    // these tests, an implementation that only handles the two
+    // existing edge cases passes the suite while being broken for
+    // every real per-cgroup or per-task allocator.
+    //
+    // The bug surface for #89 is per-cgroup arena pointers (cgx_raw,
+    // llcx_raw) failing to chase. Test G1.2 below covers
+    // `scx_cgroup_ctx`-style names matching the `*_ctx` arm; G1.5
+    // covers the per-arm ambiguous fallback; G1.7 covers the
+    // continue-to-next-arm path that the docstring at sdt_alloc.rs:565-571
+    // contradicts the code at sdt_alloc.rs:670-674 about. The doc
+    // says "fall back to hex" on any arm collision; the code says
+    // "continue to next arm". The implementer's #89 fix must
+    // reconcile this drift — these tests pin the chosen behavior.
+    //
+    // All three tests use the existing `sdta_*` BTF builder helpers
+    // declared above to avoid duplicating wire-format logic.
+
+    /// G1.1: Single size-match resolves cleanly. A BTF with one
+    /// 16-byte struct named `cgrp_ctx` and one 8-byte int. Calling
+    /// `discover_payload_btf_id(&btf, 16)` finds `cgrp_ctx` as the
+    /// unique size-match; size_matches.len() == 1 routes to the
+    /// "single match" arm and returns the id with empty reason.
+    /// Pin the contract that a single-match path bypasses the
+    /// pattern-priority dispatch entirely.
+    #[test]
+    fn discover_payload_btf_id_single_size_match_returns_id() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = sdta_push_name(&mut strings, "u64");
+        let n_cgrp_ctx = sdta_push_name(&mut strings, "cgrp_ctx");
+        let n_a = sdta_push_name(&mut strings, "a");
+        let n_b = sdta_push_name(&mut strings, "b");
+        let types = vec![
+            // id 1: u64 (8 bytes; not a size-match for 16).
+            SdtaSynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: struct cgrp_ctx { u64 a @ 0; u64 b @ 8 } size=16.
+            SdtaSynType::Struct {
+                name_off: n_cgrp_ctx,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_b,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+        let choice = discover_payload_btf_id(&btf, 16);
+        assert_eq!(
+            choice.target_type_id, 2,
+            "single 16-byte struct cgrp_ctx must be picked unambiguously"
+        );
+        assert_eq!(
+            choice.reason, "",
+            "single-match path must return empty reason; got {:?}",
+            choice.reason
+        );
+    }
+
+    /// G1.2: Per-cgroup `scx_cgroup_ctx`-style name resolves via
+    /// the `*_ctx` suffix arm. With one 16-byte struct named
+    /// `scx_cgroup_ctx`, this is also a single size-match — the
+    /// test pins that the heuristic accepts the per-cgroup name
+    /// AND that an int of size 8 doesn't pollute the candidate
+    /// list. The bug surface for #89 is exactly this case
+    /// (per-cgroup struct fails to resolve via discover);
+    /// confirming a clean single-match here pins the baseline
+    /// before the multi-candidate cases below exercise the actual
+    /// branching.
+    #[test]
+    fn discover_payload_btf_id_per_cgroup_ctx_resolves_via_ctx_suffix() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = sdta_push_name(&mut strings, "u64");
+        let n_cgrp = sdta_push_name(&mut strings, "scx_cgroup_ctx");
+        let n_a = sdta_push_name(&mut strings, "a");
+        let n_b = sdta_push_name(&mut strings, "b");
+        let types = vec![
+            SdtaSynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SdtaSynType::Struct {
+                name_off: n_cgrp,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_b,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+        let choice = discover_payload_btf_id(&btf, 16);
+        assert_eq!(
+            choice.target_type_id, 2,
+            "scx_cgroup_ctx (single 16-byte size-match) must resolve via the \
+             single-match arm; the per-cgroup struct name is the bug surface for #89"
+        );
+        assert_eq!(choice.reason, "");
+    }
+
+    /// G1.3: `task_ctx` (exact name) wins over `*_ctx` suffix
+    /// when both same-size structs exist. The heuristic at
+    /// sdt_alloc.rs:646-651 lists arm 1 (`n == "task_ctx"`)
+    /// before arm 4 (`*_ctx` suffix). Pin the priority order so
+    /// a future refactor that drops the exact-name arm in favor
+    /// of a single suffix-pattern walk surfaces here.
+    #[test]
+    fn discover_payload_btf_id_task_ctx_exact_wins_over_ctx_suffix() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = sdta_push_name(&mut strings, "u64");
+        let n_task = sdta_push_name(&mut strings, "task_ctx");
+        let n_cgrp = sdta_push_name(&mut strings, "cgrp_ctx");
+        let n_a = sdta_push_name(&mut strings, "a");
+        let types = vec![
+            SdtaSynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: task_ctx (16 bytes).
+            SdtaSynType::Struct {
+                name_off: n_task,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+            // id 3: cgrp_ctx (16 bytes — same size).
+            SdtaSynType::Struct {
+                name_off: n_cgrp,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+        let choice = discover_payload_btf_id(&btf, 16);
+        assert_eq!(
+            choice.target_type_id, 2,
+            "exact `task_ctx` arm (priority 1) must win over `*_ctx` suffix \
+             arm (priority 4); cgrp_ctx must NOT be picked: {:?}",
+            choice
+        );
+        assert_eq!(choice.reason, "");
+    }
+
+    /// G1.5: Ambiguous at the `*_ctx` suffix arm with no upper-arm
+    /// resolution. Two structs (`cgrp_ctx` and `task_data_ctx`)
+    /// both 16 bytes, neither matching exact `task_ctx`,
+    /// `*_arena_ctx`, or `*_task_ctx`. Arm 4 (`*_ctx`) gets 2 hits;
+    /// the per-arm `_ => continue` at sdt_alloc.rs:670-674 advances
+    /// past arm 4 (the last arm) and falls through to the
+    /// post-loop "no unambiguous pattern winner" branch at
+    /// sdt_alloc.rs:677-681, returning `target_type_id = 0` with
+    /// `reason = "ambiguous: 2 candidates"`. Pin BOTH the id (0)
+    /// AND the exact reason — the reason format is wire-stable
+    /// (operator-visible via SdtAllocatorSnapshot::payload_type_reason).
+    #[test]
+    fn discover_payload_btf_id_ambiguous_at_ctx_arm_falls_through() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = sdta_push_name(&mut strings, "u64");
+        let n_a = sdta_push_name(&mut strings, "a");
+        // Two structs ending in `_ctx` — both qualify ONLY at arm 4.
+        let n_cgrp = sdta_push_name(&mut strings, "cgrp_ctx");
+        let n_task_data = sdta_push_name(&mut strings, "task_data_ctx");
+        let types = vec![
+            SdtaSynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            SdtaSynType::Struct {
+                name_off: n_cgrp,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+            SdtaSynType::Struct {
+                name_off: n_task_data,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+        let choice = discover_payload_btf_id(&btf, 16);
+        assert_eq!(
+            choice.target_type_id, 0,
+            "ambiguous `*_ctx` matches must fall through every arm and \
+             return target_type_id=0; got {:?}",
+            choice
+        );
+        assert_eq!(
+            choice.reason, "ambiguous: 2 candidates",
+            "ambiguous-fallback reason format is wire-stable (operator reads \
+             SdtAllocatorSnapshot::payload_type_reason). Pin the format string \
+             byte-for-byte; a refactor that changes 'ambiguous' to 'multi' or \
+             'candidates' to 'matches' would silently break log scrapers."
+        );
+    }
+
+    /// G1.7: Per-arm continue resolves at lower arm. TWO `*_arena_ctx`
+    /// structs (ambiguous at arm 2) AND ONE `*_task_ctx` struct
+    /// (unambiguous at arm 3). Per the production code at
+    /// sdt_alloc.rs:670-674, arm 2's `_ => continue` advances to
+    /// arm 3, which has 1 hit → returns the `*_task_ctx` id.
+    ///
+    /// The docstring at sdt_alloc.rs:565-571 says "If 2+ structs
+    /// match the *same* pattern, we fall back to hex". The code
+    /// CONTRADICTS this — `continue` proceeds to the next arm
+    /// rather than aborting to the post-loop fall-through. This
+    /// test pins the CODE's behavior; if the implementer's #89
+    /// fix changes either side, the test must be updated to
+    /// match the new semantics. The doc-vs-code drift was flagged
+    /// in tester findings; the implementer is responsible for
+    /// reconciling both sides in the same commit.
+    #[test]
+    fn discover_payload_btf_id_per_arm_ambiguity_resolves_at_lower_arm() {
+        let mut strings: Vec<u8> = vec![0];
+        let n_u64 = sdta_push_name(&mut strings, "u64");
+        let n_a = sdta_push_name(&mut strings, "a");
+        // Two `*_arena_ctx` (collide at arm 2):
+        let n_cgrp_arena = sdta_push_name(&mut strings, "cgrp_arena_ctx");
+        let n_other_arena = sdta_push_name(&mut strings, "other_arena_ctx");
+        // One unique `*_task_ctx` (resolves at arm 3):
+        let n_my_task = sdta_push_name(&mut strings, "my_task_ctx");
+        let types = vec![
+            SdtaSynType::Int {
+                name_off: n_u64,
+                size: 8,
+                encoding: 0,
+                offset: 0,
+                bits: 64,
+            },
+            // id 2: cgrp_arena_ctx (16 bytes).
+            SdtaSynType::Struct {
+                name_off: n_cgrp_arena,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+            // id 3: other_arena_ctx (16 bytes — collides with id 2 at arm 2).
+            SdtaSynType::Struct {
+                name_off: n_other_arena,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+            // id 4: my_task_ctx (16 bytes — unique at arm 3,
+            // matches `*_task_ctx`).
+            SdtaSynType::Struct {
+                name_off: n_my_task,
+                size: 16,
+                members: vec![
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 0,
+                    },
+                    SdtaSynMember {
+                        name_off: n_a,
+                        type_id: 1,
+                        byte_offset: 8,
+                    },
+                ],
+            },
+        ];
+        let blob = sdta_build_btf(&types, &strings);
+        let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
+        let choice = discover_payload_btf_id(&btf, 16);
+        // Arm 1 (`task_ctx` exact): no hit. Arm 2 (`*_arena_ctx`):
+        // 2 hits → continue. Arm 3 (`*_task_ctx`): 1 hit → return
+        // id 4. Arm 4 (`*_ctx`): never reached.
+        assert_eq!(
+            choice.target_type_id, 4,
+            "arm 2 ambiguous → continue; arm 3 unique my_task_ctx → return id 4. \
+             Got {:?}. If this fails, the implementer's fix changed the \
+             continue-on-arm-ambiguity semantics — verify against the \
+             docstring at sdt_alloc.rs:565-571 (which currently contradicts \
+             the code) and update both sides together.",
+            choice
+        );
+        assert_eq!(
+            choice.reason, "",
+            "successful pattern-arm resolution must return empty reason"
         );
     }
 }

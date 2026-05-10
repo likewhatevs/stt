@@ -1750,11 +1750,24 @@ pub trait MemReader {
 
     /// Type-gated meta fallback for sdt_alloc bridge. Only called
     /// when `resolve_arena_type` returned None AND the chase target
-    /// is a known Fwd type (sdt_data). Returns the first sdt_alloc
-    /// meta with a resolved payload type if the address is in the
-    /// arena window.
+    /// is any Fwd-typed pointee (the [`try_sdt_alloc_bridge`] gate
+    /// matches `Type::Fwd(_)`, not a specific `Fwd` name). Returns
+    /// the first sdt_alloc meta with a resolved payload type if the
+    /// address is in the arena window.
     fn resolve_arena_type_meta_fallback(&self, _addr: u64) -> Option<ArenaResolveHit> {
         None
+    }
+
+    /// True when `addr` points at an allocator slot the dump pre-pass
+    /// has already rendered into `report.sdt_allocations` (the typed
+    /// payload appears in the failure dump under that surface). The
+    /// arena chase short-circuits on `true` so the per-map renderer
+    /// doesn't re-render the same allocation a second time when it
+    /// follows an entry pointer through a TASK_STORAGE / HASH map
+    /// into the same arena slot. Default returns `false` — readers
+    /// without a rendered-slot index proceed with the chase.
+    fn is_already_rendered(&self, _addr: u64) -> bool {
+        false
     }
 }
 
@@ -2997,7 +3010,7 @@ fn apply_header_skip(raw_bytes: &[u8], header_skip: usize) -> Option<&[u8]> {
 /// [`try_cross_btf_fwd_resolve`] succeeds and the chase recursion
 /// switches from the entry BTF to a sibling BTF.
 ///
-/// Two methods carry entry-BTF-keyed payloads and MUST be
+/// Three methods carry entry-BTF-keyed payloads and MUST be
 /// suppressed when the chase has crossed a BTF boundary:
 ///
 /// - [`MemReader::cast_lookup`]: the cast analyzer's
@@ -3026,13 +3039,24 @@ fn apply_header_skip(raw_bytes: &[u8], header_skip: usize) -> Option<&[u8]> {
 ///   (the sibling BTF lacks the id). The "no invalid data made"
 ///   contract requires this to be a hard `None`.
 ///
+/// - [`MemReader::resolve_arena_type_meta_fallback`][]: same rationale
+///   as `resolve_arena_type` — the sdt_alloc meta payload's
+///   `target_type_id` is resolved against the entry BTF at index-
+///   build time. A cross-BTF recursion that fell through to this
+///   override would receive an entry-BTF id and feed it into the
+///   sibling BTF's id space, the same wrong-render / wrong-skip
+///   failure mode. Inherits the trait default `None` (the impl
+///   does not delegate to `inner`), keeping the suppression
+///   coextensive with `resolve_arena_type`.
+///
 /// The remaining [`MemReader`] methods (read_kva / read_arena /
-/// is_arena_addr / nr_cpu_ids / cross_btf_resolve_fwd) carry no
-/// entry-BTF id payload — they operate on raw addresses and string
-/// names — so they stay live. Chases originating inside the
-/// cross-BTF subtree still resolve through the same arena snapshot,
-/// kernel page-walker, and cross-BTF Fwd index. The suppression is
-/// narrowly scoped to the two id-keyed lookups.
+/// is_arena_addr / nr_cpu_ids / cross_btf_resolve_fwd /
+/// is_already_rendered) carry no entry-BTF id payload — they
+/// operate on raw addresses and string names — so they stay live.
+/// Chases originating inside the cross-BTF subtree still resolve
+/// through the same arena snapshot, kernel page-walker, cross-BTF
+/// Fwd index, and rendered-slot dedup set. The suppression is
+/// narrowly scoped to the three id-keyed lookups.
 struct CrossBtfMemReader<'a> {
     inner: &'a dyn MemReader,
 }
@@ -3062,8 +3086,26 @@ impl MemReader for CrossBtfMemReader<'_> {
     // the safe direction — the sibling chase can still surface its
     // pointee via [`MemReader::cross_btf_resolve_fwd`] and the
     // ordinary [`Type::Ptr`] arm.
+    //
+    // resolve_arena_type_meta_fallback intentionally NOT delegated
+    // either: same entry-BTF id-space rationale as
+    // resolve_arena_type. The sdt_alloc meta payload's
+    // `target_type_id` is resolved against the entry BTF; feeding it
+    // into a sibling-BTF chase would produce the same wrong-render /
+    // wrong-skip failure mode. Inherits trait default `None`.
     fn cross_btf_resolve_fwd(&self, name: &str, kind: FwdKind) -> Option<CrossBtfRef<'_>> {
         self.inner.cross_btf_resolve_fwd(name, kind)
+    }
+    fn is_already_rendered(&self, addr: u64) -> bool {
+        // Delegate: the rendered-slot set keys on raw arena
+        // addresses (low-32 windowed `slot_start`), not BTF type
+        // ids, so the entry-BTF / sibling-BTF distinction does not
+        // apply. A cross-BTF recursion that lands back on a
+        // previously-rendered slot must skip the deref so the
+        // payload doesn't appear twice in the dump — once under
+        // the typed-allocator surface, once via the cross-BTF
+        // chase that returned to the same slot.
+        self.inner.is_already_rendered(addr)
     }
 }
 
@@ -3375,6 +3417,21 @@ fn chase_arena_pointer(
     depth: u32,
     visited: &mut HashSet<u64>,
 ) -> ArenaChaseOutcome {
+    // Dedup: when the chased address points at a slot the dump
+    // pre-pass has already rendered into `report.sdt_allocations`,
+    // skip the per-map chase so the same payload doesn't appear
+    // twice in the failure dump (once under the typed-allocator
+    // surface, once embedded inside whichever TASK_STORAGE / HASH
+    // map's value pointed back at it). The default trait impl
+    // returns `false`, so readers without a rendered-slot index
+    // proceed with the chase as before.
+    if mem.is_already_rendered(val) {
+        return ArenaChaseOutcome {
+            deref: None,
+            reason: Some("already rendered in sdt_allocations".to_string()),
+            sdt_alloc_resolved: false,
+        };
+    }
     // Special case: `target_type_id == 0` means the cast analyzer's
     // STX-flow path tagged the slot as Arena WITHOUT a resolved
     // BTF type id (the deferred-resolve arena cast path —

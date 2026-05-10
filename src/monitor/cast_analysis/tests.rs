@@ -7979,9 +7979,9 @@ fn stx_flow_alloc_return_round_trips_through_stack() {
 }
 
 /// Subsequent LDX from a previously-arena-tagged slot inherits
-/// `ArenaU64FromAlloc` (alias-set tracking). Storing the
-/// inherited tag into another u64 slot also records the Arena
-/// finding.
+/// `ArenaU64FromAlloc` (alias-set tracking via the source field).
+/// Storing the inherited tag into another u64 slot also records
+/// the Arena finding.
 #[test]
 fn stx_flow_alias_tracking_propagates_via_ldx() {
     // M: { u64 src_slot @ 0; u64 dst_slot @ 8 }
@@ -8019,10 +8019,11 @@ fn stx_flow_alias_tracking_propagates_via_ldx() {
     let btf = Btf::from_bytes(&blob).unwrap();
     let m_id = 2;
     let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
-    // pc 0: pseudo_call -> R0 = ArenaU64FromAlloc.
+    // pc 0: pseudo_call -> R0 = ArenaU64FromAlloc { source: None }.
     // pc 1: stx [R6 + 0] = R0 -> records (M, 0) -> Arena.
     // pc 2: ldx R7, [R6 + 0]   -> R7 inherits ArenaU64FromAlloc
-    //                              via alias-set tracking.
+    //                              { source: Some((M, 0)) } via
+    //                              alias-set tracking.
     // pc 3: stx [R6 + 8] = R7 -> records (M, 8) -> Arena.
     //
     // R6 is the parent base (callee-saved, seeded as
@@ -8146,37 +8147,45 @@ fn stx_flow_conflict_with_kptr_drops_both() {
 }
 
 /// Same slot triggers both detection paths in one program: the
-/// shape-inference path's LDX accumulates into `patterns`, then
-/// a `pseudo_call` + STX-flow path inserts into
-/// `arena_stx_findings`. With single-pass analysis, `finalize`
-/// would emit the arena-STX entry with `target_type_id=0` and the
-/// shape-inference loop would overwrite with the concrete target
-/// id. With fixpoint iteration, however, the STX-flow tag from
-/// pass 1 carries forward into pass 2, where the alias-tracking arm
-/// in [`Analyzer::handle_ldx`] sees `arena_stx_findings` already
-/// contains `(P, 8)` at the FIRST LDX site — `r2 = LDX[r1 + 8]` is
-/// re-typed `ArenaU64FromAlloc` rather than `LoadedU64Field{P, 8}`.
-/// The downstream `LDX[r2 + 0]` and `LDX[r2 + 8]` then read through
-/// an `ArenaU64FromAlloc` base (line ~1378), which sets dst Unknown
-/// without recording any access. Patterns ends pass 2 with an empty
-/// access set for `(P, 8)`, the shape-inference loop in finalize
-/// drops candidates without accesses, and the only emit is the
-/// STX-flow path's `target_type_id=0` deferred-resolve sentinel.
+/// shape-inference path's LDX accumulates into `patterns`, AND a
+/// `pseudo_call` + STX-flow path inserts into `arena_stx_findings`.
+/// The two evidence sources combine: STX-flow proves the slot
+/// holds an arena pointer (gates emission past the F1 direct-
+/// evidence requirement), and shape-inference resolves the
+/// target struct from the observed dereference pattern. The
+/// arena STX-flow loop in [`Analyzer::finalize`] runs the same
+/// shape-inference intersection across `patterns[key]` as the
+/// shape-inference loop does, so a slot with BOTH evidence
+/// sources emits a `CastHit` whose `target_type_id` is the
+/// uniquely-resolved struct id (when shape inference resolves)
+/// — not the deferred-resolve sentinel.
 ///
-/// The deferred resolve is correct: when the analyzer cannot
-/// infer the target shape from instruction evidence in any pass,
-/// the renderer's [`super::btf_render::MemReader::resolve_arena_type`]
-/// bridge resolves the payload BTF id from the live arena snapshot
-/// at chase time. This test pins the fixpoint's "alias-tracking
-/// supersedes shape inference once the slot is arena-tagged"
-/// contract.
+/// Pre-fix: the LDX alias-tracking arm at
+/// [`Analyzer::handle_ldx`] re-typed any LDX off a slot already
+/// in `arena_stx_findings` to `RegState::ArenaU64FromAlloc`,
+/// which suppressed downstream access recording (the arena arm
+/// in `handle_ldx` drops dst without populating patterns) — so
+/// even when struct shape uniquely identified the target,
+/// `target_type_id` stayed 0. Post-fix the LDX always emits
+/// `LoadedU64Field`, downstream LDXs through it record the
+/// access pattern, and shape inference resolves the target the
+/// renderer can chase against without consulting the
+/// `MemReader::resolve_arena_type` bridge. The bridge stays in
+/// place for slots whose access pattern doesn't uniquely
+/// resolve.
+///
+/// Test fixture: struct Q has `u64@0` + `u64@8` (size 16), so
+/// the access pattern at offsets 0 and 8 with size 8 uniquely
+/// identifies Q. The assertion pins that target_type_id ==
+/// Q's BTF id, NOT 0.
 #[test]
-fn stx_flow_emits_zero_target_under_fixpoint_alias_tracking() {
-    // BTF: u64(1), P(2, u64@8 source), Q(3, u64@0+u64@8). Q would
-    // be the unique candidate matching both pattern accesses
-    // (offset=0, size=8) and (offset=8, size=8) under single-pass
-    // analysis; under fixpoint the patterns set ends empty so the
-    // shape inference does not fire.
+fn stx_flow_resolves_target_via_shape_inference_under_alias_tracking() {
+    // BTF: u64(1), P(2, u64@8 source), Q(3, u64@0+u64@8). Q is the
+    // unique candidate matching both pattern accesses (offset=0,
+    // size=8) and (offset=8, size=8). Both detection paths fire and
+    // combine: STX-flow proves the slot holds an arena pointer and
+    // gates emission, shape inference resolves the target struct
+    // from the access pattern.
     let mut strings: Vec<u8> = vec![0];
     let n_u64 = push_name(&mut strings, "u64");
     let n_p = push_name(&mut strings, "P");
@@ -8221,22 +8230,24 @@ fn stx_flow_emits_zero_target_under_fixpoint_alias_tracking() {
     let blob = build_btf(&types, &strings);
     let btf = Btf::from_bytes(&blob).unwrap();
     let p_id = 2;
+    let q_id = 3;
     let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
-    // Phase 1 — single-pass shape-inference accesses for (P, 8).
-    // Pass 1 records them; pass 2 (fixpoint) sees the slot already
-    // in arena_stx_findings and re-types the LDX to
-    // RegState::ArenaU64FromAlloc, which produces no patterns
-    // accesses:
-    //   r2 = LDX[r1 + 8]   ; pass 1 -> LoadedU64Field{P, 8};
-    //                        pass 2 -> ArenaU64FromAlloc
-    //   r3 = LDX[r2 + 0]   ; pass 1 records access (0, 8);
-    //                        pass 2 reads through ArenaU64FromAlloc
-    //                        and records nothing
-    //   r4 = LDX[r2 + 8]   ; same dual behavior
+    // Phase 1 — shape-inference accesses for (P, 8). Both passes
+    // record the same pattern: the LDX at PC 0 emits
+    // `LoadedU64Field{P, 8}` regardless of whether
+    // `arena_stx_findings` already contains the slot, and
+    // downstream LDXs through that register record accesses
+    // (0, 8) and (8, 8) into `patterns[(P, 8)]`. Q is the
+    // unique candidate matching both accesses (it has u64@0
+    // and u64@8, size 16), so finalize's intersection resolves
+    // `target_type_id = q_id`.
+    //   r2 = LDX[r1 + 8]   ; LoadedU64Field{P, 8}
+    //   r3 = LDX[r2 + 0]   ; records access (0, 8)
+    //   r4 = LDX[r2 + 8]   ; records access (8, 8)
     // Phase 2 — preserve r1 across the call clobber by stashing
     // it in r6 (callee-saved per BPF ABI, R0..R5 only clobbered):
     //   r6 = r1
-    // Phase 3 — STX-flow tags the same slot every pass:
+    // Phase 3 — STX-flow tags the same slot:
     //   pseudo_call (PC 4)  ; SubprogReturn at PC=4 sets R0 to
     //                         RegState::ArenaU64FromAlloc after
     //                         the standard R0..=R5 clobber
@@ -8268,14 +8279,12 @@ fn stx_flow_emits_zero_target_under_fixpoint_alias_tracking() {
     assert_eq!(
         map.get(&(p_id, 8)),
         Some(&CastHit {
-            target_type_id: 0,
+            target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
-        "fixpoint pass 2 must re-type the LDX as ArenaU64FromAlloc \
-             via alias tracking on the carried-over arena_stx_findings, \
-             which suppresses the shape-inference recording — finalize \
-             emits the STX-flow's deferred-resolve sentinel \
-             (target_type_id=0) with no shape-inference overwrite: {map:?}"
+        "STX-flow gates emission past F1; shape inference resolves \
+             target_type_id from the recorded access pattern (Q is the \
+             only struct of size 16 with u64@0 and u64@8): {map:?}"
     );
 }
 
@@ -10180,5 +10189,306 @@ fn cross_function_fixpoint_callee_before_caller() {
         }),
         "fixpoint must propagate caller's [Pointer{{Parent}}, ArenaU64FromAlloc] \
          into callee at lower PC, producing (Parent, 8) -> Arena: {map:?}"
+    );
+}
+
+// -- finalize-order tests ----------------------------------------
+//
+// `Analyzer::finalize` runs the arena_stx loop (cast_analysis/mod.rs:2672)
+// BEFORE the standalone shape-inference loop (cast_analysis/mod.rs:2746).
+// The standalone loop's `if out.contains_key(&key) { continue; }`
+// gate at line 2759 prevents it from overwriting an arena_stx
+// emission for the same key. The internal shape-inference inside
+// the arena_stx loop (lines 2685-2710) computes the same candidate
+// intersection, so the two paths produce the same target_type_id
+// when shape inference is unique.
+//
+// The bug surface for #89 / coordinator's priority-1 fix item is
+// the AMBIGUOUS-shape case: when shape inference yields 0 or 2+
+// candidates, the arena_stx loop emits with target_type_id=0
+// (deferred resolve sentinel) AND the standalone loop's gate
+// preserves that emission. Without this test, a refactor that
+// swapped the loop order (running shape-inference first) would
+// drop the deferred-resolve entry entirely for ambiguous-shape
+// slots — every cgx_raw / llcx_raw chase would silently miss
+// because the analyzer never emitted the slot.
+
+/// Ambiguous shape preserves arena_stx deferred-resolve emit.
+///
+/// BTF: u64(1), P(2, u64@8 source) parent struct, two structs Q
+/// and R both 16 bytes with `u64@0 + u64@8` shape. Shape inference
+/// on accesses (0, 8) and (8, 8) intersects to {Q, R} — TWO
+/// candidates, ambiguous. The standalone shape-inference loop drops
+/// the slot per cast_analysis/mod.rs:2810-2811 ("0 or 2+ candidates
+/// -> drop silently"). The arena_stx loop's internal inference at
+/// 2685-2709 also yields `inferred_target = None`, so it falls back
+/// to `target_type_id = 0` per line 2710 (`unwrap_or(0)`). The map
+/// must contain `(P, 8) -> CastHit { target_type_id: 0,
+/// addr_space: Arena }` — the deferred-resolve sentinel — so the
+/// renderer's `chase_arena_pointer` special case (btf_render/mod.rs:3392)
+/// can call `MemReader::resolve_arena_type` at chase time.
+///
+/// Pin both:
+///   (a) the entry IS present (arena_stx loop emitted it), and
+///   (b) target_type_id == 0 (shape inference did not resolve).
+///
+/// A regression that ran shape-inference FIRST would drop this slot
+/// entirely (no entry in `out`), and the chase-arm `MemReader::
+/// resolve_arena_type` bridge would have nothing to resolve against.
+/// A regression that emitted with one of {Q, R} arbitrarily would
+/// produce a wrong-type render at chase time.
+#[test]
+fn finalize_arena_stx_emits_deferred_resolve_when_shape_inference_ambiguous() {
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = push_name(&mut strings, "u64");
+    let n_p = push_name(&mut strings, "P");
+    let n_q = push_name(&mut strings, "Q");
+    let n_r = push_name(&mut strings, "R");
+    let n_f = push_name(&mut strings, "f");
+    let n_a = push_name(&mut strings, "a");
+    let n_b = push_name(&mut strings, "b");
+    let types = vec![
+        SynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: P { u64 f @ 8 } — parent struct, slot at offset 8.
+        SynType::Struct {
+            name_off: n_p,
+            size: 16,
+            members: vec![SynMember {
+                name_off: n_f,
+                type_id: 1,
+                byte_offset: 8,
+            }],
+        },
+        // id 3: Q { u64 a @ 0; u64 b @ 8 } — candidate A.
+        SynType::Struct {
+            name_off: n_q,
+            size: 16,
+            members: vec![
+                SynMember {
+                    name_off: n_a,
+                    type_id: 1,
+                    byte_offset: 0,
+                },
+                SynMember {
+                    name_off: n_b,
+                    type_id: 1,
+                    byte_offset: 8,
+                },
+            ],
+        },
+        // id 4: R { u64 a @ 0; u64 b @ 8 } — candidate B with same
+        // shape. Two candidates collide on the access pattern; shape
+        // inference yields {Q, R} — ambiguous.
+        SynType::Struct {
+            name_off: n_r,
+            size: 16,
+            members: vec![
+                SynMember {
+                    name_off: n_a,
+                    type_id: 1,
+                    byte_offset: 0,
+                },
+                SynMember {
+                    name_off: n_b,
+                    type_id: 1,
+                    byte_offset: 8,
+                },
+            ],
+        },
+    ];
+    let blob = build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    let p_id = 2;
+    let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+    // Shape-inference accesses (0, 8) and (8, 8) on (P, 8) plus
+    // an STX-flow tag on (P, 8) — both Q and R match the shape.
+    //
+    //   r2 = LDX[r1 + 8]   ; LoadedU64Field{P, 8}
+    //   r3 = LDX[r2 + 0]   ; records access (0, 8) into patterns[(P, 8)]
+    //   r4 = LDX[r2 + 8]   ; records access (8, 8) into patterns[(P, 8)]
+    //   r6 = r1            ; preserve P* across the call (R6 callee-saved)
+    //   pseudo_call (PC 4) ; SubprogReturn at PC=4 → R0 = ArenaU64FromAlloc
+    //   STX[r6 + 8] = r0   ; arena_stx_findings.insert((P, 8), Pending)
+    let insns = vec![
+        ldx(BPF_SIZE_DW, 2, 1, 8),
+        ldx(BPF_SIZE_DW, 3, 2, 0),
+        ldx(BPF_SIZE_DW, 4, 2, 8),
+        mov_x(6, 1),
+        pseudo_call,
+        stx(BPF_SIZE_DW, 6, 0, 8),
+        exit(),
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 1,
+            struct_type_id: p_id,
+        }],
+        &[],
+        &[],
+        &[SubprogReturn { insn_offset: 4 }],
+    );
+    // The slot MUST be emitted. Drop = silent failure — chase_arena_pointer
+    // would never enter the deferred-resolve special case for this slot.
+    let hit = map
+        .get(&(p_id, 8))
+        .expect("(P, 8) must be in CastMap even when shape inference is ambiguous");
+    assert_eq!(
+        hit.addr_space, AddrSpace::Arena,
+        "ambiguous-shape STX-flow tag must still emit AddrSpace::Arena: {map:?}"
+    );
+    assert_eq!(
+        hit.target_type_id, 0,
+        "ambiguous shape (Q and R both 16-byte u64@0+u64@8) must yield \
+         target_type_id=0 (deferred resolve via MemReader::resolve_arena_type \
+         bridge at chase time). target_type_id={} suggests one of Q/R was \
+         picked arbitrarily — false-positive render of the wrong struct \
+         shape: {map:?}",
+        hit.target_type_id
+    );
+    // Cross-check: assert the picked id is NOT one of the candidate
+    // structs. A regression that picked Q or R would set
+    // target_type_id to 3 or 4.
+    assert!(
+        hit.target_type_id != 3 && hit.target_type_id != 4,
+        "target_type_id={} must NOT be one of the ambiguous candidates Q (3) or R (4); \
+         picking one arbitrarily would render the slot's payload against the wrong \
+         struct shape at chase time: {map:?}",
+        hit.target_type_id
+    );
+}
+
+/// #89 fix: order-independence — when the STX-flow tag for a slot
+/// fires BEFORE the dereference pattern through the same slot, the
+/// dereference accesses must still flow into shape inference. The
+/// failing pre-fix behaviour was: pseudo_call + STX(slot) tagged
+/// the slot in pass 1; pass 2's LDX off the slot inherited
+/// `RegState::ArenaU64FromAlloc` via alias-tracking; downstream
+/// LDXs through the alias-tagged register dropped accesses (the
+/// arena arm in `handle_ldx` set dst to Unknown without populating
+/// patterns), so shape inference saw an empty access set even
+/// though the access pattern uniquely identified the target
+/// struct.
+///
+/// Post-fix the alias-tagged variant carries the source slot
+/// identity (`source: Some((parent, off))`) and the LDX arm
+/// records the access against that slot. Shape inference at
+/// finalize sees the access pattern and resolves
+/// `target_type_id` to the unique BTF id when the pattern
+/// uniquely matches one struct.
+///
+/// Test fixture: struct Q { u64@0; u64@8 } is the unique 16-byte
+/// candidate matching accesses (0, 8) and (8, 8). The bug
+/// surface for cgx_raw / llcx_raw in `lib/cgroup_bw.bpf.c`'s
+/// `scx_static_alloc()`-backed pointers — the STX-flow tag fires
+/// at the allocator-return STX, the deref pattern fires later
+/// when the cached pointer is consulted, and shape inference
+/// must bridge the two evidence sources to recover the per-cgroup
+/// payload type.
+#[test]
+fn stx_flow_stx_before_deref_resolves_target_via_shape_inference() {
+    // P { u64 cgx_raw @ 8 }, Q { u64@0; u64@8 } — Q is the unique
+    // 16-byte candidate.
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = push_name(&mut strings, "u64");
+    let n_p = push_name(&mut strings, "P");
+    let n_q = push_name(&mut strings, "Q");
+    let n_cgx = push_name(&mut strings, "cgx_raw");
+    let n_a = push_name(&mut strings, "a");
+    let n_b = push_name(&mut strings, "b");
+    let types = vec![
+        SynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        SynType::Struct {
+            name_off: n_p,
+            size: 16,
+            members: vec![SynMember {
+                name_off: n_cgx,
+                type_id: 1,
+                byte_offset: 8,
+            }],
+        },
+        SynType::Struct {
+            name_off: n_q,
+            size: 16,
+            members: vec![
+                SynMember {
+                    name_off: n_a,
+                    type_id: 1,
+                    byte_offset: 0,
+                },
+                SynMember {
+                    name_off: n_b,
+                    type_id: 1,
+                    byte_offset: 8,
+                },
+            ],
+        },
+    ];
+    let blob = build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    let p_id = 2;
+    let q_id = 3;
+    let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+    // Order: STX-flow tag FIRST, then deref pattern. The deref
+    // happens AFTER the slot is already in `arena_stx_findings`.
+    //
+    //   pseudo_call (PC 0)  ; SubprogReturn at PC=0 sets R0 to
+    //                         RegState::ArenaU64FromAlloc { source: None }
+    //                         after the standard R0..=R5 clobber.
+    //   STX[r6 + 8] = r0    ; (P, 8) → arena_stx_findings.insert(Pending).
+    //   r2 = LDX[r6 + 8]    ; pass 2 sees (P, 8) in arena_stx_findings,
+    //                         re-types as ArenaU64FromAlloc { source:
+    //                         Some((P, 8)) }.
+    //   r3 = LDX[r2 + 0]    ; records access (0, 8) against (P, 8)
+    //                         via the source field.
+    //   r4 = LDX[r2 + 8]    ; records access (8, 8).
+    //
+    // R6 must be Pointer{P} (callee-saved → survives the call).
+    let insns = vec![
+        pseudo_call,
+        stx(BPF_SIZE_DW, 6, 0, 8),
+        ldx(BPF_SIZE_DW, 2, 6, 8),
+        ldx(BPF_SIZE_DW, 3, 2, 0),
+        ldx(BPF_SIZE_DW, 4, 2, 8),
+        exit(),
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 6,
+            struct_type_id: p_id,
+        }],
+        &[],
+        &[],
+        &[SubprogReturn { insn_offset: 0 }],
+    );
+    let hit = map
+        .get(&(p_id, 8))
+        .expect("(P, 8) must be in CastMap — STX-flow gates emission");
+    assert_eq!(
+        hit.addr_space,
+        AddrSpace::Arena,
+        "STX-flow tag must yield AddrSpace::Arena: {map:?}"
+    );
+    assert_eq!(
+        hit.target_type_id, q_id,
+        "post-fix shape inference must resolve target_type_id=q_id ({q_id}) \
+         even when the STX-flow tag fires BEFORE the deref pattern \
+         (pre-fix bug: alias-tagged register dropped accesses, leaving \
+         target_type_id=0): {map:?}"
     );
 }

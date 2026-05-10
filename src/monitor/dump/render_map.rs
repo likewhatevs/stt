@@ -285,7 +285,7 @@ pub(super) fn build_arena_page_index(
 /// Duplicate `slot_start` keys (two slots reporting the same
 /// windowed start, indicating a stale snapshot from a freed
 /// allocation racing with the freeze) keep the FIRST entry and
-/// emit a `tracing::debug!` line so an operator diagnosing a
+/// emit a `tracing::warn!` line so an operator diagnosing a
 /// wrong-render can spot the collision. The kernel allocator
 /// places slots back-to-back inside one `sdt_chunk` and never
 /// re-uses a position while the bitmap still has it marked
@@ -460,7 +460,6 @@ pub(super) fn resolve_arena_type_with_static_fallback(
     arena_snapshot: Option<&super::super::arena::ArenaSnapshot>,
     arena_type_index: Option<&ArenaTypeIndex>,
     scx_static_index: Option<&super::super::scx_static_alloc::ScxStaticRangeIndex>,
-    _sdt_alloc_metas: &[SdtAllocMeta],
     addr: u64,
 ) -> Option<ArenaResolveHit> {
     if let Some(hit) = resolve_arena_type_in_index(arena_snapshot, arena_type_index, addr) {
@@ -551,13 +550,22 @@ struct AccessorMemReader<'a> {
     /// "forward declaration; body not in this BTF".
     arena_type_index: Option<&'a ArenaTypeIndex>,
     /// Discovered sdt_alloc allocator metadata for the dump pass.
-    /// When [`Self::arena_type_index`] misses but the chased address
-    /// lies inside the arena window, the
-    /// [`MemReader::resolve_arena_type`] override falls back to the
-    /// first metadata entry with a resolved `target_type_id`, using
-    /// it as a best-effort payload type. Covers allocations the
-    /// per-slot index could not capture (snapshot truncation,
-    /// `MAX_SDT_ALLOC_ENTRIES` cap). Empty slice (no allocator with
+    /// Consumed only by the
+    /// [`MemReader::resolve_arena_type_meta_fallback`] override
+    /// (see [`AccessorMemReader::resolve_arena_type_meta_fallback`]),
+    /// which [`try_sdt_alloc_bridge`] calls only when the chase
+    /// target is `Type::Fwd(_)` AND the per-slot
+    /// [`MemReader::resolve_arena_type`] returned `None`. The override
+    /// returns the first metadata entry with a resolved
+    /// `target_type_id` if the address lies inside the arena window,
+    /// covering Fwd-pointee chases when the per-slot index missed
+    /// (snapshot truncation, `MAX_SDT_ALLOC_ENTRIES` cap). The
+    /// type-gating is what prevents the historical "false positive
+    /// factory" behaviour — arbitrary `u64` fields whose values
+    /// happen to land in the arena window do NOT trigger this
+    /// fallback because they reach
+    /// [`MemReader::resolve_arena_type`] (no meta consultation),
+    /// not the Fwd-gated bridge path. Empty slice (no allocator with
     /// a typed payload was discovered) disables the fallback.
     sdt_alloc_metas: &'a [SdtAllocMeta],
     /// Optional cross-BTF Fwd resolution context — see
@@ -590,6 +598,18 @@ struct AccessorMemReader<'a> {
     /// back to the historical Fwd-skip / cross-BTF behaviour
     /// rather than risking a wrong-type render.
     scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
+    /// Optional set of `slot_start` low-32 addresses for every
+    /// allocator slot the dump pre-pass already rendered into
+    /// `report.sdt_allocations`. The
+    /// [`MemReader::is_already_rendered`] override consults this
+    /// set so the per-map renderer's arena chase can short-circuit
+    /// when a TASK_STORAGE / HASH map's value points at a slot the
+    /// typed-allocator surface already shows — preventing the same
+    /// payload from appearing twice in the failure dump. `None`
+    /// (no allocator pre-pass produced any rendered slot, or the
+    /// caller chose not to dedup for this reader instance) keeps
+    /// the chase pipeline's existing behaviour intact.
+    rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
 }
 
 impl MemReader for AccessorMemReader<'_> {
@@ -691,7 +711,6 @@ impl MemReader for AccessorMemReader<'_> {
             self.arena_snapshot,
             self.arena_type_index,
             self.scx_static_index,
-            self.sdt_alloc_metas,
             addr,
         )
     }
@@ -714,6 +733,19 @@ impl MemReader for AccessorMemReader<'_> {
         // [`resolve_cross_btf_fwd_in_index`] for the canonical
         // body.
         resolve_cross_btf_fwd_in_index(self.cross_btf_fwd_index, name, kind)
+    }
+    fn is_already_rendered(&self, addr: u64) -> bool {
+        // Mask to the low-32 windowed shape the dump pre-pass keys
+        // its [`ArenaTypeIndex`] on (every slot_start in the index
+        // is `addr as u32`). The set forwarded here is built once
+        // per dump pass from the same keys, so the membership check
+        // matches the same address space the chase target was
+        // resolved against. `None` (no rendered-slot index threaded
+        // in) returns `false` per the trait default semantics.
+        let Some(set) = self.rendered_slot_addrs else {
+            return false;
+        };
+        set.contains(&(addr as u32))
     }
 }
 
@@ -831,6 +863,7 @@ impl<'a> GuestMemMapAccessor<'a> {
         sdt_alloc_metas: &'a [SdtAllocMeta],
         cross_btf_fwd_index: Option<&'a CrossBtfFwdIndex<'a>>,
         scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
+        rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
     ) -> impl MemReader + 'a {
         AccessorMemReader {
             kernel: self.kernel(),
@@ -842,6 +875,7 @@ impl<'a> GuestMemMapAccessor<'a> {
             sdt_alloc_metas,
             cross_btf_fwd_index,
             scx_static_index,
+            rendered_slot_addrs,
         }
     }
 }
@@ -1014,6 +1048,16 @@ pub(super) struct RenderMapCtx<'a> {
     /// `scx_static` instance was discovered) keeps the chase
     /// pipeline's existing skip path intact.
     pub(super) scx_static_index: Option<&'a super::super::scx_static_alloc::ScxStaticRangeIndex>,
+    /// `slot_start` low-32 addresses for every allocator slot the
+    /// dump pre-pass already rendered into `report.sdt_allocations`.
+    /// Threaded into every per-map [`AccessorMemReader`] so
+    /// [`MemReader::is_already_rendered`] short-circuits the arena
+    /// chase when a TASK_STORAGE / HASH map's value points at a
+    /// slot the typed-allocator surface already shows — preventing
+    /// the same payload from appearing twice in the failure dump.
+    /// `None` (no allocator pre-pass produced any rendered slot)
+    /// keeps the chase pipeline's existing behaviour intact.
+    pub(super) rendered_slot_addrs: Option<&'a std::collections::HashSet<u32>>,
 }
 
 /// Render `bytes` via BTF when both a `Btf` is available AND the
@@ -1454,6 +1498,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         arena_type_index,
         cross_btf_fwd_index,
         scx_static_index,
+        rendered_slot_addrs,
     } = ctx;
     let mem_reader = accessor.mem_reader(
         shared_arena.map(|(snap, _map_kva)| snap),
@@ -1464,6 +1509,7 @@ pub(super) fn render_map(ctx: &RenderMapCtx<'_>, info: &BpfMapInfo) -> FailureDu
         sdt_alloc_metas,
         cross_btf_fwd_index,
         scx_static_index,
+        rendered_slot_addrs,
     );
     // Per-map allocator selection. The TASK_STORAGE / HASH chase
     // arms consult this to pick the matching allocator metadata when

@@ -38,6 +38,14 @@
 //! allocation as structured records under
 //! [`FailureDumpReport::sdt_allocations`]. The walk runs only when
 //! every prerequisite is present:
+//!   - the per-map dump deadline has not been exceeded (the
+//!     post-pass runs after every map render, and an earlier
+//!     render exhausting the budget skips the walk to keep the
+//!     dump bounded),
+//!   - the arena's `user_vm_start` is 4 GiB-aligned (low 32 bits
+//!     zero — the bridge's address arithmetic treats slot starts as
+//!     low-32 keys against a `[user_vm_start, user_vm_start + 4 GiB)`
+//!     window; misalignment would silently mismap chases),
 //!   - the scheduler exposes a `.bss` ARRAY map with non-zero
 //!     `btf_kva` (so we can read its raw bytes and have a program
 //!     BTF to resolve types against),
@@ -2636,6 +2644,12 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // these pre-pass renders; the per-map renders below
             // pass the built `scx_static_index` where it matters.
             None,
+            // The sdt_alloc pre-pass IS the surface that produces
+            // the rendered-slot set; pass `None` so no dedup gate
+            // fires while the typed-allocator surface itself is
+            // being assembled. The per-map renders below pass the
+            // built set where it matters.
+            None,
         );
         // Locate every sdt_alloc allocator instance declared in
         // `.bss`. The Datasec walk gives us each variable's name and
@@ -2739,6 +2753,33 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         None
     } else {
         Some(&arena_type_index)
+    };
+    // Build the rendered-slot set for arena chase dedup. Includes
+    // every live slot the sdt_alloc walker surfaced under any
+    // `report.sdt_allocations` entry — typed AND untyped allocators
+    // both populate `SdtAllocatorSnapshot::all_slot_addrs` via
+    // [`super::sdt_alloc::TreeWalker::emit_leaf`]'s unconditional
+    // push (the field is keyed on the live-slot wire shape, not on
+    // payload type resolution). Keying on `arena_type_index.keys()`
+    // alone would have missed slots from allocators whose
+    // `target_type_id == 0` — those allocators never reach
+    // `append_arena_type_index_for_allocator` (the helper short-
+    // circuits on a zero target id) yet their slots ARE rendered in
+    // `report.sdt_allocations`. The per-map renderer's
+    // [`MemReader::is_already_rendered`] consults this set to skip
+    // re-rendering the same allocation when a TASK_STORAGE / HASH
+    // map's value pointer chases back into it; missing untyped slots
+    // would surface them twice in the dump (once under the typed-
+    // allocator surface, once embedded in the per-map render).
+    let rendered_slot_addrs: std::collections::HashSet<u32> = report
+        .sdt_allocations
+        .iter()
+        .flat_map(|snap| snap.all_slot_addrs.iter().map(|&a| a as u32))
+        .collect();
+    let rendered_slot_addrs_ref = if rendered_slot_addrs.is_empty() {
+        None
+    } else {
+        Some(&rendered_slot_addrs)
     };
     tracing::debug!(
         elapsed_us = sdt_alloc_t0.elapsed().as_micros() as u64,
@@ -2947,6 +2988,17 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // resolution path. `None` when no live
                 // `scx_static` instance was discovered.
                 scx_static_index: scx_static_index_ref,
+                // Built from the sdt_alloc pre-pass above: the
+                // low-32 windowed `slot_start` of every allocator
+                // slot already rendered into
+                // `report.sdt_allocations`. Lets the renderer's
+                // [`MemReader::is_already_rendered`] short-circuit
+                // the arena chase when a TASK_STORAGE / HASH
+                // map's value pointer lands in a slot the
+                // typed-allocator surface already shows — no
+                // duplicate payload in the dump. `None` when no
+                // allocator pre-pass produced any rendered slot.
+                rendered_slot_addrs: rendered_slot_addrs_ref,
             },
             &info,
         );

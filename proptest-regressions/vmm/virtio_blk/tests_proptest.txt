@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 009e5efabe3678df62dea91e4ea6f40001cf1beee66d9472f735e94ae81b31bc # shrinks to chain = WellFormedChain { req_type: 0, sector: 1, n_data_segments: 7, seg_sectors: 3 }
+cc 5d8f2ce467418488144430d490a35c7a445f1fff9f15fa1fcfa614d854a3cd80 # shrinks to chain = WellFormedChain { req_type: 0, sector: 0, n_data_segments: 3, seg_sectors: 3 }

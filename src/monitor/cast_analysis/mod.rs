@@ -522,11 +522,37 @@ enum RegState {
     /// typed `Pointer{P}` parent records `(P, off)` as an Arena cast
     /// finding directly — no shape inference required.
     ///
-    /// No payload fields: the source slot identity (parent struct +
-    /// field offset) is derived at the STX site from the destination
-    /// register's `Pointer{P}` state and the store's offset, not
-    /// carried in the value register's state.
-    ArenaU64FromAlloc,
+    /// `source` carries the `(parent_struct_id, field_offset)` slot
+    /// the value was loaded from, when known. Populated at the
+    /// alias-tracking LDX site in [`Analyzer::handle_ldx`] when an
+    /// LDX through a typed `Pointer{P}` reads a u64 field whose slot
+    /// is already in [`Analyzer::arena_stx_findings`]. `None` for the
+    /// allocator-return seed paths (`SubprogReturn`,
+    /// `handle_kfunc_call`, caller_arg_types propagation,
+    /// `bridge_map_value_spill`) where the slot identity is recorded
+    /// separately into `arena_stx_findings` by the producing site —
+    /// the value register itself has no in-frame slot of origin to
+    /// attach.
+    ///
+    /// Consumed by the `RegState::ArenaU64FromAlloc` arm of
+    /// [`Analyzer::handle_ldx`]: when `source` is `Some`, the
+    /// downstream LDX through this register records the access
+    /// pattern `(target_offset, target_size)` against the source slot
+    /// in [`Analyzer::patterns`], feeding shape inference at finalize.
+    /// `None` skips the recording — false negative on shape
+    /// inference is the safe direction.
+    ///
+    /// The slot identity is meaningful only WITHIN the function whose
+    /// LDX produced it: an arena pointer flowing across a
+    /// BPF_PSEUDO_CALL into a callee's R1..R5 has no source-slot
+    /// meaning in the callee's frame. Cross-function propagation
+    /// (caller_arg_types snapshot at every BPF_PSEUDO_CALL, FuncEntry
+    /// reseed of R1..R5) strips `source` to `None` so the callee
+    /// retains the arena tag without inheriting a stale in-caller
+    /// slot identity.
+    ArenaU64FromAlloc {
+        source: Option<(u32, u32)>,
+    },
     /// Register holds a frame-pointer-relative address: `r10 + offset`.
     /// Produced by `MOV rX, r10` (offset = 0) and propagated through
     /// `ALU64 | ADD | K` (offset += imm). Consumed by the
@@ -1264,8 +1290,13 @@ impl<'a> Analyzer<'a> {
                             if let RegState::Pointer { struct_type_id } = caller_state {
                                 self.regs[reg_idx] = RegState::Pointer { struct_type_id };
                                 self.note_type_id(struct_type_id);
-                            } else if matches!(caller_state, RegState::ArenaU64FromAlloc) {
-                                self.regs[reg_idx] = RegState::ArenaU64FromAlloc;
+                            } else if matches!(caller_state, RegState::ArenaU64FromAlloc { .. }) {
+                                // Cross-function: the caller's source
+                                // slot identity has no meaning in the
+                                // callee's frame, so reseed without
+                                // it. The callee retains the arena
+                                // tag for downstream STX recording.
+                                self.regs[reg_idx] = RegState::ArenaU64FromAlloc { source: None };
                             }
                         }
                     }
@@ -1291,12 +1322,25 @@ impl<'a> Analyzer<'a> {
 
             if insn.code == (BPF_CLASS_JMP | BPF_OP_CALL) && insn.src_reg() == BPF_PSEUDO_CALL {
                 let callee_pc = (pc as i64 + 1 + insn.imm as i64) as usize;
+                // Strip source slot from any ArenaU64FromAlloc before
+                // snapshotting: the slot identity is meaningful only
+                // within the caller's frame and would compare unequal
+                // across passes whenever the caller-side LDX produced
+                // it from disjoint slots, breaking fixpoint
+                // convergence on caller_arg_types. The callee inherits
+                // only the arena tag.
+                let strip = |s: RegState| match s {
+                    RegState::ArenaU64FromAlloc { .. } => {
+                        RegState::ArenaU64FromAlloc { source: None }
+                    }
+                    other => other,
+                };
                 let new_args = [
-                    self.regs[1],
-                    self.regs[2],
-                    self.regs[3],
-                    self.regs[4],
-                    self.regs[5],
+                    strip(self.regs[1]),
+                    strip(self.regs[2]),
+                    strip(self.regs[3]),
+                    strip(self.regs[4]),
+                    strip(self.regs[5]),
                 ];
                 self.caller_arg_types
                     .entry(callee_pc)
@@ -1581,7 +1625,7 @@ impl<'a> Analyzer<'a> {
                                     } else if matches!(
                                         self.regs[src],
                                         RegState::Pointer { .. }
-                                            | RegState::ArenaU64FromAlloc
+                                            | RegState::ArenaU64FromAlloc { .. }
                                     ) {
                                         self.regs[dst] = self.regs[src];
                                     } else {
@@ -1722,7 +1766,13 @@ impl<'a> Analyzer<'a> {
                     // are stronger evidence than the allocator
                     // allowlist.
                     if alloc_seed && matches!(self.regs[0], RegState::Unknown) {
-                        self.regs[0] = RegState::ArenaU64FromAlloc;
+                        // Allocator-return seed has no source slot:
+                        // the value was synthesized by the allocator,
+                        // not loaded from a slot. The downstream STX
+                        // of R0 records `(parent, off)` against the
+                        // STORE site's slot via `handle_stx`, not
+                        // through this register's source field.
+                        self.regs[0] = RegState::ArenaU64FromAlloc { source: None };
                         // F4 telemetry: bump the seed-applied
                         // counter so [`Self::finalize`] can
                         // distinguish "we saw allocator call
@@ -1872,14 +1922,27 @@ impl<'a> Analyzer<'a> {
                             // [`Self::arena_stx_findings`]), the
                             // loaded value is itself an arena VA. Set
                             // the destination state to
-                            // [`RegState::ArenaU64FromAlloc`] so the
-                            // tag propagates through subsequent
-                            // moves / spills / stores. Falls through
-                            // to the generic `LoadedU64Field` shape
-                            // when the slot has not been arena-tagged
-                            // yet — the first STX that tags the slot
-                            // populates the index, after which later
-                            // LDXs through the same slot inherit.
+                            // [`RegState::ArenaU64FromAlloc`] carrying
+                            // the slot identity so the tag propagates
+                            // through subsequent moves / spills /
+                            // stores AND a downstream LDX through the
+                            // tagged register can record its access
+                            // pattern in [`Self::patterns`] against
+                            // the source slot. Without the
+                            // re-typing, a re-stored value that is
+                            // an arena VA from a previously-tagged
+                            // slot would lose the
+                            // [`StxValueKind::Arena`] dispatch in
+                            // [`Self::handle_stx`], and the slot
+                            // would never be added to
+                            // [`Self::arena_stx_findings`] on a
+                            // re-store path. Falls through to the
+                            // generic [`RegState::LoadedU64Field`]
+                            // shape when the slot has not been
+                            // arena-tagged yet — the first STX that
+                            // tags the slot populates the index,
+                            // after which later LDXs through the
+                            // same slot inherit.
                             //
                             // Using [`BTreeMap::contains_key`]
                             // without inspecting the
@@ -1896,11 +1959,32 @@ impl<'a> Analyzer<'a> {
                             // drop the slot from the cast map but
                             // the LDX value loaded out of it is
                             // still an arena VA.
+                            //
+                            // The source slot recorded in the
+                            // [`RegState::ArenaU64FromAlloc`]
+                            // variant lets the
+                            // [`RegState::ArenaU64FromAlloc`] arm
+                            // in this function record the
+                            // downstream LDX's `(target_offset,
+                            // target_size)` against the source
+                            // slot's [`Self::patterns`] entry.
+                            // Shape inference at finalize then
+                            // overwrites the STX-flow's
+                            // deferred-resolve sentinel
+                            // (`target_type_id == 0`) with a
+                            // concrete BTF id when the access
+                            // pattern resolves to a unique struct
+                            // (cgx_raw / llcx_raw in
+                            // `lib/cgroup_bw.bpf.c`'s
+                            // `scx_static_alloc()`-backed
+                            // pointers).
                             let dst_state = if self
                                 .arena_stx_findings
                                 .contains_key(&(canonical_parent, canonical_field_off))
                             {
-                                RegState::ArenaU64FromAlloc
+                                RegState::ArenaU64FromAlloc {
+                                    source: Some((canonical_parent, canonical_field_off)),
+                                }
                             } else {
                                 RegState::LoadedU64Field {
                                     source_struct_id: canonical_parent,
@@ -1956,15 +2040,49 @@ impl<'a> Analyzer<'a> {
                 }
                 self.set_reg(dst, RegState::Unknown);
             }
-            RegState::ArenaU64FromAlloc => {
+            RegState::ArenaU64FromAlloc { source } => {
                 // LDX through an arena pointer reads payload bytes
-                // out of an allocator slot. The slot identity is
-                // already recorded in
-                // [`Self::arena_stx_findings`] via the STX path; the
-                // pointer's destination (parent, off) is what
-                // matters, not the arbitrary dereference offset.
-                // Drop dst to Unknown — we do not run shape inference
-                // on dereferences through arena-tagged pointers.
+                // out of an allocator slot. When the value register
+                // carries the source slot identity (set at the
+                // alias-tracking LDX site for slots already in
+                // [`Self::arena_stx_findings`]), record the
+                // `(target_offset, target_size)` access against the
+                // source slot's [`Self::patterns`] entry so shape
+                // inference at finalize can intersect access patterns
+                // across multiple dereferences and overwrite the
+                // STX-flow's deferred-resolve sentinel
+                // (`target_type_id == 0`) with a concrete BTF id when
+                // unique-shape resolution succeeds.
+                //
+                // No source means the value came from an
+                // allocator-return seed (BPF_PSEUDO_CALL with
+                // SubprogReturn, kfunc allowlist hit) or
+                // bridge/caller-arg propagation — the slot identity
+                // is already recorded directly in
+                // [`Self::arena_stx_findings`] by the producing site,
+                // and there is no in-frame source slot to attribute
+                // this dereference to. Drop the access; the renderer's
+                // [`super::btf_render::MemReader::resolve_arena_type`]
+                // bridge resolves the payload type at chase time for
+                // those slots.
+                if let Some((source_struct_id, field_offset)) = source {
+                    let target_off = match field_byte_offset(off) {
+                        Some(o) => o,
+                        None => {
+                            self.set_reg(dst, RegState::Unknown);
+                            return;
+                        }
+                    };
+                    if let Some(sz) = size_bytes {
+                        self.patterns
+                            .entry((source_struct_id, field_offset))
+                            .or_default()
+                            .insert(Access {
+                                offset: target_off,
+                                size: sz,
+                            });
+                    }
+                }
                 self.set_reg(dst, RegState::Unknown);
             }
             RegState::Unknown | RegState::FrameAddr { .. } => {
@@ -2059,7 +2177,7 @@ impl<'a> Analyzer<'a> {
             RegState::Pointer {
                 struct_type_id: tid,
             } => StxValueKind::Kptr { target: tid },
-            RegState::ArenaU64FromAlloc => StxValueKind::Arena,
+            RegState::ArenaU64FromAlloc { .. } => StxValueKind::Arena,
             RegState::Unknown => StxValueKind::Unknown,
             _ => return,
         };
@@ -2406,7 +2524,7 @@ impl<'a> Analyzer<'a> {
             && let Some(name) = func_name.as_deref()
             && ARENA_ALLOC_KFUNC_NAMES.contains(&name)
         {
-            self.regs[0] = RegState::ArenaU64FromAlloc;
+            self.regs[0] = RegState::ArenaU64FromAlloc { source: None };
             // F4 telemetry parity with the SubprogReturn arm:
             // count this as an applied allocator seed so the
             // finalize warn distinguishes "allocator was called
@@ -2469,7 +2587,7 @@ impl<'a> Analyzer<'a> {
             let ever_arena = self.func_has_alloc;
             let slot = match self.stack_slots.get(&slot_off).copied() {
                 Some(s) => s,
-                None if ever_arena => RegState::ArenaU64FromAlloc,
+                None if ever_arena => RegState::ArenaU64FromAlloc { source: None },
                 None => continue,
             };
             let key = (value_struct_id, member_off);
