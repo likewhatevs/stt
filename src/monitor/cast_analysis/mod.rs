@@ -1349,7 +1349,10 @@ impl<'a> Analyzer<'a> {
                         // distinct pseudo selector (see linux uapi
                         // `bpf.h`: `BPF_PSEUDO_KFUNC_CALL = 2`).
                         self.handle_kfunc_call(insn.imm);
-                    } else if pseudo == 0 && insn.imm == BPF_FUNC_MAP_LOOKUP_ELEM {
+                    } else if pseudo == 0
+                        && (insn.imm == BPF_FUNC_MAP_LOOKUP_ELEM
+                            || insn.imm == BPF_FUNC_MAP_LOOKUP_PERCPU_ELEM)
+                    {
                         // Plain-helper arm. `pseudo == 0` is the
                         // helper-call form (linux uapi `bpf.h`:
                         // `BPF_PSEUDO_CALL = 1` is BPF-to-BPF;
@@ -3180,6 +3183,7 @@ pub(crate) const BPF_PSEUDO_KFUNC_CALL: u8 = bs::BPF_PSEUDO_KFUNC_CALL as u8;
 /// is the map descriptor's `__type(value, T)` declaration.
 const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = bs::BPF_FUNC_map_lookup_elem as i32;
 const BPF_FUNC_MAP_UPDATE_ELEM: i32 = bs::BPF_FUNC_map_update_elem as i32;
+const BPF_FUNC_MAP_LOOKUP_PERCPU_ELEM: i32 = bs::BPF_FUNC_map_lookup_percpu_elem as i32;
 const BPF_OP_ADD: u8 = bs::BPF_ADD as u8;
 
 /// `bpf_call->src_reg == BPF_PSEUDO_CALL` denotes a BPF-to-BPF call:
