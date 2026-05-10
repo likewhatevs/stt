@@ -980,7 +980,9 @@ impl<'a> Analyzer<'a> {
             // pre-jump register state would survive past the
             // skip into the next valid instruction.
             if jump_targets.contains(&pc) {
-                self.regs = [RegState::Unknown; 11];
+                for r in 0..=5 {
+                    self.regs[r] = RegState::Unknown;
+                }
                 self.stack_slots.clear();
                 self.bridge_slot_origins.clear();
             }
