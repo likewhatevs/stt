@@ -623,11 +623,19 @@ pub(crate) fn attempt_auto_repro(
     let probe_payload_partial_path = super::sidecar::sidecar_dir()
         .join(format!("{}.repro.probe-payload.partial.json", entry.name));
     let _ = std::fs::remove_file(&probe_payload_partial_path);
-    let probe_section = extract_probe_output(
-        &repro_result.output,
-        kernel_dir_str,
-        Some(probe_payload_partial_path.as_path()),
-    );
+    let probe_section = if repro_result.stderr.contains("runnable task stall") {
+        tracing::debug!(
+            "auto-repro: suppressing chain-to-failure for stall exit \
+             (no causal task — probe events are always empty after stitch)",
+        );
+        None
+    } else {
+        extract_probe_output(
+            &repro_result.output,
+            kernel_dir_str,
+            Some(probe_payload_partial_path.as_path()),
+        )
+    };
 
     // Build diagnostic tails from the repro VM's output.
     const REPRO_TAIL_LINES: usize = 40;

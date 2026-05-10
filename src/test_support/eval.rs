@@ -1564,13 +1564,6 @@ fn run_ktstr_test_inner_impl(
         if !effective_auto_repro {
             return None;
         }
-        if result.stderr.contains("runnable task stall") {
-            tracing::debug!(
-                "auto-repro: skipped for stall exit (probe timeline is always \
-                 empty — stall has no causal task)",
-            );
-            return None;
-        }
         let repro = attempt_auto_repro(
             entry,
             &kernel,
