@@ -41,12 +41,30 @@
 //!
 //! # Liveness
 //!
-//! The walker uses the per-level `allocated[]` bitmap as the source
-//! of truth, not `tid.idx` or `pool.idx` — both are unreliable:
-//! post-free `tid.idx` is reset to 0 (ambiguous with slot 0), and
-//! `pool.idx` is the pool's high-water mark, not the live count.
-//! `chunk->data[pos]` is also nullable for pristine slots that the
-//! pool never handed out — we skip those silently.
+//! At the leaf level (level 2), `allocated[]` is the source of truth:
+//! a set bit means slot `pos` carries a live `sdt_data *` in
+//! `chunk->data[pos]`. We use the bitmap there because `tid.idx` and
+//! `pool.idx` are both unreliable — post-free `tid.idx` is reset to 0
+//! (ambiguous with slot 0), and `pool.idx` is the pool's high-water
+//! mark, not the live count. `chunk->data[pos]` is also nullable for
+//! pristine slots that the pool never handed out — we skip those
+//! silently.
+//!
+//! At internal levels (0 and 1) the bitmap semantics are inverted:
+//! `lib/sdt_alloc.bpf.c` only sets a parent bit once a child becomes
+//! FULL (`desc_find_empty` propagates the set up only while the
+//! decremented `nr_free` stays at 0) and clears it once the child
+//! transitions back from full (`mark_nodes_avail` only propagates the
+//! clear up while the incremented `nr_free` is still 1). So a set bit
+//! at an internal level means "the descendant subtree is full"; a
+//! clear bit means "partially populated, empty, or never created."
+//! The common case for any scheduler with N << 512^3 live tasks is
+//! "all clear", so the bitmap is unusable for enumeration at internal
+//! levels. The walker enumerates internal levels by pointer non-null
+//! in `chunk->descs[]` instead — every populated subtree has a
+//! non-NULL desc child stored at its `pos` (`desc_find_empty` writes
+//! `desc_children[pos]` whenever it allocates a new chunk), and a
+//! NULL pointer is a never-created subtree we skip silently.
 //!
 //! # Race window
 //!
@@ -686,14 +704,30 @@ struct TreeWalker<'a> {
 
 impl<'a> TreeWalker<'a> {
     /// Descend into a `sdt_desc` at level `level`. Levels 0 and 1
-    /// recurse via `chunk->descs[pos]`; level 2 reads `chunk->data[pos]`
-    /// and emits one [`SdtAllocEntry`] per allocated bit.
+    /// scan every position in `chunk->descs[]` and recurse into each
+    /// non-NULL child pointer (the bitmap is unusable for enumeration
+    /// at internal levels — see the module-level "Liveness" docs).
+    /// Level 2 reads `chunk->data[]` and emits one [`SdtAllocEntry`]
+    /// per allocated bit in this descriptor's `allocated[]` bitmap.
     ///
     /// Increments [`SdtAllocatorSnapshot::skipped_subtrees`] on every
     /// early return that abandons descent into a non-trivial subtree
-    /// — translate failures, out-of-range `nr_free`, NULL `chunk`.
+    /// — translate failures, out-of-range `nr_free`, NULL `chunk`. A
+    /// NULL `chunk->descs[pos]` at an internal level is a never-created
+    /// subtree and is skipped silently (NOT counted as a skipped
+    /// subtree).
     fn descend(&mut self, desc_ptr: u64, level: usize) {
         if level >= SDT_TASK_LEVELS {
+            return;
+        }
+
+        // Once `emit_leaf` has flipped `truncated`, the cap on entries
+        // is reached. Continuing to descend would still grow
+        // `all_slot_addrs` (every leaf appended unconditionally before
+        // the `entries` cap check) and waste work on every remaining
+        // subtree. Bail at the top of every recursive call so descent
+        // halts globally, not just at the next leaf.
+        if self.out.truncated {
             return;
         }
 
@@ -727,40 +761,65 @@ impl<'a> TreeWalker<'a> {
             return;
         };
 
-        // Walk each set bit in the bitmap.
-        for (word_idx, &word_value) in allocated.iter().enumerate() {
-            let mut word = word_value;
-            while word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                word &= word - 1;
-                let pos = word_idx * 64 + bit;
-                if pos >= SDT_TASK_ENTS_PER_CHUNK {
-                    continue;
-                }
+        // Enumerate slots. The leaf level (`SDT_TASK_LEVELS - 1`)
+        // reads `allocated[]` directly: a set bit there means the
+        // `sdt_data *` in `chunk->data[pos]` is live (per the
+        // module-level "Liveness" docs). Internal levels (0 and 1)
+        // ignore the bitmap entirely — `lib/sdt_alloc.bpf.c` only
+        // sets a parent bit once a child subtree is FULL, so SET on
+        // an internal level means "subtree full" and CLEAR is "empty,
+        // partial, or never created." The common-case bitmap (few
+        // tasks, deep tree) is all-zero at the internal levels, so
+        // iterating set bits would surface zero allocations. Walk
+        // every position and descend into any non-NULL `desc *`; a
+        // NULL pointer is a never-created subtree we skip silently.
+        if level == SDT_TASK_LEVELS - 1 {
+            for (word_idx, &word_value) in allocated.iter().enumerate() {
+                let mut word = word_value;
+                while word != 0 {
+                    let bit = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let pos = word_idx * 64 + bit;
+                    if pos >= SDT_TASK_ENTS_PER_CHUNK {
+                        continue;
+                    }
 
-                // chunk[pos] is a u64 pointer at chunk_pa +
-                // chunk_union + pos * 8. Internal levels treat it as
-                // a sdt_desc *; the leaf level treats it as a
-                // sdt_data *.
+                    // chunk->data[pos] at chunk_pa + chunk_union +
+                    // pos * 8.
+                    let entry_ptr_off = self.offsets.chunk_union + pos * 8;
+                    let entry_ptr = mem.read_u64(chunk_pa, entry_ptr_off);
+                    if entry_ptr == 0 {
+                        // Pristine slot: bit was set but
+                        // `chunk->data[pos]` never got populated. The
+                        // kernel allocator populates
+                        // `chunk->data[pos]` after setting the bit
+                        // (in `scx_alloc_internal`), so a snapshot
+                        // captured between the bit set and the
+                        // pointer store sees this transient state.
+                        // Skip without counting as a skipped subtree
+                        // — it's a legitimate transient.
+                        continue;
+                    }
+
+                    self.emit_leaf(entry_ptr);
+                }
+            }
+        } else {
+            // Internal level: scan every position in chunk->descs[]
+            // and descend into any non-NULL child pointer.
+            for pos in 0..SDT_TASK_ENTS_PER_CHUNK {
                 let entry_ptr_off = self.offsets.chunk_union + pos * 8;
                 let entry_ptr = mem.read_u64(chunk_pa, entry_ptr_off);
                 if entry_ptr == 0 {
-                    // Pristine slot: bit was set but the chunk arm
-                    // never got populated. The kernel allocator
-                    // populates `chunk->data[pos]` after setting the
-                    // bit (in `scx_alloc_internal`), so a snapshot
-                    // captured between the bit set and the pointer
-                    // store sees this transient state. Skip without
-                    // counting as a skipped subtree — it's a
-                    // legitimate transient.
+                    // Never-created subtree: `desc_find_empty` only
+                    // writes `desc_children[pos]` when it allocates
+                    // a new chunk for a previously empty slot. A
+                    // NULL pointer is a legitimate gap, not an
+                    // anomaly; skip without counting as a skipped
+                    // subtree.
                     continue;
                 }
-
-                if level == SDT_TASK_LEVELS - 1 {
-                    self.emit_leaf(entry_ptr);
-                } else {
-                    self.descend(entry_ptr, level + 1);
-                }
+                self.descend(entry_ptr, level + 1);
             }
         }
     }
@@ -1699,9 +1758,9 @@ mod tests {
     /// `union sdt_id` header (the only non-flex-array member in
     /// `struct sdt_data`). This is the lavd-style scheduler path:
     /// the program never accesses `sdt_data` members directly so
-    /// libbpf strips the body to a Fwd, and the walker covers
-    /// liveness via the per-level `allocated[]` bitmap rather than
-    /// the slot's own header content.
+    /// libbpf strips the body to a Fwd, and the walker covers leaf
+    /// liveness via the leaf descriptor's `allocated[]` bitmap rather
+    /// than the slot's own header content.
     #[test]
     fn sdt_alloc_offsets_sdt_data_fwd_uses_sizeof_sdt_id() {
         let (strings, names) = sdta_strings_for_from_btf();
