@@ -852,6 +852,17 @@ impl<'a> GuestMemMapAccessor<'a> {
     /// complete struct/union definitions) keeps the renderer's
     /// default "forward declaration; body not in this BTF" skip
     /// path intact.
+    ///
+    /// `rendered_slot_addrs` is the dump pass's set of low-32
+    /// windowed slot starts that already appear in
+    /// `report.sdt_allocations` (the sdt_alloc pre-pass surfaced
+    /// them under the typed-allocator surface). `Some(&set)` lets
+    /// the per-map renderer's [`MemReader::is_already_rendered`]
+    /// short-circuit the arena chase when a TASK_STORAGE / HASH
+    /// map's value pointer chases back into the same slot —
+    /// preventing the same payload from appearing twice in the
+    /// failure dump. `None` keeps the chase pipeline's existing
+    /// behaviour intact.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn mem_reader(
         &self,
@@ -969,7 +980,7 @@ pub(super) fn select_sdt_alloc_meta<'a>(
 
 /// Per-map render parameters that don't vary between maps in a
 /// dump pass. Bundled so [`render_map`] takes one context borrow
-/// plus the per-map [`BpfMapInfo`] rather than 5 separately-named
+/// plus the per-map [`BpfMapInfo`] rather than separately-named
 /// arguments. Constructed once in [`super::dump_state`] and threaded
 /// into every map render call.
 ///

@@ -3020,6 +3020,17 @@ fn jump_targets(insns: &[BpfInsn]) -> BTreeSet<usize> {
 /// whose member type has the given size. The matching phase
 /// intersects sets across observed accesses to collapse to a single
 /// candidate when one exists.
+///
+/// Recurses into anonymous nested struct / union members so that
+/// the outer struct's index entries cover offsets that physically
+/// live inside an inner anonymous aggregate. C lets a struct embed
+/// an unnamed inner struct/union directly — every cache-line-padded
+/// `struct { ... } __aligned(64);` member in the BPF schedulers is
+/// such a case (`struct scx_cgroup_ctx` lays out two anonymous
+/// inner structs at offsets 0 and 64). Named nested structs are
+/// distinct types with their own entries; recursion is gated on
+/// `btf.resolve_name(...) == ""` to avoid double-indexing them
+/// under every parent that happens to embed one.
 fn build_layout_index(btf: &Btf, max_id: u32) -> HashMap<(u32, u32), HashSet<u32>> {
     let mut out: HashMap<(u32, u32), HashSet<u32>> = HashMap::new();
     let mut size_cache: HashMap<u32, Option<u32>> = HashMap::new();
@@ -3031,21 +3042,7 @@ fn build_layout_index(btf: &Btf, max_id: u32) -> HashMap<(u32, u32), HashSet<u32
         match btf.resolve_type_by_id(tid) {
             Ok(Type::Struct(s)) | Ok(Type::Union(s)) => {
                 consecutive_fail = 0;
-                for m in &s.members {
-                    let bit_off = m.bit_offset();
-                    if bit_off % 8 != 0 {
-                        continue;
-                    }
-                    if matches!(m.bitfield_size(), Some(s) if s > 0) {
-                        continue;
-                    }
-                    let off = bit_off / 8;
-                    let size = match cached_member_size(btf, m, &mut size_cache) {
-                        Some(sz) => sz,
-                        None => continue,
-                    };
-                    out.entry((off, size)).or_default().insert(tid);
-                }
+                index_aggregate_members(btf, tid, &s.members, 0, &mut out, &mut size_cache, 0);
             }
             Ok(_) => {
                 consecutive_fail = 0;
@@ -3060,6 +3057,81 @@ fn build_layout_index(btf: &Btf, max_id: u32) -> HashMap<(u32, u32), HashSet<u32
         tid += 1;
     }
     out
+}
+
+/// Maximum recursion depth for [`index_aggregate_members`].
+///
+/// Pathological BTF (cyclic typedef chains feeding back into a
+/// struct member) could otherwise cause unbounded recursion.
+/// Real C aggregates rarely nest more than a handful of levels.
+const LAYOUT_INDEX_MAX_DEPTH: u32 = 8;
+
+/// Walk `members` recording `(offset, size) -> parent_tid` entries
+/// in `out`, and recurse into anonymous struct/union members so
+/// their inner fields surface under `parent_tid` as well as under
+/// the inner aggregate's own type id.
+///
+/// `base_offset` is added to each member's byte offset so that
+/// fields inside a nested anonymous aggregate land at the correct
+/// physical offset relative to the outer struct.
+fn index_aggregate_members(
+    btf: &Btf,
+    parent_tid: u32,
+    members: &[btf_rs::Member],
+    base_offset: u32,
+    out: &mut HashMap<(u32, u32), HashSet<u32>>,
+    size_cache: &mut HashMap<u32, Option<u32>>,
+    depth: u32,
+) {
+    if depth >= LAYOUT_INDEX_MAX_DEPTH {
+        return;
+    }
+    for m in members {
+        let bit_off = m.bit_offset();
+        if bit_off % 8 != 0 {
+            continue;
+        }
+        if matches!(m.bitfield_size(), Some(s) if s > 0) {
+            continue;
+        }
+        let off = base_offset + bit_off / 8;
+        if let Some(size) = cached_member_size(btf, m, size_cache) {
+            out.entry((off, size)).or_default().insert(parent_tid);
+        }
+
+        // Recurse into anonymous nested structs/unions so the outer
+        // parent_tid covers offsets that physically reside inside
+        // the inner aggregate. peel_modifiers strips Const /
+        // Volatile / Typedef / DeclTag / TypeTag / Restrict so
+        // `__aligned(64) struct { ... }` (which clang emits as a
+        // typedef-or-modifier-wrapped anonymous struct) still
+        // surfaces as Type::Struct here.
+        let Ok(member_tid) = m.get_type_id() else {
+            continue;
+        };
+        let Some(peeled) = super::btf_render::peel_modifiers(btf, member_tid) else {
+            continue;
+        };
+        let inner = match peeled {
+            Type::Struct(s) | Type::Union(s) => s,
+            _ => continue,
+        };
+        let Ok(name) = btf.resolve_name(&inner) else {
+            continue;
+        };
+        if !name.is_empty() {
+            continue;
+        }
+        index_aggregate_members(
+            btf,
+            parent_tid,
+            &inner.members,
+            off,
+            out,
+            size_cache,
+            depth + 1,
+        );
+    }
 }
 
 fn cached_member_size(

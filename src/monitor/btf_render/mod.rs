@@ -1759,13 +1759,15 @@ pub trait MemReader {
     }
 
     /// True when `addr` points at an allocator slot the dump pre-pass
-    /// has already rendered into `report.sdt_allocations` (the typed
-    /// payload appears in the failure dump under that surface). The
-    /// arena chase short-circuits on `true` so the per-map renderer
-    /// doesn't re-render the same allocation a second time when it
-    /// follows an entry pointer through a TASK_STORAGE / HASH map
-    /// into the same arena slot. Default returns `false` — readers
-    /// without a rendered-slot index proceed with the chase.
+    /// has already rendered into `report.sdt_allocations` (the slot's
+    /// payload appears in the failure dump under that surface — typed
+    /// render when shape inference resolved a concrete BTF id, hex
+    /// fallback otherwise). The arena chase short-circuits on `true`
+    /// so the per-map renderer doesn't re-render the same allocation a
+    /// second time when it follows an entry pointer through a
+    /// TASK_STORAGE / HASH map into the same arena slot. Default
+    /// returns `false` — readers without a rendered-slot index
+    /// proceed with the chase.
     fn is_already_rendered(&self, _addr: u64) -> bool {
         false
     }
@@ -3419,12 +3421,12 @@ fn chase_arena_pointer(
 ) -> ArenaChaseOutcome {
     // Dedup: when the chased address points at a slot the dump
     // pre-pass has already rendered into `report.sdt_allocations`,
-    // skip the per-map chase so the same payload doesn't appear
-    // twice in the failure dump (once under the typed-allocator
-    // surface, once embedded inside whichever TASK_STORAGE / HASH
-    // map's value pointed back at it). The default trait impl
-    // returns `false`, so readers without a rendered-slot index
-    // proceed with the chase as before.
+    // skip the per-map chase so the slot's payload appears in the
+    // failure dump (typed render or hex fallback) under the
+    // sdt_alloc surface only — not also embedded inside whichever
+    // TASK_STORAGE / HASH map's value pointed back at it. The
+    // default trait impl returns `false`, so readers without a
+    // rendered-slot index proceed with the chase as before.
     if mem.is_already_rendered(val) {
         return ArenaChaseOutcome {
             deref: None,
