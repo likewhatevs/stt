@@ -1420,11 +1420,17 @@ impl<'a> Analyzer<'a> {
             if let Some(src_regs) = self.branch_source_regs.get(&pc) {
                 for i in 0..11 {
                     match (self.regs[i], src_regs[i]) {
-                        // Branch source has typed state → use it.
-                        // The branch guarantees the source state
-                        // reaches this target; the fall-through
-                        // path's state is from a different control
-                        // flow and should not contaminate.
+                        (a, b) if a == b => {}
+                        (RegState::ArenaU64FromAlloc { .. }, _) => {
+                            // Fall-through has arena tag — keep it.
+                            // ArenaU64FromAlloc is strictly more
+                            // informative than any other non-Unknown
+                            // state; losing it drops alloc_size
+                            // evidence across branch merges.
+                        }
+                        (_, typed @ RegState::ArenaU64FromAlloc { .. }) => {
+                            self.regs[i] = typed;
+                        }
                         (_, typed) if !matches!(typed, RegState::Unknown) => {
                             self.regs[i] = typed;
                         }
@@ -3737,6 +3743,14 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                     _ => return None,
                 };
                 let var_underlying_type_id = var.get_type_id().ok()?;
+                let rel = byte_offset - off;
+                if let Some(terminal) = super::btf_render::peel_modifiers(btf, var_underlying_type_id)
+                    && matches!(terminal, Type::Struct(_) | Type::Union(_))
+                {
+                    if let Some(inner) = struct_member_at(btf, var_underlying_type_id, rel) {
+                        return Some(inner);
+                    }
+                }
                 return Some(MemberAt::Datasec {
                     var_underlying_type_id,
                     var_byte_offset: off,
