@@ -2364,6 +2364,324 @@ fn find_extern_func_btf_id_filters_to_func_kind() {
     assert_eq!(find_extern_func_btf_id(&btf, "absent"), None);
 }
 
+// ----- patch_subprog_calls tests ---------------------------------
+//
+// Coverage strategy mirrors the kfunc patcher: each test
+// synthesises a minimal BPF object (program text + symtab/strtab
+// + SHT_REL section) and feeds the analyzer-visible tuple
+// `(text_concat, elf, section_bases)` to
+// [`patch_subprog_calls`]. The fixtures pin the gate set the
+// function applies before rewriting `imm`:
+//
+//   1. Happy path — `BPF_PSEUDO_CALL`, `imm == -1`, defined
+//      `STT_FUNC` symbol whose section we concatenated. After
+//      patching, `imm` must equal `callee_pc - call_pc - 1` so
+//      the analyzer's `pc + 1 + imm` lands on the callee entry.
+//   2. Gate skip — non-`-1` imm. Static (file-local) subprog
+//      calls already carry the correct PC-relative offset and
+//      must not be touched.
+//   3. Gate skip — `STT_NOTYPE` symbol (the kfunc shape).
+//      `patch_kfunc_calls` handles that pipeline; a subprog
+//      patch on a kfunc reloc would silently corrupt the imm.
+//   4. Gate skip — symbol's section is NOT in `section_bases`.
+//      A subprog defined in a section we did not concatenate
+//      cannot be resolved to a callee PC and is skipped.
+//
+// These pin the false-negative-safe boundary: a regression in
+// any gate either drops a subprog patch (caller_arg_types stays
+// poisoned) or stomps a non-subprog call site with a bogus imm.
+
+/// Encode a `BPF_JMP|BPF_CALL` with the pre-relocation global
+/// subprog form: `code=0x85`, `dst=0`,
+/// `src=BPF_PSEUDO_CALL=1`, `off=0`, `imm=-1`.
+fn pre_reloc_subprog_call_bytes() -> [u8; 8] {
+    [0x85, 0x10, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff]
+}
+
+/// Encode a NOP-shaped instruction (`BPF_ALU64 | BPF_MOV | BPF_X`,
+/// dst=R0, src=R0). Suitable as filler insns for callee bodies in
+/// fixtures — the patcher ignores everything but the tagged call
+/// site.
+fn subprog_nop_bytes() -> [u8; 8] {
+    // BPF_ALU64 | BPF_MOV | BPF_X = 0x07 | 0xb0 | 0x08 = 0xbf.
+    // dst=0, src=0, off=0, imm=0.
+    [0xbf, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+}
+
+/// Test 1 — happy path: a `BPF_PSEUDO_CALL imm=-1` against an
+/// `STT_FUNC` symbol gets `imm` rewritten to point at the
+/// callee entry PC.
+#[test]
+fn patch_subprog_calls_happy_path_rewrites_imm() {
+    let callee_name = "my_subprog";
+    let mut strtab: Vec<u8> = vec![0];
+    let name_off = strtab.len() as u32;
+    strtab.extend_from_slice(callee_name.as_bytes());
+    strtab.push(0);
+
+    // Symbol 1: STT_FUNC, defined in section 1 (.text), st_value
+    // = 16 bytes (the third instruction slot, a callee entry two
+    // 8-byte slots after the EXIT terminator of the caller).
+    let callee_st_value: u64 = 16;
+    let mut symtab: Vec<u8> = Vec::new();
+    symtab.extend_from_slice(&elf64_sym(0, 0, 0, 0, 0));
+    symtab.extend_from_slice(&elf64_sym(
+        name_off,
+        st_info(syms::STB_GLOBAL, syms::STT_FUNC),
+        1, // st_shndx = section 1 (.text)
+        callee_st_value,
+        0,
+    ));
+
+    // Text layout:
+    //   pc=0: caller's `BPF_PSEUDO_CALL imm=-1`.
+    //   pc=1: caller's EXIT.
+    //   pc=2: callee entry (NOP placeholder; real BPF would have
+    //         the function body here, but the patcher only
+    //         consults the call-site instruction).
+    let mut text: Vec<u8> = Vec::new();
+    text.extend_from_slice(&pre_reloc_subprog_call_bytes());
+    text.extend_from_slice(&kfunc_exit_bytes());
+    text.extend_from_slice(&subprog_nop_bytes());
+    let rel_data: Vec<u8> = elf64_rel(0, 1, 10).to_vec();
+
+    let blob = build_elf64(
+        vec![
+            SecSpec::new(".text", sh::SHT_PROGBITS)
+                .flags(sh::SHF_EXECINSTR.into())
+                .data(text),
+            SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
+            SecSpec::new(".symtab", sh::SHT_SYMTAB)
+                .data(symtab)
+                .link(2)
+                .entsize(24),
+            SecSpec::new(".rel.text", sh::SHT_REL)
+                .data(rel_data)
+                .link(3)
+                .info(1)
+                .entsize(16),
+        ],
+        h::EM_BPF,
+        h::ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+
+    let mut text_concat: Vec<BpfInsn> = vec![
+        BpfInsn::from_le_bytes(pre_reloc_subprog_call_bytes()),
+        BpfInsn::from_le_bytes(kfunc_exit_bytes()),
+        BpfInsn::from_le_bytes(subprog_nop_bytes()),
+    ];
+    let mut section_bases: HashMap<u32, usize> = HashMap::new();
+    section_bases.insert(1, 0);
+
+    assert_eq!(text_concat[0].imm, -1);
+    patch_subprog_calls(&mut text_concat, &elf, &section_bases);
+
+    // callee_pc = base(.text) + st_value/8 = 0 + 16/8 = 2.
+    // call_pc = 0. new_imm = 2 - 0 - 1 = 1. After patch, the
+    // analyzer's `pc + 1 + imm` = 0 + 1 + 1 = 2 = callee entry PC.
+    assert_eq!(
+        text_concat[0].imm, 1,
+        "imm patched to callee_pc - call_pc - 1"
+    );
+    assert_eq!(
+        text_concat[0].src_reg(),
+        BPF_PSEUDO_CALL,
+        "src_reg untouched (subprog calls keep BPF_PSEUDO_CALL)"
+    );
+    assert_eq!(text_concat[0].code, 0x85, "opcode untouched");
+}
+
+/// Test 2 — non-`-1` imm: a static-subprog call already carrying
+/// the correct PC-relative offset must NOT be patched.
+#[test]
+fn patch_subprog_calls_skips_non_minus_one_imm() {
+    let callee_name = "static_subprog";
+    let mut strtab: Vec<u8> = vec![0];
+    let name_off = strtab.len() as u32;
+    strtab.extend_from_slice(callee_name.as_bytes());
+    strtab.push(0);
+
+    let mut symtab: Vec<u8> = Vec::new();
+    symtab.extend_from_slice(&elf64_sym(0, 0, 0, 0, 0));
+    symtab.extend_from_slice(&elf64_sym(
+        name_off,
+        st_info(syms::STB_LOCAL, syms::STT_FUNC),
+        1,
+        0,
+        0,
+    ));
+
+    // Pre-set imm = 5 (already encoded by clang for a static
+    // subprog). The patcher must leave it alone.
+    let mut call = pre_reloc_subprog_call_bytes();
+    call[4..8].copy_from_slice(&5i32.to_le_bytes());
+
+    let mut text: Vec<u8> = Vec::new();
+    text.extend_from_slice(&call);
+    text.extend_from_slice(&kfunc_exit_bytes());
+    let rel_data: Vec<u8> = elf64_rel(0, 1, 10).to_vec();
+
+    let blob = build_elf64(
+        vec![
+            SecSpec::new(".text", sh::SHT_PROGBITS)
+                .flags(sh::SHF_EXECINSTR.into())
+                .data(text),
+            SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
+            SecSpec::new(".symtab", sh::SHT_SYMTAB)
+                .data(symtab)
+                .link(2)
+                .entsize(24),
+            SecSpec::new(".rel.text", sh::SHT_REL)
+                .data(rel_data)
+                .link(3)
+                .info(1)
+                .entsize(16),
+        ],
+        h::EM_BPF,
+        h::ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+
+    let mut text_concat: Vec<BpfInsn> = vec![
+        BpfInsn::from_le_bytes(call),
+        BpfInsn::from_le_bytes(kfunc_exit_bytes()),
+    ];
+    let mut section_bases: HashMap<u32, usize> = HashMap::new();
+    section_bases.insert(1, 0);
+
+    assert_eq!(text_concat[0].imm, 5);
+    patch_subprog_calls(&mut text_concat, &elf, &section_bases);
+    assert_eq!(text_concat[0].imm, 5, "non-(-1) imm must stay untouched");
+}
+
+/// Test 3 — `STT_NOTYPE` extern symbol (the kfunc shape) must
+/// NOT trigger subprog patching. `patch_kfunc_calls` owns that
+/// pipeline; a subprog patch here would corrupt the BTF id.
+#[test]
+fn patch_subprog_calls_skips_stt_notype_symbol() {
+    let kf_name = "bpf_some_kfunc";
+    let mut strtab: Vec<u8> = vec![0];
+    let name_off = strtab.len() as u32;
+    strtab.extend_from_slice(kf_name.as_bytes());
+    strtab.push(0);
+
+    let mut symtab: Vec<u8> = Vec::new();
+    symtab.extend_from_slice(&elf64_sym(0, 0, 0, 0, 0));
+    // STT_NOTYPE + SHN_UNDEF — the extern kfunc shape.
+    symtab.extend_from_slice(&elf64_sym(
+        name_off,
+        st_info(syms::STB_GLOBAL, syms::STT_NOTYPE),
+        0,
+        0,
+        0,
+    ));
+
+    let mut text: Vec<u8> = Vec::new();
+    text.extend_from_slice(&pre_reloc_subprog_call_bytes());
+    text.extend_from_slice(&kfunc_exit_bytes());
+    let rel_data: Vec<u8> = elf64_rel(0, 1, 10).to_vec();
+
+    let blob = build_elf64(
+        vec![
+            SecSpec::new(".text", sh::SHT_PROGBITS)
+                .flags(sh::SHF_EXECINSTR.into())
+                .data(text),
+            SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
+            SecSpec::new(".symtab", sh::SHT_SYMTAB)
+                .data(symtab)
+                .link(2)
+                .entsize(24),
+            SecSpec::new(".rel.text", sh::SHT_REL)
+                .data(rel_data)
+                .link(3)
+                .info(1)
+                .entsize(16),
+        ],
+        h::EM_BPF,
+        h::ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+
+    let mut text_concat: Vec<BpfInsn> = vec![
+        BpfInsn::from_le_bytes(pre_reloc_subprog_call_bytes()),
+        BpfInsn::from_le_bytes(kfunc_exit_bytes()),
+    ];
+    let mut section_bases: HashMap<u32, usize> = HashMap::new();
+    section_bases.insert(1, 0);
+
+    patch_subprog_calls(&mut text_concat, &elf, &section_bases);
+    assert_eq!(
+        text_concat[0].imm, -1,
+        "STT_NOTYPE / SHN_UNDEF kfunc shape must not be touched"
+    );
+}
+
+/// Test 4 — symbol's section is NOT in `section_bases`. A
+/// subprog defined in a section we did not concatenate must
+/// not be patched: we cannot compute a callee PC.
+#[test]
+fn patch_subprog_calls_skips_callee_section_outside_section_bases() {
+    let callee_name = "subprog_in_other_section";
+    let mut strtab: Vec<u8> = vec![0];
+    let name_off = strtab.len() as u32;
+    strtab.extend_from_slice(callee_name.as_bytes());
+    strtab.push(0);
+
+    // Symbol points at section 5 (.other) which we will NOT
+    // include in `section_bases`.
+    let mut symtab: Vec<u8> = Vec::new();
+    symtab.extend_from_slice(&elf64_sym(0, 0, 0, 0, 0));
+    symtab.extend_from_slice(&elf64_sym(
+        name_off,
+        st_info(syms::STB_GLOBAL, syms::STT_FUNC),
+        5,
+        0,
+        0,
+    ));
+
+    let mut text: Vec<u8> = Vec::new();
+    text.extend_from_slice(&pre_reloc_subprog_call_bytes());
+    text.extend_from_slice(&kfunc_exit_bytes());
+    let rel_data: Vec<u8> = elf64_rel(0, 1, 10).to_vec();
+
+    let blob = build_elf64(
+        vec![
+            SecSpec::new(".text", sh::SHT_PROGBITS)
+                .flags(sh::SHF_EXECINSTR.into())
+                .data(text),
+            SecSpec::new(".strtab", sh::SHT_STRTAB).data(strtab),
+            SecSpec::new(".symtab", sh::SHT_SYMTAB)
+                .data(symtab)
+                .link(2)
+                .entsize(24),
+            SecSpec::new(".rel.text", sh::SHT_REL)
+                .data(rel_data)
+                .link(3)
+                .info(1)
+                .entsize(16),
+            SecSpec::new(".other", sh::SHT_PROGBITS).data(vec![0u8; 8]),
+        ],
+        h::EM_BPF,
+        h::ET_REL,
+    );
+    let elf = goblin::elf::Elf::parse(&blob).expect("parse elf");
+
+    let mut text_concat: Vec<BpfInsn> = vec![
+        BpfInsn::from_le_bytes(pre_reloc_subprog_call_bytes()),
+        BpfInsn::from_le_bytes(kfunc_exit_bytes()),
+    ];
+    // section_bases includes only section 1 (.text), NOT section 5.
+    let mut section_bases: HashMap<u32, usize> = HashMap::new();
+    section_bases.insert(1, 0);
+
+    patch_subprog_calls(&mut text_concat, &elf, &section_bases);
+    assert_eq!(
+        text_concat[0].imm, -1,
+        "callee section outside section_bases must skip patching"
+    );
+}
+
 // ----- build_subprog_returns tests -------------------------------
 //
 // Coverage strategy: each test synthesises a minimal BPF object

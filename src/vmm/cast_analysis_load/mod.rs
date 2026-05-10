@@ -865,6 +865,29 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>) 
         "cast_analysis: patch_kfunc_calls finished"
     );
 
+    // BPF-to-BPF subprog call patching. libbpf-rs's Linker leaves
+    // every global subprog call as `BPF_PSEUDO_CALL` with
+    // `imm = -1`, paired with a `STT_FUNC` relocation. The cast
+    // analyzer's `caller_arg_types` mechanism (see
+    // [`crate::monitor::cast_analysis::Analyzer::analyze`])
+    // computes `callee_pc = pc + 1 + insn.imm`, so an unpatched
+    // `imm == -1` resolves to `pc` (the call site itself) and
+    // poisons the lookup table with bogus entries. Patching
+    // mirrors what libbpf does at load time
+    // (`bpf_object__reloc_code` in tools/lib/bpf/libbpf.c):
+    // `sub_insn_idx = sym.st_value/8 + insn.imm + 1`, with
+    // `insn.imm = -1` for the global-subprog case. We rewrite
+    // the placeholder `imm` in place so the analyzer's
+    // `pc + 1 + imm` computation lands on the correct callee
+    // entry PC in the concatenated text stream.
+    let subprog_patch_t0 = std::time::Instant::now();
+    patch_subprog_calls(&mut text_concat, &elf, &section_bases);
+    tracing::debug!(
+        elapsed_us = subprog_patch_t0.elapsed().as_micros() as u64,
+        insns = text_concat.len(),
+        "cast_analysis: patch_subprog_calls finished"
+    );
+
     // BSS / DATA / RODATA datasec annotations: walk every
     // relocation section in the inner ELF and emit a
     // `DatasecPointer` per `R_BPF_64_64` reloc that targets a
@@ -1470,6 +1493,182 @@ fn patch_kfunc_calls(
         // expected after the rewrite.
         insn.set_src_reg(BPF_PSEUDO_KFUNC_CALL);
         insn.imm = func_btf_id as i32;
+    }
+}
+
+/// Mirror libbpf's BPF-to-BPF subprog call patching on the host side.
+///
+/// libbpf-rs's `Linker` leaves every global BPF-to-BPF subprog call
+/// as a `BPF_PSEUDO_CALL` with `imm = -1`, paired with an ELF
+/// relocation against an `STT_FUNC` symbol whose containing section
+/// is one of the program text sections we concatenated into
+/// `text_concat`. Without patching, the cast analyzer's
+/// [`crate::monitor::cast_analysis::Analyzer::analyze`] computes
+/// `callee_pc = pc + 1 + insn.imm = pc + 1 + (-1) = pc` and
+/// inserts the caller's R1..R5 snapshot into `caller_arg_types`
+/// at the call site itself instead of at the callee's entry PC.
+/// The downstream lookup at `entries_by_pc` then reseeds R1..R5
+/// at every callee entry with `RegState::Unknown`, dropping all
+/// inter-procedural typed-pointer flow.
+///
+/// At kernel-load time libbpf computes
+/// `sub_insn_idx = sym.st_value/8 + insn.imm + 1` per
+/// `bpf_object__reloc_code` (tools/lib/bpf/libbpf.c). For a
+/// global subprog: `sym.st_value` = byte offset of the callee's
+/// first instruction within its section; `insn.imm = -1` is the
+/// libbpf placeholder; `+1` accounts for the BPF call ABI
+/// (next-instruction-relative). The result `sub_insn_idx` is the
+/// callee's entry PC in libbpf's appended-into-main-prog
+/// instruction stream — the same shape as our `text_concat`,
+/// modulo per-section base offsets we tracked in `section_bases`.
+///
+/// We patch in place so the analyzer's computation lands on the
+/// correct callee entry: target `imm` = `callee_pc - call_pc - 1`
+/// where both PCs are absolute indices in `text_concat`. After
+/// patching, the analyzer's
+/// `callee_pc = pc + 1 + insn.imm = call_pc + 1 + (callee_pc - call_pc - 1)`
+/// resolves to the actual callee entry PC.
+///
+/// # What gets patched
+///
+/// - Instruction must be `BPF_JMP|BPF_CALL` (code byte `0x85`).
+/// - Current `src_reg` must be `BPF_PSEUDO_CALL` (1). After
+///   [`patch_kfunc_calls`] runs, kfunc call sites have
+///   `src_reg == BPF_PSEUDO_KFUNC_CALL` (2) and skip this gate.
+/// - Current `imm` must be `-1` (the libbpf placeholder). Static
+///   (file-local) subprog calls have `imm` already pointing at the
+///   target byte offset and skip this gate — clang's pre-relocation
+///   encoding for static subprogs is correct as-is.
+/// - Symbol must be `STT_FUNC` and not `SHN_UNDEF`. Extern calls
+///   (`STT_NOTYPE`, `SHN_UNDEF`) were already handled by
+///   [`patch_kfunc_calls`]; non-FUNC symbols (data, section,
+///   notype) cannot be subprog targets.
+/// - Symbol's section must appear in `section_bases` — only
+///   sections we concatenated are eligible callee containers.
+/// - `sym.st_value` must be a multiple of [`BPF_INSN_SIZE`]; a
+///   non-aligned offset is malformed input (no real subprog
+///   starts on a non-8-byte-aligned boundary).
+///
+/// All gates plus the section-base lookup must hold before any
+/// byte is patched. Anything else is a no-op.
+///
+/// # Errors
+///
+/// This function never fails. An ELF without relocation sections,
+/// a relocation pointing into a section we did not concatenate, a
+/// symbol we cannot resolve, an out-of-range PC, an unaligned
+/// `st_value`, an arithmetic overflow on the imm computation —
+/// every failure path produces a silent no-op. The cast map ends
+/// up identical to the pre-patching world for those instructions.
+/// False negatives are safe per the analyzer's "false negative is
+/// safe; false positive is not" stance.
+fn patch_subprog_calls(
+    text_concat: &mut [BpfInsn],
+    elf: &goblin::elf::Elf<'_>,
+    section_bases: &HashMap<u32, usize>,
+) {
+    // The shared `iter_text_relocs` helper handles the rel-section /
+    // target-section / `r_offset` validation preamble. Each item
+    // is a relocation that targets a known program text section
+    // at an 8-byte-aligned, in-bounds offset; the subprog-specific
+    // gates (call opcode, imm == -1, BPF_PSEUDO_CALL src_reg,
+    // STT_FUNC defined symbol, callee section in `section_bases`,
+    // st_value alignment) are applied here.
+    //
+    // Capture `text_concat.len()` once up front so the callee-PC
+    // bound check inside the loop body does not collide with the
+    // mutable borrow from `text_concat.get_mut(call_pc)`.
+    let text_len = text_concat.len();
+    for (call_pc, reloc) in iter_text_relocs(elf, section_bases) {
+        let Some(insn) = text_concat.get_mut(call_pc) else {
+            continue;
+        };
+        // Gate 1: the instruction must be a BPF call site.
+        if insn.code != cast_analysis_load_consts::BPF_JMP_CALL_CODE {
+            continue;
+        }
+        // Gate 2: `imm` must be the libbpf placeholder for global
+        // subprog calls. Static (file-local) subprog calls already
+        // carry the correct PC-relative offset in `imm` and must
+        // not be touched.
+        if insn.imm != -1 {
+            continue;
+        }
+        // Gate 3: src_reg must be the clang-emitted
+        // `BPF_PSEUDO_CALL` (1). After [`patch_kfunc_calls`] runs
+        // first, kfunc call sites have `src_reg ==
+        // BPF_PSEUDO_KFUNC_CALL` (2) and naturally skip this gate.
+        if insn.src_reg() != BPF_PSEUDO_CALL {
+            continue;
+        }
+        // Resolve the symbol. The reloc's symbol must be a defined
+        // STT_FUNC (the global subprog shape). Extern kfunc calls
+        // were already handled upstream; data symbols, section
+        // symbols, and STT_NOTYPE entries are not subprog targets.
+        let Some(sym) = elf.syms.get(reloc.r_sym) else {
+            continue;
+        };
+        const STT_FUNC: u8 = goblin::elf::sym::STT_FUNC;
+        const SHN_UNDEF: usize = 0;
+        if sym.st_shndx == SHN_UNDEF {
+            continue;
+        }
+        if sym.st_type() != STT_FUNC {
+            continue;
+        }
+        // The symbol's section must appear in `section_bases` —
+        // only sections we concatenated are valid callee
+        // containers. A subprog defined in a section we did not
+        // collect (e.g. SHF_EXECINSTR-less PROGBITS, or one whose
+        // size is not a multiple of [`BPF_INSN_SIZE`]) cannot be
+        // resolved to a callee PC and is skipped silently.
+        let callee_sec_idx = sym.st_shndx as u32;
+        let Some(&callee_section_base) = section_bases.get(&callee_sec_idx) else {
+            continue;
+        };
+        // `sym.st_value` is the byte offset of the callee's first
+        // instruction within its section (relative to the section's
+        // sh_addr). For BPF .o files, sections are non-allocated
+        // and sh_addr is 0, so st_value is a plain byte offset.
+        // We still subtract sh_addr defensively to handle any
+        // future shape where the inner ELF might surface an
+        // allocated text section.
+        let Some(callee_section) = elf.section_headers.get(callee_sec_idx as usize) else {
+            continue;
+        };
+        let Some(sym_offset_bytes) = sym.st_value.checked_sub(callee_section.sh_addr) else {
+            continue;
+        };
+        let sym_offset_bytes = sym_offset_bytes as usize;
+        if !sym_offset_bytes.is_multiple_of(BPF_INSN_SIZE) {
+            continue;
+        }
+        let callee_pc = match callee_section_base.checked_add(sym_offset_bytes / BPF_INSN_SIZE) {
+            Some(p) => p,
+            None => continue,
+        };
+        // Bound-check the callee PC against text_concat — a
+        // st_value past the end of the concatenated stream is a
+        // corrupt ELF and would produce a meaningless caller_arg
+        // entry; drop silently.
+        if callee_pc >= text_len {
+            continue;
+        }
+        // Compute the new `imm` so the analyzer's
+        // `pc + 1 + imm` lands on `callee_pc`. The signed-
+        // arithmetic conversion handles call sites that point
+        // backward (callee earlier in the stream than caller).
+        let call_pc_i64 = call_pc as i64;
+        let callee_pc_i64 = callee_pc as i64;
+        let new_imm = callee_pc_i64 - call_pc_i64 - 1;
+        // i32 range guard: a single BPF program text plus its
+        // siblings cannot exceed 2^31 instructions in any realistic
+        // build, but the source ELF is attacker-influenced so we
+        // bound-check rather than silently truncate.
+        if new_imm < i32::MIN as i64 || new_imm > i32::MAX as i64 {
+            continue;
+        }
+        insn.imm = new_imm as i32;
     }
 }
 
