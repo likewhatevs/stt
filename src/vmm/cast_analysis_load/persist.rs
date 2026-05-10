@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::FwdIndexEntry;
 
-const SCHEMA_VERSION: u32 = 11;
+const SCHEMA_VERSION: u32 = 12;
 
 #[derive(Serialize, Deserialize)]
 struct PersistedAddrSpace(u8);
@@ -87,6 +87,7 @@ struct PersistedCastAnalysis {
     cast_entries: Vec<((u32, u32), PersistedCastHit)>,
     fwd_entries: Vec<(String, PersistedFwdIndexEntry)>,
     btf_count: u32,
+    alloc_size_types: Vec<(u64, String)>,
 }
 
 fn cache_dir() -> Option<PathBuf> {
@@ -100,7 +101,7 @@ fn cache_path(hash: u64) -> Option<PathBuf> {
 pub(super) fn try_load(
     hash: u64,
     expected_btf_count: usize,
-) -> Option<(CastMap, HashMap<String, FwdIndexEntry>)> {
+) -> Option<(CastMap, HashMap<String, FwdIndexEntry>, Vec<(u64, String)>)> {
     let path = cache_path(hash)?;
     let bytes = std::fs::read(&path).ok()?;
     let (persisted, _): (PersistedCastAnalysis, _) =
@@ -137,7 +138,7 @@ pub(super) fn try_load(
         path = %path.display(),
         "cast_analysis: loaded from disk cache"
     );
-    Some((cast_map, fwd_index))
+    Some((cast_map, fwd_index, persisted.alloc_size_types))
 }
 
 pub(super) fn try_save(
@@ -145,6 +146,7 @@ pub(super) fn try_save(
     cast_map: &CastMap,
     fwd_index: &HashMap<String, FwdIndexEntry>,
     btf_count: usize,
+    alloc_size_types: &[(u64, String)],
 ) {
     let Some(path) = cache_path(hash) else { return };
 
@@ -157,6 +159,7 @@ pub(super) fn try_save(
             .map(|(k, v)| (k.clone(), v.into()))
             .collect(),
         btf_count: btf_count as u32,
+        alloc_size_types: alloc_size_types.to_vec(),
     };
 
     let encoded = match bincode::serde::encode_to_vec(&persisted, bincode::config::standard()) {

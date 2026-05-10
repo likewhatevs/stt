@@ -387,13 +387,13 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
             // instruction walker. BTFs are reparsed from the binary
             // bytes (Btf is not serializable).
             let btfs = parse_btfs_from_bytes(&bytes);
-            if let Some((cast_map, fwd_index)) = persist::try_load(hash, btfs.len()) {
+            if let Some((cast_map, fwd_index, alloc_size_types)) = persist::try_load(hash, btfs.len()) {
                 tracing::debug!("cast_analysis: disk cache hit");
                 let out = CastAnalysisOutput {
                     cast_maps: vec![Arc::new(cast_map)],
                     btfs,
                     fwd_index,
-                    alloc_size_types: Vec::new(), // TODO: persist alloc_sizes in cache
+                    alloc_size_types,
                 };
                 let total: usize = out.cast_maps.iter().map(|m| m.len()).sum();
                 return if total == 0 && out.fwd_index.is_empty() {
@@ -418,7 +418,7 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
                 .flat_map(|m| m.iter())
                 .map(|(&k, &v)| (k, v))
                 .collect();
-            persist::try_save(hash, &merged_for_cache, &out.fwd_index, out.btfs.len());
+            persist::try_save(hash, &merged_for_cache, &out.fwd_index, out.btfs.len(), &out.alloc_size_types);
             let total_casts: usize = out.cast_maps.iter().map(|m| m.len()).sum();
             if total_casts == 0 && out.fwd_index.is_empty() {
                 None
