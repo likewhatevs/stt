@@ -687,21 +687,36 @@ fn build_fwd_index(btfs: &[Arc<Btf>]) -> HashMap<String, FwdIndexEntry> {
             match btf.resolve_type_by_id(tid) {
                 Ok(ty) => {
                     consecutive_fail = 0;
-                    if let Type::Struct(s) | Type::Union(s) = ty
-                        && let Ok(name) = btf.resolve_name(&s)
-                        && !name.is_empty()
-                    {
-                        // First-write-wins: skip duplicate names so
-                        // a same-named layout in BTF #0 is preferred
-                        // over BTF #1's. The renderer only consults
-                        // the index when the local Fwd resolve
-                        // failed, so a same-name conflict between
-                        // two BTFs would have already resolved
-                        // locally in whichever BTF the Fwd lives.
-                        out.entry(name).or_insert(FwdIndexEntry {
-                            btfs_idx: idx,
-                            type_id: tid,
-                        });
+                    match &ty {
+                        Type::Struct(s) | Type::Union(s) => {
+                            if let Ok(name) = btf.resolve_name(s) {
+                                if !name.is_empty() {
+                                    out.entry(name).or_insert(FwdIndexEntry {
+                                        btfs_idx: idx,
+                                        type_id: tid,
+                                    });
+                                }
+                            }
+                        }
+                        Type::Typedef(td) => {
+                            if let Ok(td_name) = btf.resolve_name(td) {
+                                if !td_name.is_empty() {
+                                    if let Ok(pid) = <dyn btf_rs::BtfType>::get_type_id(td) {
+                                        if let Ok(Type::Struct(s)) = btf.resolve_type_by_id(pid) {
+                                            if btf.resolve_name(&s).map_or(true, |n| n.is_empty()) {
+                                                let base = td_name.strip_suffix("_t")
+                                                    .unwrap_or(&td_name);
+                                                out.entry(base.to_string()).or_insert(FwdIndexEntry {
+                                                    btfs_idx: idx,
+                                                    type_id: pid,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Err(_) => {
