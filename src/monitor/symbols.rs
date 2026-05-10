@@ -234,6 +234,11 @@ pub(crate) struct KernelSymbols {
     /// `.data` (file-scope static), so resolution uses
     /// [`text_kva_to_pa_with_base`].
     pub scx_watchdog_timestamp: Option<u64>,
+    /// Kernel virtual address of `scx_watchdog_interval` (file-scope
+    /// static `unsigned long` at `kernel/sched/ext.c:86`). The workfn
+    /// poll cadence. Must be updated alongside `watchdog_timeout` to
+    /// make the override effective within one interval period.
+    pub scx_watchdog_interval: Option<u64>,
     /// Kernel virtual address of `jiffies_64` (`u64` global maintained
     /// by the timer subsystem). Used by the dual-snapshot freeze
     /// coordinator to compare each runnable task's `p->scx.runnable_at`
@@ -363,6 +368,7 @@ impl KernelSymbols {
         // .symtab with lowercase 'd' in `nm` output but is still
         // resolvable by name. Absent on kernels without sched_ext.
         let scx_watchdog_timestamp = sym_addr("scx_watchdog_timestamp");
+        let scx_watchdog_interval = sym_addr("scx_watchdog_interval");
 
         let jiffies_64 = sym_addr("jiffies_64");
         let per_cpu_start = sym_addr("__per_cpu_start").unwrap_or(0);
@@ -397,6 +403,7 @@ impl KernelSymbols {
             prog_idr,
             scx_watchdog_timeout,
             scx_watchdog_timestamp,
+            scx_watchdog_interval,
             jiffies_64,
             per_cpu_start,
             kernel_cpustat,
@@ -1115,6 +1122,7 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
@@ -1149,6 +1157,7 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
@@ -1185,6 +1194,7 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
@@ -1224,6 +1234,7 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
@@ -1266,6 +1277,7 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
@@ -1304,6 +1316,7 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
@@ -1339,6 +1352,7 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,
@@ -1370,6 +1384,7 @@ mod tests {
             prog_idr: None,
             scx_watchdog_timeout: None,
             scx_watchdog_timestamp: None,
+            scx_watchdog_interval: None,
             jiffies_64: None,
             kernel_cpustat: None,
             kstat: None,

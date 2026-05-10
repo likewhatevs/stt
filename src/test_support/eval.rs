@@ -1350,6 +1350,7 @@ fn run_ktstr_test_inner_impl(
     // Release VM resources (CPU/LLC flocks, guest memory) before
     // the multi-second LLM inference so concurrent peers can
     // acquire the same LLC slots during extraction.
+    let post_vm_t = std::time::Instant::now();
     drop(vm);
     // Release the kernel-cache reader flock — the VM no longer
     // maps the kernel image, so concurrent `cargo ktstr kernel
@@ -1600,7 +1601,8 @@ fn run_ktstr_test_inner_impl(
         }))
     };
 
-    evaluate_vm_result(
+    eprintln!("post-VM overhead before eval: {:?}", post_vm_t.elapsed());
+    let eval_result = evaluate_vm_result(
         entry,
         &result,
         &merged_assert,
@@ -1610,7 +1612,9 @@ fn run_ktstr_test_inner_impl(
         &vm_topology,
         active_flags,
         &repro_fn,
-    )
+    );
+    eprintln!("evaluate_vm_result (includes auto-repro): {:?}", post_vm_t.elapsed());
+    eval_result
 }
 
 /// Evaluate a VM result and produce the appropriate error or Ok.

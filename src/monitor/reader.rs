@@ -1881,6 +1881,12 @@ pub(crate) enum WatchdogOverride {
         watchdog_offset: usize,
         /// Jiffies value to write.
         jiffies: u64,
+        /// PA of `scx_watchdog_interval` global.
+        interval_pa: Option<u64>,
+        /// PA of `scx_watchdog_timestamp` global.
+        timestamp_pa: Option<u64>,
+        /// PA of `jiffies_64` global (to read current time).
+        jiffies_64_pa: Option<u64>,
     },
     /// Pre-7.1 path: write directly to the static global's PA.
     StaticGlobal {
@@ -1888,6 +1894,12 @@ pub(crate) enum WatchdogOverride {
         watchdog_timeout_pa: u64,
         /// Jiffies value to write.
         jiffies: u64,
+        /// PA of `scx_watchdog_interval` global.
+        interval_pa: Option<u64>,
+        /// PA of `scx_watchdog_timestamp` global.
+        timestamp_pa: Option<u64>,
+        /// PA of `jiffies_64` global.
+        jiffies_64_pa: Option<u64>,
     },
 }
 
@@ -2511,6 +2523,7 @@ pub(crate) fn monitor_loop(
                     scx_root_pa,
                     watchdog_offset,
                     jiffies,
+                    ..
                 } => {
                     let sch_kva = mem.read_u64(*scx_root_pa, 0);
                     if sch_kva == 0 {
@@ -2523,10 +2536,23 @@ pub(crate) fn monitor_loop(
                 WatchdogOverride::StaticGlobal {
                     watchdog_timeout_pa,
                     jiffies,
+                    ..
                 } => (Some(*watchdog_timeout_pa), 0, *jiffies),
+            };
+            let (interval_pa, timestamp_pa, jiffies_64_pa) = match wd {
+                WatchdogOverride::ScxSched {
+                    interval_pa, timestamp_pa, jiffies_64_pa, ..
+                }
+                | WatchdogOverride::StaticGlobal {
+                    interval_pa, timestamp_pa, jiffies_64_pa, ..
+                } => (*interval_pa, *timestamp_pa, *jiffies_64_pa),
             };
             if let Some(pa) = write_pa {
                 mem.write_u64(pa, write_offset, wd_jiffies);
+                if let Some(intv_pa) = interval_pa {
+                    let intv = std::cmp::max(wd_jiffies / 2, 1);
+                    mem.write_u64(intv_pa, 0, intv);
+                }
                 if watchdog_observation.is_none() {
                     let observed = mem.read_u64(pa, write_offset);
                     watchdog_observation = Some(super::WatchdogObservation {
@@ -3810,6 +3836,9 @@ mod tests {
             scx_root_pa,
             watchdog_offset,
             jiffies: 99999,
+            interval_pa: None,
+            timestamp_pa: None,
+            jiffies_64_pa: None,
         };
 
         let handle = {
@@ -3872,6 +3901,9 @@ mod tests {
             scx_root_pa,
             watchdog_offset: 16,
             jiffies: 0xDEADBEEF,
+            interval_pa: None,
+            timestamp_pa: None,
+            jiffies_64_pa: None,
         };
 
         let handle = {
@@ -3931,6 +3963,9 @@ mod tests {
         let wd = WatchdogOverride::StaticGlobal {
             watchdog_timeout_pa: watchdog_pa,
             jiffies: 77777,
+            interval_pa: None,
+            timestamp_pa: None,
+            jiffies_64_pa: None,
         };
 
         let handle = {

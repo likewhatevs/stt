@@ -7261,22 +7261,43 @@ impl KtstrVm {
                             start_kernel_map_for_thread,
                             phys_base,
                         );
+                        let resolve_pa = |kva| {
+                            monitor::symbols::text_kva_to_pa_with_base(
+                                kva,
+                                start_kernel_map_for_thread,
+                                phys_base,
+                            )
+                        };
+                        let interval_pa = symbols.scx_watchdog_interval.map(&resolve_pa);
+                        let timestamp_pa = symbols.scx_watchdog_timestamp.map(&resolve_pa);
+                        let jiffies_64_pa = symbols.jiffies_64.map(&resolve_pa);
                         return Some(monitor::reader::WatchdogOverride::ScxSched {
                             scx_root_pa,
                             watchdog_offset: wd_offs.scx_sched_watchdog_timeout_off,
                             jiffies,
+                            interval_pa,
+                            timestamp_pa,
+                            jiffies_64_pa,
                         });
                     }
-                    // Pre-7.1 fallback: direct write to scx_watchdog_timeout static global.
                     if let Some(wdt_kva) = symbols.scx_watchdog_timeout {
-                        let watchdog_timeout_pa = monitor::symbols::text_kva_to_pa_with_base(
-                            wdt_kva,
-                            start_kernel_map_for_thread,
-                            phys_base,
-                        );
+                        let resolve_pa = |kva| {
+                            monitor::symbols::text_kva_to_pa_with_base(
+                                kva,
+                                start_kernel_map_for_thread,
+                                phys_base,
+                            )
+                        };
+                        let watchdog_timeout_pa = resolve_pa(wdt_kva);
+                        let interval_pa = symbols.scx_watchdog_interval.map(&resolve_pa);
+                        let timestamp_pa = symbols.scx_watchdog_timestamp.map(&resolve_pa);
+                        let jiffies_64_pa = symbols.jiffies_64.map(&resolve_pa);
                         return Some(monitor::reader::WatchdogOverride::StaticGlobal {
                             watchdog_timeout_pa,
                             jiffies,
+                            interval_pa,
+                            timestamp_pa,
+                            jiffies_64_pa,
                         });
                     }
                     None

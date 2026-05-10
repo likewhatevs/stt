@@ -501,12 +501,16 @@ impl KtstrVm {
         let start = Instant::now();
 
         let initramfs_handle = self.spawn_initramfs_resolve();
+        eprintln!("  initramfs spawn: {:?}", start.elapsed());
         let (mut vm, kernel_result) = self.create_vm_and_load_kernel()?;
+        eprintln!("  kvm+kernel: {:?}", start.elapsed());
 
         #[cfg(target_arch = "x86_64")]
         let _kernel_result = {
             let kr = self.setup_memory(&mut vm, kernel_result, initramfs_handle)?;
+            eprintln!("  setup_memory (joins initramfs): {:?}", start.elapsed());
             self.setup_vcpus(&vm, kr.entry)?;
+            eprintln!("  setup_vcpus: {:?}", start.elapsed());
             kr
         };
         #[cfg(target_arch = "aarch64")]
@@ -516,16 +520,12 @@ impl KtstrVm {
             kr
         };
 
-        // Open persistent stats fds before vCPUs move to threads.
-        // Stats fds hold kernel references independent of VcpuFd ownership.
-        // Read once after VM exit to capture cumulative totals.
-        // KVM_GET_STATS_FD is generic uapi (include/uapi/linux/kvm.h),
-        // so this works on every KVM-supported architecture.
         let stats_ctx = kvm_stats::open_stats_context(&vm.vcpus);
         if stats_ctx.is_none() {
             tracing::debug!("KVM_GET_STATS_FD not supported, skipping stats collection");
         }
 
+        eprintln!("VM setup total: {:?}", start.elapsed());
         tracing::debug!(elapsed_us = start.elapsed().as_micros(), "total_setup");
 
         // Run-phase clock approximates the watchdog's hard_deadline
