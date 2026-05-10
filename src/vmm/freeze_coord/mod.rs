@@ -5655,6 +5655,29 @@ impl KtstrVm {
                                     ),
                                 }
                                 freeze_state = FreezeState::Done;
+                                // Error-class exit dump complete: tear
+                                // the run down immediately rather than
+                                // looping back to epoll_wait under EEVDF
+                                // fallback for the remainder of the
+                                // host-watchdog window. The dump is
+                                // already serialized and emitted above,
+                                // the probe ringbuf has drained by the
+                                // time sched_ext_exit fired, and serial
+                                // output is flushed — no useful work
+                                // remains in the post-exit window. Set
+                                // the run-level kill AtomicBool and kick
+                                // the eventfd so the BSP run loop
+                                // (kill.load) and this coord loop
+                                // (freeze_coord_kill.load at line 2026)
+                                // both observe the edge on the next
+                                // wake.
+                                tracing::info!(
+                                    "freeze-coord: kill triggered after \
+                                     error-exit dump capture"
+                                );
+                                freeze_coord_kill
+                                    .store(true, Ordering::Release);
+                                let _ = freeze_coord_kill_evt.write(1);
                             }
                             None if watchpoint_only_trigger_post => {
                                 freeze_coord_watchpoint
