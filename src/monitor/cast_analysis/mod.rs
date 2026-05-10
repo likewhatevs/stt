@@ -839,6 +839,12 @@ struct Analyzer<'a> {
     /// findings when a non-arena value overwrites the originating
     /// stack slot.
     bridge_slot_origins: std::collections::HashMap<i16, (u32, u32)>,
+    /// True when the current function has received an
+    /// ArenaU64FromAlloc from a SubprogReturn (allocator call).
+    /// The bridge uses this as a function-level heuristic: if the
+    /// function allocated arena memory, its bpf_map_update_elem
+    /// values likely store arena pointers. Cleared at FuncEntry.
+    func_has_alloc: bool,
     /// Register state snapshots from conditional branch sources.
     /// Keyed by branch target PC. At each conditional jump, the
     /// current register state is saved for the target. When the
@@ -957,6 +963,7 @@ impl<'a> Analyzer<'a> {
             alloc_seeds_applied: 0,
             caller_arg_types: HashMap::new(),
             bridge_slot_origins: HashMap::new(),
+            func_has_alloc: false,
             branch_source_regs: HashMap::new(),
         }
     }
@@ -1018,6 +1025,7 @@ impl<'a> Analyzer<'a> {
             alloc_seeds_applied: 0,
             caller_arg_types,
             bridge_slot_origins: HashMap::new(),
+            func_has_alloc: false,
             branch_source_regs: HashMap::new(),
         }
     }
@@ -1101,6 +1109,7 @@ impl<'a> Analyzer<'a> {
         self.regs = [RegState::Unknown; 11];
         self.stack_slots.clear();
         self.bridge_slot_origins.clear();
+        self.func_has_alloc = false;
         let proto = match self.btf.resolve_type_by_id(func_proto_id) {
             Ok(Type::FuncProto(fp)) => fp,
             Ok(Type::Func(f)) => match f.get_type_id() {
@@ -1218,10 +1227,15 @@ impl<'a> Analyzer<'a> {
             if let Some(src_regs) = self.branch_source_regs.get(&pc) {
                 for i in 0..11 {
                     match (self.regs[i], src_regs[i]) {
-                        (RegState::Unknown, typed) => self.regs[i] = typed,
-                        (_, RegState::Unknown) => {}
-                        (a, b) if a == b => {}
-                        _ => self.regs[i] = RegState::Unknown,
+                        // Branch source has typed state → use it.
+                        // The branch guarantees the source state
+                        // reaches this target; the fall-through
+                        // path's state is from a different control
+                        // flow and should not contaminate.
+                        (_, typed) if !matches!(typed, RegState::Unknown) => {
+                            self.regs[i] = typed;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1349,6 +1363,7 @@ impl<'a> Analyzer<'a> {
                 self.regs = [RegState::Unknown; 11];
                 self.stack_slots.clear();
                 self.bridge_slot_origins.clear();
+                self.func_has_alloc = false;
             }
         }
     }
@@ -1720,6 +1735,7 @@ impl<'a> Analyzer<'a> {
                         // programs but the analyzer must not
                         // panic on them).
                         self.alloc_seeds_applied = self.alloc_seeds_applied.saturating_add(1);
+                        self.func_has_alloc = true;
                     }
                 }
                 // EXIT, JA, conditional jumps: no state change at
@@ -2398,6 +2414,7 @@ impl<'a> Analyzer<'a> {
             // ever called" identically across kfunc and subprog
             // paths.
             self.alloc_seeds_applied = self.alloc_seeds_applied.saturating_add(1);
+            self.func_has_alloc = true;
         }
     }
 
@@ -2449,12 +2466,15 @@ impl<'a> Analyzer<'a> {
             else {
                 continue;
             };
-            let Some(&slot) = self.stack_slots.get(&slot_off) else {
-                continue;
+            let ever_arena = self.func_has_alloc;
+            let slot = match self.stack_slots.get(&slot_off).copied() {
+                Some(s) => s,
+                None if ever_arena => RegState::ArenaU64FromAlloc,
+                None => continue,
             };
             let key = (value_struct_id, member_off);
             match slot {
-                RegState::ArenaU64FromAlloc => {
+                _ if ever_arena => {
                     self.note_type_id(value_struct_id);
                     if let std::collections::btree_map::Entry::Vacant(e) =
                         self.arena_stx_findings.entry(key)
