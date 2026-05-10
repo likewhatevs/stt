@@ -695,6 +695,18 @@ impl MemReader for AccessorMemReader<'_> {
             addr,
         )
     }
+    fn resolve_arena_type_meta_fallback(&self, addr: u64) -> Option<ArenaResolveHit> {
+        if !is_arena_addr_in_snapshot(self.arena_snapshot, addr) {
+            return None;
+        }
+        self.sdt_alloc_metas
+            .iter()
+            .find(|m| m.target_type_id != 0)
+            .map(|meta| ArenaResolveHit {
+                target_type_id: meta.target_type_id,
+                header_skip: meta.header_size,
+            })
+    }
     fn cross_btf_resolve_fwd(&self, name: &str, kind: FwdKind) -> Option<CrossBtfRef<'_>> {
         // Single-line forwarder to the free helper so unit tests
         // can exercise the resolve path without a full

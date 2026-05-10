@@ -1747,6 +1747,15 @@ pub trait MemReader {
     fn cross_btf_resolve_fwd(&self, _name: &str, _kind: FwdKind) -> Option<CrossBtfRef<'_>> {
         None
     }
+
+    /// Type-gated meta fallback for sdt_alloc bridge. Only called
+    /// when `resolve_arena_type` returned None AND the chase target
+    /// is a known Fwd type (sdt_data). Returns the first sdt_alloc
+    /// meta with a resolved payload type if the address is in the
+    /// arena window.
+    fn resolve_arena_type_meta_fallback(&self, _addr: u64) -> Option<ArenaResolveHit> {
+        None
+    }
 }
 
 /// Render a BTF type's bytes into a [`RenderedValue`] without an
@@ -2954,7 +2963,18 @@ fn try_sdt_alloc_bridge(
     if !matches!(target_ty, Type::Fwd(_)) {
         return None;
     }
-    mem.resolve_arena_type(val)
+    if let Some(hit) = mem.resolve_arena_type(val) {
+        return Some(hit);
+    }
+    // Index miss — the sdt_alloc tree walker may have found 0
+    // live allocations (race with scheduler unregistration
+    // freeing all slots before the freeze captures bitmaps).
+    // Fall back to the sdt_alloc meta when the chased address
+    // is in the arena window. This is TYPE-GATED (only fires
+    // for Fwd pointee chases from typed Ptr fields, not for
+    // arbitrary u64 fields) so it cannot produce the "false
+    // positive factory" behavior the blanket meta fallback had.
+    mem.resolve_arena_type_meta_fallback(val)
 }
 
 /// Slice past `header_skip` bytes when the sdt_alloc bridge fires.
