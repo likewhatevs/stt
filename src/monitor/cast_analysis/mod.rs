@@ -2974,6 +2974,14 @@ impl<'a> Analyzer<'a> {
         // with empty access sets (the slot was loaded but never
         // dereferenced); those carry no signal either way and are
         // not treated as arena evidence here.
+        // Arena+Kptr agreement: when a slot has BOTH an arena finding
+        // AND a kptr finding, AND the kptr's value was stored through
+        // an addr_space_cast (the slot is arena_confirmed), the two
+        // observations AGREE — the pointer is an arena VA with a known
+        // type. Merge: emit an Arena CastHit with the kptr's
+        // target_type_id. Only drop when the slot is NOT
+        // arena_confirmed (genuine kernel/arena ambiguity).
+        let mut arena_kptr_merged: BTreeMap<(u32, u32), u32> = BTreeMap::new();
         let conflicting: BTreeSet<(u32, u32)> = self
             .patterns
             .iter()
@@ -2982,6 +2990,18 @@ impl<'a> Analyzer<'a> {
             .chain(self.arena_confirmed.iter().copied())
             .chain(self.arena_stx_findings.keys().copied())
             .filter(|k| self.kptr_findings.contains_key(k))
+            .filter(|k| {
+                // If the slot is arena_confirmed (addr_space_cast
+                // observed), the kptr and arena findings AGREE.
+                // Merge instead of dropping.
+                if self.arena_confirmed.contains(k) {
+                    if let Some(KptrEntry::Single(tid)) = self.kptr_findings.get(k) {
+                        arena_kptr_merged.insert(*k, *tid);
+                    }
+                    return false; // not a conflict
+                }
+                true // genuine conflict
+            })
             .collect();
 
         // Track keys already emitted as Arena via the STX-flow path
@@ -3096,6 +3116,28 @@ impl<'a> Analyzer<'a> {
                 *key,
                 CastHit {
                     target_type_id,
+                    addr_space: AddrSpace::Arena,
+                    alloc_size,
+                },
+            );
+        }
+
+        // Arena+Kptr merged: emit Arena CastHits with the kptr's
+        // resolved target_type_id for slots where both arena and kptr
+        // observations agreed (addr_space_cast confirmed arena).
+        for (key, kptr_target) in &arena_kptr_merged {
+            let alloc_size = self.arena_alloc_size_index.get(key).copied().flatten();
+            tracing::debug!(
+                parent = key.0,
+                offset = key.1,
+                target = kptr_target,
+                alloc_size = ?alloc_size,
+                "cast_analysis: arena+kptr merged hit emitted"
+            );
+            out.insert(
+                *key,
+                CastHit {
+                    target_type_id: *kptr_target,
                     addr_space: AddrSpace::Arena,
                     alloc_size,
                 },
