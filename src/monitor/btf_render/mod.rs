@@ -329,6 +329,9 @@ fn write_rendered_value(
             had,
             partial,
         } => {
+            if *had == 0 {
+                return Ok(());
+            }
             write!(f, "<truncated needed={needed} had={had}> ")?;
             write_rendered_value(f, partial, depth)
         }
@@ -2374,13 +2377,12 @@ fn render_struct(
     // doc for the partial-render contract.
     let mut members = Vec::with_capacity(s.members.len());
     for m in &s.members {
+        let bit_off = m.bit_offset() as usize;
+        let byte_off = bit_off / 8;
+        if byte_off >= bytes.len() && bytes.len() < s.size() {
+            continue;
+        }
         let name = btf.resolve_name(m).unwrap_or_default();
-        // `parent_type_id` is the BTF id of the struct/union we are
-        // currently rendering (post modifier-peel). The renderer
-        // hands it down so [`render_member`] can consult
-        // [`MemReader::cast_lookup`] for `(parent, member_offset)`
-        // to recover typed-pointer renders for `u64` fields the
-        // BPF cast analyzer flagged.
         let value = render_member(btf, m, Some(parent_type_id), bytes, depth, mem, visited);
         members.push(RenderedMember { name, value });
     }

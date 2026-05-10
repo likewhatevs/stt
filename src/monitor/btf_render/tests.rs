@@ -518,7 +518,10 @@ fn display_truncated_with_struct_partial_shows_decoded_members() {
         "expected breadcrumb form, got: {out}"
     );
     assert!(out.contains("a=7"));
-    assert!(out.contains("b <truncated needed=4 had=0>"));
+    assert!(
+        !out.contains("truncated needed=4 had=0"),
+        "had=0 truncated fields must be suppressed: {out}"
+    );
 }
 
 // ---- partial-render contract -------------------------------------
