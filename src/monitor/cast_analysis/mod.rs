@@ -2994,11 +2994,26 @@ impl<'a> Analyzer<'a> {
                 // If the slot is arena_confirmed (addr_space_cast
                 // observed), the kptr and arena findings AGREE.
                 // Merge instead of dropping.
+                // Merge when the kptr's target is Fwd in the
+                // entry BTF — a scheduler-specific arena struct
+                // whose body was dropped by split-BTF dedup. A
+                // kernel kptr would have a full Struct body in
+                // the vmlinux base, not a Fwd.
+                if let Some(KptrEntry::Single(tid)) = self.kptr_findings.get(k) {
+                    if let Ok(ty) = self.btf.resolve_type_by_id(*tid) {
+                        if matches!(ty, Type::Fwd(_)) {
+                            arena_kptr_merged.insert(*k, *tid);
+                            return false;
+                        }
+                    }
+                }
+                // Also check arena_confirmed (addr_space_cast
+                // evidence at the SAME key).
                 if self.arena_confirmed.contains(k) {
                     if let Some(KptrEntry::Single(tid)) = self.kptr_findings.get(k) {
                         arena_kptr_merged.insert(*k, *tid);
                     }
-                    return false; // not a conflict
+                    return false;
                 }
                 true // genuine conflict
             })
