@@ -8148,29 +8148,35 @@ fn stx_flow_conflict_with_kptr_drops_both() {
 /// Same slot triggers both detection paths in one program: the
 /// shape-inference path's LDX accumulates into `patterns`, then
 /// a `pseudo_call` + STX-flow path inserts into
-/// `arena_stx_findings`. `finalize` emits the arena-STX entry
-/// with `target_type_id=0` first (line ~1855 in the source),
-/// then the shape-inference loop overwrites with the concrete
-/// target id when it has direct evidence (line ~1949). Pin the
-/// overwrite-by-shape-inference contract: the final entry is
-/// `(parent, off) -> CastHit { target_type_id: <q_id>, Arena }`,
-/// NOT the deferred `target_type_id=0` sentinel.
+/// `arena_stx_findings`. With single-pass analysis, `finalize`
+/// would emit the arena-STX entry with `target_type_id=0` and the
+/// shape-inference loop would overwrite with the concrete target
+/// id. With fixpoint iteration, however, the STX-flow tag from
+/// pass 1 carries forward into pass 2, where the alias-tracking arm
+/// in [`Analyzer::handle_ldx`] sees `arena_stx_findings` already
+/// contains `(P, 8)` at the FIRST LDX site — `r2 = LDX[r1 + 8]` is
+/// re-typed `ArenaU64FromAlloc` rather than `LoadedU64Field{P, 8}`.
+/// The downstream `LDX[r2 + 0]` and `LDX[r2 + 8]` then read through
+/// an `ArenaU64FromAlloc` base (line ~1378), which sets dst Unknown
+/// without recording any access. Patterns ends pass 2 with an empty
+/// access set for `(P, 8)`, the shape-inference loop in finalize
+/// drops candidates without accesses, and the only emit is the
+/// STX-flow path's `target_type_id=0` deferred-resolve sentinel.
 ///
-/// Order of operations in the synthesized program matters: the
-/// shape-inference LDX chain runs BEFORE the STX-flow STX,
-/// because once `arena_stx_findings` has the slot, subsequent
-/// LDXs through that slot are tagged
-/// [`RegState::ArenaU64FromAlloc`] (alias-tracking, line ~1318)
-/// instead of `LoadedU64Field` — and `ArenaU64FromAlloc` does
-/// not contribute to the `patterns` map (the LDX-of-arena-tag
-/// arm at line ~1378 sets dst Unknown without recording).
-/// Building the shape pattern first lets both paths converge on
-/// the same slot.
+/// The deferred resolve is correct: when the analyzer cannot
+/// infer the target shape from instruction evidence in any pass,
+/// the renderer's [`super::btf_render::MemReader::resolve_arena_type`]
+/// bridge resolves the payload BTF id from the live arena snapshot
+/// at chase time. This test pins the fixpoint's "alias-tracking
+/// supersedes shape inference once the slot is arena-tagged"
+/// contract.
 #[test]
-fn stx_flow_emits_zero_target_then_shape_overwrites_with_concrete_target() {
-    // BTF: u64(1), P(2, u64@8 source), Q(3, u64@0+u64@8). Q is
-    // the unique candidate matching both pattern accesses
-    // (offset=0, size=8) and (offset=8, size=8).
+fn stx_flow_emits_zero_target_under_fixpoint_alias_tracking() {
+    // BTF: u64(1), P(2, u64@8 source), Q(3, u64@0+u64@8). Q would
+    // be the unique candidate matching both pattern accesses
+    // (offset=0, size=8) and (offset=8, size=8) under single-pass
+    // analysis; under fixpoint the patterns set ends empty so the
+    // shape inference does not fire.
     let mut strings: Vec<u8> = vec![0];
     let n_u64 = push_name(&mut strings, "u64");
     let n_p = push_name(&mut strings, "P");
@@ -8215,17 +8221,22 @@ fn stx_flow_emits_zero_target_then_shape_overwrites_with_concrete_target() {
     let blob = build_btf(&types, &strings);
     let btf = Btf::from_bytes(&blob).unwrap();
     let p_id = 2;
-    let q_id = 3;
     let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
-    // Phase 1 — shape inference accumulates `patterns` for (P, 8):
-    //   r2 = LDX[r1 + 8]   ; r2 = LoadedU64Field{P, 8}, patterns
-    //                        seeded with empty access set
-    //   r3 = LDX[r2 + 0]   ; records access (0, 8)
-    //   r4 = LDX[r2 + 8]   ; records access (8, 8)
+    // Phase 1 — single-pass shape-inference accesses for (P, 8).
+    // Pass 1 records them; pass 2 (fixpoint) sees the slot already
+    // in arena_stx_findings and re-types the LDX to
+    // RegState::ArenaU64FromAlloc, which produces no patterns
+    // accesses:
+    //   r2 = LDX[r1 + 8]   ; pass 1 -> LoadedU64Field{P, 8};
+    //                        pass 2 -> ArenaU64FromAlloc
+    //   r3 = LDX[r2 + 0]   ; pass 1 records access (0, 8);
+    //                        pass 2 reads through ArenaU64FromAlloc
+    //                        and records nothing
+    //   r4 = LDX[r2 + 8]   ; same dual behavior
     // Phase 2 — preserve r1 across the call clobber by stashing
     // it in r6 (callee-saved per BPF ABI, R0..R5 only clobbered):
     //   r6 = r1
-    // Phase 3 — STX-flow tags the same slot:
+    // Phase 3 — STX-flow tags the same slot every pass:
     //   pseudo_call (PC 4)  ; SubprogReturn at PC=4 sets R0 to
     //                         RegState::ArenaU64FromAlloc after
     //                         the standard R0..=R5 clobber
@@ -8257,12 +8268,14 @@ fn stx_flow_emits_zero_target_then_shape_overwrites_with_concrete_target() {
     assert_eq!(
         map.get(&(p_id, 8)),
         Some(&CastHit {
-            target_type_id: q_id,
+            target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
-        "shape-inference loop must OVERWRITE the STX-flow's \
-             target_type_id=0 sentinel with the concrete unique \
-             candidate id (per finalize's emit ordering): {map:?}"
+        "fixpoint pass 2 must re-type the LDX as ArenaU64FromAlloc \
+             via alias tracking on the carried-over arena_stx_findings, \
+             which suppresses the shape-inference recording — finalize \
+             emits the STX-flow's deferred-resolve sentinel \
+             (target_type_id=0) with no shape-inference overwrite: {map:?}"
     );
 }
 

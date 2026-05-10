@@ -453,7 +453,15 @@ pub type CastMap = BTreeMap<(u32, u32), CastHit>;
 const CANDIDATE_SEARCH_SLACK: u32 = 65_536;
 
 /// Per-register state during the forward walk.
-#[derive(Debug, Clone, Copy)]
+///
+/// `PartialEq` participates in [`analyze_casts`]'s fixpoint loop: each
+/// pass extracts [`Analyzer::caller_arg_types`] (a
+/// `HashMap<usize, [RegState; 5]>`) and compares it byte-for-byte
+/// against the prior pass's snapshot. Convergence is detected when the
+/// map stops changing, so `RegState` equality is the propagation
+/// primitive for the whole fixpoint. All variant payloads (u32 / i16)
+/// already implement `PartialEq` so the derive is straightforward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegState {
     Unknown,
     /// Register holds a pointer to a known BTF struct.
@@ -578,6 +586,75 @@ struct Access {
 /// opcode, malformed encoding) — those manifest as false negatives,
 /// the safe direction. Empty input or input that produces no
 /// typed-pointer-rooted load or store yields an empty [`CastMap`].
+///
+/// # Fixpoint iteration
+///
+/// The forward walk is a single linear pass that records two pieces
+/// of cross-call evidence as it goes:
+/// - At every `BPF_PSEUDO_CALL` site, the caller's view of `R1..R5`
+///   keyed by the callee's entry PC ([`Analyzer::caller_arg_types`]).
+/// - At every STX of an [`RegState::ArenaU64FromAlloc`] value into a
+///   typed `Pointer{P}` parent's u64 field, the slot key
+///   ([`Analyzer::arena_stx_findings`]).
+///
+/// Both pieces of evidence support typing decisions made AT lower PCs
+/// than the producer:
+/// - Subprograms declared with `u64` parameters that actually carry
+///   typed-pointer values (the BPF idiom for arena-pointer subprog
+///   args) cannot be typed by the linear walk alone: the caller's
+///   typed register state reaches the call site, but on the first
+///   pass the analyzer has not yet propagated those types into the
+///   callee's register file when the callee body is processed (the
+///   linear walk visits the callee's instructions BEFORE the caller's
+///   call site if the callee text precedes the caller in the program
+///   slab, AND even when the order is reverse, the seed-from-caller
+///   logic at the FuncEntry boundary only upgrades a register from
+///   `Unknown` — which requires the caller's state to already be
+///   recorded).
+/// - The alias-tracking arm in [`Analyzer::handle_ldx`] checks
+///   `arena_stx_findings` to decide whether an LDX through a
+///   previously-arena-tagged slot loads an arena VA. Consumer LDX
+///   sites at lower PCs than the producer (a separate subprog whose
+///   text precedes the producer's, or a caller that reads the slot
+///   before the bridge / STX-flow path tags it) cannot see the
+///   evidence on a single pass.
+///
+/// To recover those typings, [`analyze_casts`] runs the forward walk
+/// repeatedly. Each iteration:
+/// 1. Builds a fresh [`Analyzer`] (or one pre-populated with the prior
+///    iteration's `caller_arg_types` and `arena_stx_findings` via
+///    [`Analyzer::with_carryover`]).
+/// 2. Seeds entry registers and runs the full forward walk.
+/// 3. Extracts the post-walk `caller_arg_types` and
+///    `arena_stx_findings` via [`Analyzer::into_carryover`].
+/// 4. Compares both extracted maps against the prior iteration's. If
+///    identical, the fixpoint has been reached.
+///
+/// Only `caller_arg_types` and `arena_stx_findings` carry across
+/// passes. The remaining analyzer state — `kptr_findings`, `patterns`,
+/// `arena_confirmed`, the register file, the stack-slot map — is
+/// rebuilt from scratch each pass. Carrying `arena_stx_findings` is
+/// safe because every entry is sourced from direct evidence the slot
+/// held an arena VA (an allocator-return seed, an
+/// `ARENA_ALLOC_KFUNC_NAMES` allowlist hit, or
+/// [`Analyzer::bridge_map_value_spill`] reading an
+/// `ArenaU64FromAlloc` stack slot); the map grows monotonically across
+/// passes (insertion sites never erase a `Pending` entry) and is
+/// bounded above by the number of distinct
+/// `(parent_struct_id, field_offset)` slots in the program BTF, so
+/// the fixpoint converges in a finite number of iterations.
+///
+/// The loop is capped at [`MAX_PASSES`] iterations to bound work on
+/// programs that resist convergence. The cap matches the BPF
+/// verifier's call-depth limit (`MAX_CALL_FRAMES = 8` in linux
+/// `kernel/bpf/verifier.h`), since each additional layer of typed-arg
+/// propagation corresponds to one more layer of subprog nesting. A
+/// program that has not converged after 8 passes will not converge
+/// further along the call-depth axis — its caller_arg_types snapshot
+/// has stopped accumulating new typings, which is a
+/// false-negative-safe terminus. The final iteration runs once more
+/// with the converged carry-over so [`Analyzer::finalize`] sees the
+/// full set of findings produced under the converged maps.
 pub fn analyze_casts(
     insns: &[BpfInsn],
     btf: &Btf,
@@ -586,18 +663,82 @@ pub fn analyze_casts(
     datasec_pointers: &[DatasecPointer],
     subprog_returns: &[SubprogReturn],
 ) -> CastMap {
-    let mut analyzer = Analyzer::new(btf);
-    analyzer.seed(initial_regs);
     let targets = jump_targets(insns);
-    analyzer.run(
+    let mut caller_args: CallerArgTypes = HashMap::new();
+    let mut arena_stx: ArenaStxFindings = BTreeMap::new();
+
+    for pass in 0..MAX_PASSES {
+        let mut a = if pass == 0 {
+            Analyzer::new(btf)
+        } else {
+            Analyzer::with_carryover(btf, caller_args.clone(), arena_stx.clone())
+        };
+        a.seed(initial_regs);
+        a.run(
+            insns,
+            &targets,
+            func_entries,
+            datasec_pointers,
+            subprog_returns,
+        );
+        let (next_args, next_stx) = a.into_carryover();
+        if next_args == caller_args && next_stx == arena_stx {
+            // Converged: re-run one more time with the converged
+            // carry-over so finalize() sees a fully populated
+            // analyzer. `into_carryover` consumed `a` above, so a
+            // fresh analyzer is required to call finalize() on; the
+            // run is idempotent under stable carry-over (the carried
+            // maps are monotonic and stable here, so every other
+            // analyzer state — patterns, kptr_findings,
+            // arena_confirmed — is rebuilt to the same shape it had
+            // on the iteration that detected convergence).
+            let mut final_a = Analyzer::with_carryover(btf, next_args, next_stx);
+            final_a.seed(initial_regs);
+            final_a.run(
+                insns,
+                &targets,
+                func_entries,
+                datasec_pointers,
+                subprog_returns,
+            );
+            return final_a.finalize();
+        }
+        caller_args = next_args;
+        arena_stx = next_stx;
+    }
+
+    // Cap reached without convergence: finalize on the last
+    // observed carry-over. False negatives on the still-changing
+    // tail of the propagation are the safe direction.
+    let mut final_a = Analyzer::with_carryover(btf, caller_args, arena_stx);
+    final_a.seed(initial_regs);
+    final_a.run(
         insns,
         &targets,
         func_entries,
         datasec_pointers,
         subprog_returns,
     );
-    analyzer.finalize()
+    final_a.finalize()
 }
+
+/// Maximum fixpoint iterations [`analyze_casts`] runs before bailing
+/// on convergence. Set to 8 to mirror the BPF verifier's
+/// `MAX_CALL_FRAMES` call-depth limit (linux
+/// `kernel/bpf/verifier.h`): each additional pass propagates
+/// caller-arg typings one nesting level deeper, so 8 passes cover the
+/// deepest call graph the verifier accepts. A program that would need
+/// pass 9 to converge cannot exist in valid BPF bytecode the analyzer
+/// is asked to inspect.
+const MAX_PASSES: usize = 8;
+
+/// Per BPF_PSEUDO_CALL site, snapshot of the caller's R1..R5 keyed by
+/// the callee's entry PC. See [`Analyzer::caller_arg_types`].
+type CallerArgTypes = HashMap<usize, [RegState; 5]>;
+
+/// Per `(parent_struct_id, field_byte_offset)` slot, the arena-STX
+/// finding state. See [`Analyzer::arena_stx_findings`].
+type ArenaStxFindings = BTreeMap<(u32, u32), ArenaStxEntry>;
 
 struct Analyzer<'a> {
     btf: &'a Btf,
@@ -743,7 +884,16 @@ enum KptrEntry {
 /// future code path adds a way to record disagreement on the same
 /// slot from the arena side, it can use this variant; finalize's
 /// filter will drop it identically to today.
-#[derive(Debug, Clone, Copy)]
+///
+/// `PartialEq` participates in [`analyze_casts`]'s fixpoint loop
+/// alongside [`RegState`]: each pass extracts the analyzer's
+/// `arena_stx_findings` map and compares it against the prior pass's
+/// snapshot. Convergence is detected when both
+/// [`Analyzer::caller_arg_types`] and [`Analyzer::arena_stx_findings`]
+/// stop changing, so `ArenaStxEntry` equality is the propagation
+/// primitive for the arena-tagging half of the fixpoint. Both variants
+/// are unit so the derive is straightforward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArenaStxEntry {
     /// Allocator-tagged value observed at the slot. The renderer's
     /// [`super::btf_render::MemReader::resolve_arena_type`] bridge
@@ -798,9 +948,80 @@ impl<'a> Analyzer<'a> {
             arena_stx_findings: BTreeMap::new(),
             max_seen_type_id: 0,
             alloc_seeds_applied: 0,
-            caller_arg_types: std::collections::HashMap::new(),
-            bridge_slot_origins: std::collections::HashMap::new(),
+            caller_arg_types: HashMap::new(),
+            bridge_slot_origins: HashMap::new(),
         }
+    }
+
+    /// Construct an analyzer pre-populated with a prior iteration's
+    /// `caller_arg_types` and `arena_stx_findings` snapshots, used by
+    /// [`analyze_casts`]'s fixpoint loop. The remaining analyzer state
+    /// is reset to its [`Self::new`] default. Only these two maps
+    /// carry across passes:
+    ///
+    /// - `caller_arg_types` propagates the caller's tracked register
+    ///   state at every BPF_PSEUDO_CALL site so that on a subsequent
+    ///   pass the callee's FuncEntry can upgrade its R1..R5 from
+    ///   `Unknown` to the typed view the caller provided.
+    /// - `arena_stx_findings` propagates the slots that some pass has
+    ///   observed receiving an `ArenaU64FromAlloc` STX. The
+    ///   alias-tracking arm in [`Self::handle_ldx`] checks this map at
+    ///   every typed-Pointer LDX of a u64 field; entries are needed
+    ///   when the consumer LDX site appears at a lower PC than the
+    ///   bridge / STX-flow producer that originally tagged the slot,
+    ///   so the linear walk cannot observe the producer's evidence
+    ///   in time. Entries are inserted from real allocator-return
+    ///   evidence (BPF_PSEUDO_CALL with [`SubprogReturn`] seed,
+    ///   [`Self::handle_kfunc_call`] arena-allocator allowlist hit,
+    ///   or [`Self::bridge_map_value_spill`] reading an
+    ///   `ArenaU64FromAlloc` stack slot) so carrying them across
+    ///   passes is safe — a slot only ends up in this map after the
+    ///   analyzer saw direct evidence the slot held an arena VA.
+    ///   The map only grows monotonically across passes (insertion
+    ///   sites never erase a `Pending` entry), so it converges
+    ///   bounded by the number of distinct `(parent_struct_id, field_offset)`
+    ///   slots in the program BTF.
+    fn with_carryover(
+        btf: &'a Btf,
+        caller_arg_types: CallerArgTypes,
+        arena_stx_findings: ArenaStxFindings,
+    ) -> Self {
+        // Seed `max_seen_type_id` from the largest parent struct id
+        // present in `arena_stx_findings`. Without this seed, the
+        // candidate-search slack in finalize() would be computed
+        // against a value smaller than the parent ids the carry-over
+        // already references, so [`build_layout_index`] could miss
+        // candidate structs whose ids fall above the un-seeded slack
+        // window.
+        let max_seen_type_id = arena_stx_findings
+            .keys()
+            .map(|(parent, _)| *parent)
+            .max()
+            .unwrap_or(0);
+        Self {
+            btf,
+            regs: [RegState::Unknown; 11],
+            patterns: BTreeMap::new(),
+            kptr_findings: BTreeMap::new(),
+            stack_slots: BTreeMap::new(),
+            arena_confirmed: BTreeSet::new(),
+            arena_stx_findings,
+            max_seen_type_id,
+            alloc_seeds_applied: 0,
+            caller_arg_types,
+            bridge_slot_origins: HashMap::new(),
+        }
+    }
+
+    /// Extract the post-walk `caller_arg_types` and
+    /// `arena_stx_findings` maps for the fixpoint loop. Consumes the
+    /// analyzer because the maps are moved out rather than cloned;
+    /// the caller in [`analyze_casts`] either detects convergence
+    /// (and rebuilds a fresh analyzer to call finalize on) or feeds
+    /// the extracted maps into a successor pass via
+    /// [`Self::with_carryover`].
+    fn into_carryover(self) -> (CallerArgTypes, ArenaStxFindings) {
+        (self.caller_arg_types, self.arena_stx_findings)
     }
 
     fn seed(&mut self, initial_regs: &[InitialReg]) {
@@ -979,13 +1200,14 @@ impl<'a> Analyzer<'a> {
             // still clears stale state. Without this ordering,
             // pre-jump register state would survive past the
             // skip into the next valid instruction.
-            if jump_targets.contains(&pc) {
-                for r in 0..=5 {
-                    self.regs[r] = RegState::Unknown;
-                }
-                self.stack_slots.clear();
-                self.bridge_slot_origins.clear();
-            }
+            // Branch-target join: the linear walk is a
+            // may-analysis — typed state from any reaching path is
+            // a valid observation. Resetting registers here would
+            // destroy real typed state (arena tags, Pointer
+            // provenance) that survived across the branch in
+            // callee-saved registers or stack spills. Finalize's
+            // conflict-drop gate catches disagreements between
+            // paths (arena vs kptr on the same slot).
 
             if skip_next {
                 skip_next = false;
