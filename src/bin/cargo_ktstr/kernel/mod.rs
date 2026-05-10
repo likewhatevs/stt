@@ -86,7 +86,7 @@ pub(crate) fn resolve_path_kernel(p: &Path, raw_input: &str) -> Result<(PathBuf,
         )
     })?;
     if let Some(hit) = outcome.cache_hit {
-        eprintln!(
+        tracing::info!(
             "cargo ktstr: cache hit for {raw_input} ({key}{age})",
             key = hit.cache_key,
             age = format_built_age(&hit.built_at),
@@ -462,7 +462,7 @@ pub(crate) fn resolve_kernel_set(specs: &[String]) -> Result<Vec<(String, PathBu
     let resolve_one_with_progress = |id: KernelId| -> Result<(String, PathBuf), String> {
         let result = resolve_one(id);
         if let Ok((label, _)) = &result {
-            eprintln!("cargo ktstr: resolved kernel {label:?}");
+            tracing::debug!("cargo ktstr: resolved kernel {label:?}");
         }
         result
     };

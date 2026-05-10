@@ -170,7 +170,7 @@ fn run_cargo_sub(
         // budget listing's vmlinux probe in `dispatch.rs`) sees a
         // valid kernel even when running under multi-kernel.
         let first_dir = &resolved[0].1;
-        eprintln!("cargo ktstr: using kernel {}", first_dir.display());
+        tracing::debug!("cargo ktstr: using kernel {}", first_dir.display());
         cmd.env(ktstr::KTSTR_KERNEL_ENV, first_dir);
 
         if resolved.len() > 1 {
@@ -185,7 +185,7 @@ fn run_cargo_sub(
 
     precompute_cast_cache();
 
-    eprintln!("cargo ktstr: running {label}");
+    tracing::debug!("cargo ktstr: running {label}");
     let status = cmd
         .status()
         .map_err(|e| format!("spawn cargo {}: {e}", sub_argv.join(" ")))?;

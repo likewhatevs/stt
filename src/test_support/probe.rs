@@ -1292,7 +1292,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     let name = match extract_test_fn_arg(args) {
         Some(n) => n,
         None => {
-            eprintln!("ktstr-init: no --ktstr-test-fn in args, skipping dispatch");
+            tracing::debug!("ktstr-init: no --ktstr-test-fn in args, skipping dispatch");
             return None;
         }
     };
@@ -1728,7 +1728,7 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     let name = match extract_test_fn_arg(args) {
         Some(n) => n,
         None => {
-            eprintln!("ktstr-init: no --ktstr-test-fn in args, skipping dispatch");
+            tracing::debug!("ktstr-init: no --ktstr-test-fn in args, skipping dispatch");
             return None;
         }
     };
