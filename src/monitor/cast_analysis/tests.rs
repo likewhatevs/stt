@@ -9739,3 +9739,291 @@ fn cross_function_u64_param_inherits_caller_pointer_type() {
          and record arena STX at (M, 8): {map:?}"
     );
 }
+
+/// Map-value arena propagation: an arena pointer stashed into a
+/// `u64` field of a stack-local map-value struct V at
+/// `bpf_map_update_elem(map, key, &V)` must round-trip through the
+/// map so that the matching `bpf_map_lookup_elem(map)` returned R0
+/// carries V-typed arena evidence on the same field. A subsequent
+/// `LDX r2 = *(u64 *)(r0 + 8)` must therefore tag r2 as
+/// [`RegState::ArenaU64FromAlloc`], and a follow-up
+/// `STX *(u64 *)(r6 + 0) = r2` into a typed `Pointer{P}` parent
+/// must record `(P, 0) -> Arena` via the existing
+/// `arena_stx_findings` finalize path.
+///
+/// This is the load-bearing contract for the map-value arena
+/// propagation feature: scx schedulers stash `scx_static_alloc` /
+/// `scx_alloc_internal` returns inside map-value structs so the
+/// arena pointer survives across BPF program invocations. The
+/// renderer chases the recovered pointer from a parent struct
+/// field that received the lookup-loaded value — without the
+/// round-trip propagation the field renders as a raw u64 counter
+/// even though the runtime byte pattern is an arena VA.
+///
+/// Synthesized program (clang-style codegen for the
+/// "stack-local V, update_elem(&V), then lookup_elem to read V
+/// back" pattern):
+///
+/// ```text
+///   pc 0: pseudo_call          ; SubprogReturn @ pc=0 -> R0 = ArenaU64FromAlloc
+///   pc 1: stx [r10 + (-16)] = r0
+///                              ; spill arena value at the V.field
+///                              ; offset within the stack-local V
+///                              ; (V base lives at r10-24, V.field
+///                              ; at +8 -> r10-16)
+///   pc 2-3: ld_imm64 r1, .maps@0
+///                              ; r1 = DatasecPointer{maps, 0}
+///   pc 4: r2 = r10             ; key pointer (content irrelevant)
+///   pc 5: r2 += -24
+///   pc 6: r3 = r10             ; value pointer = &V on the stack
+///   pc 7: r3 += -24
+///   pc 8: call helper(BPF_FUNC_map_update_elem)
+///                              ; FUTURE FEATURE: walks V's u64
+///                              ; fields, sees stack_slot[-16] is
+///                              ; ArenaU64FromAlloc, tags map's
+///                              ; (V, 8) as arena-backed.
+///   pc 9-10: ld_imm64 r1, .maps@0
+///   pc 11: call helper(BPF_FUNC_map_lookup_elem)
+///                              ; R0 = Pointer{V}.
+///   pc 12: ldx r2 = *(u64 *)(r0 + 8)
+///                              ; FUTURE FEATURE: V.field is the
+///                              ; map's tagged arena field, so r2
+///                              ; takes ArenaU64FromAlloc instead
+///                              ; of LoadedU64Field{V, 8}.
+///   pc 13: stx *(u64 *)(r6 + 0) = r2
+///                              ; records (P, 0) -> Arena via the
+///                              ; arena_stx_findings path.
+///   pc 14: exit
+/// ```
+///
+/// R6 is seeded `Pointer{P}` via [`InitialReg`]; R6 is callee-
+/// saved per the BPF ABI so it survives both helper-call clobbers.
+/// The map's value type V is distinct from the parent struct P so
+/// the analyzer's self-store rejection in [`Analyzer::handle_stx`]
+/// does not fire — the recorded finding is `parent=P, target=V`'s
+/// value, not `P -> P`.
+///
+/// Helper id 2 is `BPF_FUNC_map_update_elem` per linux uapi
+/// `bpf.h` (`FN(map_update_elem, 2, ##ctx)`); helper id 1 is
+/// `BPF_FUNC_map_lookup_elem`. Both are plain helpers (`src_reg
+/// == 0`). The numeric literal 2 is used here directly because
+/// the analyzer does not yet expose a `BPF_FUNC_MAP_UPDATE_ELEM`
+/// constant — that constant is part of the feature this test
+/// guards.
+#[test]
+fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
+    // BTF: u64(1), V(2, u64@8), P(3, u64@0), Ptr->V(4),
+    // map_def(5, type@0 + V*@8), Var "the_map"(6),
+    // Datasec ".maps"(7).
+    let mut strings: Vec<u8> = vec![0];
+    let n_u64 = push_name(&mut strings, "u64");
+    let n_v = push_name(&mut strings, "V");
+    let n_v_field = push_name(&mut strings, "field");
+    let n_p = push_name(&mut strings, "P");
+    let n_p_field = push_name(&mut strings, "field");
+    let n_type = push_name(&mut strings, "type");
+    let n_value = push_name(&mut strings, "value");
+    let n_map_def = push_name(&mut strings, "anon_map_def");
+    let n_map_var = push_name(&mut strings, "the_map");
+    let n_maps = push_name(&mut strings, ".maps");
+    let types = vec![
+        // id 1: u64 (size=8, bits=64).
+        SynType::Int {
+            name_off: n_u64,
+            size: 8,
+            encoding: 0,
+            offset: 0,
+            bits: 64,
+        },
+        // id 2: struct V { u64 field @ 8 }, size=16. The map's
+        // value type — V.field at offset 8 is the slot the
+        // pre-update STX spills the arena value into.
+        SynType::Struct {
+            name_off: n_v,
+            size: 16,
+            members: vec![SynMember {
+                name_off: n_v_field,
+                type_id: 1,
+                byte_offset: 8,
+            }],
+        },
+        // id 3: struct P { u64 field @ 0 }, size=8. The parent
+        // struct that receives the post-lookup arena STX —
+        // distinct from V so the analyzer's self-store rejection
+        // in handle_stx does not fire.
+        SynType::Struct {
+            name_off: n_p,
+            size: 8,
+            members: vec![SynMember {
+                name_off: n_p_field,
+                type_id: 1,
+                byte_offset: 0,
+            }],
+        },
+        // id 4: Ptr -> V. The map_def's `value` member type per
+        // libbpf's `__type(value, V)` macro expansion (`typeof(V) *`).
+        SynType::Ptr { type_id: 2 },
+        // id 5: anonymous map_def struct {
+        //   u32 type @ 0;  /* placeholder for __uint(type, ...) */
+        //   V *value @ 8;
+        // } size=16. Mirrors the per-map struct shape libbpf's
+        // `parse_btf_map_def` consumes.
+        SynType::Struct {
+            name_off: n_map_def,
+            size: 16,
+            members: vec![
+                SynMember {
+                    name_off: n_type,
+                    type_id: 1,
+                    byte_offset: 0,
+                },
+                SynMember {
+                    name_off: n_value,
+                    type_id: 4,
+                    byte_offset: 8,
+                },
+            ],
+        },
+        // id 6: Var "the_map" of type map_def, GLOBAL linkage.
+        SynType::Var {
+            name_off: n_map_var,
+            type_id: 5,
+            linkage: 1,
+        },
+        // id 7: Datasec ".maps" containing the_map at offset 0.
+        SynType::Datasec {
+            name_off: n_maps,
+            size: 16,
+            entries: vec![SynVarSecinfo {
+                type_id: 6,
+                offset: 0,
+                size: 16,
+            }],
+        },
+    ];
+    let blob = build_btf(&types, &strings);
+    let btf = Btf::from_bytes(&blob).unwrap();
+    let v_id = 2u32;
+    let p_id = 3u32;
+    let datasec_id = 7u32;
+    let var_off = 0u32;
+
+    let pseudo_call = mk_insn(BPF_CLASS_JMP | BPF_OP_CALL, 0, BPF_PSEUDO_CALL, 0, 0);
+    let stx_spill = stx(BPF_SIZE_DW, 10, 0, -16);
+    let [ld_lo_pre, ld_hi_pre] = ld_imm64(1, var_off as i32);
+    let mov_r2_from_r10 = mov_x(2, 10);
+    // R2 += -24 (ALU64 ADD K). Encoded as
+    // `BPF_CLASS_ALU64 | BPF_ADD | BPF_SRC_K` per linux uapi
+    // `bpf.h`; src field is unused, imm carries the constant.
+    let r2_minus_24 = mk_insn(BPF_CLASS_ALU64 | (bs::BPF_ADD as u8), 2, 0, 0, -24);
+    let mov_r3_from_r10 = mov_x(3, 10);
+    let r3_minus_24 = mk_insn(BPF_CLASS_ALU64 | (bs::BPF_ADD as u8), 3, 0, 0, -24);
+    // BPF_FUNC_map_update_elem == 2 per linux uapi `bpf.h`
+    // (`FN(map_update_elem, 2, ...)`). The analyzer does not yet
+    // export a BPF_FUNC_MAP_UPDATE_ELEM constant — that addition
+    // is part of the feature this test guards.
+    let call_update = helper_call(2);
+    let [ld_lo_post, ld_hi_post] = ld_imm64(1, var_off as i32);
+    let call_lookup = helper_call(BPF_FUNC_MAP_LOOKUP_ELEM);
+    let ldx_v_field = ldx(BPF_SIZE_DW, 2, 0, 8);
+    let stx_into_p = stx(BPF_SIZE_DW, 6, 2, 0);
+
+    let insns = vec![
+        // pc 0: pseudo_call -> R0 = ArenaU64FromAlloc.
+        pseudo_call,
+        // pc 1: spill R0 to stack at the V.field offset.
+        stx_spill,
+        // pc 2-3: ld_imm64 r1, .maps@0 (DatasecPointer for update).
+        ld_lo_pre,
+        ld_hi_pre,
+        // pc 4-5: r2 = r10 + (-24) (key pointer; content
+        // irrelevant — `bpf_map_update_elem`'s key arg is a
+        // verifier-side gate, not a cast-finding signal).
+        mov_r2_from_r10,
+        r2_minus_24,
+        // pc 6-7: r3 = r10 + (-24) (value pointer = &V on stack).
+        mov_r3_from_r10,
+        r3_minus_24,
+        // pc 8: call bpf_map_update_elem.
+        call_update,
+        // pc 9-10: ld_imm64 r1, .maps@0 again (the post-update
+        // R1 was clobbered by the helper call — pre-relocation
+        // bytecode reloads the descriptor).
+        ld_lo_post,
+        ld_hi_post,
+        // pc 11: call bpf_map_lookup_elem -> R0 = Pointer{V}.
+        call_lookup,
+        // pc 12: ldx r2 = *(u64 *)(r0 + 8) — load V.field.
+        ldx_v_field,
+        // pc 13: stx *(u64 *)(r6 + 0) = r2 — store into P.field.
+        stx_into_p,
+        // pc 14: exit.
+        exit(),
+    ];
+    // PC layout summary (LD_IMM64 second slots are skipped via
+    // skip_next; numbering above counts every BpfInsn slot):
+    //   0 pseudo_call
+    //   1 stx [r10-16] = r0
+    //   2 ld_lo_pre, 3 ld_hi_pre
+    //   4 mov r2,r10, 5 r2 += -24
+    //   6 mov r3,r10, 7 r3 += -24
+    //   8 call(2)        -- bpf_map_update_elem
+    //   9 ld_lo_post, 10 ld_hi_post
+    //   11 call(1)       -- bpf_map_lookup_elem
+    //   12 ldx r2, [r0+8]
+    //   13 stx [r6+0] = r2
+    //   14 exit
+    let datasec_pointers = vec![
+        DatasecPointer {
+            insn_offset: 2,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        },
+        DatasecPointer {
+            insn_offset: 9,
+            datasec_type_id: datasec_id,
+            base_offset: var_off,
+        },
+    ];
+    let map = analyze_casts(
+        &insns,
+        &btf,
+        &[InitialReg {
+            reg: 6,
+            struct_type_id: p_id,
+        }],
+        &[],
+        &datasec_pointers,
+        &[SubprogReturn { insn_offset: 0 }],
+    );
+    // The end-to-end contract: the post-lookup LDX of V.field
+    // produces R2 = ArenaU64FromAlloc (because the prior
+    // update_elem tagged V's u64@8 slot as arena-backed via the
+    // stack-spilled value), and the subsequent STX into P.field
+    // records (P, 0) -> Arena via the arena_stx_findings finalize
+    // path. `target_type_id == 0` because the renderer's
+    // `MemReader::resolve_arena_type` bridge supplies the actual
+    // payload BTF id at chase time — same convention every
+    // arena-STX finding uses (see
+    // `stx_flow_alloc_return_records_arena_finding`).
+    //
+    // Until the map-value propagation feature lands, this test
+    // fails — the analyzer treats `bpf_map_update_elem` as an
+    // ordinary helper that clobbers R0..=R5 without inspecting
+    // R3's pointee, so V's (2, 8) slot never receives the arena
+    // tag, the post-lookup LDX produces `LoadedU64Field{V, 8}`
+    // instead of `ArenaU64FromAlloc`, and the final STX records
+    // nothing in `arena_stx_findings`. Reference is V's id
+    // (2) for the Var var_off==0 → the_map → V layout.
+    let _ = v_id;
+    assert_eq!(
+        map.get(&(p_id, 0)),
+        Some(&CastHit {
+            target_type_id: 0,
+            addr_space: AddrSpace::Arena,
+        }),
+        "map-value arena propagation must surface `(P, 0) -> Arena` \
+         after update_elem(&V_with_arena_at_off_8) -> lookup_elem -> \
+         LDX V.field -> STX into P.field: {map:?}"
+    );
+}

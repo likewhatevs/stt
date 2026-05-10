@@ -452,7 +452,7 @@ pub(super) fn resolve_arena_type_with_static_fallback(
     arena_snapshot: Option<&super::super::arena::ArenaSnapshot>,
     arena_type_index: Option<&ArenaTypeIndex>,
     scx_static_index: Option<&super::super::scx_static_alloc::ScxStaticRangeIndex>,
-    sdt_alloc_metas: &[SdtAllocMeta],
+    _sdt_alloc_metas: &[SdtAllocMeta],
     addr: u64,
 ) -> Option<ArenaResolveHit> {
     if let Some(hit) = resolve_arena_type_in_index(arena_snapshot, arena_type_index, addr) {
@@ -477,26 +477,15 @@ pub(super) fn resolve_arena_type_with_static_fallback(
         );
         return None;
     }
-    // Meta fallback: if the address is in the arena range and at
-    // least one sdt_alloc meta has a resolved payload type, use
-    // that as a best-effort resolve. Covers allocations missed by
-    // the index (snapshot truncation, MAX_SDT_ALLOC_ENTRIES cap).
-    // Same data chase_sdt_data_payload uses — same correctness.
-    if is_arena_addr_in_snapshot(arena_snapshot, addr)
-        && let Some(meta) = sdt_alloc_metas.iter().find(|m| m.target_type_id != 0)
-    {
-        tracing::debug!(
-            addr = format_args!("{:#x}", addr),
-            target_type_id = meta.target_type_id,
-            header_size = meta.header_size,
-            allocator = %meta.allocator_name,
-            "resolve_arena_type: index miss, falling back to sdt_alloc meta",
-        );
-        return Some(ArenaResolveHit {
-            target_type_id: meta.target_type_id,
-            header_skip: meta.header_size,
-        });
-    }
+    // No meta fallback: the meta-based "best-effort" resolve was a
+    // false positive factory — it turned ANY arena-window address
+    // into a typed chase using the first allocator's payload type,
+    // regardless of whether the address was an actual allocation.
+    // Counters and timestamps whose values fell in the 4 GiB arena
+    // window were rendered as typed structs (wrong). If the per-slot
+    // ArenaTypeIndex missed (cap exceeded, snapshot truncation), the
+    // chase fails closed with a clear skip reason. Correctness over
+    // coverage.
     None
 }
 

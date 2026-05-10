@@ -519,6 +519,14 @@ enum RegState {
     /// register's `Pointer{P}` state and the store's offset, not
     /// carried in the value register's state.
     ArenaU64FromAlloc,
+    /// Register holds a frame-pointer-relative address: `r10 + offset`.
+    /// Produced by `MOV rX, r10` (offset = 0) and propagated through
+    /// `ALU64 | ADD | K` (offset += imm). Consumed by the
+    /// `bpf_map_update_elem` handler to identify the stack region
+    /// backing the map value struct.
+    FrameAddr {
+        offset: i16,
+    },
 }
 
 /// Observed `(offset, size_bytes)` access through a `LoadedU64Field`
@@ -683,6 +691,13 @@ struct Analyzer<'a> {
     /// arena pointers — the FuncProto declares u64, but the caller
     /// passes a Pointer{T} that the linear walk tracked.
     caller_arg_types: std::collections::HashMap<usize, [RegState; 5]>,
+    /// Reverse mapping from stack slot offset to the
+    /// `(value_struct_id, member_offset)` key in `arena_stx_findings`
+    /// that the `bridge_map_value_spill` method recorded from that
+    /// slot. Used by the spill path to invalidate bridge-derived
+    /// findings when a non-arena value overwrites the originating
+    /// stack slot.
+    bridge_slot_origins: std::collections::HashMap<i16, (u32, u32)>,
 }
 
 /// Kptr finding state: a single `(parent, offset)` slot may be
@@ -784,6 +799,7 @@ impl<'a> Analyzer<'a> {
             max_seen_type_id: 0,
             alloc_seeds_applied: 0,
             caller_arg_types: std::collections::HashMap::new(),
+            bridge_slot_origins: std::collections::HashMap::new(),
         }
     }
 
@@ -854,6 +870,7 @@ impl<'a> Analyzer<'a> {
         // from a prior function must not survive past this entry.
         self.regs = [RegState::Unknown; 11];
         self.stack_slots.clear();
+        self.bridge_slot_origins.clear();
         let proto = match self.btf.resolve_type_by_id(func_proto_id) {
             Ok(Type::FuncProto(fp)) => fp,
             Ok(Type::Func(f)) => match f.get_type_id() {
@@ -965,6 +982,7 @@ impl<'a> Analyzer<'a> {
             if jump_targets.contains(&pc) {
                 self.regs = [RegState::Unknown; 11];
                 self.stack_slots.clear();
+                self.bridge_slot_origins.clear();
             }
 
             if skip_next {
@@ -1051,6 +1069,7 @@ impl<'a> Analyzer<'a> {
             if (is_exit || unconditional_ja) && !jump_targets.contains(&(pc + 1)) {
                 self.regs = [RegState::Unknown; 11];
                 self.stack_slots.clear();
+                self.bridge_slot_origins.clear();
             }
         }
     }
@@ -1230,7 +1249,11 @@ impl<'a> Analyzer<'a> {
                         }
                         match insn.off {
                             0 => {
-                                self.regs[dst] = self.regs[src];
+                                if src == BPF_REG_R10 {
+                                    self.regs[dst] = RegState::FrameAddr { offset: 0 };
+                                } else {
+                                    self.regs[dst] = self.regs[src];
+                                }
                             }
                             1 => {
                                 // BPF_ADDR_SPACE_CAST. The verifier
@@ -1252,12 +1275,19 @@ impl<'a> Analyzer<'a> {
                                             .insert((source_struct_id, field_offset));
                                     }
                                     self.regs[dst] = self.regs[src];
+                                } else if insn.imm == (1 << 16) {
+                                    if let RegState::LoadedU64Field {
+                                        source_struct_id,
+                                        field_offset,
+                                    } = self.regs[src]
+                                    {
+                                        self.arena_confirmed
+                                            .insert((source_struct_id, field_offset));
+                                        self.regs[dst] = self.regs[src];
+                                    } else {
+                                        self.set_reg(dst, RegState::Unknown);
+                                    }
                                 } else {
-                                    // as(0) → as(1) (0x10000,
-                                    // cast_user) or reserved imm:
-                                    // the result is a user-vma
-                                    // arena address that cannot be
-                                    // a tracked pointer in our model.
                                     self.set_reg(dst, RegState::Unknown);
                                 }
                             }
@@ -1276,10 +1306,18 @@ impl<'a> Analyzer<'a> {
                     } else {
                         self.set_reg(dst, RegState::Unknown);
                     }
+                } else if class == BPF_CLASS_ALU64
+                    && op == BPF_OP_ADD
+                    && (insn.code & 0x08) == 0
+                    && let RegState::FrameAddr { offset } = self.regs[dst]
+                {
+                    let new_off = (offset as i32).saturating_add(insn.imm);
+                    if let Ok(narrowed) = i16::try_from(new_off) {
+                        self.regs[dst] = RegState::FrameAddr { offset: narrowed };
+                    } else {
+                        self.set_reg(dst, RegState::Unknown);
+                    }
                 } else {
-                    // All other ALU ops (add/sub/and/or/lsh/etc.,
-                    // including BPF_OP_MOV with BPF_SRC_K) destroy
-                    // the typed-pointer property. Drop dst state.
                     self.set_reg(dst, RegState::Unknown);
                 }
             }
@@ -1296,6 +1334,7 @@ impl<'a> Analyzer<'a> {
                     // the saved snapshot survives across the
                     // clobber boundary.
                     let pre_call_r1 = self.regs[1];
+                    let pre_call_r3 = self.regs[3];
                     for r in 0..=5 {
                         self.set_reg(r, RegState::Unknown);
                     }
@@ -1352,6 +1391,17 @@ impl<'a> Analyzer<'a> {
                             };
                             self.note_type_id(sid);
                         }
+                    } else if pseudo == 0
+                        && insn.imm == BPF_FUNC_MAP_UPDATE_ELEM
+                        && let RegState::DatasecPointer {
+                            datasec_type_id,
+                            base_offset,
+                        } = pre_call_r1
+                        && let Some(value_sid) =
+                            map_value_struct_id(self.btf, datasec_type_id, base_offset)
+                        && let RegState::FrameAddr { offset: r3_base } = pre_call_r3
+                    {
+                        self.bridge_map_value_spill(value_sid, r3_base);
                     }
                     // Allocator-return seed: caller-supplied annotation
                     // identified this `BPF_PSEUDO_CALL` PC as a call to
@@ -1613,15 +1663,9 @@ impl<'a> Analyzer<'a> {
                 // on dereferences through arena-tagged pointers.
                 self.set_reg(dst, RegState::Unknown);
             }
-            RegState::Unknown => {
-                // Loading through an untyped base never produces a
-                // tracked register (we don't speculate the source
-                // type from BTF alone).
+            RegState::Unknown | RegState::FrameAddr { .. } => {
                 self.set_reg(dst, RegState::Unknown);
             }
-            // Typed-pointer variants were handled above; the
-            // `typed_base` arm always returns to avoid falling
-            // through.
             RegState::Pointer { .. } | RegState::DatasecPointer { .. } => unreachable!(),
         }
     }
@@ -1677,6 +1721,11 @@ impl<'a> Analyzer<'a> {
             // gives an Unknown register. Pointer / LoadedU64Field
             // round-trip preserved.
             self.stack_slots.insert(off, self.regs[src]);
+            if !matches!(self.regs[src], RegState::ArenaU64FromAlloc)
+                && let Some(bridge_key) = self.bridge_slot_origins.remove(&off)
+            {
+                self.arena_stx_findings.remove(&bridge_key);
+            }
             return;
         }
 
@@ -2080,6 +2129,78 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn bridge_map_value_spill(&mut self, value_struct_id: u32, r3_base: i16) {
+        let (t, _peeled_id) =
+            match super::btf_render::peel_modifiers_with_id(self.btf, value_struct_id) {
+                Some(v) => v,
+                None => return,
+            };
+        let s = match t {
+            Type::Struct(s) | Type::Union(s) => s,
+            _ => return,
+        };
+        for m in &s.members {
+            if matches!(m.bitfield_size(), Some(b) if b > 0) {
+                continue;
+            }
+            let bit_off = m.bit_offset();
+            if bit_off % 8 != 0 {
+                continue;
+            }
+            let member_off = bit_off / 8;
+            let Ok(member_tid) = m.get_type_id() else {
+                continue;
+            };
+            let Some(terminal) = super::btf_render::peel_modifiers(self.btf, member_tid) else {
+                continue;
+            };
+            let Type::Int(int) = terminal else { continue };
+            if int.size() != 8 || int.is_signed() || int.is_bool() || int.is_char() {
+                continue;
+            }
+            let Some(slot_off) = i16::try_from(member_off as i32)
+                .ok()
+                .and_then(|o| r3_base.checked_add(o))
+            else {
+                continue;
+            };
+            let Some(&slot) = self.stack_slots.get(&slot_off) else {
+                continue;
+            };
+            let key = (value_struct_id, member_off);
+            match slot {
+                RegState::ArenaU64FromAlloc => {
+                    self.note_type_id(value_struct_id);
+                    if let std::collections::btree_map::Entry::Vacant(e) =
+                        self.arena_stx_findings.entry(key)
+                    {
+                        e.insert(ArenaStxEntry::Pending);
+                        self.bridge_slot_origins.insert(slot_off, key);
+                    }
+                }
+                RegState::Pointer {
+                    struct_type_id: target,
+                } => {
+                    if value_struct_id == target {
+                        continue;
+                    }
+                    self.note_type_id(value_struct_id);
+                    self.note_type_id(target);
+                    match self.kptr_findings.get(&key).copied() {
+                        None => {
+                            self.kptr_findings.insert(key, KptrEntry::Single(target));
+                        }
+                        Some(KptrEntry::Single(prev)) if prev == target => {}
+                        Some(_) => {
+                            self.kptr_findings.insert(key, KptrEntry::Conflicting);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn note_type_id(&mut self, id: u32) {
         if id > self.max_seen_type_id {
             self.max_seen_type_id = id;
@@ -2211,15 +2332,42 @@ impl<'a> Analyzer<'a> {
             if conflicting.contains(key) {
                 continue;
             }
+            let inferred_target = self.patterns.get(key).and_then(|accesses| {
+                if accesses.is_empty() {
+                    return None;
+                }
+                let mut iter = accesses.iter();
+                let first = iter.next()?;
+                let empty = HashSet::new();
+                let mut candidates: HashSet<u32> = layout
+                    .get(&(first.offset, first.size))
+                    .cloned()
+                    .unwrap_or_default();
+                for acc in iter {
+                    let next = layout.get(&(acc.offset, acc.size)).unwrap_or(&empty);
+                    candidates.retain(|c| next.contains(c));
+                    if candidates.is_empty() {
+                        break;
+                    }
+                }
+                candidates.remove(&key.0);
+                if candidates.len() == 1 {
+                    candidates.into_iter().next()
+                } else {
+                    None
+                }
+            });
+            let target_type_id = inferred_target.unwrap_or(0);
             tracing::debug!(
                 parent = key.0,
                 offset = key.1,
+                target = target_type_id,
                 "cast_analysis: arena STX-flow hit emitted"
             );
             out.insert(
                 *key,
                 CastHit {
-                    target_type_id: 0,
+                    target_type_id,
                     addr_space: AddrSpace::Arena,
                 },
             );
@@ -2257,12 +2405,10 @@ impl<'a> Analyzer<'a> {
             if conflicting.contains(&(*source, *field_off)) {
                 continue;
             }
-            // F1 gate: shape inference alone is not enough. Require
-            // either a `bpf_addr_space_cast` observation
-            // (`arena_confirmed`) OR an arena-STX observation
-            // (`arena_stx_findings`) on the same slot before we
-            // emit a shape-inference target.
             let key = (*source, *field_off);
+            if out.contains_key(&key) {
+                continue;
+            }
             let has_direct_evidence =
                 self.arena_confirmed.contains(&key) || self.arena_stx_findings.contains_key(&key);
             if !has_direct_evidence {
@@ -3033,6 +3179,8 @@ pub(crate) const BPF_PSEUDO_KFUNC_CALL: u8 = bs::BPF_PSEUDO_KFUNC_CALL as u8;
 /// returned pointer points at the map's value bytes whose BTF type
 /// is the map descriptor's `__type(value, T)` declaration.
 const BPF_FUNC_MAP_LOOKUP_ELEM: i32 = bs::BPF_FUNC_map_lookup_elem as i32;
+const BPF_FUNC_MAP_UPDATE_ELEM: i32 = bs::BPF_FUNC_map_update_elem as i32;
+const BPF_OP_ADD: u8 = bs::BPF_ADD as u8;
 
 /// `bpf_call->src_reg == BPF_PSEUDO_CALL` denotes a BPF-to-BPF call:
 /// `bpf_call->imm` is a pc-relative offset to another BPF function
