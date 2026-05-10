@@ -344,6 +344,7 @@ pub(crate) fn attempt_auto_repro(
     console_output: &str,
     topo: Option<&TopoOverride>,
     active_flags: &[String],
+    primary_exit_kind: Option<u64>,
 ) -> Option<String> {
     use crate::probe::stack::extract_stack_functions_all;
 
@@ -403,7 +404,7 @@ pub(crate) fn attempt_auto_repro(
     // always empty after stitch. Skip probe attachment entirely to
     // avoid the BPF discovery + kprobe/fentry attach overhead. The
     // repro VM still boots for the failure dump and diagnostic tails.
-    let is_stall = console_output.contains("runnable task stall");
+    let is_stall = primary_exit_kind == Some(crate::probe::scx_defs::EXIT_ERROR_STALL);
 
     // When no stack functions were extracted (e.g. BPF text error with no
     // backtrace), still boot the repro VM. The guest-side discover_bpf_symbols()
@@ -633,7 +634,7 @@ pub(crate) fn attempt_auto_repro(
     let probe_payload_partial_path = super::sidecar::sidecar_dir()
         .join(format!("{}.repro.probe-payload.partial.json", entry.name));
     let _ = std::fs::remove_file(&probe_payload_partial_path);
-    let probe_section = if repro_result.stderr.contains("runnable task stall") {
+    let probe_section = if is_stall {
         tracing::debug!(
             "auto-repro: suppressing chain-to-failure for stall exit \
              (no causal task — probe events are always empty after stitch)",

@@ -1560,6 +1560,18 @@ fn run_ktstr_test_inner_impl(
     // - a scheduler is running (not EEVDF)
     // - the test does not expect failure (expect_err = false)
     let effective_auto_repro = entry.auto_repro && scheduler.is_some() && !entry.expect_err;
+    let primary_exit_kind = {
+        let dump_path =
+            super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
+        std::fs::read_to_string(&dump_path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .and_then(|v| {
+                v.get("scx_sched_state")
+                    .and_then(|s| s.get("exit_kind"))
+                    .and_then(|k| k.as_u64())
+            })
+    };
     let repro_fn = |output: &str| -> Option<String> {
         if !effective_auto_repro {
             return None;
@@ -1573,6 +1585,7 @@ fn run_ktstr_test_inner_impl(
             &result.stderr,
             topo,
             active_flags,
+            primary_exit_kind,
         );
         // When auto-repro was attempted but produced no data, return a
         // diagnostic so the user knows it was tried.
