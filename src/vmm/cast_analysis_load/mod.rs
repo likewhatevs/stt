@@ -570,22 +570,35 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
     // struct bodies that may be Fwd-only in the kernel's split BTF.
     // Store (size, struct_name) so the renderer can cross-BTF-resolve
     // by name at chase time.
-    let mut alloc_size_types: Vec<(u64, String)> = Vec::new();
+    //
+    // Walk each BTF's struct id-space exactly once via
+    // [`enumerate_named_structs`] (consecutive-fail-cap to bail at the
+    // dense table's end, [`crate::monitor::sdt_alloc::MAX_BTF_ID_PROBE`]
+    // backstops a sparse BTF). The cached `(size, name)` table is then
+    // probed per alloc_size — replaces a quadratic per-size re-walk
+    // AND the prior `take_while().last()` max-id discovery, which
+    // bailed on the first id gap and undercounted on sparse split-BTF
+    // tables.
+    let mut alloc_size_types: Vec<(u64, String)> =
+        Vec::with_capacity(all_alloc_sizes.len());
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let per_btf_structs: Vec<Vec<(u64, String)>> = btfs
+        .iter()
+        .map(|ebtf| enumerate_named_structs(ebtf))
+        .collect();
     for &size in &all_alloc_sizes {
         if size == 0 {
             continue;
         }
-        for ebtf in &btfs {
+        for (ebtf, structs) in btfs.iter().zip(per_btf_structs.iter()) {
             let choice = super::super::monitor::sdt_alloc::discover_payload_btf_id(
                 ebtf,
                 size as usize,
             );
             if choice.target_type_id != 0 {
                 if let Ok(ty) = ebtf.resolve_type_by_id(choice.target_type_id)
-                    && let Ok(name) = ebtf.resolve_name(
-                        ty.as_btf_type().expect("struct has btf_type"),
-                    )
+                    && let Some(bt) = ty.as_btf_type()
+                    && let Ok(name) = ebtf.resolve_name(bt)
                     && !name.is_empty()
                     && seen_names.insert(name.to_string())
                 {
@@ -597,29 +610,15 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
             // convention candidates (names ending in _ctx,
             // _arena_ctx, or exact task_ctx). The cross-BTF
             // resolution at chase time disambiguates by name.
-            let max_id = (0u32..)
-                .take_while(|id| ebtf.resolve_type_by_id(*id).is_ok())
-                .last()
-                .unwrap_or(0);
-            for tid in 1..=max_id {
-                let Ok(ty) = ebtf.resolve_type_by_id(tid) else {
-                    continue;
-                };
-                let Type::Struct(s) = &ty else { continue };
-                if s.size() as u64 != size {
-                    continue;
-                }
-                let Ok(name) = ebtf.resolve_name(s) else {
-                    continue;
-                };
-                if name.is_empty() {
+            for (struct_size, name) in structs {
+                if *struct_size != size {
                     continue;
                 }
                 let dominated = name == "task_ctx"
                     || name.ends_with("_ctx")
                     || name.ends_with("_arena_ctx");
-                if dominated && seen_names.insert(name.to_string()) {
-                    alloc_size_types.push((size, name.to_string()));
+                if dominated && seen_names.insert(name.clone()) {
+                    alloc_size_types.push((size, name.clone()));
                 }
             }
         }
@@ -714,6 +713,47 @@ fn build_fwd_index(btfs: &[Arc<Btf>]) -> HashMap<String, FwdIndexEntry> {
             }
             tid += 1;
         }
+    }
+    out
+}
+
+/// Enumerate every named [`Type::Struct`] in one BTF as
+/// `(struct_size, struct_name)` pairs.
+///
+/// Mirrors the consecutive-fail-cap pattern from [`build_fwd_index`]
+/// and [`crate::monitor::sdt_alloc::discover_payload_btf_id`]: real
+/// BPF BTFs have dense id tables, so 256 consecutive `resolve_type_by_id`
+/// failures is safe to treat as "table exhausted"; the hard ceiling
+/// [`crate::monitor::sdt_alloc::MAX_BTF_ID_PROBE`] backstops a
+/// pathological / sparse BTF id space.
+///
+/// Anonymous structs (empty resolved name) and non-Struct kinds are
+/// skipped — the caller looks up by name and only cares about struct
+/// kinds.
+fn enumerate_named_structs(btf: &Btf) -> Vec<(u64, String)> {
+    const CONSECUTIVE_FAIL_CAP: u32 = 256;
+    let mut out: Vec<(u64, String)> = Vec::new();
+    let mut tid: u32 = 1;
+    let mut consecutive_fail: u32 = 0;
+    while tid < crate::monitor::sdt_alloc::MAX_BTF_ID_PROBE {
+        match btf.resolve_type_by_id(tid) {
+            Ok(ty) => {
+                consecutive_fail = 0;
+                if let Type::Struct(s) = &ty
+                    && let Ok(name) = btf.resolve_name(s)
+                    && !name.is_empty()
+                {
+                    out.push((s.size() as u64, name));
+                }
+            }
+            Err(_) => {
+                consecutive_fail += 1;
+                if consecutive_fail >= CONSECUTIVE_FAIL_CAP {
+                    break;
+                }
+            }
+        }
+        tid += 1;
     }
     out
 }

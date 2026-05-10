@@ -3530,38 +3530,39 @@ fn chase_arena_pointer(
                             if let Some(cross_ref) = mem.cross_btf_resolve_fwd(
                                 struct_name,
                                 FwdKind::Struct,
-                            ) {
-                                if let Some(btf_size) = type_size(cross_ref.btf, &cross_ref.btf.resolve_type_by_id(cross_ref.type_id).unwrap()) {
-                                    if btf_size > 0 && btf_size <= *candidate_size as usize {
-                                        let read_size = btf_size.min(POINTER_CHASE_CAP);
-                                        let truncated = btf_size > POINTER_CHASE_CAP;
-                                        if let Some(raw_bytes) = mem.read_arena(val, read_size) {
-                                            let payload = recurse_into_target(
-                                                &ResolvedTarget {
-                                                    effective_type_id: cross_ref.type_id,
-                                                    current_btf: cross_ref.btf,
-                                                    btf_size,
-                                                    header_skip: 0,
-                                                    sdt_alloc_resolved: false,
-                                                    cross_btf_hit: Some(CrossBtfRef {
-                                                        btf: cross_ref.btf,
-                                                        type_id: cross_ref.type_id,
-                                                    }),
-                                                },
-                                                &raw_bytes,
-                                                val,
-                                                depth,
-                                                mem,
-                                                visited,
-                                                truncated,
-                                            );
-                                            return ArenaChaseOutcome {
-                                                deref: Some(payload),
-                                                reason: None,
-                                                sdt_alloc_resolved: false,
-                                            };
-                                        }
-                                    }
+                            ) && let Ok(ty) =
+                                cross_ref.btf.resolve_type_by_id(cross_ref.type_id)
+                                && let Some(btf_size) = type_size(cross_ref.btf, &ty)
+                                && btf_size > 0
+                                && btf_size <= *candidate_size as usize
+                            {
+                                let read_size = btf_size.min(POINTER_CHASE_CAP);
+                                let truncated = btf_size > POINTER_CHASE_CAP;
+                                if let Some(raw_bytes) = mem.read_arena(val, read_size) {
+                                    let payload = recurse_into_target(
+                                        &ResolvedTarget {
+                                            effective_type_id: cross_ref.type_id,
+                                            current_btf: cross_ref.btf,
+                                            btf_size,
+                                            header_skip: 0,
+                                            sdt_alloc_resolved: false,
+                                            cross_btf_hit: Some(CrossBtfRef {
+                                                btf: cross_ref.btf,
+                                                type_id: cross_ref.type_id,
+                                            }),
+                                        },
+                                        &raw_bytes,
+                                        val,
+                                        depth,
+                                        mem,
+                                        visited,
+                                        truncated,
+                                    );
+                                    return ArenaChaseOutcome {
+                                        deref: Some(payload),
+                                        reason: None,
+                                        sdt_alloc_resolved: false,
+                                    };
                                 }
                             }
                             // Also try direct resolution in the entry BTF
@@ -3569,11 +3570,37 @@ fn chase_arena_pointer(
                                 btf,
                                 *candidate_size as usize,
                             );
-                            if choice.target_type_id != 0 {
-                                // Resolved in entry BTF — use the normal
-                                // target resolution path (same as the
-                                // per-CastHit alloc_size arm below).
-                                break; // fall through to the entry-BTF path below
+                            if choice.target_type_id != 0
+                                && let Some((resolved_ty, resolved_id)) =
+                                    peel_modifiers_resolving_fwd(btf, choice.target_type_id)
+                                && let Some(btf_size) = type_size(btf, &resolved_ty)
+                                && btf_size > 0
+                            {
+                                let read_size = btf_size.min(POINTER_CHASE_CAP);
+                                let truncated = btf_size > POINTER_CHASE_CAP;
+                                if let Some(raw_bytes) = mem.read_arena(val, read_size) {
+                                    let payload = recurse_into_target(
+                                        &ResolvedTarget {
+                                            effective_type_id: resolved_id,
+                                            current_btf: btf,
+                                            btf_size,
+                                            header_skip: 0,
+                                            sdt_alloc_resolved: true,
+                                            cross_btf_hit: None,
+                                        },
+                                        &raw_bytes,
+                                        val,
+                                        depth,
+                                        mem,
+                                        visited,
+                                        truncated,
+                                    );
+                                    return ArenaChaseOutcome {
+                                        deref: Some(payload),
+                                        reason: None,
+                                        sdt_alloc_resolved: true,
+                                    };
+                                }
                             }
                         }
                         return ArenaChaseOutcome {
@@ -3607,38 +3634,39 @@ fn chase_arena_pointer(
                         if let Some(cross_ref) = mem.cross_btf_resolve_fwd(
                             struct_name,
                             FwdKind::Struct,
-                        ) {
-                            if let Some(btf_size) = type_size(cross_ref.btf, &cross_ref.btf.resolve_type_by_id(cross_ref.type_id).unwrap()) {
-                                if btf_size > 0 && btf_size <= *candidate_size as usize {
-                                    let read_size = btf_size.min(POINTER_CHASE_CAP);
-                                    let truncated = btf_size > POINTER_CHASE_CAP;
-                                    if let Some(raw_bytes) = mem.read_arena(val, read_size) {
-                                        let payload = recurse_into_target(
-                                            &ResolvedTarget {
-                                                effective_type_id: cross_ref.type_id,
-                                                current_btf: cross_ref.btf,
-                                                btf_size,
-                                                header_skip: 0,
-                                                sdt_alloc_resolved: false,
-                                                cross_btf_hit: Some(CrossBtfRef {
-                                                    btf: cross_ref.btf,
-                                                    type_id: cross_ref.type_id,
-                                                }),
-                                            },
-                                            &raw_bytes,
-                                            val,
-                                            depth,
-                                            mem,
-                                            visited,
-                                            truncated,
-                                        );
-                                        return ArenaChaseOutcome {
-                                            deref: Some(payload),
-                                            reason: None,
-                                            sdt_alloc_resolved: false,
-                                        };
-                                    }
-                                }
+                        ) && let Ok(ty) =
+                            cross_ref.btf.resolve_type_by_id(cross_ref.type_id)
+                            && let Some(btf_size) = type_size(cross_ref.btf, &ty)
+                            && btf_size > 0
+                            && btf_size <= *candidate_size as usize
+                        {
+                            let read_size = btf_size.min(POINTER_CHASE_CAP);
+                            let truncated = btf_size > POINTER_CHASE_CAP;
+                            if let Some(raw_bytes) = mem.read_arena(val, read_size) {
+                                let payload = recurse_into_target(
+                                    &ResolvedTarget {
+                                        effective_type_id: cross_ref.type_id,
+                                        current_btf: cross_ref.btf,
+                                        btf_size,
+                                        header_skip: 0,
+                                        sdt_alloc_resolved: false,
+                                        cross_btf_hit: Some(CrossBtfRef {
+                                            btf: cross_ref.btf,
+                                            type_id: cross_ref.type_id,
+                                        }),
+                                    },
+                                    &raw_bytes,
+                                    val,
+                                    depth,
+                                    mem,
+                                    visited,
+                                    truncated,
+                                );
+                                return ArenaChaseOutcome {
+                                    deref: Some(payload),
+                                    reason: None,
+                                    sdt_alloc_resolved: false,
+                                };
                             }
                         }
                     }

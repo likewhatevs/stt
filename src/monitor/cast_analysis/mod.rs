@@ -1275,6 +1275,18 @@ impl<'a> Analyzer<'a> {
         // PC; without preservation, the FuncEntry reset at PC+1
         // destroys it before any subsequent instruction can
         // propagate the alloc_size to an STX finding.
+        //
+        // The match gates on `alloc_size: Some(_)` — an
+        // `ArenaU64FromAlloc { alloc_size: None }` seed is NOT
+        // preserved. `None` comes from kfunc allocators whose
+        // per-slot headers carry the payload BTF id, which the
+        // renderer's [`crate::monitor::btf_render::MemReader::resolve_arena_type`]
+        // bridge resolves at chase time. Losing the tag across a
+        // FuncEntry merely falls back to the existing bridge path
+        // (no information lost). Preserving `Some(_)` is the only
+        // shape that benefits — the `scx_static_alloc_internal` bump
+        // allocator emits no per-slot header, so the captured
+        // `alloc_size` is the only payload-type evidence available.
         let saved_r0 = match self.regs[0] {
             r0 @ RegState::ArenaU64FromAlloc { alloc_size: Some(_), .. } => Some(r0),
             _ => None,
