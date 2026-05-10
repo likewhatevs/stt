@@ -5586,7 +5586,7 @@ fn append_arena_type_index_for_allocator_multi_entry_insert() {
         7,
         8,
         16,
-        &[0x1000, 0x2000],
+        &[0x1000, 0x2000, 0x3000],
     );
     let expected_info = ArenaSlotInfo {
         elem_size: 16,
@@ -5643,13 +5643,13 @@ fn append_arena_type_index_for_allocator_multi_allocator_merge() {
         mk_alloc_entry(0, 0, 0x0000_1000),
         mk_alloc_entry(1, 0, 0x0000_2000),
     ];
-    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &[0x1000u64]);
+    append_arena_type_index_for_allocator(&mut index, "alloc_a", 7, 8, 16, &[0x1000u64, 0x2000u64]);
     // Allocator B — payload type 11, two distinct slots.
     let _entries_b = [
         mk_alloc_entry(0, 0, 0x0000_3000),
         mk_alloc_entry(1, 0, 0x0000_4000),
     ];
-    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &[0x2000u64]);
+    append_arena_type_index_for_allocator(&mut index, "alloc_b", 11, 8, 16, &[0x3000u64, 0x4000u64]);
     let info_a = ArenaSlotInfo {
         elem_size: 16,
         header_size: 8,
