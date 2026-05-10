@@ -4246,6 +4246,10 @@ impl KtstrVm {
                                         // context — see
                                         // [`DumpContext::cross_btf_fwd_index`].
                                         cross_btf_fwd_index: cross_btf_fwd_index_owned,
+                                        captured_alloc_sizes: cast_analysis
+                                            .as_ref()
+                                            .map(|o| o.captured_alloc_sizes.as_slice())
+                                            .unwrap_or(&[]),
                                     },
                                 );
                                 tracing::debug!(

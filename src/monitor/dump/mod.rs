@@ -1643,6 +1643,9 @@ pub struct DumpContext<'a> {
     /// pre-integration default); same effect as passing an empty
     /// map but cheaper to thread.
     pub cast_map: Option<&'a super::cast_analysis::CastMap>,
+    /// Unique alloc_sizes captured from `scx_static_alloc_internal`
+    /// call sites. Threaded to the renderer as a last-resort fallback.
+    pub captured_alloc_sizes: &'a [u64],
     /// Cross-BTF Fwd resolution context: every parsed embedded
     /// BPF object's program BTF plus a name-keyed index over
     /// every complete struct/union across them. Threaded into
@@ -1997,6 +2000,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
         deadline,
         cast_map,
         cross_btf_fwd_index,
+        captured_alloc_sizes,
     } = ctx;
     let cross_btf_fwd_index_ref = cross_btf_fwd_index.as_ref();
     // Wall-clock origin for per-phase elapsed_us tracing and the
@@ -2650,6 +2654,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // being assembled. The per-map renders below pass the
             // built set where it matters.
             None,
+            captured_alloc_sizes,
         );
         // Locate every sdt_alloc allocator instance declared in
         // `.bss`. The Datasec walk gives us each variable's name and
@@ -3042,12 +3047,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
                 // duplicate payload in the dump. `None` when no
                 // allocator pre-pass produced any rendered slot.
                 rendered_slot_addrs: rendered_slot_addrs_ref,
-                // Host-resolved vmlinux BTF — the base of every
-                // split program BTF. Threaded straight from
-                // [`DumpContext::btf`] so the chase path's
-                // `alloc_size` fallback can pass it as the
-                // base-BTF filter to
-                // [`super::super::sdt_alloc::discover_payload_btf_id`].
+                captured_alloc_sizes,
             },
             &info,
         );

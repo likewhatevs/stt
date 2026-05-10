@@ -193,6 +193,11 @@ pub(crate) struct CastAnalysisOutput {
     /// the chase falls through to the existing "forward declaration;
     /// body not in this BTF" skip path for those.
     pub(crate) fwd_index: HashMap<String, FwdIndexEntry>,
+    /// Unique alloc_sizes captured from `scx_static_alloc_internal`
+    /// call sites via [`build_subprog_returns`]. Threaded to the
+    /// renderer as a last-resort fallback for deferred-resolve
+    /// arena chases whose CastHit has `alloc_size: None`.
+    pub(crate) captured_alloc_sizes: Vec<u64>,
 }
 
 /// Per-`KtstrVm` lazy on-demand BPF cast-analysis handle.
@@ -382,6 +387,7 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
                     cast_maps: vec![Arc::new(cast_map)],
                     btfs,
                     fwd_index,
+                    captured_alloc_sizes: Vec::new(), // TODO: persist alloc_sizes in cache
                 };
                 let total: usize = out.cast_maps.iter().map(|m| m.len()).sum();
                 return if total == 0 && out.fwd_index.is_empty() {
@@ -469,6 +475,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
                 cast_maps: vec![Arc::new(CastMap::new())],
                 btfs: Vec::new(),
                 fwd_index: HashMap::new(),
+                captured_alloc_sizes: Vec::new(),
             };
         }
     };
@@ -483,6 +490,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
                 cast_maps: vec![Arc::new(CastMap::new())],
                 btfs: Vec::new(),
                 fwd_index: HashMap::new(),
+                captured_alloc_sizes: Vec::new(),
             };
         }
     };
@@ -493,17 +501,19 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
 
     let mut cast_maps: Vec<Arc<CastMap>> = Vec::new();
     let mut btfs: Vec<Arc<Btf>> = Vec::new();
+    let mut all_alloc_sizes: Vec<u64> = Vec::new();
     let started = std::time::Instant::now();
     tracing::debug!("cast_analysis: starting analyze_casts pipeline");
     for inner in iter_embedded_bpf_objects(&outer, bytes, bpf_objs_section) {
         let one_t0 = std::time::Instant::now();
-        let (one, btf_for_obj) = analyze_one_object_with_btf(inner);
+        let (one, btf_for_obj, obj_alloc_sizes) = analyze_one_object_with_btf(inner);
         tracing::debug!(
             elapsed_ms = one_t0.elapsed().as_millis() as u64,
             casts = one.len(),
             "cast_analysis: analyze_one_object_with_btf finished"
         );
         cast_maps.push(Arc::new(one));
+        all_alloc_sizes.extend_from_slice(&obj_alloc_sizes);
         if let Some(btf) = btf_for_obj {
             btfs.push(btf);
         }
@@ -547,10 +557,13 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
             "cast_analysis: recovered typed pointers from scheduler"
         );
     }
+    all_alloc_sizes.sort_unstable();
+    all_alloc_sizes.dedup();
     CastAnalysisOutput {
         cast_maps,
         btfs,
         fwd_index,
+        captured_alloc_sizes: all_alloc_sizes,
     }
 }
 
@@ -734,7 +747,7 @@ fn iter_embedded_bpf_objects<'data>(
 /// a `.BTF` section — the cast map is still returned (empty in that
 /// case) so the merger keeps working without distinguishing the
 /// no-BTF inner from one with no recovered casts.
-fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>) {
+fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>, Vec<u64>) {
     let elf = match goblin::elf::Elf::parse(obj_bytes) {
         Ok(e) => e,
         Err(e) => {
@@ -742,7 +755,7 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>) 
                 error = %e,
                 "cast_analysis: parse inner BPF object ELF failed"
             );
-            return (CastMap::new(), None);
+            return (CastMap::new(), None, Vec::new());
         }
     };
 
@@ -753,7 +766,7 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>) 
         Some(b) => b,
         None => {
             tracing::debug!("cast_analysis: inner ELF has no .BTF section");
-            return (CastMap::new(), None);
+            return (CastMap::new(), None, Vec::new());
         }
     };
     let btf = match Btf::from_bytes(btf_bytes) {
@@ -763,7 +776,7 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>) 
                 error = ?e,
                 "cast_analysis: parse .BTF failed"
             );
-            return (CastMap::new(), None);
+            return (CastMap::new(), None, Vec::new());
         }
     };
     let btf = Arc::new(btf);
@@ -823,7 +836,7 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>) 
         // definitions: a header-only object that contributes no
         // analyzer findings can still expose a complete sibling
         // for a Fwd in another object.
-        return (CastMap::new(), Some(btf));
+        return (CastMap::new(), Some(btf), Vec::new());
     }
 
     // .BTF.ext is optional — without it, every program function still
@@ -943,7 +956,13 @@ fn analyze_one_object_with_btf(obj_bytes: &[u8]) -> (CastMap, Option<Arc<Btf>>) 
         casts = result.len(),
         "cast_analysis: analyze_casts inner pass finished"
     );
-    (result, Some(btf))
+    let mut alloc_sizes: Vec<u64> = subprog_returns
+        .iter()
+        .filter_map(|sr| sr.alloc_size)
+        .collect();
+    alloc_sizes.sort_unstable();
+    alloc_sizes.dedup();
+    (result, Some(btf), alloc_sizes)
 }
 
 /// Walk every ELF relocation section in `elf` whose target section
