@@ -6,8 +6,8 @@
 //! struct definition discovered in the scheduler's source tree.
 //!
 //! The pipeline:
-//! 1. Parse `cargo:rerun-if-changed` from the build output to discover
-//!    the `.bpf.c` source paths the build compiled.
+//! 1. Extract `.bpf.c` source paths from BTF string tables in prior
+//!    build's `.bpf.o` files (clang embeds absolute paths).
 //! 2. Run `clang -M` on each source (in parallel) with the build's
 //!    cflags to get the transitive include chain, filtering out
 //!    system/kernel headers.
@@ -15,15 +15,17 @@
 //!    struct definitions.
 //! 4. Generate a header with weak global pointer declarations that
 //!    anchor each struct in BTF.
+//!
+//! The anchor is cached in `target/ktstr_btf_anchor.h` with an ahash
+//! of all inputs (ktstr version, source paths, cflags, .bpf.o sizes).
+//! Regenerated only when inputs change.
 
 use std::collections::{BTreeSet, HashSet};
 use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const ANCHOR_SCHEMA_VERSION: u32 = 1;
-
-/// Discover sources via STT_FILE, run clang -M for deps, extract
+/// Discover sources via BTF strings, run clang -M for deps, extract
 /// structs via tree-sitter-c, write the anchor header.
 pub(crate) fn generate_btf_anchor(
     bpf_object_dir: &Path,
@@ -31,31 +33,55 @@ pub(crate) fn generate_btf_anchor(
     cflags: &[String],
     anchor_path: &Path,
 ) -> Option<PathBuf> {
-    // Step 1: find .bpf.o files and extract STT_FILE source paths
+    // Step 1: find .bpf.o files and extract source paths from BTF
     let mut bpf_sources = discover_sources_from_objects(bpf_object_dir);
     if bpf_sources.is_empty() {
-        tracing::debug!("btf_anchor: no .bpf.c sources found via STT_FILE");
+        tracing::debug!("btf_anchor: no .bpf.c sources found via BTF");
         return None;
     }
     tracing::debug!(
         sources = bpf_sources.len(),
-        "btf_anchor: discovered BPF sources via STT_FILE"
+        "btf_anchor: discovered BPF sources via BTF"
     );
 
-    // Fast path: if the source file set hasn't changed, the cached
-    // anchor is still valid. Hash the sorted source paths (cheap:
-    // just string hashing, no I/O beyond the BTF scan above).
+    // Fast path: hash all inputs that affect the anchor output.
+    // - ktstr version: pipeline logic changes invalidate
+    // - source paths: file set changes
+    // - .bpf.o sizes: proxy for source content changes (recompilation
+    //   changes object size via BTF/code changes)
+    // - cflags: different includes change the dep chain
     bpf_sources.sort();
-    let source_hash = {
+    let input_hash = {
         let mut h = ahash::RandomState::with_seeds(0x6b74, 0x7374, 0x7200, 0x616e).build_hasher();
-        ANCHOR_SCHEMA_VERSION.hash(&mut h);
+        env!("CARGO_PKG_VERSION").hash(&mut h);
         for p in &bpf_sources {
             p.to_string_lossy().hash(&mut h);
+        }
+        for cflag in cflags {
+            cflag.hash(&mut h);
+        }
+        if let Ok(entries) = std::fs::read_dir(bpf_object_dir) {
+            let mut sizes: Vec<(String, u64)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".bpf.o") {
+                        e.metadata().ok().map(|m| (name, m.len()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            sizes.sort();
+            for (name, size) in &sizes {
+                name.hash(&mut h);
+                size.hash(&mut h);
+            }
         }
         h.finish()
     };
     if let Some(old_hash) = read_anchor_hash(anchor_path) {
-        if old_hash == source_hash {
+        if old_hash == input_hash {
             tracing::debug!("btf_anchor: cached anchor is current");
             let abs = std::fs::canonicalize(anchor_path)
                 .unwrap_or_else(|_| anchor_path.to_path_buf());
@@ -88,7 +114,7 @@ pub(crate) fn generate_btf_anchor(
     if let Some(parent) = anchor_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    write_anchor_header(anchor_path, &structs, source_hash)?;
+    write_anchor_header(anchor_path, &structs, input_hash)?;
 
     let abs = std::fs::canonicalize(anchor_path)
         .unwrap_or_else(|_| anchor_path.to_path_buf());
