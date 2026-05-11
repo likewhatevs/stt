@@ -110,6 +110,27 @@ pub(crate) fn extract_sched_ext_dump(output: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Extract exit reason from `sched_ext_dump:` trace lines when the
+/// `sched_ext: BPF scheduler "..." disabled (...)` anchor line is
+/// absent (truncated console). Looks for `triggered exit kind NNNN:`
+/// followed by the reason text on the next dump line.
+pub(crate) fn extract_exit_from_dump_trace(console: &str) -> Option<String> {
+    let lines: Vec<&str> = console.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("sched_ext_dump:") && line.contains("triggered exit kind") {
+            if let Some(next) = lines.get(i + 1) {
+                if let Some(pos) = next.find("sched_ext_dump:") {
+                    let body = next[pos + "sched_ext_dump:".len()..].trim();
+                    if !body.is_empty() {
+                        return Some(body.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Extract kernel version from console output (COM1/stderr).
 ///
 /// Looks for "Linux version X.Y.Z..." in boot messages.

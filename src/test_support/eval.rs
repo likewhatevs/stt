@@ -24,7 +24,8 @@ use crate::timeline::StimulusEvent;
 use crate::vmm;
 
 use super::output::{
-    classify_init_stage, extract_kernel_version, extract_panic_message, extract_sched_ext_dump,
+    classify_init_stage, extract_exit_from_dump_trace, extract_kernel_version,
+    extract_panic_message, extract_sched_ext_dump,
     format_console_diagnostics, parse_assert_result_from_drain, sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
@@ -2090,11 +2091,10 @@ fn evaluate_vm_result(
             if ev.message.is_empty() {
                 format!("scheduler exited ({})", ev.scheduler_name)
             } else {
-                format!(
-                    "scheduler exited: {}",
-                    ev.message,
-                )
+                format!("scheduler exited: {}", ev.message)
             }
+        } else if let Some(reason) = extract_exit_from_dump_trace(&result.stderr) {
+            format!("scheduler exited: {reason}")
         } else {
             ERR_NO_TEST_RESULT_FROM_GUEST.to_string()
         }
