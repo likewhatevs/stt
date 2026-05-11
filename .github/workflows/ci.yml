@@ -24,8 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
-        with:
-          tools: just
       - run: just lint
 
   test-x64:
@@ -36,17 +34,14 @@ jobs:
         kernel-version: ['6.14', '7.0']
     steps:
       - uses: actions/checkout@v5
-      - name: Provision Rust toolchain from rust-toolchain.toml
+      - name: Provision Rust toolchain
         run: |
-          source "$HOME/.cargo/env"
-          rustup show active-toolchain || rustup toolchain install
-          echo "/usr/bin" >> $GITHUB_PATH
-          echo "/usr/local/bin" >> $GITHUB_PATH
-          echo "/usr/lib64/ccache" >> $GITHUB_PATH
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-nextest
+          tool: cargo-nextest
       - run: just kernel-build ${{ matrix.kernel-version }}
       - run: just test ${{ matrix.kernel-version }}
       - if: ${{ !cancelled() }}
@@ -62,24 +57,21 @@ jobs:
           report_type: test_results
 
   test-arm64:
-    runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]
+    runs-on: [ktstr-arm64]
     strategy:
       fail-fast: false
       matrix:
         kernel-version: ['6.14', '7.0']
     steps:
       - uses: actions/checkout@v5
-      - name: Provision Rust toolchain from rust-toolchain.toml
+      - name: Provision Rust toolchain
         run: |
-          source "$HOME/.cargo/env"
-          rustup show active-toolchain || rustup toolchain install
-          echo "/usr/bin" >> $GITHUB_PATH
-          echo "/usr/local/bin" >> $GITHUB_PATH
-          echo "/usr/lib64/ccache" >> $GITHUB_PATH
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-nextest
+          tool: cargo-nextest
       - run: just kernel-build ${{ matrix.kernel-version }}
       - run: just test ${{ matrix.kernel-version }}
       - if: ${{ !cancelled() }}
@@ -98,17 +90,14 @@ jobs:
     runs-on: [ktstr-x64]
     steps:
       - uses: actions/checkout@v5
-      - name: Provision Rust toolchain from rust-toolchain.toml
+      - name: Provision Rust toolchain
         run: |
-          source "$HOME/.cargo/env"
-          rustup show active-toolchain || rustup toolchain install
-          echo "/usr/bin" >> $GITHUB_PATH
-          echo "/usr/local/bin" >> $GITHUB_PATH
-          echo "/usr/lib64/ccache" >> $GITHUB_PATH
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-llvm-cov,cargo-nextest
+          tool: cargo-llvm-cov,cargo-nextest
       - run: just kernel-build
       - run: just coverage
       - if: ${{ !cancelled() }}
@@ -121,20 +110,17 @@ jobs:
           flags: x64
 
   coverage-arm64:
-    runs-on: [self-hosted, Linux, kvm, kernel-build, ARM64]
+    runs-on: [ktstr-arm64]
     steps:
       - uses: actions/checkout@v5
-      - name: Provision Rust toolchain from rust-toolchain.toml
+      - name: Provision Rust toolchain
         run: |
-          source "$HOME/.cargo/env"
-          rustup show active-toolchain || rustup toolchain install
-          echo "/usr/bin" >> $GITHUB_PATH
-          echo "/usr/local/bin" >> $GITHUB_PATH
-          echo "/usr/lib64/ccache" >> $GITHUB_PATH
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+      - run: cargo install just
       - uses: taiki-e/install-action@v2
         with:
-          tool: just,cargo-llvm-cov,cargo-nextest
+          tool: cargo-llvm-cov,cargo-nextest
       - run: just kernel-build
       - run: just coverage
       - if: ${{ !cancelled() }}

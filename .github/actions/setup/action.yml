@@ -79,6 +79,10 @@ runs:
         # with format-incompatible reads.
         version: "v0.10.0"
 
+    - name: Install just
+      shell: bash
+      run: cargo install just
+
     - name: Install cargo tools
       if: inputs.tools != ''
       uses: taiki-e/install-action@v2
