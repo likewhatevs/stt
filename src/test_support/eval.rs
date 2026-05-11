@@ -1562,16 +1562,29 @@ fn run_ktstr_test_inner_impl(
     // - the test does not expect failure (expect_err = false)
     let effective_auto_repro = entry.auto_repro && scheduler.is_some() && !entry.expect_err;
     let primary_exit_kind = {
-        let dump_path =
-            super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
-        std::fs::read_to_string(&dump_path)
-            .ok()
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-            .and_then(|v| {
-                v.get("scx_sched_state")
-                    .and_then(|s| s.get("exit_kind"))
-                    .and_then(|k| k.as_u64())
+        let from_dump = {
+            let dump_path =
+                super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
+            std::fs::read_to_string(&dump_path)
+                .ok()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .and_then(|v| {
+                    v.get("scx_sched_state")
+                        .and_then(|s| s.get("exit_kind"))
+                        .and_then(|k| k.as_u64())
+                })
+        };
+        from_dump.or_else(|| {
+            let scx_exits = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr);
+            scx_exits.last().and_then(|ev| {
+                use crate::monitor::dmesg_scx::ScxExitKind;
+                match ev.kind {
+                    ScxExitKind::Stall => Some(crate::probe::scx_defs::EXIT_ERROR_STALL),
+                    ScxExitKind::Error => Some(crate::probe::scx_defs::EXIT_ERROR),
+                    _ => None,
+                }
             })
+        })
     };
     let repro_fn = |output: &str| -> Option<String> {
         if !effective_auto_repro {
@@ -2036,12 +2049,25 @@ fn evaluate_vm_result(
              duration also extends the host watchdog deadline",
             result.duration, vm_timeout, entry.watchdog_timeout, entry.duration,
         );
+        let timeout_reason = {
+            let scx_exits = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr);
+            if let Some(ev) = scx_exits.last() {
+                if ev.message.is_empty() {
+                    format!("timed out (scheduler {} exited)", ev.scheduler_name)
+                } else {
+                    format!("timed out (scheduler exited: {})", ev.message)
+                }
+            } else {
+                ERR_TIMED_OUT_NO_RESULT.to_string()
+            }
+        };
         let msg = format!(
-            "{}ktstr_test '{}'{} [topo={}] {ERR_TIMED_OUT_NO_RESULT}{}{}{}{}{}{}{}{}",
+            "{}ktstr_test '{}'{} [topo={}] {}{}{}{}{}{}{}{}{}",
             fingerprint_line,
             entry.name,
             sched_label,
             topo,
+            timeout_reason,
             watchdog_section,
             crash_section,
             console_section,
@@ -2059,7 +2085,19 @@ fn evaluate_vm_result(
     } else if let Some(crash_msg) = extract_panic_message(output) {
         format!("{ERR_GUEST_CRASHED_PREFIX} {crash_msg}")
     } else if entry.scheduler.has_active_scheduling() {
-        ERR_NO_TEST_RESULT_FROM_GUEST.to_string()
+        let scx_exits = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr);
+        if let Some(ev) = scx_exits.last() {
+            if ev.message.is_empty() {
+                format!("scheduler exited ({})", ev.scheduler_name)
+            } else {
+                format!(
+                    "scheduler exited: {}",
+                    ev.message,
+                )
+            }
+        } else {
+            ERR_NO_TEST_RESULT_FROM_GUEST.to_string()
+        }
     } else {
         ERR_NO_TEST_FUNCTION_OUTPUT.to_string()
     };
