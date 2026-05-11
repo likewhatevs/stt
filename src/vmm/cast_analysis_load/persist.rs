@@ -98,6 +98,7 @@ fn cache_path(hash: u64) -> Option<PathBuf> {
     cache_dir().map(|d| d.join(format!("v{SCHEMA_VERSION}_{hash:016x}.bin")))
 }
 
+#[allow(clippy::type_complexity)]
 pub(super) fn try_load(
     hash: u64,
     expected_btf_count: usize,

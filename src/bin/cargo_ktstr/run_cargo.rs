@@ -280,7 +280,7 @@ fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<st
                         .filter(|e| {
                             e.file_name()
                                 .to_str()
-                                .map_or(false, |n| n.ends_with(".bpf.o"))
+                                .is_some_and(|n| n.ends_with(".bpf.o"))
                         })
                         .count()
                 })
@@ -322,15 +322,11 @@ fn resolve_target_dir() -> std::path::PathBuf {
     if let Ok(output) = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
-    {
-        if output.status.success() {
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                if let Some(dir) = v["target_directory"].as_str() {
+        && output.status.success()
+            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                && let Some(dir) = v["target_directory"].as_str() {
                     return std::path::PathBuf::from(dir);
                 }
-            }
-        }
-    }
     std::path::PathBuf::from("target")
 }
 

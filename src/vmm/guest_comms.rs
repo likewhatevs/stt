@@ -658,7 +658,6 @@ static SNAPSHOT_REQUEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// guest process. `OnceLock<Option<File>>` so a not-yet-ready open
 /// (multiport handshake still in flight) does not pin the slot to
 /// None — the next call retries.
-
 /// Number of fast-poll iterations at the start of
 /// [`bounded_read_exact`] before escalating to the slow-poll cadence.
 /// Four iterations of 100µs gives ~400µs of fast-path coverage,

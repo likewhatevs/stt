@@ -2294,8 +2294,8 @@ impl KtstrVm {
                         {
                             let kernel = map.guest_kernel();
                             let pb = kernel.phys_base();
-                            if pb != 0 {
-                                if let Some(pb_kva) = dump_cpu_time_symbols
+                            if pb != 0
+                                && let Some(pb_kva) = dump_cpu_time_symbols
                                     .as_ref()
                                     .and_then(|s| s.phys_base_kva)
                                 {
@@ -2305,7 +2305,6 @@ impl KtstrVm {
                                         coord_kaslr_offset = pb.wrapping_sub(real_pb);
                                     }
                                 }
-                            }
                         }
                         // Drain CAPTURE requests deferred during the
                         // pre-adoption window. Append onto
@@ -3018,8 +3017,7 @@ impl KtstrVm {
                     if !err_triggered
                         && bsp_done_final_pass
                         && freeze_state != FreezeState::Done
-                    {
-                        if let (Some(owned), Some(mem)) =
+                        && let (Some(owned), Some(mem)) =
                             (owned_accessor.as_ref(), freeze_coord_mem.as_deref())
                         {
                             let kernel = owned.guest_kernel();
@@ -3027,8 +3025,8 @@ impl KtstrVm {
                             let mut ek_kva = freeze_coord_watchpoint
                                 .request_kva
                                 .load(Ordering::Acquire);
-                            if ek_kva == 0 {
-                                if let Some(syms) = dump_cpu_time_symbols.as_ref()
+                            if ek_kva == 0
+                                && let Some(syms) = dump_cpu_time_symbols.as_ref()
                                     && let Some(root_kva) = syms.scx_root
                                     && let Some(ref offs) = dump_scx_walker_offsets
                                     && let Some(ref so) = offs.sched
@@ -3039,9 +3037,8 @@ impl KtstrVm {
                                         ek_kva = sched_kva + so.exit_kind as u64;
                                     }
                                 }
-                            }
-                            if ek_kva != 0 {
-                                if let Some(pa) = crate::monitor::idr::translate_any_kva(
+                            if ek_kva != 0
+                                && let Some(pa) = crate::monitor::idr::translate_any_kva(
                                     mem,
                                     walk.cr3_pa,
                                     walk.page_offset,
@@ -3055,9 +3052,7 @@ impl KtstrVm {
                                         err_triggered = true;
                                     }
                                 }
-                            }
                         }
-                    }
                     // Closures capture by reference. Building the
                     // full freeze-rendezvous-dump cycle once and
                     // calling it for either the early or late
@@ -6874,7 +6869,7 @@ impl KtstrVm {
         // resolved offsets. On a BTF sidecar cache hit the supplied
         // `elf` is unused; on a miss `load_btf_from_elf` reuses it
         // instead of running its own `Elf::parse`.
-        let btf = match monitor::btf_offsets::load_btf_from_elf(&elf, &vmlinux_data, &vmlinux) {
+        let btf = match monitor::btf_offsets::load_btf_from_elf(&elf, vmlinux_data, &vmlinux) {
             Ok(b) => b,
             Err(_) => return Ok(None),
         };
@@ -7160,12 +7155,11 @@ impl KtstrVm {
                             );
                             if let Some(v) = monitor::symbols::resolve_phys_base(
                                 &mem, &symbols, cr3_val, l5, tcr_el1_value,
-                            ) {
-                                if v != 0 {
+                            )
+                                && v != 0 {
                                     pb = v;
                                     break;
                                 }
-                            }
                         }
                         let mut pfds = [
                             libc::pollfd { fd: pb_fd, events: libc::POLLIN, revents: 0 },
@@ -7745,7 +7739,7 @@ impl KtstrVm {
                         .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
                         .unwrap_or(0);
                     let cr3_val = cr3.load(std::sync::atomic::Ordering::Acquire);
-                    match monitor::bpf_map::GuestMemMapAccessorOwned::from_elf_with_hint(Arc::clone(&mem), &vmlinux_elf, &vmlinux_data, &vmlinux, tcr_val, cr3_val, pb_hint) {
+                    match monitor::bpf_map::GuestMemMapAccessorOwned::from_elf_with_hint(Arc::clone(&mem), &vmlinux_elf, vmlinux_data, &vmlinux, tcr_val, cr3_val, pb_hint) {
                         Ok(a) => {
                             let _ = probes_ready_evt.write(1);
                             break a;

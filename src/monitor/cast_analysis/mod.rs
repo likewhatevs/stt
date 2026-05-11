@@ -1420,8 +1420,8 @@ impl<'a> Analyzer<'a> {
             // but the branch source had it typed, restore the typed
             // value. If both are typed but disagree, drop to Unknown.
             if let Some(src_regs) = self.branch_source_regs.get(&pc) {
-                for i in 0..11 {
-                    match (self.regs[i], src_regs[i]) {
+                for (i, src_reg) in src_regs.iter().enumerate().take(11) {
+                    match (self.regs[i], *src_reg) {
                         (a, b) if a == b => {}
                         (RegState::ArenaU64FromAlloc { .. }, _) => {
                             // Fall-through has arena tag — keep it.
@@ -3001,14 +3001,12 @@ impl<'a> Analyzer<'a> {
                 // whose body was dropped by split-BTF dedup. A
                 // kernel kptr would have a full Struct body in
                 // the vmlinux base, not a Fwd.
-                if let Some(KptrEntry::Single(tid)) = self.kptr_findings.get(k) {
-                    if let Ok(ty) = self.btf.resolve_type_by_id(*tid) {
-                        if matches!(ty, Type::Fwd(_)) {
+                if let Some(KptrEntry::Single(tid)) = self.kptr_findings.get(k)
+                    && let Ok(ty) = self.btf.resolve_type_by_id(*tid)
+                        && matches!(ty, Type::Fwd(_)) {
                             arena_kptr_merged.insert(*k, *tid);
                             return false;
                         }
-                    }
-                }
                 true // genuine conflict
             })
             .collect();
@@ -3713,11 +3711,9 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                 if let Some(terminal) =
                     super::btf_render::peel_modifiers(btf, var_underlying_type_id)
                     && matches!(terminal, Type::Struct(_) | Type::Union(_))
-                {
-                    if let Some(inner) = struct_member_at(btf, var_underlying_type_id, rel) {
+                    && let Some(inner) = struct_member_at(btf, var_underlying_type_id, rel) {
                         return Some(inner);
                     }
-                }
                 return Some(MemberAt::Datasec {
                     var_underlying_type_id,
                     var_byte_offset: off,

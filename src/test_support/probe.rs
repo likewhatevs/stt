@@ -145,14 +145,14 @@ pub(crate) const SCHED_EXT_DUMP_MARKER: &str = "sched_ext_dump:";
 ///    `--- repro VM sched_ext dump ---` section above; the dmesg
 ///    section emits a pointer-to-that diagnostic. This covers two
 ///    sub-cases:
-///    a. every non-dump byte was whitespace (clean run, dump lines
-///       only);
-///    b. non-dump bytes existed but matched
-///       [`classify_dmesg_corruption`] (0xFF / U+FFFD / control
-///       chars) — surfacing the classifier's "scheduler crashed
-///       before kernel printk" message here would contradict the
-///       proven-real dump section above. Point at the dump section
-///       so the operator does not chase a phantom crash.
+///    - every non-dump byte was whitespace (clean run, dump lines
+///      only);
+///    - non-dump bytes existed but matched
+///      [`classify_dmesg_corruption`] (0xFF / U+FFFD / control
+///      chars) — surfacing the classifier's "scheduler crashed
+///      before kernel printk" message here would contradict the
+///      proven-real dump section above. Point at the dump section
+///      so the operator does not chase a phantom crash.
 /// 2. The filter dropped nothing and the post-filter text matches
 ///    a corruption shape — surface [`classify_dmesg_corruption`]'s
 ///    diagnostic.
