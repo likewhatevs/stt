@@ -3003,10 +3003,11 @@ impl<'a> Analyzer<'a> {
                 // the vmlinux base, not a Fwd.
                 if let Some(KptrEntry::Single(tid)) = self.kptr_findings.get(k)
                     && let Ok(ty) = self.btf.resolve_type_by_id(*tid)
-                        && matches!(ty, Type::Fwd(_)) {
-                            arena_kptr_merged.insert(*k, *tid);
-                            return false;
-                        }
+                    && matches!(ty, Type::Fwd(_))
+                {
+                    arena_kptr_merged.insert(*k, *tid);
+                    return false;
+                }
                 true // genuine conflict
             })
             .collect();
@@ -3711,9 +3712,10 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                 if let Some(terminal) =
                     super::btf_render::peel_modifiers(btf, var_underlying_type_id)
                     && matches!(terminal, Type::Struct(_) | Type::Union(_))
-                    && let Some(inner) = struct_member_at(btf, var_underlying_type_id, rel) {
-                        return Some(inner);
-                    }
+                    && let Some(inner) = struct_member_at(btf, var_underlying_type_id, rel)
+                {
+                    return Some(inner);
+                }
                 return Some(MemberAt::Datasec {
                     var_underlying_type_id,
                     var_byte_offset: off,

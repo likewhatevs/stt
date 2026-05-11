@@ -323,10 +323,11 @@ fn resolve_target_dir() -> std::path::PathBuf {
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
         && output.status.success()
-            && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                && let Some(dir) = v["target_directory"].as_str() {
-                    return std::path::PathBuf::from(dir);
-                }
+        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(dir) = v["target_directory"].as_str()
+    {
+        return std::path::PathBuf::from(dir);
+    }
     std::path::PathBuf::from("target")
 }
 

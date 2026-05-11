@@ -117,14 +117,16 @@ pub(crate) fn extract_sched_ext_dump(output: &str) -> Option<String> {
 pub(crate) fn extract_exit_from_dump_trace(console: &str) -> Option<String> {
     let lines: Vec<&str> = console.lines().collect();
     for (i, line) in lines.iter().enumerate() {
-        if line.contains("sched_ext_dump:") && line.contains("triggered exit kind")
+        if line.contains("sched_ext_dump:")
+            && line.contains("triggered exit kind")
             && let Some(next) = lines.get(i + 1)
-                && let Some(pos) = next.find("sched_ext_dump:") {
-                    let body = next[pos + "sched_ext_dump:".len()..].trim();
-                    if !body.is_empty() {
-                        return Some(body.to_string());
-                    }
-                }
+            && let Some(pos) = next.find("sched_ext_dump:")
+        {
+            let body = next[pos + "sched_ext_dump:".len()..].trim();
+            if !body.is_empty() {
+                return Some(body.to_string());
+            }
+        }
     }
     None
 }

@@ -694,28 +694,27 @@ fn build_fwd_index(btfs: &[Arc<Btf>]) -> HashMap<String, FwdIndexEntry> {
                     match &ty {
                         Type::Struct(s) | Type::Union(s) => {
                             if let Ok(name) = btf.resolve_name(s)
-                                && !name.is_empty() {
-                                    out.entry(name).or_insert(FwdIndexEntry {
-                                        btfs_idx: idx,
-                                        type_id: tid,
-                                    });
-                                }
+                                && !name.is_empty()
+                            {
+                                out.entry(name).or_insert(FwdIndexEntry {
+                                    btfs_idx: idx,
+                                    type_id: tid,
+                                });
+                            }
                         }
                         Type::Typedef(td) => {
                             if let Ok(td_name) = btf.resolve_name(td)
                                 && !td_name.is_empty()
-                                    && let Ok(pid) = <dyn btf_rs::BtfType>::get_type_id(td)
-                                        && let Ok(Type::Struct(s)) = btf.resolve_type_by_id(pid)
-                                            && btf.resolve_name(&s).map_or(true, |n| n.is_empty()) {
-                                                let base =
-                                                    td_name.strip_suffix("_t").unwrap_or(&td_name);
-                                                out.entry(base.to_string()).or_insert(
-                                                    FwdIndexEntry {
-                                                        btfs_idx: idx,
-                                                        type_id: pid,
-                                                    },
-                                                );
-                                            }
+                                && let Ok(pid) = <dyn btf_rs::BtfType>::get_type_id(td)
+                                && let Ok(Type::Struct(s)) = btf.resolve_type_by_id(pid)
+                                && btf.resolve_name(&s).map_or(true, |n| n.is_empty())
+                            {
+                                let base = td_name.strip_suffix("_t").unwrap_or(&td_name);
+                                out.entry(base.to_string()).or_insert(FwdIndexEntry {
+                                    btfs_idx: idx,
+                                    type_id: pid,
+                                });
+                            }
                         }
                         _ => {}
                     }

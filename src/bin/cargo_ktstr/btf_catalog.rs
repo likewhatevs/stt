@@ -81,12 +81,12 @@ pub(crate) fn generate_btf_anchor(
         h.finish()
     };
     if let Some(old_hash) = read_anchor_hash(anchor_path)
-        && old_hash == input_hash {
-            tracing::debug!("btf_anchor: cached anchor is current");
-            let abs =
-                std::fs::canonicalize(anchor_path).unwrap_or_else(|_| anchor_path.to_path_buf());
-            return Some(abs);
-        }
+        && old_hash == input_hash
+    {
+        tracing::debug!("btf_anchor: cached anchor is current");
+        let abs = std::fs::canonicalize(anchor_path).unwrap_or_else(|_| anchor_path.to_path_buf());
+        return Some(abs);
+    }
 
     // Step 2: clang -M on each source to get transitive deps
     let dep_files = collect_dep_files(&bpf_sources, clang, cflags);
@@ -147,9 +147,10 @@ fn discover_sources_from_objects(dir: &Path) -> Vec<PathBuf> {
                 if s.ends_with(".bpf.c") {
                     let p = PathBuf::from(s);
                     if p.is_file()
-                        && let Ok(canonical) = std::fs::canonicalize(&p) {
-                            sources.insert(canonical);
-                        }
+                        && let Ok(canonical) = std::fs::canonicalize(&p)
+                    {
+                        sources.insert(canonical);
+                    }
                 }
             }
         }
@@ -224,9 +225,10 @@ fn btf_strings(btf: &[u8]) -> Vec<&str> {
     let mut result = Vec::new();
     for chunk in str_section.split(|&b| b == 0) {
         if let Ok(s) = std::str::from_utf8(chunk)
-            && !s.is_empty() {
-                result.push(s);
-            }
+            && !s.is_empty()
+        {
+            result.push(s);
+        }
     }
     result
 }
@@ -266,9 +268,10 @@ fn collect_dep_files(sources: &[PathBuf], clang: &str, cflags: &[String]) -> Vec
                         let p = PathBuf::from(token);
                         if p.is_file()
                             && let Ok(canonical) = std::fs::canonicalize(&p)
-                                && !is_system_header(&canonical) {
-                                    local.insert(canonical);
-                                }
+                            && !is_system_header(&canonical)
+                        {
+                            local.insert(canonical);
+                        }
                     }
                 }
                 deps_ref.lock().unwrap().extend(local);
@@ -285,9 +288,10 @@ fn is_system_header(path: &Path) -> bool {
         return true;
     }
     if let Some(name) = path.file_name().and_then(|n| n.to_str())
-        && (name == "vmlinux.h" || name == "vmlinux.bpf.h") {
-            return true;
-        }
+        && (name == "vmlinux.h" || name == "vmlinux.bpf.h")
+    {
+        return true;
+    }
     if s.contains("scx_utils-bpf_h/") {
         return true;
     }
@@ -319,11 +323,13 @@ fn collect_structs(node: tree_sitter::Node, source: &[u8], names: &mut BTreeSet<
     for child in node.children(&mut cursor) {
         if child.kind() == "struct_specifier"
             && child.child_by_field_name("body").is_some()
-                && let Some(name_node) = child.child_by_field_name("name")
-                    && let Ok(name) = std::str::from_utf8(&source[name_node.byte_range()])
-                        && !name.is_empty() && !name.starts_with("__") {
-                            names.insert(name.to_string());
-                        }
+            && let Some(name_node) = child.child_by_field_name("name")
+            && let Ok(name) = std::str::from_utf8(&source[name_node.byte_range()])
+            && !name.is_empty()
+            && !name.starts_with("__")
+        {
+            names.insert(name.to_string());
+        }
         collect_structs(child, source, names);
     }
 }

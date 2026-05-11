@@ -608,10 +608,10 @@ fn write_struct(
                 && let RenderedValue::Struct {
                     members: ref inner, ..
                 } = m.value
-                {
-                    flat_members.extend_from_slice(inner);
-                    continue;
-                }
+            {
+                flat_members.extend_from_slice(inner);
+                continue;
+            }
             flat_members.push(m.clone());
         }
         flat_members.as_slice()
@@ -2448,10 +2448,11 @@ fn render_struct(
         let name = btf.resolve_name(m).unwrap_or_default();
         let value = render_member(btf, m, Some(parent_type_id), bytes, depth, mem, visited);
         if name.is_empty()
-            && let RenderedValue::Struct { members: inner, .. } = value {
-                members.extend(inner);
-                continue;
-            }
+            && let RenderedValue::Struct { members: inner, .. } = value
+        {
+            members.extend(inner);
+            continue;
+        }
         members.push(RenderedMember { name, value });
     }
     let rendered = RenderedValue::Struct { type_name, members };
