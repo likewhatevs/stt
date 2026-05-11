@@ -1586,6 +1586,15 @@ fn run_ktstr_test_inner_impl(
                 }
             })
         })
+        .or_else(|| {
+            extract_exit_from_dump_trace(&result.stderr).and_then(|reason| {
+                if reason.contains("runnable task stall") {
+                    Some(crate::probe::scx_defs::EXIT_ERROR_STALL)
+                } else {
+                    None
+                }
+            })
+        })
     };
     let repro_fn = |output: &str| -> Option<String> {
         if !effective_auto_repro {
