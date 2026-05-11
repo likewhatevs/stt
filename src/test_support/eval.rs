@@ -1926,6 +1926,7 @@ fn evaluate_vm_result(
         // of milliseconds. These transient stalls are real but not indicative
         // of scheduler bugs.
         if entry.scheduler.has_active_scheduling()
+            && merged_assert.has_monitor_thresholds()
             && let Some(ref monitor) = result.monitor
         {
             let eval_report = trim_settle_samples(monitor);

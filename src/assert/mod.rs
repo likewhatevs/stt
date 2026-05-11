@@ -2124,6 +2124,15 @@ impl Assert {
     }
 
     /// Extract `MonitorThresholds` for monitor-side evaluation.
+    pub(crate) fn has_monitor_thresholds(&self) -> bool {
+        self.max_imbalance_ratio.is_some()
+            || self.max_local_dsq_depth.is_some()
+            || self.fail_on_stall.is_some()
+            || self.sustained_samples.is_some()
+            || self.max_fallback_rate.is_some()
+            || self.max_keep_last_rate.is_some()
+    }
+
     pub(crate) fn monitor_thresholds(&self) -> crate::monitor::MonitorThresholds {
         use crate::monitor::MonitorThresholds;
         let d = MonitorThresholds::DEFAULT;
