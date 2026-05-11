@@ -1628,6 +1628,62 @@ fn is_inline_scalar_rejects_composites() {
     }));
 }
 
+// ---- anonymous-only struct rendering ----------------------------
+
+#[test]
+fn struct_with_only_anonymous_members_renders_inner_fields() {
+    // After flatten: anonymous struct members are promoted to the parent.
+    // render_struct produces this flattened form; verify Display handles it.
+    let v = RenderedValue::Struct {
+        type_name: Some("scx_cgroup_ctx".into()),
+        members: vec![
+            RenderedMember { name: "id".into(), value: RenderedValue::Uint { bits: 64, value: 49 } },
+            RenderedMember { name: "quota".into(), value: RenderedValue::Uint { bits: 64, value: 5000000 } },
+            RenderedMember { name: "is_throttled".into(), value: RenderedValue::Bool { value: true } },
+            RenderedMember { name: "nr_throttled".into(), value: RenderedValue::Uint { bits: 32, value: 100 } },
+        ],
+    };
+    let rendered = format!("{v}");
+    assert!(!rendered.ends_with("{}"), "flattened struct must not render as empty: {rendered}");
+    assert!(rendered.contains("id"), "field 'id' must be visible: {rendered}");
+    assert!(rendered.contains("49"), "field value must be visible: {rendered}");
+    assert!(rendered.contains("is_throttled"), "field 'is_throttled' must be visible: {rendered}");
+}
+
+#[test]
+fn struct_with_nested_anonymous_members_flattens_on_display() {
+    // Legacy/JSON form: anonymous members still nested. Display should
+    // flatten them for rendering.
+    let v = RenderedValue::Struct {
+        type_name: Some("scx_cgroup_ctx".into()),
+        members: vec![
+            RenderedMember {
+                name: String::new(),
+                value: RenderedValue::Struct {
+                    type_name: None,
+                    members: vec![
+                        RenderedMember { name: "id".into(), value: RenderedValue::Uint { bits: 64, value: 49 } },
+                        RenderedMember { name: "quota".into(), value: RenderedValue::Uint { bits: 64, value: 5000000 } },
+                    ],
+                },
+            },
+            RenderedMember {
+                name: String::new(),
+                value: RenderedValue::Struct {
+                    type_name: None,
+                    members: vec![
+                        RenderedMember { name: "is_throttled".into(), value: RenderedValue::Bool { value: true } },
+                    ],
+                },
+            },
+        ],
+    };
+    let rendered = format!("{v}");
+    assert!(!rendered.ends_with("{}"), "nested anonymous struct must not render as empty: {rendered}");
+    assert!(rendered.contains("id"), "inner field 'id' must be visible: {rendered}");
+    assert!(rendered.contains("is_throttled"), "inner field 'is_throttled' must be visible: {rendered}");
+}
+
 // ---- Ptr Display with deref → arrow notation -------------------
 //
 // A Ptr with `deref: Some(...)` renders as `0x<hex> → <inner>`.

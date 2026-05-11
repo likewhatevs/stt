@@ -593,11 +593,29 @@ fn write_struct(
     members: &[RenderedMember],
     depth: usize,
 ) -> std::fmt::Result {
-    // Build the anon-overlay sibling-scalar pool once upfront so
-    // each anonymous-member dedup check is O(1). Without this,
-    // the per-member `anon_overlay_duplicates_siblings` rebuilt
-    // the same HashSet for every anonymous overlay — quadratic
-    // in the number of overlays.
+    // Flatten anonymous struct members: C anonymous structs expose
+    // their inner fields directly on the parent. Without flattening,
+    // the Display code would see empty-name members wrapping inner
+    // structs and suppress them (producing `Type{}`).
+    let mut flat_members;
+    let members = if members.iter().any(|m| {
+        m.name.is_empty() && matches!(m.value, RenderedValue::Struct { .. })
+    }) {
+        flat_members = Vec::with_capacity(members.len());
+        for m in members {
+            if m.name.is_empty() {
+                if let RenderedValue::Struct { members: ref inner, .. } = m.value {
+                    flat_members.extend_from_slice(inner);
+                    continue;
+                }
+            }
+            flat_members.push(m.clone());
+        }
+        flat_members.as_slice()
+    } else {
+        members
+    };
+
     let any_anon = members.iter().any(|m| m.name.is_empty());
     let sibling_scalar_pool: Option<std::collections::HashSet<u64>> = if any_anon {
         Some(build_sibling_scalar_pool(members))
@@ -2433,6 +2451,12 @@ fn render_struct(
         }
         let name = btf.resolve_name(m).unwrap_or_default();
         let value = render_member(btf, m, Some(parent_type_id), bytes, depth, mem, visited);
+        if name.is_empty() {
+            if let RenderedValue::Struct { members: inner, .. } = value {
+                members.extend(inner);
+                continue;
+            }
+        }
         members.push(RenderedMember { name, value });
     }
     let rendered = RenderedValue::Struct { type_name, members };
