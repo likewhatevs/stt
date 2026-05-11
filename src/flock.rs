@@ -2,10 +2,12 @@
 //!
 //! ktstr uses advisory `flock(2)` in four places:
 //!
-//!  - LLC reservation locks at `/tmp/ktstr-llc-{N}.lock` and per-CPU
-//!    locks at `/tmp/ktstr-cpu-{C}.lock` (see
+//!  - LLC reservation locks at `{lock_dir}/ktstr-llc-{N}.lock` and
+//!    per-CPU locks at `{lock_dir}/ktstr-cpu-{C}.lock` where
+//!    `lock_dir` is resolved by [`crate::cache::resolve_lock_dir`]
+//!    (`KTSTR_LOCK_DIR` env var, fallback `/tmp`). See
 //!    `crate::vmm::host_topology::acquire_resource_locks` and
-//!    friends).
+//!    friends.
 //!  - Per-cache-entry coordination locks at
 //!    `{cache_root}/.locks/{cache_key}.lock` (see
 //!    `crate::cache::CacheDir::acquire_shared_lock` and friends).
@@ -553,7 +555,7 @@ fn mount_major_minor_for_path_with_contents(path: &Path, contents: &str) -> Resu
     // Canonicalize the query path. When the lockfile doesn't yet
     // exist (first-call create path), canonicalize fails; fall back
     // to the caller's path verbatim, which is already absolute for
-    // every ktstr call site (`/tmp/ktstr-llc-{N}.lock`,
+    // every ktstr call site (`{lock_dir}/ktstr-llc-{N}.lock`,
     // `{cache_root}/.locks/{key}.lock`, …).
     let canon: PathBuf = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 

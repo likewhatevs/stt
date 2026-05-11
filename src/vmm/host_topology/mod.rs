@@ -593,11 +593,11 @@ pub enum LockOutcome {
 
 /// Acquire resource locks for a pinning plan (non-blocking).
 ///
-/// **LLC locks** (`/tmp/ktstr-llc-{N}.lock`):
+/// **LLC locks** (`{lock_dir}/ktstr-llc-{N}.lock`):
 /// - `Exclusive`: `flock(LOCK_EX | LOCK_NB)` — sole access to the LLC.
 /// - `Shared`: `flock(LOCK_SH | LOCK_NB)` — multiple holders coexist.
 ///
-/// **CPU locks** (`/tmp/ktstr-cpu-{C}.lock`):
+/// **CPU locks** (`{lock_dir}/ktstr-cpu-{C}.lock`):
 /// - Always `flock(LOCK_EX | LOCK_NB)` — exclusive per CPU.
 /// - Skipped for `Exclusive` LLC mode (the LLC lock already provides
 ///   exclusivity over all CPUs in the group).
@@ -631,19 +631,21 @@ pub fn acquire_resource_locks(
     }
 }
 
-/// Default path prefix for LLC flock files. Production binds to
-/// `/tmp/ktstr-llc-`; test builds can override via [`llc_lock_path`]
-/// (see the `#[cfg(test)]` hook).
-const LLC_LOCK_PREFIX: &str = "/tmp/ktstr-llc-";
+/// Compose the LLC lockfile prefix from the resolved lock directory.
+/// Returns `{lock_dir}/ktstr-llc-`.
+fn llc_lock_prefix() -> String {
+    format!("{}/ktstr-llc-", crate::cache::resolve_lock_dir().display())
+}
 
-/// Default path prefix for per-CPU flock files. Production binds to
-/// `/tmp/ktstr-cpu-`; test builds can override via [`cpu_lock_path`]
-/// (see the `#[cfg(test)]` hook).
-const CPU_LOCK_PREFIX: &str = "/tmp/ktstr-cpu-";
+/// Compose the per-CPU lockfile prefix from the resolved lock directory.
+/// Returns `{lock_dir}/ktstr-cpu-`.
+fn cpu_lock_prefix() -> String {
+    format!("{}/ktstr-cpu-", crate::cache::resolve_lock_dir().display())
+}
 
 #[cfg(test)]
 thread_local! {
-    /// Thread-local override for [`LLC_LOCK_PREFIX`]. Tests set this
+    /// Thread-local override for the LLC lock prefix. Tests set this
     /// to a per-test tempdir so the acquire path operates on its
     /// own lockfile pool instead of padding the `LlcGroup` vector
     /// to 90,000+ entries just to avoid collision with production
@@ -653,16 +655,16 @@ thread_local! {
     static LLC_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 
-    /// Thread-local override for [`CPU_LOCK_PREFIX`]. Symmetric
-    /// with [`LLC_LOCK_PREFIX_OVERRIDE`] for the per-CPU path.
+    /// Thread-local override for the per-CPU lock prefix. Symmetric
+    /// with [`LLC_LOCK_PREFIX_OVERRIDE`].
     static CPU_LOCK_PREFIX_OVERRIDE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Compose the LLC lockfile path for `llc_idx`. Production always
-/// returns `{LLC_LOCK_PREFIX}{llc_idx}.lock`; tests can override the
+/// Compose the LLC lockfile path for `llc_idx`. Production resolves
+/// via `KTSTR_LOCK_DIR` (fallback `/tmp`); tests can override the
 /// prefix via [`LLC_LOCK_PREFIX_OVERRIDE`] to keep their lockfile
-/// pool out of the real `/tmp/ktstr-llc-*` namespace.
+/// pool isolated.
 fn llc_lock_path(llc_idx: usize) -> String {
     #[cfg(test)]
     {
@@ -670,11 +672,11 @@ fn llc_lock_path(llc_idx: usize) -> String {
             return format!("{p}{llc_idx}.lock");
         }
     }
-    format!("{LLC_LOCK_PREFIX}{llc_idx}.lock")
+    format!("{}{llc_idx}.lock", llc_lock_prefix())
 }
 
 /// Compose the per-CPU lockfile path for `cpu`. Symmetric with
-/// [`llc_lock_path`] — production binds to the hardcoded prefix;
+/// [`llc_lock_path`] — production resolves via `KTSTR_LOCK_DIR`;
 /// tests can override via [`CPU_LOCK_PREFIX_OVERRIDE`].
 fn cpu_lock_path(cpu: usize) -> String {
     #[cfg(test)]
@@ -683,7 +685,7 @@ fn cpu_lock_path(cpu: usize) -> String {
             return format!("{p}{cpu}.lock");
         }
     }
-    format!("{CPU_LOCK_PREFIX}{cpu}.lock")
+    format!("{}{cpu}.lock", cpu_lock_prefix())
 }
 
 /// Try to acquire all resource locks (all-or-nothing).
@@ -1046,8 +1048,8 @@ impl CpuCap {
 pub(crate) struct LlcSnapshot {
     /// Host LLC index — matches [`HostTopology::llc_groups`] ordering.
     pub(crate) llc_idx: usize,
-    /// Canonical `/tmp/ktstr-llc-{N}.lock` path. Stored so the ACQUIRE
-    /// phase doesn't re-format the string per LLC.
+    /// Canonical `{lock_dir}/ktstr-llc-{N}.lock` path. Stored so the
+    /// ACQUIRE phase doesn't re-format the string per LLC.
     pub(crate) lockfile_path: std::path::PathBuf,
     /// Processes currently holding this LLC's flock (any mode). Empty
     /// when no peer holds the lock. Derived from a single `/proc/locks`

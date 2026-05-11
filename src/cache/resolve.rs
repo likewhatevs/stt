@@ -150,6 +150,17 @@ pub(crate) fn resolve_cache_root() -> anyhow::Result<PathBuf> {
     resolve_cache_root_with_suffix("kernels")
 }
 
+/// Resolve the directory for LLC and per-CPU lock files.
+///
+/// Resolution: `KTSTR_LOCK_DIR` when set and non-empty, otherwise
+/// `/tmp`. The fallback matches the historical default.
+pub(crate) fn resolve_lock_dir() -> PathBuf {
+    match std::env::var("KTSTR_LOCK_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from("/tmp"),
+    }
+}
+
 /// Re-route a cache-entry directory to its original source tree when
 /// blazesym DWARF access is required. Validates the source-tree
 /// vmlinux's current size and mtime against the values captured at
@@ -1155,5 +1166,28 @@ mod tests {
                 )
             });
         }
+    }
+
+    // -- resolve_lock_dir --
+
+    #[test]
+    fn lock_dir_uses_ktstr_lock_dir_when_set() {
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set("KTSTR_LOCK_DIR", "/var/run/ktstr");
+        assert_eq!(resolve_lock_dir(), PathBuf::from("/var/run/ktstr"));
+    }
+
+    #[test]
+    fn lock_dir_falls_back_to_tmp_when_unset() {
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::remove("KTSTR_LOCK_DIR");
+        assert_eq!(resolve_lock_dir(), PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn lock_dir_falls_back_to_tmp_when_empty() {
+        let _lock = lock_env();
+        let _guard = EnvVarGuard::set("KTSTR_LOCK_DIR", "");
+        assert_eq!(resolve_lock_dir(), PathBuf::from("/tmp"));
     }
 }

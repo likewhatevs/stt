@@ -4,7 +4,8 @@
 //! Troubleshooting companion to `--cpu-cap`: when a build or test is
 //! stalled behind a peer's reservation, `ktstr locks` names the peer
 //! (PID + cmdline) without disturbing any of its flocks. Reads
-//! `/tmp/ktstr-llc-*.lock`, `/tmp/ktstr-cpu-*.lock`, and
+//! `{lock_dir}/ktstr-llc-*.lock`, `{lock_dir}/ktstr-cpu-*.lock`
+//! (where `lock_dir` is `KTSTR_LOCK_DIR` or `/tmp`), and
 //! `{cache_root}/.locks/*.lock`; calls [`crate::flock::read_holders`]
 //! once per file, which does a single `/proc/locks` parse internally.
 
@@ -95,7 +96,8 @@ pub(crate) struct LocksSnapshot {
 fn collect_locks_snapshot() -> Result<LocksSnapshot> {
     let cache_root = CacheDir::default_root().ok();
     let runs_root = crate::test_support::runs_root();
-    collect_locks_snapshot_from(Path::new("/tmp"), cache_root.as_deref(), Some(&runs_root))
+    let lock_dir = crate::cache::resolve_lock_dir();
+    collect_locks_snapshot_from(&lock_dir, cache_root.as_deref(), Some(&runs_root))
 }
 
 /// Seam behind [`collect_locks_snapshot`]: enumerate LLC, per-CPU,

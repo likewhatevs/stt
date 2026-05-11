@@ -439,7 +439,8 @@ pub(crate) enum KtstrCommand {
     /// Enumerate every ktstr flock held on this host.
     ///
     /// Troubleshooting companion for `--cpu-cap` contention. Scans
-    /// `/tmp/ktstr-llc-*.lock`, `/tmp/ktstr-cpu-*.lock`, and
+    /// `{KTSTR_LOCK_DIR}/ktstr-llc-*.lock`,
+    /// `{KTSTR_LOCK_DIR}/ktstr-cpu-*.lock` (default `/tmp`), and
     /// `{cache_root}/.locks/*.lock`, cross-referenced against
     /// `/proc/locks` via [`ktstr::cli::list_locks`] to name the holder
     /// process (PID + cmdline) for each held lock. Read-only — does
