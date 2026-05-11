@@ -1399,18 +1399,18 @@ fn is_string_value(v: &RenderedValue) -> bool {
 /// qualify for inline-entry rendering in the FailureDumpEntry /
 /// FailureDumpMap table layouts.
 pub(crate) fn is_inline_scalar(v: &RenderedValue) -> bool {
-    matches!(
-        v,
+    match v {
         RenderedValue::Int { .. }
-            | RenderedValue::Uint { .. }
-            | RenderedValue::Bool { .. }
-            | RenderedValue::Char { .. }
-            | RenderedValue::Float { .. }
-            | RenderedValue::Enum { .. }
-            | RenderedValue::Ptr { .. }
-            | RenderedValue::Bytes { .. }
-            | RenderedValue::Unsupported { .. }
-    )
+        | RenderedValue::Uint { .. }
+        | RenderedValue::Bool { .. }
+        | RenderedValue::Char { .. }
+        | RenderedValue::Float { .. }
+        | RenderedValue::Enum { .. }
+        | RenderedValue::Bytes { .. }
+        | RenderedValue::Unsupported { .. } => true,
+        RenderedValue::Ptr { deref, .. } => deref.is_none(),
+        _ => false,
+    }
 }
 
 /// Whether a value is a "flat scalar" — a primitive carrying a

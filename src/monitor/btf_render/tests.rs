@@ -1617,6 +1617,15 @@ fn is_inline_scalar_rejects_composites() {
         had: 0,
         partial: Box::new(RenderedValue::Bytes { hex: "".into() }),
     }));
+    assert!(!is_inline_scalar(&RenderedValue::Ptr {
+        value: 0x1000,
+        deref: Some(Box::new(RenderedValue::Struct {
+            type_name: Some("scx_cgroup_llc_ctx".into()),
+            members: vec![],
+        })),
+        deref_skipped_reason: None,
+        cast_annotation: None,
+    }));
 }
 
 // ---- Ptr Display with deref → arrow notation -------------------
