@@ -384,15 +384,18 @@ int main(void) {{
             .replace("CONFIG_TC=y", "# CONFIG_TC is not set");
         std::fs::write(&config_path, config).expect("write patched busybox .config");
 
-        // Resolve patched config so make doesn't run interactive oldconfig.
+        // Resolve patched config non-interactively. Busybox's Kbuild
+        // lacks olddefconfig; pipe empty input to oldconfig so every
+        // NEW prompt accepts its default without blocking on stdin.
         let status = Command::new("make")
-            .arg("olddefconfig")
+            .arg("oldconfig")
             .current_dir(&busybox_src)
+            .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .expect("make olddefconfig");
-        assert!(status.success(), "busybox make olddefconfig failed");
+            .expect("make oldconfig");
+        assert!(status.success(), "busybox make oldconfig failed");
 
         // Build busybox.
         let nproc = std::thread::available_parallelism()
