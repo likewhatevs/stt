@@ -595,6 +595,7 @@ pub struct PayloadTypeChoice {
 /// so the fallback paths are distinguishable without re-running the
 /// heuristic.
 pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize,
+    allocator_name: &str,
 ) -> PayloadTypeChoice {
     if payload_size == 0 {
         return PayloadTypeChoice {
@@ -664,13 +665,39 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize,
             reason: String::new(),
         },
         n => {
-            // Multiple size-match candidates; prefer conventional
-            // names. Order is most-specific first so a struct named
-            // exactly `task_ctx` wins over `foo_task_ctx`. If 2+
-            // structs share the SAME pattern arm, the loop continues
-            // to lower-priority arms — a higher-specificity collision
-            // does not prevent a lower-specificity unambiguous match
-            // from resolving.
+            // Multiple size-match candidates. First try matching the
+            // allocator name: `scx_atq_allocator` → strip `_allocator`
+            // → `scx_atq` → match struct named `scx_atq`. This is the
+            // highest-specificity signal because scx_static_alloc
+            // allocators are conventionally named after their payload type.
+            let name_stem = allocator_name.strip_suffix("_allocator").unwrap_or(allocator_name);
+            if !name_stem.is_empty() {
+                let stems: &[&str] = &[
+                    name_stem,
+                    name_stem.strip_prefix("scx_").unwrap_or(""),
+                ];
+                for stem in stems {
+                    if stem.is_empty() {
+                        continue;
+                    }
+                    let hits: Vec<u32> = size_matches
+                        .iter()
+                        .filter(|(_, sn)| sn == stem)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if hits.len() == 1 {
+                        return PayloadTypeChoice {
+                            target_type_id: hits[0],
+                            reason: String::new(),
+                        };
+                    }
+                }
+            }
+
+            // Fall through to conventional suffix patterns. Order is
+            // most-specific first so a struct named exactly `task_ctx`
+            // wins over `foo_task_ctx`. If 2+ structs share the SAME
+            // pattern arm, the loop continues to lower-priority arms.
             type Pat = fn(&str) -> bool;
             let patterns: &[Pat] = &[
                 |n: &str| n == "task_ctx",
@@ -1232,7 +1259,7 @@ mod tests {
                 return;
             }
         };
-        let choice = discover_payload_btf_id(&btf, 0);
+        let choice = discover_payload_btf_id(&btf, 0, "");
         assert_eq!(
             choice.target_type_id, 0,
             "zero-size must yield target_type_id=0"
@@ -1269,7 +1296,7 @@ mod tests {
             }
         };
         let impossible_size = usize::MAX / 2;
-        let choice = discover_payload_btf_id(&btf, impossible_size);
+        let choice = discover_payload_btf_id(&btf, impossible_size, "");
         assert_eq!(choice.target_type_id, 0);
         let expected = format!("no candidate of size {impossible_size}");
         assert_eq!(
@@ -1941,7 +1968,7 @@ mod tests {
 
     /// G1.1: Single size-match resolves cleanly. A BTF with one
     /// 16-byte struct named `cgrp_ctx` and one 8-byte int. Calling
-    /// `discover_payload_btf_id(&btf, 16)` finds `cgrp_ctx`
+    /// `discover_payload_btf_id(&btf, 16, "")` finds `cgrp_ctx`
     /// as the unique size-match; size_matches.len() == 1 routes to
     /// the "single match" arm and returns the id with empty reason.
     /// Pin the contract that a single-match path bypasses the
@@ -1982,7 +2009,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, 16, "");
         assert_eq!(
             choice.target_type_id, 2,
             "single 16-byte struct cgrp_ctx must be picked unambiguously"
@@ -2038,7 +2065,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, 16, "");
         assert_eq!(
             choice.target_type_id, 2,
             "scx_cgroup_ctx (single 16-byte size-match) must resolve via the \
@@ -2105,7 +2132,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, 16, "");
         assert_eq!(
             choice.target_type_id, 2,
             "exact `task_ctx` arm (priority 1) must win over `*_ctx` suffix \
@@ -2177,7 +2204,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, 16, "");
         assert_eq!(
             choice.target_type_id, 0,
             "ambiguous `*_ctx` matches must fall through every arm and \
@@ -2281,7 +2308,7 @@ mod tests {
         ];
         let blob = sdta_build_btf(&types, &strings);
         let btf = Btf::from_bytes(&blob).expect("synthetic BTF parses");
-        let choice = discover_payload_btf_id(&btf, 16);
+        let choice = discover_payload_btf_id(&btf, 16, "");
         // Arm 1 (`task_ctx` exact): no hit. Arm 2 (`*_arena_ctx`):
         // 2 hits → continue. Arm 3 (`*_task_ctx`): 1 hit → return
         // id 4. Arm 4 (`*_ctx`): never reached.

@@ -3597,6 +3597,7 @@ fn chase_arena_pointer(
                             let choice = super::sdt_alloc::discover_payload_btf_id(
                                 btf,
                                 *candidate_size as usize,
+                                "",
                             );
                             if choice.target_type_id != 0
                                 && let Some((resolved_ty, resolved_id)) =
@@ -3648,7 +3649,7 @@ fn chase_arena_pointer(
                         };
                     }
                 };
-                let choice = super::sdt_alloc::discover_payload_btf_id(btf, size as usize);
+                let choice = super::sdt_alloc::discover_payload_btf_id(btf, size as usize, "");
                 if choice.target_type_id != 0 {
                     (choice.target_type_id, 0usize, "alloc_size")
                 } else {

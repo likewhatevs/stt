@@ -594,6 +594,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
             let choice = super::super::monitor::sdt_alloc::discover_payload_btf_id(
                 ebtf,
                 size as usize,
+                "",
             );
             if choice.target_type_id != 0 {
                 if let Ok(ty) = ebtf.resolve_type_by_id(choice.target_type_id)

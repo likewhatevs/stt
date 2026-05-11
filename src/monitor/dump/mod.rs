@@ -2816,7 +2816,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // set. Without this filter the size-match arm could win
             // on a vmlinux struct whose layout has nothing to do
             // with the scheduler's allocator slot.
-            let choice = discover_payload_btf_id(prog_btf, payload_size);
+            let choice = discover_payload_btf_id(prog_btf, payload_size, &var_name);
 
             let snap = walk_sdt_allocator(
                 accessor.kernel(),
