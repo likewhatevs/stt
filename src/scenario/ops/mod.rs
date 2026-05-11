@@ -7782,8 +7782,7 @@ mod tests {
         // Wait briefly for thread workers to install their
         // per-thread comm via prctl in worker_main. 100 ms is
         // generous against scheduler jitter on contended hosts;
-        // test sleep approved per the team-lead's pragmatic-test
-        // ruling.
+        // sleep is intentional: waits for prctl to propagate.
         std::thread::sleep(Duration::from_millis(100));
         // Enumerate /proc/<leader>/task/ — every directory entry
         // is a TID inside the container's tgid. Read each TID's

@@ -2985,7 +2985,7 @@ fn arena_snapshot_default_user_vm_start_is_zero() {
     );
 }
 
-// -- render_map refactor regression tests (task #42) --------------
+// -- render_map refactor regression tests -------------------------
 //
 // The refactor extracted `render_value_or_hex` and
 // `render_key_optional` from 6+ duplicated match arms in
@@ -4332,7 +4332,7 @@ fn ringbuf_map_info(map_kva: u64) -> super::super::bpf_map::BpfMapInfo {
     }
 }
 
-// -- #55 ringbuf state render tests -------------------------------
+// -- ringbuf state render tests -------------------------------
 
 /// `render_ringbuf_state` returns the no-offsets error string when
 /// `BpfMapOffsets::ringbuf_offsets` is None (kernel built without
@@ -4523,7 +4523,7 @@ fn render_ringbuf_mask_max_returns_err() {
     assert!(matches!(result, Err(ref s) if s.contains("mask = u64::MAX")));
 }
 
-// -- #53 stack-trace render tests ---------------------------------
+// -- stack-trace render tests ---------------------------------
 
 fn synth_stackmap_offsets() -> super::super::btf_offsets::BpfStackmapOffsets {
     super::super::btf_offsets::BpfStackmapOffsets {
@@ -4776,7 +4776,7 @@ fn render_stack_traces_build_id_mode_pcs_empty() {
     );
 }
 
-// -- #53 fd-array render tests ------------------------------------
+// -- fd-array render tests ------------------------------------
 
 fn synth_fd_array_offsets() -> crate::monitor::btf_offsets::BpfMapOffsets {
     let mut o = crate::monitor::btf_offsets::BpfMapOffsets::EMPTY;
@@ -4954,7 +4954,7 @@ fn render_fd_array_max_entries_truncation() {
     let _ = scene; // silence unused
 }
 
-// -- #52 STRUCT_OPS render error paths ----------------------------
+// -- STRUCT_OPS render error paths ----------------------------
 
 /// `render_map` STRUCT_OPS arm with `struct_ops_offsets = None`
 /// surfaces the BTF-offsets-unresolved diagnostic — the renderer
@@ -5821,7 +5821,7 @@ fn append_arena_slot_index_for_allocator_multi_allocator_merge() {
 // Pins the end-to-end chain `append_arena_slot_index_for_allocator`
 // (per allocator) → `resolve_arena_type_in_index` (per chase) when
 // TWO distinct allocators contribute slots to the same per-pass
-// `ArenaSlotIndex`. The bug surface for #89 is that per-cgroup
+// `ArenaSlotIndex`. The bug surface is that per-cgroup
 // arena pointers (`cgx_raw`, `llcx_raw`) chase through `resolve_arena_type`
 // against an index that holds slots from BOTH the per-task allocator
 // AND the per-cgroup allocator. If the merge drops the second

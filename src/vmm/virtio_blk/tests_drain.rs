@@ -1356,7 +1356,7 @@ fn throttle_stall_event_idx_retry_routes_through_gate() {
 /// Throttle stall on the bytes bucket alone (iops bucket
 /// unlimited). DiskThrottle with `bytes_per_sec=Some(512)` and
 /// `iops=None` accepts 1 request per second worth of bytes; a
-/// Post-#32 overconsumption policy: when `n > capacity` the
+/// Overconsumption policy: when `n > capacity` the
 /// throttle gate is `available >= 0` (not `available >= n`),
 /// so an oversized request whose chain is the FIRST one this
 /// drain sees against a freshly-seeded bucket succeeds and
@@ -1374,7 +1374,7 @@ fn throttle_stall_event_idx_retry_routes_through_gate() {
 /// survives, used.idx=0, throttled_count=1, io_errors=0.
 /// Companion to the iops-only stall tests; together they
 /// cover both single-bucket-exhaustion shapes under the
-/// post-#32 policy.
+/// overconsumption policy.
 #[test]
 fn throttle_bytes_request_exceeds_capacity_stalls() {
     let cap = 4096u64;
@@ -1503,7 +1503,7 @@ fn throttle_both_buckets_max_wait() {
 
     // Drive the bytes bucket into debt so a 2048-byte
     // (oversized) request stalls on the bytes-bucket gate.
-    // Post-#32 overconsumption policy: when n > capacity the
+    // Overconsumption policy: when n > capacity the
     // gate is `available >= 0`, so a fresh bucket
     // (available=capacity=1024) would grant the 2048-byte
     // request and drive available negative. To force the
@@ -1586,7 +1586,7 @@ fn throttle_both_buckets_max_wait() {
 /// status-write pipeline as the iops-bucket retry covered
 /// upstream.
 ///
-/// Post-#32 overconsumption policy: a fresh bucket grants any
+/// Overconsumption policy: a fresh bucket grants any
 /// request whose size is `<= capacity` while `available >= n`,
 /// and grants oversized (`n > capacity`) requests while
 /// `available >= 0`. To exercise the STALL path the bucket

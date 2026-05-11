@@ -434,8 +434,7 @@ fn worker_drop_fires_when_paused_false_on_both_loads() {
 /// this re-check the production code would both decrement
 /// `expected_parks` AND credit the eventfd write — a
 /// double-count that breaks the rendezvous arithmetic. This is
-/// the load-bearing invariant the team-lead's task description
-/// names explicitly.
+/// the load-bearing invariant for correct rendezvous counting.
 #[test]
 fn worker_drop_continues_when_paused_true_on_recheck() {
     let decision = decide_worker_drop(

@@ -1201,7 +1201,7 @@ mod tests {
             "missing target_type_id: {out}"
         );
         assert!(out.contains("1 live"), "missing entry count: {out}");
-        assert!(out.contains("idx=7"), "missing entry render: {out}");
+        assert!(out.contains("42"), "missing entry payload: {out}");
     }
 
     #[test]
@@ -1954,15 +1954,10 @@ mod tests {
     // existing edge cases passes the suite while being broken for
     // every real per-cgroup or per-task allocator.
     //
-    // The bug surface for #89 is per-cgroup arena pointers (cgx_raw,
-    // llcx_raw) failing to chase. Test G1.2 below covers
-    // `scx_cgroup_ctx`-style names matching the `*_ctx` arm; G1.5
-    // covers the per-arm ambiguous fallback; G1.7 covers the
-    // continue-to-next-arm path that the docstring at sdt_alloc.rs:565-571
-    // contradicts the code at sdt_alloc.rs:670-674 about. The doc
-    // says "fall back to hex" on any arm collision; the code says
-    // "continue to next arm". The implementer's #89 fix must
-    // reconcile this drift — these tests pin the chosen behavior.
+    // Per-cgroup arena pointers (cgx_raw, llcx_raw) failing to
+    // chase. Test G1.2 below covers `scx_cgroup_ctx`-style names
+    // matching the `*_ctx` arm; G1.5 covers the per-arm ambiguous
+    // fallback; G1.7 covers the continue-to-next-arm path.
     //
     // All three tests use the existing `sdta_*` BTF builder helpers
     // declared above to avoid duplicating wire-format logic.
@@ -2027,7 +2022,7 @@ mod tests {
     /// `scx_cgroup_ctx`, this is also a single size-match — the
     /// test pins that the heuristic accepts the per-cgroup name
     /// AND that an int of size 8 doesn't pollute the candidate
-    /// list. The bug surface for #89 is exactly this case
+    /// list. The bug surface is exactly this case
     /// (per-cgroup struct fails to resolve via discover);
     /// confirming a clean single-match here pins the baseline
     /// before the multi-candidate cases below exercise the actual

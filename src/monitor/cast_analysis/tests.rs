@@ -10301,7 +10301,7 @@ fn cross_function_fixpoint_callee_before_caller() {
 // intersection, so the two paths produce the same target_type_id
 // when shape inference is unique.
 //
-// The bug surface for #89 / coordinator's priority-1 fix item is
+// The bug surface for the ambiguous-shape fix is
 // the AMBIGUOUS-shape case: when shape inference yields 0 or 2+
 // candidates, the arena_stx loop emits with target_type_id=0
 // (deferred resolve sentinel) AND the standalone loop's gate
@@ -10467,7 +10467,7 @@ fn finalize_arena_stx_emits_deferred_resolve_when_shape_inference_ambiguous() {
     );
 }
 
-/// #89 fix: order-independence — when the STX-flow tag for a slot
+/// Order-independence: when the STX-flow tag for a slot
 /// fires BEFORE the dereference pattern through the same slot, the
 /// dereference accesses must still flow into shape inference. The
 /// failing pre-fix behaviour was: pseudo_call + STX(slot) tagged

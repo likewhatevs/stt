@@ -2535,7 +2535,7 @@ pub(super) fn spawn_pcomm_container(
 
             // Encode and write the report stream as a single
             // `Vec<WorkerReport>` JSON document via `serde_json`.
-            // serde_json for pcomm Vec<WorkerReport> per task #6
+            // serde_json for pcomm Vec<WorkerReport>
             // design ruling; fork-mode workers use bincode for
             // single WorkerReport. The pcomm container is a
             // fork-mode child and its payload sits on the same

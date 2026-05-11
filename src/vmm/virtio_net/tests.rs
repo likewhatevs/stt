@@ -189,7 +189,7 @@ fn driver_features_gated_by_status() {
     write_reg(&mut dev, VIRTIO_MMIO_DRIVER_FEATURES, 0xDEAD);
     // After ACKNOWLEDGE + DRIVER, features writes are accepted —
     // BUT the FEATURES_OK transition is gated on VERSION_1 being
-    // negotiated (see F7 in adversarial review). A driver that
+    // negotiated (per virtio spec §2.2). A driver that
     // writes feature page 0 only without VERSION_1 (which lives at
     // bit 32 in feature page 1) hits the FAILED path. This test
     // negotiates VERSION_1 properly first so the FSM advances; the
