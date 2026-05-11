@@ -598,13 +598,17 @@ fn write_struct(
     // the Display code would see empty-name members wrapping inner
     // structs and suppress them (producing `Type{}`).
     let mut flat_members;
-    let members = if members.iter().any(|m| {
-        m.name.is_empty() && matches!(m.value, RenderedValue::Struct { .. })
-    }) {
+    let members = if members
+        .iter()
+        .any(|m| m.name.is_empty() && matches!(m.value, RenderedValue::Struct { .. }))
+    {
         flat_members = Vec::with_capacity(members.len());
         for m in members {
             if m.name.is_empty() {
-                if let RenderedValue::Struct { members: ref inner, .. } = m.value {
+                if let RenderedValue::Struct {
+                    members: ref inner, ..
+                } = m.value
+                {
                     flat_members.extend_from_slice(inner);
                     continue;
                 }
@@ -2008,15 +2012,8 @@ fn render_value_inner(
                         // fallback only fires when the analyzer's
                         // STX-flow path emitted `target_type_id == 0`,
                         // which is the cast-finding code path below.
-                        let outcome = chase_arena_pointer(
-                            btf,
-                            pointee_type_id,
-                            None,
-                            val,
-                            m,
-                            depth,
-                            visited,
-                        );
+                        let outcome =
+                            chase_arena_pointer(btf, pointee_type_id, None, val, m, depth, visited);
                         if outcome.reason.is_some() {
                             deref_skipped_reason = outcome.reason;
                         }
@@ -3555,11 +3552,9 @@ fn chase_arena_pointer(
                             if mem.read_arena(val, *candidate_size as usize).is_none() {
                                 continue;
                             }
-                            if let Some(cross_ref) = mem.cross_btf_resolve_fwd(
-                                struct_name,
-                                FwdKind::Struct,
-                            ) && let Ok(ty) =
-                                cross_ref.btf.resolve_type_by_id(cross_ref.type_id)
+                            if let Some(cross_ref) =
+                                mem.cross_btf_resolve_fwd(struct_name, FwdKind::Struct)
+                                && let Ok(ty) = cross_ref.btf.resolve_type_by_id(cross_ref.type_id)
                                 && let Some(btf_size) = type_size(cross_ref.btf, &ty)
                                 && btf_size > 0
                                 && btf_size <= *candidate_size as usize
@@ -3664,11 +3659,9 @@ fn chase_arena_pointer(
                         if mem.read_arena(val, *candidate_size as usize).is_none() {
                             continue;
                         }
-                        if let Some(cross_ref) = mem.cross_btf_resolve_fwd(
-                            struct_name,
-                            FwdKind::Struct,
-                        ) && let Ok(ty) =
-                            cross_ref.btf.resolve_type_by_id(cross_ref.type_id)
+                        if let Some(cross_ref) =
+                            mem.cross_btf_resolve_fwd(struct_name, FwdKind::Struct)
+                            && let Ok(ty) = cross_ref.btf.resolve_type_by_id(cross_ref.type_id)
                             && let Some(btf_size) = type_size(cross_ref.btf, &ty)
                             && btf_size > 0
                             && btf_size <= *candidate_size as usize

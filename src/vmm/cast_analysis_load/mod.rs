@@ -387,7 +387,9 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
             // instruction walker. BTFs are reparsed from the binary
             // bytes (Btf is not serializable).
             let btfs = parse_btfs_from_bytes(&bytes);
-            if let Some((cast_map, fwd_index, alloc_size_types)) = persist::try_load(hash, btfs.len()) {
+            if let Some((cast_map, fwd_index, alloc_size_types)) =
+                persist::try_load(hash, btfs.len())
+            {
                 tracing::debug!("cast_analysis: disk cache hit");
                 let out = CastAnalysisOutput {
                     cast_maps: vec![Arc::new(cast_map)],
@@ -418,7 +420,13 @@ pub(crate) fn cached_cast_analysis_for_scheduler(path: &Path) -> Option<Arc<Cast
                 .flat_map(|m| m.iter())
                 .map(|(&k, &v)| (k, v))
                 .collect();
-            persist::try_save(hash, &merged_for_cache, &out.fwd_index, out.btfs.len(), &out.alloc_size_types);
+            persist::try_save(
+                hash,
+                &merged_for_cache,
+                &out.fwd_index,
+                out.btfs.len(),
+                &out.alloc_size_types,
+            );
             let total_casts: usize = out.cast_maps.iter().map(|m| m.len()).sum();
             if total_casts == 0 && out.fwd_index.is_empty() {
                 None
@@ -579,8 +587,7 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
     // AND the prior `take_while().last()` max-id discovery, which
     // bailed on the first id gap and undercounted on sparse split-BTF
     // tables.
-    let mut alloc_size_types: Vec<(u64, String)> =
-        Vec::with_capacity(all_alloc_sizes.len());
+    let mut alloc_size_types: Vec<(u64, String)> = Vec::with_capacity(all_alloc_sizes.len());
     let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let per_btf_structs: Vec<Vec<(u64, String)>> = btfs
         .iter()
@@ -591,11 +598,8 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
             continue;
         }
         for (ebtf, structs) in btfs.iter().zip(per_btf_structs.iter()) {
-            let choice = super::super::monitor::sdt_alloc::discover_payload_btf_id(
-                ebtf,
-                size as usize,
-                "",
-            );
+            let choice =
+                super::super::monitor::sdt_alloc::discover_payload_btf_id(ebtf, size as usize, "");
             if choice.target_type_id != 0 {
                 if let Ok(ty) = ebtf.resolve_type_by_id(choice.target_type_id)
                     && let Some(bt) = ty.as_btf_type()
@@ -615,9 +619,8 @@ pub(crate) fn build_cast_analysis_from_bytes(bytes: &[u8]) -> CastAnalysisOutput
                 if *struct_size != size {
                     continue;
                 }
-                let dominated = name == "task_ctx"
-                    || name.ends_with("_ctx")
-                    || name.ends_with("_arena_ctx");
+                let dominated =
+                    name == "task_ctx" || name.ends_with("_ctx") || name.ends_with("_arena_ctx");
                 if dominated && seen_names.insert(name.clone()) {
                     alloc_size_types.push((size, name.clone()));
                 }
@@ -705,12 +708,14 @@ fn build_fwd_index(btfs: &[Arc<Btf>]) -> HashMap<String, FwdIndexEntry> {
                                     if let Ok(pid) = <dyn btf_rs::BtfType>::get_type_id(td) {
                                         if let Ok(Type::Struct(s)) = btf.resolve_type_by_id(pid) {
                                             if btf.resolve_name(&s).map_or(true, |n| n.is_empty()) {
-                                                let base = td_name.strip_suffix("_t")
-                                                    .unwrap_or(&td_name);
-                                                out.entry(base.to_string()).or_insert(FwdIndexEntry {
-                                                    btfs_idx: idx,
-                                                    type_id: pid,
-                                                });
+                                                let base =
+                                                    td_name.strip_suffix("_t").unwrap_or(&td_name);
+                                                out.entry(base.to_string()).or_insert(
+                                                    FwdIndexEntry {
+                                                        btfs_idx: idx,
+                                                        type_id: pid,
+                                                    },
+                                                );
                                             }
                                         }
                                     }

@@ -83,8 +83,8 @@ pub(crate) fn generate_btf_anchor(
     if let Some(old_hash) = read_anchor_hash(anchor_path) {
         if old_hash == input_hash {
             tracing::debug!("btf_anchor: cached anchor is current");
-            let abs = std::fs::canonicalize(anchor_path)
-                .unwrap_or_else(|_| anchor_path.to_path_buf());
+            let abs =
+                std::fs::canonicalize(anchor_path).unwrap_or_else(|_| anchor_path.to_path_buf());
             return Some(abs);
         }
     }
@@ -116,8 +116,7 @@ pub(crate) fn generate_btf_anchor(
     }
     write_anchor_header(anchor_path, &structs, input_hash)?;
 
-    let abs = std::fs::canonicalize(anchor_path)
-        .unwrap_or_else(|_| anchor_path.to_path_buf());
+    let abs = std::fs::canonicalize(anchor_path).unwrap_or_else(|_| anchor_path.to_path_buf());
     Some(abs)
 }
 
@@ -178,8 +177,10 @@ fn find_btf_section_raw(bytes: &[u8]) -> Option<&[u8]> {
     if strtab_base + 64 > bytes.len() {
         return None;
     }
-    let strtab_off = u64::from_le_bytes(bytes[strtab_base + 24..strtab_base + 32].try_into().ok()?) as usize;
-    let strtab_size = u64::from_le_bytes(bytes[strtab_base + 32..strtab_base + 40].try_into().ok()?) as usize;
+    let strtab_off =
+        u64::from_le_bytes(bytes[strtab_base + 24..strtab_base + 32].try_into().ok()?) as usize;
+    let strtab_size =
+        u64::from_le_bytes(bytes[strtab_base + 32..strtab_base + 40].try_into().ok()?) as usize;
     if strtab_off + strtab_size > bytes.len() {
         return None;
     }
@@ -235,11 +236,7 @@ fn btf_strings(btf: &[u8]) -> Vec<&str> {
 
 /// Run `clang -M -MG` on each source in parallel and collect every
 /// dependency, filtering out system/kernel headers.
-fn collect_dep_files(
-    sources: &[PathBuf],
-    clang: &str,
-    cflags: &[String],
-) -> Vec<PathBuf> {
+fn collect_dep_files(sources: &[PathBuf], clang: &str, cflags: &[String]) -> Vec<PathBuf> {
     let all_deps = std::sync::Mutex::new(HashSet::<PathBuf>::new());
 
     std::thread::scope(|s| {
@@ -323,11 +320,7 @@ fn extract_struct_names(files: &[PathBuf]) -> BTreeSet<String> {
     names
 }
 
-fn collect_structs(
-    node: tree_sitter::Node,
-    source: &[u8],
-    names: &mut BTreeSet<String>,
-) {
+fn collect_structs(node: tree_sitter::Node, source: &[u8], names: &mut BTreeSet<String>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "struct_specifier" {

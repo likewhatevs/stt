@@ -2951,8 +2951,7 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
             // per-map chases — the cast analyzer's shape inference
             // may resolve a concrete target type that the pre-pass
             // heuristic missed.
-            let &header_size = header_size_by_allocator
-                .get(snap.allocator_name.as_str())?;
+            let &header_size = header_size_by_allocator.get(snap.allocator_name.as_str())?;
             Some(snap.entries.iter().flat_map(move |e| {
                 let slot_start = e.user_addr as u32;
                 let payload_start = slot_start.wrapping_add(header_size as u32);

@@ -632,7 +632,8 @@ fn simple_cast_recovers_target() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -710,7 +711,8 @@ fn shape_inference_alone_drops_without_arena_confirmed() {
     );
     assert_eq!(
         map_with_evidence.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -995,7 +997,8 @@ fn multi_offset_disambiguates_target() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q1_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -1121,7 +1124,8 @@ fn multiple_distinct_casts_recorded() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q1_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -1129,7 +1133,8 @@ fn multiple_distinct_casts_recorded() {
     );
     assert_eq!(
         map.get(&(t_id, 16)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q2_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -1332,7 +1337,8 @@ fn null_check_fall_through_preserves_state() {
         );
         assert_eq!(
             map.get(&(t_id, 8)),
-            Some(&CastHit { alloc_size: None,
+            Some(&CastHit {
+                alloc_size: None,
                 target_type_id: q_id,
                 addr_space: AddrSpace::Arena,
             }),
@@ -1403,7 +1409,8 @@ fn mov_x_propagates_loaded_state() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -1441,7 +1448,8 @@ fn ld_imm64_skips_second_slot() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -1613,7 +1621,8 @@ fn kptr_from_function_param_stored_to_u64_field() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -1658,7 +1667,8 @@ fn kptr_through_stack_spill() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -1749,7 +1759,8 @@ fn kptr_from_kfunc_return() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -1910,7 +1921,8 @@ fn mixed_arena_and_kptr_in_one_program() {
     );
     assert_eq!(
         map.get(&(m_id, 0)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: a_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -1918,7 +1930,8 @@ fn mixed_arena_and_kptr_in_one_program() {
     );
     assert_eq!(
         map.get(&(m_id, 16)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -2059,7 +2072,8 @@ fn func_entry_seeding_from_btf() {
     );
     assert_eq!(
         map.get(&(p_id, slot1)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -2200,7 +2214,8 @@ fn addr_space_cast_arena_alone_does_not_emit() {
     );
     assert_eq!(
         map_kptr_only.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -2266,7 +2281,8 @@ fn addr_space_cast_kernel_to_arena_drops_dst() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -2475,7 +2491,8 @@ fn atomic_non_fetch_preserves_regs() {
         );
         assert_eq!(
             map.get(&(p_id, slot_off)),
-            Some(&CastHit { alloc_size: None,
+            Some(&CastHit {
+                alloc_size: None,
                 target_type_id: t_id,
                 addr_space: AddrSpace::Kernel,
             }),
@@ -2671,7 +2688,8 @@ fn atomic_store_rel_preserves_src_and_dst() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off1)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -2679,7 +2697,8 @@ fn atomic_store_rel_preserves_src_and_dst() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off2)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -3090,7 +3109,8 @@ fn stack_spill_overwrite_uses_latest() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t2_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -3137,7 +3157,8 @@ fn stack_spill_survives_helper_call() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -3397,7 +3418,8 @@ fn kptr_conflict_two_targets_drops() {
     );
     assert_eq!(
         map_single.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t1_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -3659,7 +3681,8 @@ fn variadic_param_breaks_seeding() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off1)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -4008,7 +4031,8 @@ fn finalize_source_in_candidates_with_others_emits_other() {
     );
     assert_eq!(
         map.get(&(t_id, 0)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -4159,7 +4183,8 @@ fn finalize_max_seen_type_id_slack_finds_distant_candidate() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -4414,7 +4439,8 @@ fn member_size_bytes_unsupported_terminals_skipped() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: u_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -4510,7 +4536,8 @@ fn build_layout_index_skips_bitfields_in_candidates() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q2_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -4651,7 +4678,8 @@ fn union_works_like_struct_for_layout_and_member_lookup() {
     );
     assert_eq!(
         map.get(&(p_id, 16)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -4659,7 +4687,8 @@ fn union_works_like_struct_for_layout_and_member_lookup() {
     );
     assert_eq!(
         map.get(&(source_u_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: target_u_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -4709,7 +4738,8 @@ fn build_layout_index_consecutive_fail_cap_short_circuits() {
     // loop early without panic, and Q(3) is recorded normally.
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -4805,7 +4835,8 @@ fn kind_flag_struct_includes_non_bitfield_members() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -4949,7 +4980,8 @@ fn stack_spill_same_target_stays_single() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -5186,7 +5218,8 @@ fn kfunc_call_with_funcproto_id_directly() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -5412,7 +5445,8 @@ fn mov_x_self_copy_preserves_state() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -5742,7 +5776,8 @@ fn addr_space_cast_arena_imm1_on_pointer_propagates() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -6047,7 +6082,8 @@ fn bss_kptr_records_kernel_cast() {
     let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers, &[]);
     assert_eq!(
         map.get(&(datasec_id, var_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -6212,7 +6248,8 @@ fn bss_multi_variable_layout() {
     let map = analyze_casts(&insns, &btf, &[], &[], &datasec_pointers, &[]);
     assert_eq!(
         map.get(&(datasec_id, 0)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -6220,7 +6257,8 @@ fn bss_multi_variable_layout() {
     );
     assert_eq!(
         map.get(&(datasec_id, 16)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -6287,7 +6325,8 @@ fn end_to_end_bss_global_stores_kfunc_pointer() {
     assert_eq!(map.len(), 1, "exactly one finding expected: {map:?}");
     assert_eq!(
         map.get(&(datasec_id, var_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -6390,7 +6429,8 @@ fn out_of_range_jump_targets_dropped() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -6536,7 +6576,8 @@ fn func_entry_multiple_at_same_pc_last_wins() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -6572,7 +6613,8 @@ fn func_entry_past_insns_len_no_op() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -6749,7 +6791,8 @@ fn func_entry_pc_gt_0_reseeds_mid_stream() {
     );
     assert_eq!(
         map.get(&(p_id, slot_off)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: t_id,
             addr_space: AddrSpace::Kernel,
         }),
@@ -6793,7 +6836,8 @@ fn ld_imm64_second_slot_with_non_zero_content_skipped() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -6885,7 +6929,8 @@ fn initial_reg_duplicate_seeds_last_wins() {
     );
     assert_eq!(
         map.get(&(s2_id, 16)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -6975,7 +7020,8 @@ fn large_program_buried_cast_recorded() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -7085,7 +7131,8 @@ fn many_func_entries_each_seeds() {
         let t_id = (2 + i) as u32;
         assert_eq!(
             map.get(&(p_id, 8 * i as u32)),
-            Some(&CastHit { alloc_size: None,
+            Some(&CastHit {
+                alloc_size: None,
                 target_type_id: t_id,
                 addr_space: AddrSpace::Kernel,
             }),
@@ -7202,7 +7249,8 @@ fn many_struct_types_unique_match_resolves() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: qtarget_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -7291,7 +7339,8 @@ fn deep_modifier_chain_resolves_to_u64() {
     );
     assert_eq!(
         map.get(&(t_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -7406,7 +7455,8 @@ fn maximum_stack_slots_all_recorded() {
         let t_id: u32 = (2 + i) as u32;
         assert_eq!(
             map.get(&(p_id, 8 * i as u32)),
-            Some(&CastHit { alloc_size: None,
+            Some(&CastHit {
+                alloc_size: None,
                 target_type_id: t_id,
                 addr_space: AddrSpace::Kernel,
             }),
@@ -7528,7 +7578,8 @@ fn many_field_struct_records_two_distinct_casts() {
     assert_eq!(map.len(), 2, "two distinct casts expected: {map:?}");
     assert_eq!(
         map.get(&(t_id, 400)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q50_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -7536,7 +7587,8 @@ fn many_field_struct_records_two_distinct_casts() {
     );
     assert_eq!(
         map.get(&(t_id, 792)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q99_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -7636,7 +7688,8 @@ fn many_cast_patterns_in_one_program() {
         let q_id: u32 = 4 + i;
         assert_eq!(
             map.get(&(t_id, 8 * i)),
-            Some(&CastHit { alloc_size: None,
+            Some(&CastHit {
+                alloc_size: None,
                 target_type_id: q_id,
                 addr_space: AddrSpace::Arena,
             }),
@@ -7835,11 +7888,15 @@ fn stx_flow_alloc_return_records_arena_finding() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     assert_eq!(
         map.get(&(m_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -7894,11 +7951,15 @@ fn stx_flow_alloc_return_propagates_through_mov() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     assert_eq!(
         map.get(&(m_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -7961,11 +8022,15 @@ fn stx_flow_alloc_return_round_trips_through_stack() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     assert_eq!(
         map.get(&(m_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -8041,11 +8106,15 @@ fn stx_flow_alias_tracking_propagates_via_ldx() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     assert_eq!(
         map.get(&(m_id, 0)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -8053,7 +8122,8 @@ fn stx_flow_alias_tracking_propagates_via_ldx() {
     );
     assert_eq!(
         map.get(&(m_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -8133,7 +8203,10 @@ fn stx_flow_conflict_with_kptr_drops_both() {
         ],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     assert!(
         !map.contains_key(&(m_id, 0)),
@@ -8269,11 +8342,15 @@ fn stx_flow_resolves_target_via_shape_inference_under_alias_tracking() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 4 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 4,
+        }],
     );
     assert_eq!(
         map.get(&(p_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -8393,7 +8470,8 @@ fn kfunc_arena_alloc_allowlist_records_arena_finding() {
     );
     assert_eq!(
         map.get(&(m_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -8496,7 +8574,8 @@ fn kfunc_arena_alloc_typed_return_falls_through() {
     // arm 1 returned first.
     assert_eq!(
         map.get(&(m_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 3, // R's id
             addr_space: AddrSpace::Kernel,
         }),
@@ -8664,7 +8743,8 @@ fn helper_map_lookup_elem_typed_value_seeds_r0() {
     );
     assert_eq!(
         map.get(&(parent_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: value_sid,
             addr_space: AddrSpace::Kernel,
         }),
@@ -8774,7 +8854,8 @@ fn helper_map_lookup_elem_value_type_struct_via_typedef() {
     );
     assert_eq!(
         map.get(&(parent_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: value_sid,
             addr_space: AddrSpace::Kernel,
         }),
@@ -8959,7 +9040,8 @@ fn stx_through_helper_returned_pointer_records_finding() {
     );
     assert_eq!(
         map.get(&(parent_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: value_sid,
             addr_space: AddrSpace::Kernel,
         }),
@@ -9292,7 +9374,10 @@ fn arena_stx_pending_then_duplicate_is_idempotent() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     assert!(
         !map.is_empty(),
@@ -9482,7 +9567,8 @@ fn struct_member_at_resolves_array_element_offset() {
     );
     assert_eq!(
         map.get(&(t_id, 16)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: q_id,
             addr_space: AddrSpace::Arena,
         }),
@@ -9557,11 +9643,15 @@ fn stx_nested_struct_arena_finding_keys_on_inner() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     assert_eq!(
         map.get(&(inner_id, 0)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -9569,7 +9659,8 @@ fn stx_nested_struct_arena_finding_keys_on_inner() {
     );
     assert_eq!(
         map.get(&(inner_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -9749,11 +9840,15 @@ fn cross_function_u64_param_inherits_caller_pointer_type() {
             func_proto_id: 3,
         }],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 4 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 4,
+        }],
     );
     assert_eq!(
         map.get(&(m_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -10016,7 +10111,10 @@ fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
         }],
         &[],
         &datasec_pointers,
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     // The end-to-end contract: the post-lookup LDX of V.field
     // produces R2 = ArenaU64FromAlloc (because the prior
@@ -10040,7 +10138,8 @@ fn helper_map_update_then_lookup_propagates_arena_through_map_value() {
     let _ = v_id;
     assert_eq!(
         map.get(&(p_id, 0)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -10148,14 +10247,14 @@ fn cross_function_fixpoint_callee_before_caller() {
     let insns = vec![
         // --- callee at PC 0..1 ---
         stx(BPF_SIZE_DW, 1, 2, 8), // PC 0: STX [R1+8] = R2
-        exit(),                      // PC 1
+        exit(),                    // PC 1
         // --- caller at PC 2..7 ---
-        mov_x(6, 1),                // PC 2: save R1 to callee-saved R6
-        alloc_call,                  // PC 3: allocator → R0=ArenaU64FromAlloc
-        mov_x(2, 0),                // PC 4: R2 = R0 (arena result)
-        mov_x(1, 6),                // PC 5: R1 = R6 (restore parent ptr)
-        callee_call,                 // PC 6: call callee at PC 0
-        exit(),                      // PC 7
+        mov_x(6, 1), // PC 2: save R1 to callee-saved R6
+        alloc_call,  // PC 3: allocator → R0=ArenaU64FromAlloc
+        mov_x(2, 0), // PC 4: R2 = R0 (arena result)
+        mov_x(1, 6), // PC 5: R1 = R6 (restore parent ptr)
+        callee_call, // PC 6: call callee at PC 0
+        exit(),      // PC 7
     ];
 
     let map = analyze_casts(
@@ -10173,12 +10272,16 @@ fn cross_function_fixpoint_callee_before_caller() {
             }, // caller (Ptr->Parent)
         ],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 3 }], // allocator at PC 3
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 3,
+        }], // allocator at PC 3
     );
 
     assert_eq!(
         map.get(&(parent_id, 8)),
-        Some(&CastHit { alloc_size: None,
+        Some(&CastHit {
+            alloc_size: None,
             target_type_id: 0,
             addr_space: AddrSpace::Arena,
         }),
@@ -10328,7 +10431,10 @@ fn finalize_arena_stx_emits_deferred_resolve_when_shape_inference_ambiguous() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 4 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 4,
+        }],
     );
     // The slot MUST be emitted. Drop = silent failure — chase_arena_pointer
     // would never enter the deferred-resolve special case for this slot.
@@ -10336,7 +10442,8 @@ fn finalize_arena_stx_emits_deferred_resolve_when_shape_inference_ambiguous() {
         .get(&(p_id, 8))
         .expect("(P, 8) must be in CastMap even when shape inference is ambiguous");
     assert_eq!(
-        hit.addr_space, AddrSpace::Arena,
+        hit.addr_space,
+        AddrSpace::Arena,
         "ambiguous-shape STX-flow tag must still emit AddrSpace::Arena: {map:?}"
     );
     assert_eq!(
@@ -10469,7 +10576,10 @@ fn stx_flow_stx_before_deref_resolves_target_via_shape_inference() {
         }],
         &[],
         &[],
-        &[SubprogReturn { alloc_size: None, insn_offset: 0 }],
+        &[SubprogReturn {
+            alloc_size: None,
+            insn_offset: 0,
+        }],
     );
     let hit = map
         .get(&(p_id, 8))

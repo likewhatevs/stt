@@ -792,8 +792,7 @@ pub fn analyze_casts(
             // analyzer state — patterns, kptr_findings,
             // arena_confirmed — is rebuilt to the same shape it had
             // on the iteration that detected convergence).
-            let mut final_a =
-                Analyzer::with_carryover(btf, next_args, next_stx, next_alloc_size);
+            let mut final_a = Analyzer::with_carryover(btf, next_args, next_stx, next_alloc_size);
             final_a.seed(initial_regs);
             final_a.run(
                 insns,
@@ -1288,7 +1287,10 @@ impl<'a> Analyzer<'a> {
         // allocator emits no per-slot header, so the captured
         // `alloc_size` is the only payload-type evidence available.
         let saved_r0 = match self.regs[0] {
-            r0 @ RegState::ArenaU64FromAlloc { alloc_size: Some(_), .. } => Some(r0),
+            r0 @ RegState::ArenaU64FromAlloc {
+                alloc_size: Some(_),
+                ..
+            } => Some(r0),
             _ => None,
         };
         self.regs = [RegState::Unknown; 11];
@@ -1463,9 +1465,7 @@ impl<'a> Analyzer<'a> {
                             if let RegState::Pointer { struct_type_id } = caller_state {
                                 self.regs[reg_idx] = RegState::Pointer { struct_type_id };
                                 self.note_type_id(struct_type_id);
-                            } else if let r @ RegState::ArenaU64FromAlloc { .. } =
-                                caller_state
-                            {
+                            } else if let r @ RegState::ArenaU64FromAlloc { .. } = caller_state {
                                 self.regs[reg_idx] = r;
                             }
                         }
@@ -1536,7 +1536,8 @@ impl<'a> Analyzer<'a> {
             if (class == BPF_CLASS_JMP || class == BPF_CLASS_JMP32)
                 && op != BPF_OP_CALL
                 && op != 0x00 // JA (unconditional)
-                && insn.code != 0x06 // goto32 (unconditional)
+                && insn.code != 0x06
+            // goto32 (unconditional)
             {
                 let target = (pc as i64 + 1 + insn.off as i64) as usize;
                 self.branch_source_regs
@@ -2516,10 +2517,7 @@ impl<'a> Analyzer<'a> {
                         //     create an entry when none existed
                         //     (so the index reflects "this slot
                         //     saw an arena STX, no captured size").
-                        match (
-                            self.arena_alloc_size_index.get(&key).copied(),
-                            alloc_size,
-                        ) {
+                        match (self.arena_alloc_size_index.get(&key).copied(), alloc_size) {
                             (None, _) => {
                                 self.arena_alloc_size_index.insert(key, alloc_size);
                             }
@@ -2871,12 +2869,14 @@ impl<'a> Analyzer<'a> {
                     self.note_type_id(value_struct_id);
                     let captured = match slot {
                         RegState::ArenaU64FromAlloc { alloc_size, .. } => alloc_size,
-                        RegState::LoadedU64Field { source_struct_id, field_offset } => {
-                            self.arena_alloc_size_index
-                                .get(&(source_struct_id, field_offset))
-                                .copied()
-                                .flatten()
-                        }
+                        RegState::LoadedU64Field {
+                            source_struct_id,
+                            field_offset,
+                        } => self
+                            .arena_alloc_size_index
+                            .get(&(source_struct_id, field_offset))
+                            .copied()
+                            .flatten(),
                         _ => None,
                     };
                     if let std::collections::btree_map::Entry::Vacant(e) =
@@ -2886,10 +2886,7 @@ impl<'a> Analyzer<'a> {
                         self.arena_alloc_size_index.insert(key, captured);
                         self.bridge_slot_origins.insert(slot_off, key);
                     } else {
-                        match (
-                            self.arena_alloc_size_index.get(&key).copied(),
-                            captured,
-                        ) {
+                        match (self.arena_alloc_size_index.get(&key).copied(), captured) {
                             (None, _) => {
                                 self.arena_alloc_size_index.insert(key, captured);
                             }
@@ -3713,7 +3710,8 @@ fn struct_member_at(btf: &Btf, parent_type_id: u32, byte_offset: u32) -> Option<
                 };
                 let var_underlying_type_id = var.get_type_id().ok()?;
                 let rel = byte_offset - off;
-                if let Some(terminal) = super::btf_render::peel_modifiers(btf, var_underlying_type_id)
+                if let Some(terminal) =
+                    super::btf_render::peel_modifiers(btf, var_underlying_type_id)
                     && matches!(terminal, Type::Struct(_) | Type::Union(_))
                 {
                     if let Some(inner) = struct_member_at(btf, var_underlying_type_id, rel) {

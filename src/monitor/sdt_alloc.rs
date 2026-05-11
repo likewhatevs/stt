@@ -594,7 +594,9 @@ pub struct PayloadTypeChoice {
 /// surfaced to the operator via [`SdtAllocatorSnapshot::payload_type_reason`]
 /// so the fallback paths are distinguishable without re-running the
 /// heuristic.
-pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize,
+pub fn discover_payload_btf_id(
+    btf: &Btf,
+    payload_size: usize,
     allocator_name: &str,
 ) -> PayloadTypeChoice {
     if payload_size == 0 {
@@ -670,12 +672,11 @@ pub fn discover_payload_btf_id(btf: &Btf, payload_size: usize,
             // → `scx_atq` → match struct named `scx_atq`. This is the
             // highest-specificity signal because scx_static_alloc
             // allocators are conventionally named after their payload type.
-            let name_stem = allocator_name.strip_suffix("_allocator").unwrap_or(allocator_name);
+            let name_stem = allocator_name
+                .strip_suffix("_allocator")
+                .unwrap_or(allocator_name);
             if !name_stem.is_empty() {
-                let stems: &[&str] = &[
-                    name_stem,
-                    name_stem.strip_prefix("scx_").unwrap_or(""),
-                ];
+                let stems: &[&str] = &[name_stem, name_stem.strip_prefix("scx_").unwrap_or("")];
                 for stem in stems {
                     if stem.is_empty() {
                         continue;

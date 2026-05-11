@@ -223,9 +223,8 @@ impl GuestKernel {
         } else {
             resolve_pgtable_l5(&mem, &kern_syms, start_kernel_map, phys_base)
         };
-        let page_offset = resolve_page_offset_with_tcr(
-            &mem, &kern_syms, start_kernel_map, tcr_el1, phys_base,
-        );
+        let page_offset =
+            resolve_page_offset_with_tcr(&mem, &kern_syms, start_kernel_map, tcr_el1, phys_base);
         let aarch64_params = decode_aarch64_params(tcr_el1);
         Ok(Self {
             mem,

@@ -25,8 +25,8 @@ use crate::vmm;
 
 use super::output::{
     classify_init_stage, extract_exit_from_dump_trace, extract_kernel_version,
-    extract_panic_message, extract_sched_ext_dump,
-    format_console_diagnostics, parse_assert_result_from_drain, sched_log_fingerprint,
+    extract_panic_message, extract_sched_ext_dump, format_console_diagnostics,
+    parse_assert_result_from_drain, sched_log_fingerprint,
 };
 use super::probe::attempt_auto_repro;
 use super::profraw::write_profraw;
@@ -1575,26 +1575,27 @@ fn run_ktstr_test_inner_impl(
                         .and_then(|k| k.as_u64())
                 })
         };
-        from_dump.or_else(|| {
-            let scx_exits = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr);
-            scx_exits.last().and_then(|ev| {
-                use crate::monitor::dmesg_scx::ScxExitKind;
-                match ev.kind {
-                    ScxExitKind::Stall => Some(crate::probe::scx_defs::EXIT_ERROR_STALL),
-                    ScxExitKind::Error => Some(crate::probe::scx_defs::EXIT_ERROR),
-                    _ => None,
-                }
+        from_dump
+            .or_else(|| {
+                let scx_exits = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr);
+                scx_exits.last().and_then(|ev| {
+                    use crate::monitor::dmesg_scx::ScxExitKind;
+                    match ev.kind {
+                        ScxExitKind::Stall => Some(crate::probe::scx_defs::EXIT_ERROR_STALL),
+                        ScxExitKind::Error => Some(crate::probe::scx_defs::EXIT_ERROR),
+                        _ => None,
+                    }
+                })
             })
-        })
-        .or_else(|| {
-            extract_exit_from_dump_trace(&result.stderr).and_then(|reason| {
-                if reason.contains("runnable task stall") {
-                    Some(crate::probe::scx_defs::EXIT_ERROR_STALL)
-                } else {
-                    None
-                }
+            .or_else(|| {
+                extract_exit_from_dump_trace(&result.stderr).and_then(|reason| {
+                    if reason.contains("runnable task stall") {
+                        Some(crate::probe::scx_defs::EXIT_ERROR_STALL)
+                    } else {
+                        None
+                    }
+                })
             })
-        })
     };
     let repro_fn = |output: &str| -> Option<String> {
         if !effective_auto_repro {
@@ -1636,7 +1637,10 @@ fn run_ktstr_test_inner_impl(
         active_flags,
         &repro_fn,
     );
-    eprintln!("evaluate_vm_result (includes auto-repro): {:?}", post_vm_t.elapsed());
+    eprintln!(
+        "evaluate_vm_result (includes auto-repro): {:?}",
+        post_vm_t.elapsed()
+    );
     eval_result
 }
 

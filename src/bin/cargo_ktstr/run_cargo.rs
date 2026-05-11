@@ -275,10 +275,16 @@ fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<st
     bpf_object_dirs.sort_by_key(|d| {
         std::cmp::Reverse(
             std::fs::read_dir(d)
-                .map(|r| r.flatten().filter(|e| {
-                    e.file_name().to_str().map_or(false, |n| n.ends_with(".bpf.o"))
-                }).count())
-                .unwrap_or(0)
+                .map(|r| {
+                    r.flatten()
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .map_or(false, |n| n.ends_with(".bpf.o"))
+                        })
+                        .count()
+                })
+                .unwrap_or(0),
         )
     });
     let bpf_object_dir = &bpf_object_dirs[0];
@@ -306,12 +312,7 @@ fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<st
     }
 
     let clang = std::env::var("BPF_CLANG").unwrap_or_else(|_| "clang".to_string());
-    crate::btf_catalog::generate_btf_anchor(
-        bpf_object_dir,
-        &clang,
-        &cflags,
-        &anchor_path,
-    )
+    crate::btf_catalog::generate_btf_anchor(bpf_object_dir, &clang, &cflags, &anchor_path)
 }
 
 fn resolve_target_dir() -> std::path::PathBuf {

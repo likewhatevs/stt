@@ -2541,10 +2541,16 @@ pub(crate) fn monitor_loop(
             };
             let (interval_pa, _timestamp_pa, _jiffies_64_pa) = match wd {
                 WatchdogOverride::ScxSched {
-                    interval_pa, timestamp_pa, jiffies_64_pa, ..
+                    interval_pa,
+                    timestamp_pa,
+                    jiffies_64_pa,
+                    ..
                 }
                 | WatchdogOverride::StaticGlobal {
-                    interval_pa, timestamp_pa, jiffies_64_pa, ..
+                    interval_pa,
+                    timestamp_pa,
+                    jiffies_64_pa,
+                    ..
                 } => (*interval_pa, *timestamp_pa, *jiffies_64_pa),
             };
             if let Some(pa) = write_pa {

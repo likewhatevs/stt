@@ -901,10 +901,9 @@ impl KtstrVm {
         // dump_cpu_time_symbols) and VmRunState (for
         // collect_verifier_stats). Eliminates the 14-28s cold-cache
         // re-read that caused cleanup hangs.
-        let vmlinux_data_shared: Option<Arc<Vec<u8>>> =
-            freeze_coord_vmlinux
-                .as_ref()
-                .and_then(|p| super::vmlinux::cached_vmlinux_bytes(p));
+        let vmlinux_data_shared: Option<Arc<Vec<u8>>> = freeze_coord_vmlinux
+            .as_ref()
+            .and_then(|p| super::vmlinux::cached_vmlinux_bytes(p));
         // Cached `name -> KVA` map for `Op::WatchSnapshot` arming.
         // Build once here at run_vm scope so every TLV-driven
         // WATCH request is an O(1) HashMap lookup instead of a
