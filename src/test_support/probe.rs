@@ -3937,7 +3937,7 @@ mod tests {
         // bytes from an uninitialised UART arrive as U+FFFD after
         // `String::from_utf8_lossy`, never as U+00FF.
         for ch in ['\u{c0}', '\u{e9}', '\u{f1}', '\u{ff}'] {
-            let s: String = std::iter::repeat(ch).take(5).collect();
+            let s: String = std::iter::repeat_n(ch, 5).collect();
             let diag = classify_dmesg_corruption(&s);
             assert!(
                 diag.is_none(),

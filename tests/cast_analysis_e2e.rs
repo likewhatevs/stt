@@ -1435,15 +1435,15 @@ fn scenario_cast_analysis_cross_subprog_arena_chase(
             .unwrap_or("<no-kind>");
         if kind == "ptr" {
             any_arena_chase = true;
-            if let Some(ann) = stashed.get("cast_annotation").and_then(|a| a.as_str()) {
-                if !ann.contains("arena") {
-                    anyhow::bail!(
-                        "stashed_arena_ptr rendered as Ptr but cast_annotation \
-                         does not contain 'arena': got {ann:?}. The cast \
-                         analyzer tagged the field but with the wrong domain. \
-                         stashed: {stashed}"
-                    );
-                }
+            if let Some(ann) = stashed.get("cast_annotation").and_then(|a| a.as_str())
+                && !ann.contains("arena")
+            {
+                anyhow::bail!(
+                    "stashed_arena_ptr rendered as Ptr but cast_annotation \
+                     does not contain 'arena': got {ann:?}. The cast \
+                     analyzer tagged the field but with the wrong domain. \
+                     stashed: {stashed}"
+                );
             }
             break;
         }

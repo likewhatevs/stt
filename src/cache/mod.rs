@@ -68,7 +68,9 @@ pub use crate::kernel_path::KernelId;
 
 // Crate-internal API re-exports for callers in other modules
 // (test_support/model, vmm/disk_template, monitor/btf_offsets).
-pub(crate) use resolve::{path_inside_cache_root, resolve_cache_root_with_suffix, resolve_lock_dir};
+pub(crate) use resolve::{
+    path_inside_cache_root, resolve_cache_root_with_suffix, resolve_lock_dir,
+};
 // Re-exported for rustdoc cross-link resolution (cache/mod.rs:31's
 // `[`strip_vmlinux_debug`]` link). No `crate::cache::strip_vmlinux_debug`
 // code call sites today; intra-cache callers (cache_dir.rs, tests)
