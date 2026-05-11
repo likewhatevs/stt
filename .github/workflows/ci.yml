@@ -29,7 +29,7 @@ jobs:
       - run: just lint
 
   test-x64:
-    runs-on: [self-hosted, X64]
+    runs-on: [ktstr-x64]
     strategy:
       fail-fast: false
       matrix:
@@ -95,7 +95,7 @@ jobs:
           report_type: test_results
 
   coverage-x64:
-    runs-on: [self-hosted, X64]
+    runs-on: [ktstr-x64]
     steps:
       - uses: actions/checkout@v5
       - name: Provision Rust toolchain from rust-toolchain.toml
