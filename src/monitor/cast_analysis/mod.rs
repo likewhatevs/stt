@@ -1463,22 +1463,10 @@ impl<'a> Analyzer<'a> {
                             if let RegState::Pointer { struct_type_id } = caller_state {
                                 self.regs[reg_idx] = RegState::Pointer { struct_type_id };
                                 self.note_type_id(struct_type_id);
-                            } else if let RegState::ArenaU64FromAlloc { alloc_size, .. } =
+                            } else if let r @ RegState::ArenaU64FromAlloc { .. } =
                                 caller_state
                             {
-                                // Cross-function: the caller's source
-                                // slot identity has no meaning in the
-                                // callee's frame, so reseed without
-                                // it. The callee retains the arena
-                                // tag AND the captured alloc_size
-                                // (the size is a property of the
-                                // producing call site that survives
-                                // the call boundary) for downstream
-                                // STX recording.
-                                self.regs[reg_idx] = RegState::ArenaU64FromAlloc {
-                                    source: None,
-                                    alloc_size,
-                                };
+                                self.regs[reg_idx] = r;
                             }
                         }
                     }
@@ -1510,35 +1498,16 @@ impl<'a> Analyzer<'a> {
 
             if insn.code == (BPF_CLASS_JMP | BPF_OP_CALL) && insn.src_reg() == BPF_PSEUDO_CALL {
                 let callee_pc = (pc as i64 + 1 + insn.imm as i64) as usize;
-                // Strip source slot from any ArenaU64FromAlloc before
-                // snapshotting: the slot identity is meaningful only
-                // within the caller's frame and would compare unequal
-                // across passes whenever the caller-side LDX produced
-                // it from disjoint slots, breaking fixpoint
-                // convergence on caller_arg_types. The callee inherits
-                // only the arena tag.
-                // Strip the source slot (in-caller frame identity has
-                // no meaning across the call boundary) but PRESERVE
-                // `alloc_size` — the captured `sizeof` argument is a
-                // property of the producing call site, not the
-                // caller's frame. The callee inherits it so a
-                // downstream STX inside the callee still records the
-                // size for the per-slot finding.
-                let strip = |s: RegState| match s {
-                    RegState::ArenaU64FromAlloc { alloc_size, .. } => {
-                        RegState::ArenaU64FromAlloc {
-                            source: None,
-                            alloc_size,
-                        }
-                    }
-                    other => other,
-                };
+                // Snapshot caller's argument registers for the callee.
+                // ArenaU64FromAlloc state (including source slot and
+                // alloc_size) is preserved across the call boundary —
+                // the callee inherits the full arena context.
                 let new_args = [
-                    strip(self.regs[1]),
-                    strip(self.regs[2]),
-                    strip(self.regs[3]),
-                    strip(self.regs[4]),
-                    strip(self.regs[5]),
+                    self.regs[1],
+                    self.regs[2],
+                    self.regs[3],
+                    self.regs[4],
+                    self.regs[5],
                 ];
                 self.caller_arg_types
                     .entry(callee_pc)

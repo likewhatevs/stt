@@ -121,6 +121,13 @@ siphasher = "1"
 # with an 8-byte needle is O(n) in naive byte compares; memmem uses
 # a two-way algorithm with x86_64 AVX2 / aarch64 Neon when available.
 memchr = "2"
+# C parser for extracting struct definitions from scx BPF source files.
+# Used by cargo-ktstr's BTF type anchor generator to force clang to
+# retain struct types that would otherwise be eliminated by inlining +
+# dead-code elimination. tree-sitter-c parses any C formatting without
+# regex fragility.
+tree-sitter = "0.24"
+tree-sitter-c = "0.23"
 # Human-readable duration parsing for the `--watch <interval>` flag on
 # `ktstr locks`. Accepts "100ms", "1s", "5m", "1h" forms per rev 5 §6.
 # Tiny crate (~2 modules, zero non-std deps).

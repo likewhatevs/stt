@@ -54,6 +54,9 @@ mod stats;
 #[path = "cargo_ktstr/verifier.rs"]
 mod verifier;
 
+#[path = "cargo_ktstr/btf_catalog.rs"]
+mod btf_catalog;
+
 #[cfg(test)]
 #[path = "cargo_ktstr/parse_tests.rs"]
 mod parse_tests;

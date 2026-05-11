@@ -185,6 +185,22 @@ fn run_cargo_sub(
 
     precompute_cast_cache();
 
+    let target_dir_path = resolve_target_dir();
+
+    // BTF type anchor: if a prior build left .bpf.o files, extract
+    // struct definitions from the BPF source tree and generate a
+    // -include header with weak global anchors that force clang to
+    // retain struct types that inlining + DCE would eliminate. The
+    // anchor is cached in target/ktstr_btf_anchor.h. First build
+    // has no anchor (no prior .bpf.o files); second build onward
+    // always uses it. Delete the header to regenerate.
+    if let Some(anchor_path) = generate_btf_anchor(&target_dir_path, release) {
+        let existing = std::env::var("BPF_EXTRA_CFLAGS_PRE_INCL").unwrap_or_default();
+        let inject = format!("-include {} {existing}", anchor_path.display());
+        cmd.env("BPF_EXTRA_CFLAGS_PRE_INCL", inject.trim());
+        eprintln!("cargo ktstr: BTF type anchor at {}", anchor_path.display());
+    }
+
     tracing::debug!("cargo ktstr: running {label}");
     let status = cmd
         .status()
@@ -237,6 +253,84 @@ fn precompute_cast_cache() {
             ktstr::precompute_cast_analysis(&path);
         });
     }
+}
+
+fn generate_btf_anchor(target_dir: &std::path::Path, release: bool) -> Option<std::path::PathBuf> {
+    let anchor_path = target_dir.join("ktstr_btf_anchor.h");
+    let profile = if release { "release" } else { "debug" };
+    let build_root = target_dir.join(profile).join("build");
+
+    let mut bpf_object_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&build_root) {
+        for entry in entries.flatten() {
+            let out = entry.path().join("out");
+            if out.join("bpf.bpf.o").is_file() {
+                bpf_object_dirs.push(out);
+            }
+        }
+    }
+    if bpf_object_dirs.is_empty() {
+        return None;
+    }
+    bpf_object_dirs.sort_by_key(|d| {
+        std::cmp::Reverse(
+            std::fs::read_dir(d)
+                .map(|r| r.flatten().filter(|e| {
+                    e.file_name().to_str().map_or(false, |n| n.ends_with(".bpf.o"))
+                }).count())
+                .unwrap_or(0)
+        )
+    });
+    let bpf_object_dir = &bpf_object_dirs[0];
+
+    // Collect cflags and compute struct set for cache invalidation.
+    let mut cflags: Vec<String> = Vec::new();
+    if let Ok(base) = std::env::var("BPF_BASE_CFLAGS") {
+        cflags.extend(base.split_whitespace().map(String::from));
+    } else {
+        cflags.extend(["-g", "-O2"].iter().map(|s| s.to_string()));
+    }
+    if let Ok(pre) = std::env::var("BPF_EXTRA_CFLAGS_PRE_INCL") {
+        cflags.extend(pre.split_whitespace().map(String::from));
+    }
+    if let Ok(entries) = std::fs::read_dir(&build_root) {
+        for entry in entries.flatten() {
+            let bpf_h = entry.path().join("out/scx_utils-bpf_h");
+            if bpf_h.is_dir() {
+                cflags.push(format!("-I{}", bpf_h.display()));
+            }
+        }
+    }
+    if let Ok(post) = std::env::var("BPF_EXTRA_CFLAGS_POST_INCL") {
+        cflags.extend(post.split_whitespace().map(String::from));
+    }
+
+    let clang = std::env::var("BPF_CLANG").unwrap_or_else(|_| "clang".to_string());
+    crate::btf_catalog::generate_btf_anchor(
+        bpf_object_dir,
+        &clang,
+        &cflags,
+        &anchor_path,
+    )
+}
+
+fn resolve_target_dir() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("CARGO_TARGET_DIR") {
+        return std::path::PathBuf::from(d);
+    }
+    if let Ok(output) = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(dir) = v["target_directory"].as_str() {
+                    return std::path::PathBuf::from(dir);
+                }
+            }
+        }
+    }
+    std::path::PathBuf::from("target")
 }
 
 fn cleanup_shm() {
