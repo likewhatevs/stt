@@ -431,25 +431,8 @@ impl std::fmt::Display for SdtAllocatorSnapshot {
             write!(f, " ({} subtrees skipped)", self.skipped_subtrees)?;
         }
         for entry in &self.entries {
-            let type_label = match &entry.payload {
-                super::btf_render::RenderedValue::Struct { type_name: Some(n), .. } => n.as_str(),
-                _ => "",
-            };
-            write!(f, "\n  ── [{type_label} idx={}", entry.idx)?;
-            if entry.genn != 0 {
-                write!(f, " genn={}", entry.genn)?;
-            }
-            write!(f, " addr={:#x}] ", entry.user_addr)?;
-            let hdr_len = 7 + type_label.len()
-                + 5 + itoa::Buffer::new().format(entry.idx).len()
-                + if entry.genn != 0 { 6 + itoa::Buffer::new().format(entry.genn).len() } else { 0 }
-                + 7 + format!("{:#x}", entry.user_addr).len();
-            let pad = 72usize.saturating_sub(hdr_len);
-            for _ in 0..pad {
-                f.write_str("─")?;
-            }
-            f.write_str("\n  ")?;
-            std::fmt::Display::fmt(&entry.payload, f)?;
+            f.write_str("\n")?;
+            super::btf_render::write_value_at_depth(f, &entry.payload, 2)?;
         }
         Ok(())
     }
