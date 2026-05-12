@@ -2,7 +2,7 @@
 
 use super::ops::{CgroupDef, CpusetSpec, HoldSpec, Op, Setup, Step, execute_steps};
 use super::{CgroupGroup, Ctx, collect_all, spawn_diverse};
-use crate::assert::{self, AssertResult};
+use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 use std::collections::BTreeSet;
@@ -145,7 +145,12 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
     thread::sleep(ctx.duration);
 
     let mut r = AssertResult::pass();
-    r.merge(assert::assert_not_starved(&h_cgroup.stop_and_collect()));
+    {
+        let reports = h_cgroup.stop_and_collect();
+        if ctx.assert.has_worker_checks() {
+            r.merge(ctx.assert.assert_cgroup(&reports, None));
+        }
+    }
     for h in pinned_handles {
         let reports = h.stop_and_collect();
         for w in &reports {
@@ -162,7 +167,9 @@ pub fn custom_cgroup_dsq_contention(ctx: &Ctx) -> Result<AssertResult> {
                 ));
             }
         }
-        r.merge(assert::assert_not_starved(&reports));
+        if ctx.assert.has_worker_checks() {
+            r.merge(ctx.assert.assert_cgroup(&reports, None));
+        }
     }
     Ok(r)
 }
@@ -244,11 +251,9 @@ pub fn custom_cgroup_dynamic_workload_variety(ctx: &Ctx) -> Result<AssertResult>
     let cg3_result: Option<AssertResult> = handles.pop().map(|h| {
         let reports = h.stop_and_collect();
         if ctx.assert.has_worker_checks() {
-            // cg_3 was created via add_cgroup_no_cpuset, so there is
-            // no cpuset/numa narrow to apply.
             ctx.assert.assert_cgroup_with_numa(&reports, None, None)
         } else {
-            assert::assert_not_starved(&reports)
+            AssertResult::pass()
         }
     });
     // Best-effort early teardown: the CgroupGroup guard's Drop
@@ -366,8 +371,13 @@ pub fn custom_cgroup_cpuset_cross_llc_race(ctx: &Ctx) -> Result<AssertResult> {
     }
 
     let mut r = AssertResult::pass();
-    r.merge(assert::assert_not_starved(&h0.stop_and_collect()));
-    r.merge(assert::assert_not_starved(&h1.stop_and_collect()));
+    if ctx.assert.has_worker_checks() {
+        r.merge(ctx.assert.assert_cgroup(&h0.stop_and_collect(), None));
+        r.merge(ctx.assert.assert_cgroup(&h1.stop_and_collect(), None));
+    } else {
+        let _ = h0.stop_and_collect();
+        let _ = h1.stop_and_collect();
+    }
     Ok(r)
 }
 

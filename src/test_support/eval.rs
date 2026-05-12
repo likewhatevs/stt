@@ -3997,7 +3997,9 @@ mod tests {
             periodic_fired: 0,
             periodic_target: 0,
         };
-        let assertions = crate::assert::Assert::default_checks();
+        let assertions = crate::assert::Assert::NO_OVERRIDES
+            .max_imbalance_ratio(4.0)
+            .fail_on_stall(true);
         let msg = format!(
             "{}",
             evaluate_vm_result(
@@ -4444,7 +4446,9 @@ mod tests {
             periodic_fired: 0,
             periodic_target: 0,
         };
-        let assertions = crate::assert::Assert::default_checks();
+        let assertions = crate::assert::Assert::NO_OVERRIDES
+            .max_imbalance_ratio(4.0)
+            .fail_on_stall(true);
         let msg = format!(
             "{}",
             evaluate_vm_result(

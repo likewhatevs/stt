@@ -48,7 +48,7 @@ use anyhow::Result;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
-use crate::assert::{self, AssertResult};
+use crate::assert::AssertResult;
 use crate::topology::TestTopology;
 use crate::workload::*;
 
@@ -1169,7 +1169,7 @@ pub fn setup_cgroups<'a>(
 /// where the optional cpuset is passed through to
 /// [`Assert::assert_cgroup`](crate::assert::Assert::assert_cgroup)
 /// for isolation checks. When `checks` has no worker-level checks,
-/// falls back to [`assert_not_starved`](assert::assert_not_starved).
+/// workers are collected but no assertions run.
 pub(crate) fn collect_handles<'a>(
     handles: impl IntoIterator<Item = (WorkloadHandle, Option<&'a BTreeSet<usize>>)>,
     checks: &crate::assert::Assert,
@@ -1181,8 +1181,6 @@ pub(crate) fn collect_handles<'a>(
         if checks.has_worker_checks() {
             let numa_nodes = cpuset.and_then(|cs| topo.map(|t| t.numa_nodes_for_cpuset(cs)));
             r.merge(checks.assert_cgroup_with_numa(&reports, cpuset, numa_nodes.as_ref()));
-        } else {
-            r.merge(assert::assert_not_starved(&reports));
         }
     }
     r
@@ -1190,10 +1188,8 @@ pub(crate) fn collect_handles<'a>(
 
 /// Stop all workers, collect reports, and run assertion checks.
 ///
-/// Uses `checks` for worker evaluation. When the Assert has no
-/// worker-level checks configured (all fields None), falls back
-/// to `assert_not_starved`. Returns a merged [`AssertResult`]
-/// across all workers.
+/// Uses `checks` for worker evaluation. Returns a merged
+/// [`AssertResult`] across all workers.
 pub fn collect_all(handles: Vec<WorkloadHandle>, checks: &crate::assert::Assert) -> AssertResult {
     collect_handles(handles.into_iter().map(|h| (h, None)), checks, None)
 }
@@ -1253,6 +1249,7 @@ pub fn spawn_diverse(ctx: &Ctx, cgroup_names: &[&str]) -> Result<Vec<WorkloadHan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assert;
 
     #[test]
     fn flag_short_name_roundtrip() {

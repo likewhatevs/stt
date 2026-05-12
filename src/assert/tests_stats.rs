@@ -18,7 +18,16 @@ use super::*;
 /// throughput, benchmarking, monitor, and NUMA blocks.
 #[test]
 fn assert_format_human_field_order_is_stable() {
-    let a = Assert::default_checks();
+    let a = Assert::NO_OVERRIDES
+        .check_not_starved()
+        .check_isolation()
+        .max_gap_ms(2000)
+        .max_spread_pct(15.0)
+        .max_throughput_cv(1.0)
+        .min_work_rate(10.0)
+        .max_p99_wake_latency_ns(1000)
+        .max_keep_last_rate(100.0)
+        .min_page_locality(0.5);
     let out = a.format_human();
     // Sample 6 canonical-order pairs and assert each earlier
     // field precedes each later field in the rendered output.
@@ -75,24 +84,16 @@ fn assert_format_human_no_overrides_renders_all_none() {
     );
 }
 
-/// Fields populated on `Assert::default_checks()` render with
-/// their set values, not `none`. Pins the display of a concrete
-/// numeric value so a regression that accidentally rendered
-/// every field as `none` (e.g. always taking the `None` arm of
-/// the helper) would trip this test.
+/// `default_checks()` is now `NO_OVERRIDES` — all fields render
+/// as `none`.
 #[test]
-fn assert_format_human_default_checks_shows_populated_values() {
+fn assert_format_human_default_checks_shows_all_none() {
     let a = Assert::default_checks();
     let out = a.format_human();
-    // `default_checks` populates at least `not_starved = true`
-    // and several monitor thresholds. Assert at least one
-    // `not_starved: true` row and at least one non-`none` row
-    // appears, without hardcoding specific numeric values
-    // (which could change without breaking the formatter's
-    // contract).
-    assert!(
-        out.contains("not_starved") && out.contains(": true"),
-        "default_checks must populate not_starved = true: {out}",
+    let none_count = out.matches(": none").count();
+    assert_eq!(
+        none_count, 19,
+        "default_checks must render every field as `none`, got {none_count}:\n{out}",
     );
 }
 

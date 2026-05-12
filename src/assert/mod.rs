@@ -1556,10 +1556,11 @@ impl AssertPlan {
 /// acts as an override — `None` means "inherit from parent layer".
 ///
 /// Merge order: `Assert::default_checks()` -> `Scheduler.assert` -> per-test `assert`.
+/// `default_checks()` is `NO_OVERRIDES` — all assertions are opt-in.
 ///
 /// ```
 /// # use ktstr::assert::Assert;
-/// // Start from defaults, override imbalance threshold.
+/// // Scheduler opts into imbalance checking.
 /// let sched_assert = Assert::NO_OVERRIDES.max_imbalance_ratio(5.0);
 ///
 /// // Merge: defaults <- scheduler <- test.
@@ -1567,9 +1568,9 @@ impl AssertPlan {
 ///     .merge(&sched_assert)
 ///     .merge(&Assert::NO_OVERRIDES.max_gap_ms(5000));
 ///
-/// assert_eq!(merged.not_starved, Some(true));   // from default_checks
+/// assert_eq!(merged.not_starved, None);              // not opted in
 /// assert_eq!(merged.max_imbalance_ratio, Some(5.0)); // from sched
-/// assert_eq!(merged.max_gap_ms, Some(5000));    // from test
+/// assert_eq!(merged.max_gap_ms, Some(5000));         // from test
 /// ```
 #[must_use = "builder methods return a new Assert; discard means config is lost"]
 #[derive(Clone, Copy, Debug)]
@@ -1728,17 +1729,7 @@ impl Assert {
 
     /// Identity element for [`Assert::merge`]: every field is `None`,
     /// so neither side of a merge with `NO_OVERRIDES` is altered.
-    ///
-    /// The constant is named `NO_OVERRIDES` rather than `NONE` because
-    /// "none" invites the misreading "no checks"; this value adds no
-    /// overrides but, when used as a per-test or per-scheduler value
-    /// (`entry.assert`, `scheduler.assert`), the runtime merge chain
-    /// `default_checks().merge(&scheduler.assert).merge(&entry.assert)`
-    /// still leaves [`default_checks`](Self::default_checks) intact,
-    /// so `not_starved` and the monitor thresholds keep firing. To
-    /// turn a default check off, override it explicitly with the
-    /// builder method (e.g. `not_starved = Some(false)` via
-    /// struct-update syntax) rather than reaching for `NO_OVERRIDES`.
+    /// Equivalent to [`Self::default_checks`].
     pub const NO_OVERRIDES: Assert = Assert {
         not_starved: None,
         isolation: None,
@@ -1762,39 +1753,13 @@ impl Assert {
     };
 
     /// Baseline of the runtime merge chain
-    /// `default_checks().merge(&scheduler.assert).merge(&entry.assert)`:
-    /// `not_starved` enabled and monitor thresholds populated from
-    /// [`MonitorThresholds::DEFAULT`] (imbalance 4.0, dsq_depth 50,
-    /// stall on, sustained 5, fallback 200.0/s, keep_last 100.0/s).
+    /// `default_checks().merge(&scheduler.assert).merge(&entry.assert)`.
     ///
-    /// Because [`Assert::NO_OVERRIDES`] is the merge identity, scheduler-
-    /// or per-test asserts that leave a default field as `None` inherit
-    /// it. To suppress a default check, override the field explicitly
-    /// (e.g. `not_starved: Some(false)`), not by switching to
-    /// `NO_OVERRIDES`.
+    /// All checks are off by default — tests opt in to the assertions
+    /// they care about via scheduler-level or per-test `Assert`
+    /// overrides.
     pub const fn default_checks() -> Assert {
-        use crate::monitor::MonitorThresholds;
-        Assert {
-            not_starved: Some(true),
-            isolation: None,
-            max_gap_ms: None,
-            max_spread_pct: None,
-            max_throughput_cv: None,
-            min_work_rate: None,
-            max_p99_wake_latency_ns: None,
-            max_wake_latency_cv: None,
-            min_iteration_rate: None,
-            max_migration_ratio: None,
-            max_imbalance_ratio: Some(MonitorThresholds::DEFAULT.max_imbalance_ratio),
-            max_local_dsq_depth: Some(MonitorThresholds::DEFAULT.max_local_dsq_depth),
-            fail_on_stall: Some(MonitorThresholds::DEFAULT.fail_on_stall),
-            sustained_samples: Some(MonitorThresholds::DEFAULT.sustained_samples),
-            max_fallback_rate: Some(MonitorThresholds::DEFAULT.max_fallback_rate),
-            max_keep_last_rate: Some(MonitorThresholds::DEFAULT.max_keep_last_rate),
-            min_page_locality: None,
-            max_cross_node_migration_ratio: None,
-            max_slow_tier_ratio: None,
-        }
+        Self::NO_OVERRIDES
     }
 
     /// Build a fresh [`Verdict`] under this `Assert`'s threshold

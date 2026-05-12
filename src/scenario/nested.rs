@@ -3,7 +3,7 @@
 use super::backdrop::Backdrop;
 use super::ops::{CgroupDef, HoldSpec, Op, Step, execute_scenario, execute_steps};
 use super::{CgroupGroup, Ctx, collect_all, dfl_wl, setup_cgroups};
-use crate::assert::{self, AssertResult};
+use crate::assert::AssertResult;
 use crate::workload::*;
 use anyhow::Result;
 use std::collections::BTreeSet;
@@ -174,8 +174,9 @@ pub fn custom_nested_cgroup_cpuset(ctx: &Ctx) -> Result<AssertResult> {
     thread::sleep(ctx.duration);
     let reports = h.stop_and_collect();
     let mut r = AssertResult::pass();
-    r.merge(assert::assert_not_starved(&reports));
-    r.merge(assert::assert_isolation(&reports, &sub_set));
+    if ctx.assert.has_worker_checks() {
+        r.merge(ctx.assert.assert_cgroup(&reports, Some(&sub_set)));
+    }
     Ok(r)
 }
 
