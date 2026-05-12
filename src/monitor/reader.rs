@@ -2539,7 +2539,7 @@ pub(crate) fn monitor_loop(
                     ..
                 } => (Some(*watchdog_timeout_pa), 0, *jiffies),
             };
-            let (interval_pa, _timestamp_pa, _jiffies_64_pa) = match wd {
+            let (interval_pa, timestamp_pa, jiffies_64_pa) = match wd {
                 WatchdogOverride::ScxSched {
                     interval_pa,
                     timestamp_pa,
@@ -2558,6 +2558,19 @@ pub(crate) fn monitor_loop(
                 if let Some(intv_pa) = interval_pa {
                     let intv = std::cmp::max(wd_jiffies / 2, 1);
                     mem.write_u64(intv_pa, 0, intv);
+                }
+                // Host-side heartbeat: refresh scx_watchdog_timestamp with
+                // current jiffies_64 so scx_tick doesn't fire a spurious
+                // stall during the gap before the kworker re-arms at the
+                // new interval. The kworker was armed at attach time with
+                // the scheduler's original timeout_ms (e.g. 15s for
+                // mitosis's 30s default); writing scx_watchdog_interval
+                // above only takes effect on the kworker's NEXT firing.
+                // Without this, scx_tick sees a 5s threshold but the
+                // timestamp is 15s stale → SCX_EXIT_ERROR_STALL.
+                if let (Some(ts_pa), Some(j64_pa)) = (timestamp_pa, jiffies_64_pa) {
+                    let now = mem.read_u64(j64_pa, 0);
+                    mem.write_u64(ts_pa, 0, now);
                 }
                 if watchdog_observation.is_none() {
                     let observed = mem.read_u64(pa, write_offset);
