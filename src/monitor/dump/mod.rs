@@ -605,6 +605,22 @@ pub const SCHEMA_DEGRADED: &str = "degraded";
 pub const REASON_DEGRADED_RENDEZVOUS_TIMEOUT: &str =
     "vCPU rendezvous timed out before parked acknowledgement";
 
+/// Reason string written into [`DegradedFailureDumpReport::reason`]
+/// when the host kill signal flipped during the vCPU freeze
+/// rendezvous, short-circuiting the wait before every parked
+/// acknowledgement arrived. Distinct from
+/// [`REASON_DEGRADED_RENDEZVOUS_TIMEOUT`] (which fires only when the
+/// 30s deadline expires): a kill-mid-rendezvous typically lands in
+/// the rendezvous loop within milliseconds, so the elapsed_ms in the
+/// dynamic detail (appended at emit time) reads as a small number
+/// and the "timed out" label is internally contradictory. The kill
+/// sources documented in the freeze coordinator's kill-promotion
+/// section are SCHED_EXIT propagation, watchdog hard-deadline expiry,
+/// and panic-hook flips. Wire-format-stable; matches the operator-
+/// grep contract used by every other `REASON_*` constant.
+pub const REASON_DEGRADED_KILL_DURING_RENDEZVOUS: &str =
+    "vCPU rendezvous aborted by external kill before parked acknowledgement";
+
 /// Snapshot tag used when the early-snapshot trigger fires but
 /// `freeze_and_capture(false)` returns `Degraded` (early-half
 /// rendezvous timeout). The freeze coordinator writes the degraded

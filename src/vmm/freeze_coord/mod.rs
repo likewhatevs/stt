@@ -4458,12 +4458,25 @@ impl KtstrVm {
                                         capture_start.elapsed().as_millis() as u64;
                                     let total = expected_parks;
                                     let stuck = total.saturating_sub(parked_count);
+                                    // Distinguish the kill-during-rendezvous
+                                    // case from a true 30s timeout. The
+                                    // Acquire load synchronises-with the
+                                    // kill-setter's Release; if kill flipped
+                                    // during the rendezvous wait (SCHED_EXIT
+                                    // propagation, watchdog hard timeout,
+                                    // panic-hook), the loop's break at
+                                    // freeze_coord_kill check fires here
+                                    // with elapsed_ms typically in single-
+                                    // digit ms, where "timed out" would be
+                                    // contradictory.
+                                    let killed = freeze_coord_kill.load(Ordering::Acquire);
+                                    let reason_prefix = if killed {
+                                        crate::monitor::dump::REASON_DEGRADED_KILL_DURING_RENDEZVOUS
+                                    } else {
+                                        crate::monitor::dump::REASON_DEGRADED_RENDEZVOUS_TIMEOUT
+                                    };
                                     let reason = format!(
-                                        "{}: {}ms; {}/{} vCPUs parked",
-                                        crate::monitor::dump::REASON_DEGRADED_RENDEZVOUS_TIMEOUT,
-                                        elapsed_ms,
-                                        parked_count,
-                                        total,
+                                        "{reason_prefix}: {elapsed_ms}ms; {parked_count}/{total} vCPUs parked",
                                     );
                                     tracing::warn!(
                                         elapsed_ms,
