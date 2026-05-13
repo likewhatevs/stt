@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.max_llcs (Some(2)) is below effective topology llcs (4); every gauntlet preset would reject this test at runtime and the test would never execute. Raise max_llcs to 4 or higher, or lower topology llcs.
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints_max_llcs_paren_wrapped_func.rs:15:19
+   |
+15 |         max_llcs: (Some)(2),
+   |                   ^^^^^^^^^

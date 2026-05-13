@@ -2859,7 +2859,7 @@ fn u64_from_option_some_lit(expr: &syn::Expr) -> Option<u64> {
     let syn::Expr::Call(call) = expr else {
         return None;
     };
-    let syn::Expr::Path(ep) = &*call.func else {
+    let syn::Expr::Path(ep) = unwrap_parens(&call.func) else {
         return None;
     };
     if path_last_segment_ident(&ep.path)? != "Some" {
