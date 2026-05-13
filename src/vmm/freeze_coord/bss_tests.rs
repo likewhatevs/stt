@@ -370,3 +370,39 @@ fn bss_state_label_out_of_bounds() {
 fn bss_state_label_not_resolved() {
     assert_eq!(bss_state_label(BssReadState::NotResolved), "not_resolved");
 }
+
+/// Wildcard-trap anchor: bss_state_label MUST NOT emit "unknown"
+/// for any BssReadState variant. The production match at
+/// mod.rs:188-195 is exhaustive, so a NEW BssReadState variant
+/// fails to compile until it gets an explicit label arm — but a
+/// future refactor that adds a wildcard `_ => "unknown"` arm
+/// would silently land "unknown" in the wire format for the new
+/// variant. The four bss_state_label_<variant> canaries above
+/// pin the existing arms; this canary catches the wildcard-
+/// refactor regression because no variant should ever map to
+/// the "unknown" string. Operator tooling (jq filters,
+/// auto-repro tail renderer) keys off the snake_case labels and
+/// has no behavior defined for "unknown".
+#[test]
+fn bss_state_label_no_wildcard_unknown_fallback() {
+    let variants = [
+        BssReadState::Triggered,
+        BssReadState::NotTriggered,
+        BssReadState::OutOfBounds,
+        BssReadState::NotResolved,
+    ];
+    for v in variants {
+        let label = bss_state_label(v);
+        assert!(
+            !label.is_empty(),
+            "bss_state_label({v:?}) must be non-empty"
+        );
+        assert_ne!(
+            label, "unknown",
+            "bss_state_label({v:?}) must NOT return \"unknown\" — a \
+             wildcard match arm regression would silently land this \
+             in the DegradedFailureDumpReport.bss_latch_state wire \
+             field for any unhandled variant"
+        );
+    }
+}
