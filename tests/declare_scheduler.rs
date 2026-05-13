@@ -8,6 +8,14 @@
 //! live alongside the existing `derive_*` fixtures under
 //! `tests/compile_fail/` and are exercised by the `compile_fail`
 //! integration test target.
+//!
+//! The crate-level `#![deny(missing_docs)]` guard below pins the
+//! `#[allow(missing_docs)]` attribute that `declare_scheduler!`
+//! emits on the generated `pub static` — every macro invocation in
+//! this file is a `pub` item, so a regression that drops the
+//! suppression would refuse to compile here.
+
+#![deny(missing_docs)]
 
 use ktstr::declare_scheduler;
 use ktstr::test_support::{
@@ -90,6 +98,30 @@ fn explicit_empty_kernels_equals_default() {
     assert!(DECLARE_SCHEDULER_EXPLICIT_EMPTY.kernels.is_empty());
 }
 
+// -- missing-docs suppression --
+//
+// With `#![deny(missing_docs)]` at the crate root above, every
+// `pub static` emitted by `declare_scheduler!` is a `pub` item that
+// would trip the lint without the macro-emitted
+// `#[allow(missing_docs)]` attribute. This declaration plus the
+// `allow_missing_docs_attribute_lets_pub_static_compile` test below
+// pin that the attribute is in place; if the macro drops it, this
+// file fails to compile.
+
+declare_scheduler!(DECLARE_SCHEDULER_NO_DOCS, {
+    name = "declare_scheduler_no_docs",
+    binary = "scx_no_docs",
+});
+
+#[test]
+fn allow_missing_docs_attribute_lets_pub_static_compile() {
+    assert_eq!(DECLARE_SCHEDULER_NO_DOCS.name, "declare_scheduler_no_docs");
+    assert!(matches!(
+        DECLARE_SCHEDULER_NO_DOCS.binary,
+        SchedulerSpec::Discover("scx_no_docs")
+    ));
+}
+
 // -- KTSTR_SCHEDULERS registration --
 
 #[test]
@@ -112,6 +144,7 @@ fn slice_contains_every_declared_scheduler() {
     assert!(names.contains(&"declare_scheduler_minimal"));
     assert!(names.contains(&"declare_scheduler_full"));
     assert!(names.contains(&"declare_scheduler_explicit_empty"));
+    assert!(names.contains(&"declare_scheduler_no_docs"));
 }
 
 // -- SchedulerJson roundtrip --

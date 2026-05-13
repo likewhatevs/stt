@@ -1560,13 +1560,34 @@ fn declare_scheduler_inner(
             ),
         ));
     }
-    if matches!(const_name_str.as_str(), "EEVDF" | "KERNEL_DEFAULT") {
-        return Err(syn::Error::new(
-            const_name.span(),
-            format!(
-                "declare_scheduler!: `{const_name_str}` is reserved as a built-in scheduler name; pick a different identifier"
-            ),
-        ));
+    // Reserve the const names that match the built-in `Scheduler::EEVDF`
+    // and `Payload::KERNEL_DEFAULT` baselines so user code cannot shadow
+    // either symbol. Match by exact identifier — the spelling is
+    // case-sensitive in Rust so the lowercase form (e.g. `eevdf`) is
+    // already rejected by the SCREAMING_SNAKE_CASE check above. The
+    // companion string-name reservation (handled on the `name = "..."`
+    // arm below) is case-insensitive because wire names typically
+    // lowercase.
+    match const_name_str.as_str() {
+        "EEVDF" => {
+            return Err(syn::Error::new(
+                const_name.span(),
+                format!(
+                    "declare_scheduler!: const name `{const_name_str}` is reserved \
+                     for the built-in Scheduler::EEVDF baseline; pick a different identifier"
+                ),
+            ));
+        }
+        "KERNEL_DEFAULT" => {
+            return Err(syn::Error::new(
+                const_name.span(),
+                format!(
+                    "declare_scheduler!: const name `{const_name_str}` is reserved \
+                     for the built-in Payload::KERNEL_DEFAULT baseline; pick a different identifier"
+                ),
+            ));
+        }
+        _ => {}
     }
 
     // Parse fields.
@@ -1624,6 +1645,19 @@ fn declare_scheduler_inner(
             }
             "binary" => {
                 let lit = expect_str_lit(&value, &key, "binary")?;
+                // An empty binary name flows into
+                // `SchedulerSpec::Discover("")` and fails confusingly
+                // at runtime inside `build_and_find_binary("")`. Reject
+                // at macro-time so the error surfaces at the call site
+                // — symmetric to the empty-name check below, except
+                // that this one underlines the offending literal via
+                // `new_spanned` so the caret lands on the empty `""`.
+                if lit.is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        "declare_scheduler!: `binary` must be a non-empty string",
+                    ));
+                }
                 sched_binary = Some(lit);
             }
             "topology" => {
@@ -1763,6 +1797,13 @@ fn declare_scheduler_inner(
     let registry_ident = format_ident!("__KTSTR_SCHED_REG_{}", const_name);
 
     let expanded = quote! {
+        // Suppress `missing_docs` on the emitted static so consumer
+        // crates that set `#![deny(missing_docs)]` can still invoke
+        // `declare_scheduler!`. The const name is the user-supplied
+        // identifier and the macro itself is the documented entry
+        // point — requiring a doc comment per declaration would force
+        // boilerplate at every call site.
+        #[allow(missing_docs)]
         pub static #const_name: ::ktstr::test_support::Scheduler = #builder_chain;
 
         #[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_SCHEDULERS)]

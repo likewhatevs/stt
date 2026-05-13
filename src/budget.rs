@@ -619,6 +619,58 @@ mod tests {
         assert_only(gauntlet_f, "GAUNTLET");
     }
 
+    /// One-bit-vs-multi-bit shift overlap guard.
+    ///
+    /// `extract_features_bit_shifts_orthogonal` catches collisions
+    /// between two one-bit shifts but reads multi-bit fields through
+    /// the same `*_SHIFT` constants the writer uses, so a one-bit
+    /// shift that accidentally lands INSIDE a multi-bit field's
+    /// range (e.g. `PERF_MODE_SHIFT = 18` collides with the
+    /// 3-bit DURATION field at `[18..=20]`) would fire on every path
+    /// — making the orthogonality test pass vacuously while the
+    /// feature vector silently drops a coverage axis.
+    ///
+    /// Widths match the bit layout doc at the top of this module and
+    /// the bucket helpers in this file:
+    /// - SCHED 4 bits (1u64 << (hash % 4))
+    /// - CPU_BUCKET 5 bits (cpu_bucket: 1<<0..=1<<4)
+    /// - LLC_BUCKET 5 bits (llc_bucket: 1<<0..=1<<4)
+    /// - DURATION 3 bits (duration_bucket: 1<<0..=1<<2)
+    /// - NAME_HASH 4 bits (1u64 << (hash % 4))
+    /// - NUMA_BUCKET 4 bits (numa_bucket: 1<<0..=1<<3)
+    #[test]
+    fn extract_features_one_bit_shifts_outside_multi_bit_ranges() {
+        // Each (shift_start, shift_end_inclusive, name) entry is a
+        // multi-bit field's bit range. One-bit shifts must NOT fall
+        // inside any of these ranges.
+        let multi_bit_ranges: &[(u32, u32, &str)] = &[
+            (SCHED_SHIFT, SCHED_SHIFT + 3, "SCHED"),
+            (CPU_BUCKET_SHIFT, CPU_BUCKET_SHIFT + 4, "CPU_BUCKET"),
+            (LLC_BUCKET_SHIFT, LLC_BUCKET_SHIFT + 4, "LLC_BUCKET"),
+            (DURATION_SHIFT, DURATION_SHIFT + 2, "DURATION"),
+            (NAME_HASH_SHIFT, NAME_HASH_SHIFT + 3, "NAME_HASH"),
+            (NUMA_BUCKET_SHIFT, NUMA_BUCKET_SHIFT + 3, "NUMA_BUCKET"),
+        ];
+        let one_bit_shifts: &[(u32, &str)] = &[
+            (SMT_SHIFT, "SMT"),
+            (PERF_MODE_SHIFT, "PERF_MODE"),
+            (HOST_ONLY_SHIFT, "HOST_ONLY"),
+            (EXPECT_ERR_SHIFT, "EXPECT_ERR"),
+            (WORKERS_SHIFT, "WORKERS"),
+            (GAUNTLET_SHIFT, "GAUNTLET"),
+        ];
+        for &(shift, name) in one_bit_shifts {
+            for &(start, end, range_name) in multi_bit_ranges {
+                assert!(
+                    shift < start || shift > end,
+                    "{name} shift={shift} falls inside multi-bit field {range_name} \
+                     range [{start}..={end}] — overlap would let {range_name} \
+                     silently set the {name} bit"
+                );
+            }
+        }
+    }
+
     #[test]
     fn estimate_duration_small_topo() {
         let entry = KtstrTestEntry {
