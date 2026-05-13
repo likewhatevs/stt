@@ -1687,16 +1687,19 @@ fn declare_scheduler_inner(
         match key_str.as_str() {
             "name" => {
                 let lit = expect_str_lit(&value, &key, "name")?;
-                // Reject empty and whitespace-only names inline so the
-                // caret lands on the offending literal via new_spanned.
-                // A whitespace-only name (`" "`) passed the previous
-                // post-loop is_empty() check and flowed to runtime
-                // where sidecar lookups would fail confusingly.
-                if lit.trim().is_empty() {
+                // Reject empty, whitespace-only, and invisible-only names
+                // inline so the caret lands on the offending literal via
+                // new_spanned. `str::trim` strips Unicode White_Space but
+                // not Cf-category invisibles (ZWSP, BOM, etc.), so an
+                // operator copy-pasting a string with stray invisible
+                // chars could slip past `trim().is_empty()` and surface
+                // confusingly at runtime sidecar lookup.
+                if is_visibly_empty(&lit) {
                     return Err(syn::Error::new_spanned(
                         &value,
-                        "declare_scheduler!: `name` must be a non-empty \
-                         string (whitespace-only is also rejected)",
+                        "declare_scheduler!: `name` must contain at least \
+                         one visible character (empty, whitespace-only, \
+                         and invisible-only literals are rejected)",
                     ));
                 }
                 // Mirror the const-name reservation above: the string
@@ -1730,29 +1733,37 @@ fn declare_scheduler_inner(
             }
             "binary" => {
                 let lit = expect_str_lit(&value, &key, "binary")?;
-                // Reject empty and whitespace-only binary names. Both
-                // flow into `SchedulerSpec::Discover(...)` and fail
-                // confusingly at runtime inside `build_and_find_binary`.
-                // new_spanned points the caret at the offending literal.
-                if lit.trim().is_empty() {
+                // Reject empty, whitespace-only, and invisible-only
+                // binary names — all flow into `SchedulerSpec::Discover(...)`
+                // and fail confusingly at runtime inside
+                // `build_and_find_binary`. See `is_visibly_empty` for the
+                // invisible-char (ZWSP, BOM, etc.) rejection rationale.
+                if is_visibly_empty(&lit) {
                     return Err(syn::Error::new_spanned(
                         &value,
-                        "declare_scheduler!: `binary` must be a non-empty \
-                         string (whitespace-only is also rejected)",
+                        "declare_scheduler!: `binary` must contain at \
+                         least one visible character (empty, whitespace-\
+                         only, and invisible-only literals are rejected)",
                     ));
                 }
                 sched_binary = Some(lit);
             }
             "binary_path" => {
                 let lit = expect_str_lit(&value, &key, "binary_path")?;
-                // Empty path flows into `SchedulerSpec::Path("")` and
-                // fails confusingly at `resolve_scheduler` (anyhow
-                // ensure on path.exists()). Reject at macro time.
-                if lit.is_empty() {
+                // Reject empty, whitespace-only, and invisible-only
+                // paths via the same `is_visibly_empty` predicate the
+                // `name` and `binary` arms use. Anything else falls
+                // through to the `~`/relative-path checks below; an
+                // invisible-only string would otherwise surface as
+                // "must be absolute" instead of naming the actual
+                // root cause.
+                if is_visibly_empty(&lit) {
                     return Err(syn::Error::new_spanned(
                         &value,
-                        "declare_scheduler!: `binary_path` must be a \
-                         non-empty string",
+                        "declare_scheduler!: `binary_path` must contain \
+                         at least one visible character (empty, \
+                         whitespace-only, and invisible-only literals \
+                         are rejected)",
                     ));
                 }
                 // Tilde expansion does not happen at compile time and
@@ -2377,6 +2388,44 @@ fn expect_array<'a>(
             format!("declare_scheduler!: `{field}` must be an array literal `[..]`"),
         ))
     }
+}
+
+/// Returns true when `s` contains no visible characters — i.e. it is
+/// empty, contains only Unicode `White_Space` (stripped by `str::trim`),
+/// or contains only Cf-category invisibles that `trim` leaves behind.
+///
+/// The Cf carve-out enumerates the realistic copy-paste hazards rather
+/// than relying on a Unicode-category lookup (which would pull in a UCD
+/// crate just for a macro-time check). Covered:
+/// - U+00AD SOFT HYPHEN (browser-wrapped text)
+/// - U+200B ZERO WIDTH SPACE, U+200C ZERO WIDTH NON-JOINER,
+///   U+200D ZERO WIDTH JOINER, U+200E LEFT-TO-RIGHT MARK,
+///   U+200F RIGHT-TO-LEFT MARK
+/// - U+202A-U+202E bidi formatting (LRE, RLE, PDF, LRO, RLO)
+/// - U+2060 WORD JOINER, U+2061-U+2064 math invisibles
+///   (FUNCTION APPLICATION, INVISIBLE TIMES, INVISIBLE SEPARATOR,
+///   INVISIBLE PLUS)
+/// - U+2066-U+2069 bidi isolates (LRI, RLI, FSI, PDI)
+/// - U+FEFF BYTE ORDER MARK / ZWNBSP
+///
+/// Without this carve-out, an operator who pastes a string containing
+/// any of these characters past the bare `trim().is_empty()` check
+/// ships a literal that surfaces as a confusing runtime failure
+/// (sidecar lookup miss / binary not found) instead of an explicit
+/// compile-time rejection.
+fn is_visibly_empty(s: &str) -> bool {
+    s.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\u{00AD}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            )
+    })
 }
 
 /// Validate a single `kernel_builtin_enable` or `kernel_builtin_disable`

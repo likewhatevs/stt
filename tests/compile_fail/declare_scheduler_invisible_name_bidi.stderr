@@ -1,5 +1,5 @@
 error: declare_scheduler!: `name` must contain at least one visible character (empty, whitespace-only, and invisible-only literals are rejected)
- --> tests/compile_fail/declare_scheduler_empty_name.rs:4:12
+ --> tests/compile_fail/declare_scheduler_invisible_name_bidi.rs:8:12
   |
-4 |     name = "",
-  |            ^^
+8 |     name = "\u{202D}\u{2067}",
+  |            ^^^^^^^^^^^^^^^^^^

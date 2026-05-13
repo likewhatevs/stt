@@ -1,4 +1,4 @@
-error: declare_scheduler!: `name` must be a non-empty string (whitespace-only is also rejected)
+error: declare_scheduler!: `name` must contain at least one visible character (empty, whitespace-only, and invisible-only literals are rejected)
  --> tests/compile_fail/declare_scheduler_whitespace_name.rs:8:12
   |
 8 |     name = "   ",

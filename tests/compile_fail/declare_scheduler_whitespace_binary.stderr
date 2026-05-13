@@ -1,4 +1,4 @@
-error: declare_scheduler!: `binary` must be a non-empty string (whitespace-only is also rejected)
+error: declare_scheduler!: `binary` must contain at least one visible character (empty, whitespace-only, and invisible-only literals are rejected)
   --> tests/compile_fail/declare_scheduler_whitespace_binary.rs:10:14
    |
 10 |     binary = "   ",
