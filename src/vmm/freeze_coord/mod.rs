@@ -7166,29 +7166,29 @@ impl KtstrVm {
                                         "freeze-coord: degraded dump (JSON serialization failed)"
                                     ),
                                 }
-                                // NEW-V4-2 symmetry: late Degraded
-                                // doesn't invalidate a Captured early
-                                // either — the early was a runnable-
-                                // age spike observation while the late
-                                // is "rendezvous timed out". Both
-                                // signals matter to an operator. The
-                                // main dump path already holds the
-                                // degraded JSON (atomic-published
-                                // above), so we drop the early to a
-                                // tagged sibling path. The WRITE
-                                // pattern (snapshot_tagged_path +
-                                // std::fs::write) mirrors the
-                                // `LateCaptureOutcome::Degraded` arm
-                                // of the early-snapshot dispatch
-                                // above, but the tag and signal
-                                // differ: early-Degraded means the
-                                // early itself was Degraded; early-
-                                // pre-late-degraded means the early
-                                // was Captured and the LATE was
-                                // Degraded — distinct cases. Per
-                                // `feedback_no_silent_drops`: any
-                                // captured snapshot must reach disk.
-                                // V6-F1 (advphd_qemu) + N7-1 (#70):
+                                // Late Degraded doesn't invalidate a
+                                // Captured early either — the early
+                                // was a runnable-age spike observation
+                                // while the late is "rendezvous timed
+                                // out". Both signals matter to an
+                                // operator. The main dump path already
+                                // holds the degraded JSON (atomic-
+                                // published above), so we drop the
+                                // early to a tagged sibling path. The
+                                // write routes through the shared
+                                // `write_to_tagged_path` helper (atomic
+                                // publish + parent-dir fsync + stderr
+                                // fallback) — same as the
+                                // `LateCaptureOutcome::Degraded` arm of
+                                // the early-snapshot dispatch above.
+                                // The tag and signal differ: early-
+                                // Degraded means the early itself was
+                                // Degraded; early-pre-late-degraded
+                                // means the early was Captured and the
+                                // LATE was Degraded — distinct cases.
+                                // Any captured snapshot must reach
+                                // disk.
+                                //
                                 // base_path check FIRST in the let-
                                 // chain (no take()), and `.take()` only
                                 // AFTER the write succeeds. Two silent-
@@ -7582,10 +7582,11 @@ impl KtstrVm {
                 // failure-dump observation worth surfacing.
                 //
                 // Symmetric with the `LateCaptureOutcome::Suppressed`
-                // late-trigger arm above in WRITE PATTERN ONLY (same
-                // snapshot_tagged_path + std::fs::write boilerplate,
-                // same operator-discoverable tagged sibling
-                // discipline). SIGNAL DIFFERS:
+                // late-trigger arm above in WRITE PATTERN ONLY (both
+                // route through the shared `write_to_tagged_path`
+                // helper for atomic publish + parent-dir fsync +
+                // stderr fallback). Same operator-discoverable tagged
+                // sibling discipline. SIGNAL DIFFERS:
                 //   - late-Suppressed: late trigger DID fire, the
                 //     gate examined `*scx_root->exit_kind` and
                 //     decided clean (kind < SCX_EXIT_ERROR). Tag:
