@@ -45,7 +45,6 @@ fn main() {
     };
 
     let dst = out_dir.join("kernel_path.rs");
-    std::fs::write(&dst, trimmed).unwrap_or_else(|e| {
-        panic!("ktstr-macros build.rs: write {} failed: {e}", dst.display())
-    });
+    std::fs::write(&dst, trimmed)
+        .unwrap_or_else(|e| panic!("ktstr-macros build.rs: write {} failed: {e}", dst.display()));
 }

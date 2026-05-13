@@ -151,13 +151,22 @@ fn kernel_variant_strings_accepted_by_macro() {
     assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels.len(), 6);
     assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[0], "6.14");
     assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[1], "6.14..=6.20");
-    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[2], "/tmp/linux-custom");
-    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[3], "foo/../bar/linux");
+    assert_eq!(
+        DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[2],
+        "/tmp/linux-custom"
+    );
+    assert_eq!(
+        DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[3],
+        "foo/../bar/linux"
+    );
     assert_eq!(
         DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[4],
         "git+https://example.com/linux.git#main"
     );
-    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[5], "my-cache-key-x86-64");
+    assert_eq!(
+        DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[5],
+        "my-cache-key-x86-64"
+    );
 }
 
 // -- assert + config_file_def fields --
@@ -188,7 +197,10 @@ fn assert_field_threads_to_scheduler() {
         DECLARE_SCHEDULER_WITH_ASSERT.assert.max_imbalance_ratio,
         Some(2.5)
     );
-    assert_eq!(DECLARE_SCHEDULER_WITH_ASSERT.assert.fail_on_stall, Some(true));
+    assert_eq!(
+        DECLARE_SCHEDULER_WITH_ASSERT.assert.fail_on_stall,
+        Some(true)
+    );
     assert_eq!(
         DECLARE_SCHEDULER_WITH_ASSERT.assert.sustained_samples,
         Some(15)
@@ -223,14 +235,8 @@ fn assert_accepts_bare_const_path() {
     // no method-chain or call. Validator must accept Expr::Path
     // alongside the MethodCall and Call shapes the other
     // declarations exercise.
-    assert_eq!(
-        DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.not_starved,
-        None
-    );
-    assert_eq!(
-        DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.max_gap_ms,
-        None
-    );
+    assert_eq!(DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.not_starved, None);
+    assert_eq!(DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.max_gap_ms, None);
 }
 
 #[test]
@@ -433,8 +439,7 @@ declare_scheduler!(DECLARE_SCHEDULER_KERNEL_BUILTIN, {
 
 #[test]
 fn kernel_builtin_pair_emits_kernel_builtin_variant() {
-    let SchedulerSpec::KernelBuiltin { enable, disable } =
-        DECLARE_SCHEDULER_KERNEL_BUILTIN.binary
+    let SchedulerSpec::KernelBuiltin { enable, disable } = DECLARE_SCHEDULER_KERNEL_BUILTIN.binary
     else {
         panic!(
             "expected KernelBuiltin, got display_name {}",
@@ -453,7 +458,11 @@ fn kernel_builtin_pair_emits_kernel_builtin_variant() {
         DECLARE_SCHEDULER_KERNEL_BUILTIN.binary.display_name(),
         "kernel",
     );
-    assert!(DECLARE_SCHEDULER_KERNEL_BUILTIN.binary.has_active_scheduling());
+    assert!(
+        DECLARE_SCHEDULER_KERNEL_BUILTIN
+            .binary
+            .has_active_scheduling()
+    );
 }
 
 declare_scheduler!(DECLARE_SCHEDULER_KERNEL_MULTILINE, {

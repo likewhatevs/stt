@@ -1415,6 +1415,23 @@ impl KtstrVm {
         let freeze_coord_cast_map: Arc<crate::vmm::cast_analysis_load::LazyCastMap> =
             self.cast_map.clone();
         let freeze_coord_on_demand_in_flight = on_demand_in_flight.clone();
+        // Snapshot bridge clone for the coord run-loop. The bridge
+        // stores `FailureDumpReport` entries under per-tag keys (TLV
+        // CAPTURE, periodic, user-watchpoint paths). On a Degraded
+        // outcome the bridge entry is flattened to a SCHEMA_SINGLE
+        // placeholder with `is_placeholder=true` so existing in-process
+        // `Snapshot` API consumers don't need to branch on the
+        // dispatcher's 3-arm match; the canonical SCHEMA_DEGRADED form
+        // (with `watchpoint_hit`, `bss_latch_state`, `exit_kind`,
+        // `elapsed_ms` fields) lives in the on-disk failure-dump JSON
+        // written via [`write_to_tagged_path`]. Consumers wanting the
+        // structured trigger-state fields should read the file via
+        // [`crate::monitor::dump::FailureDumpReportAny::from_json`]
+        // rather than the bridge. The early-snapshot Degraded path
+        // writes a tagged sibling via [`write_to_tagged_path`] but
+        // does NOT publish to the bridge — late-trigger arms consume
+        // held early snapshots from a closure-local `early_snapshot`
+        // variable, not the bridge.
         let freeze_coord_snapshot_bridge = snapshot_bridge.clone();
         // Stats-client clone for the periodic-capture path. The
         // periodic-fire branch issues a `stats(&[])` request BEFORE
@@ -4621,6 +4638,37 @@ impl KtstrVm {
                                     // suppression in that case rather
                                     // than overriding on potentially
                                     // recycled bytes.
+                                    //
+                                    // Probe-lifecycle assumption: this
+                                    // defense assumes probe BPF map
+                                    // unload is bracketed by an
+                                    // `OutOfBounds` observation that
+                                    // latches `bss_oob_warn_logged`
+                                    // BEFORE the next gate check fires.
+                                    // Concurrent unload + slab recycle
+                                    // within a single iteration body
+                                    // (probe unloads AND the page is
+                                    // re-allocated AND the gate fires
+                                    // between two `bss_read_state(...)`
+                                    // calls) is unreachable under the
+                                    // current probe lifecycle: the
+                                    // probe runs in the guest kernel
+                                    // and lives for the guest VM's
+                                    // lifetime; the freeze coordinator
+                                    // joins inside `run_vm` BEFORE the
+                                    // guest VM drops (see the
+                                    // watchpoint-invalidation comment
+                                    // near `run.vm` teardown), so the
+                                    // probe's `.bss` page remains
+                                    // valid for the entire coord
+                                    // observation window. Revisit if
+                                    // probe ownership moves to a
+                                    // separate lifecycle (e.g. per-
+                                    // test hot-reload that unloads +
+                                    // reloads the probe mid-VM-run) —
+                                    // that would require the latch
+                                    // to fire per (unload, reload)
+                                    // cycle rather than once per VM.
                                     if matches!(bss_state, BssReadState::Triggered)
                                         && !bss_oob_warn_logged
                                     {
@@ -5146,25 +5194,47 @@ impl KtstrVm {
                     // as last-ditch preservation. stderr is a
                     // separate channel from the filesystem and
                     // typically survives the kinds of failures
-                    // (ENOSPC, EROFS, EACCES) that fail file
-                    // writes. The summary uses the operator-
-                    // friendly stats this closure already receives
-                    // (map_count, vcpu_regs_count, tasks_enriched,
-                    // elapsed_ms, json_bytes) so the structural
-                    // signal survives independently of the 16 KiB
-                    // head truncation that may drop late fields in
-                    // the serde-ordered payload. Per
-                    // `feedback_no_silent_drops`: silent loss of a
-                    // Captured failure-dump on disk-full is the
-                    // exact silent-drop class to prevent.
-                    // ADV V8-1 (cloud_hypervisor) + N9-1 (#75):
-                    // STDERR last-ditch preservation cap shared by
-                    // the 3 stderr-fallback sites (emit_json,
-                    // emit_degraded_json, end-of-coord drain). UTF-
-                    // 8-safe slicing delegated to the module-level
-                    // `utf8_safe_truncate_len` helper above so the
-                    // 3 sites share one implementation rather than
-                    // each carrying an inline copy that could drift.
+                    // (ENOSPC, EROFS, EACCES) that fail file writes.
+                    // The summary uses the operator-friendly stats
+                    // this closure already receives (map_count,
+                    // vcpu_regs_count, tasks_enriched, elapsed_ms,
+                    // json_bytes) so the structural signal survives
+                    // independently of the 16 KiB head truncation
+                    // that may drop late fields in the serde-ordered
+                    // payload. Silent loss of a Captured
+                    // failure-dump on disk-full is the exact
+                    // silent-drop class to prevent.
+                    //
+                    // STDERR last-ditch preservation cap is shared
+                    // by the 3 stderr-fallback sites (emit_json,
+                    // emit_degraded_json, end-of-coord drain).
+                    // UTF-8-safe slicing delegated to the module-
+                    // level `utf8_safe_truncate_len` helper above so
+                    // the 3 sites share one implementation rather
+                    // than each carrying an inline copy that could
+                    // drift.
+                    //
+                    // Why stderr fallback, not Result propagation:
+                    // the freeze coordinator is an autonomous thread —
+                    // its closure has no caller to receive an `Err`
+                    // from a failed emit. Propagating Err to the
+                    // thread join site in `run_vm` would block teardown
+                    // on a serde-/tracing-/FS-failure path the operator
+                    // may want to see immediately, not at join time.
+                    // `tracing::warn!` dispatch can itself fail
+                    // (subscriber disconnected, journald socket closed,
+                    // file-appender out of space) with no visible
+                    // signal when it does. stderr is the OS-mediated
+                    // last channel: writes survive ENOSPC/EROFS on the
+                    // dump filesystem (stderr is typically a separate
+                    // pipe to the test harness), survive subscriber
+                    // teardown (`eprintln!` bypasses the tracing
+                    // pipeline), and surface in the same captured
+                    // stream the harness already monitors for panic
+                    // messages. Per `feedback_no_silent_drops`: the
+                    // dump fires loudly even when the configured sink
+                    // AND the structured log channels are both
+                    // unavailable.
                     const STDERR_DUMP_CAP: usize = 16 * 1024;
                     #[allow(clippy::too_many_arguments)]
                     let emit_json = |json: &str,
@@ -7069,7 +7139,16 @@ impl KtstrVm {
                                     }
                                 }
                                 freeze_state = FreezeState::Done;
-                                tracing::info!(
+                                // warn (not info) — Degraded means the
+                                // trigger fired but capture was lossy
+                                // (rendezvous timeout); the kill that
+                                // follows is forced teardown, not clean
+                                // shutdown. Cf. Captured arm above which
+                                // uses info for the canonical success
+                                // path. Operators monitoring scheduler-
+                                // test runs care about the Degraded
+                                // class — info would bury it.
+                                tracing::warn!(
                                     "freeze-coord: kill triggered after \
                                      degraded dump capture"
                                 );

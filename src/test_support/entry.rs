@@ -609,7 +609,6 @@ impl Scheduler {
     pub const fn has_active_scheduling(&self) -> bool {
         self.binary.has_active_scheduling()
     }
-
 }
 
 /// Registration entry for an `#[ktstr_test]`-annotated function.
@@ -1220,7 +1219,9 @@ pub fn find_scheduler(name: &str) -> Option<&'static Scheduler> {
 /// so the test author can identify the two declarations.
 fn scheduler_index() -> &'static std::collections::HashMap<&'static str, &'static Scheduler> {
     static INDEX: std::sync::LazyLock<std::collections::HashMap<&'static str, &'static Scheduler>> =
-        std::sync::LazyLock::new(|| build_scheduler_index_or_panic(KTSTR_SCHEDULERS.iter().copied()));
+        std::sync::LazyLock::new(|| {
+            build_scheduler_index_or_panic(KTSTR_SCHEDULERS.iter().copied())
+        });
     &INDEX
 }
 

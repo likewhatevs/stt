@@ -44,10 +44,10 @@
 
 use anyhow::Result;
 use ktstr::assert::AssertResult;
+use ktstr::declare_scheduler;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::declare_scheduler;
 #[allow(unused_imports)]
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 

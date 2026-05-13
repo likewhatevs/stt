@@ -1881,8 +1881,10 @@ fn declare_scheduler_inner(
                     if let Err(msg) = parsed.validate() {
                         return Err(syn::Error::new_spanned(
                             elem,
-                            format!("declare_scheduler!: invalid kernel \
-                                     spec `{s}`: {msg}"),
+                            format!(
+                                "declare_scheduler!: invalid kernel \
+                                     spec `{s}`: {msg}"
+                            ),
                         ));
                     }
                     // A literal containing `..` that did not classify
@@ -1894,9 +1896,7 @@ fn declare_scheduler_inner(
                     // identifiers that don't carry `..` separators;
                     // `Path("foo/..bar")` is fine (file paths legally
                     // contain `..`) and already matched the Path arm.
-                    if s.contains("..")
-                        && matches!(parsed, kernel_path::KernelId::CacheKey(_))
-                    {
+                    if s.contains("..") && matches!(parsed, kernel_path::KernelId::CacheKey(_)) {
                         return Err(syn::Error::new_spanned(
                             elem,
                             format!(
@@ -2424,11 +2424,7 @@ fn is_visibly_empty(s: &str) -> bool {
 /// - `echo VALUE > /path` — writes VALUE+newline to /path
 /// - blank line (skipped)
 /// - `#`-prefixed comment (skipped)
-fn validate_kernel_builtin_cmd(
-    elem: &syn::Expr,
-    cmd: &str,
-    slot: &str,
-) -> syn::Result<()> {
+fn validate_kernel_builtin_cmd(elem: &syn::Expr, cmd: &str, slot: &str) -> syn::Result<()> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return Ok(());
@@ -2565,9 +2561,12 @@ fn validate_const_eligible(
         }
         syn::Expr::Lit(_) => Ok(()),
         syn::Expr::MethodCall(mc) => match mode {
-            ConstEligibility::StructLiteralOnly => {
-                Err(field_not_const_error(field_name, accepted_shapes, expr, true))
-            }
+            ConstEligibility::StructLiteralOnly => Err(field_not_const_error(
+                field_name,
+                accepted_shapes,
+                expr,
+                true,
+            )),
             ConstEligibility::AllowConstMethodChains => {
                 recurse(&mc.receiver)?;
                 for arg in &mc.args {
@@ -2584,12 +2583,22 @@ fn validate_const_eligible(
                     }
                     Ok(())
                 } else {
-                    Err(field_not_const_error(field_name, accepted_shapes, expr, true))
+                    Err(field_not_const_error(
+                        field_name,
+                        accepted_shapes,
+                        expr,
+                        true,
+                    ))
                 }
             }
             ConstEligibility::AllowConstMethodChains => {
                 if call_func_is_single_segment_lowercase(&call.func) {
-                    Err(field_not_const_error(field_name, accepted_shapes, expr, true))
+                    Err(field_not_const_error(
+                        field_name,
+                        accepted_shapes,
+                        expr,
+                        true,
+                    ))
                 } else {
                     for arg in &call.args {
                         recurse(arg)?;
@@ -2599,7 +2608,12 @@ fn validate_const_eligible(
             }
         },
         syn::Expr::Block(_) => Err(field_block_not_const_error(field_name, expr)),
-        _ => Err(field_not_const_error(field_name, accepted_shapes, expr, false)),
+        _ => Err(field_not_const_error(
+            field_name,
+            accepted_shapes,
+            expr,
+            false,
+        )),
     }
 }
 
@@ -2713,13 +2727,11 @@ fn field_block_not_const_error(field_name: &str, expr: &syn::Expr) -> syn::Error
 }
 
 /// Field-specific accepted-shapes sentence for `constraints`.
-const CONSTRAINTS_ACCEPTED_SHAPES: &str =
-    "Use a struct literal `TopologyConstraints { ..TopologyConstraints::DEFAULT }` \
+const CONSTRAINTS_ACCEPTED_SHAPES: &str = "Use a struct literal `TopologyConstraints { ..TopologyConstraints::DEFAULT }` \
      or a const path like `TopologyConstraints::DEFAULT`.";
 
 /// Field-specific accepted-shapes sentence for `assert`.
-const ASSERT_ACCEPTED_SHAPES: &str =
-    "Use a const path like `Assert::NO_OVERRIDES`, a const-fn call like \
+const ASSERT_ACCEPTED_SHAPES: &str = "Use a const path like `Assert::NO_OVERRIDES`, a const-fn call like \
      `Assert::default_checks()`, or a chain of const-fn setters like \
      `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`.";
 

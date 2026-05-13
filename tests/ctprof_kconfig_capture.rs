@@ -357,12 +357,7 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
 /// Duration: 3 s — enough wall-clock for the workload to run
 /// to completion + the test process to accumulate enough RSS
 /// before the post-workload capture fires.
-#[ktstr_test(
-    llcs = 1,
-    cores = 2,
-    threads = 1,
-    duration_s = 3
-)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 3)]
 fn ctprof_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription(
     ctx: &Ctx,
 ) -> Result<AssertResult> {

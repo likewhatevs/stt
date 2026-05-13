@@ -803,10 +803,7 @@ fn run_deferred_dispatch(_entry: &KtstrTestEntry, deferred_name: &str) -> Result
 /// kept as a named helper so the `--ktstr-test-fn` + `--ktstr-topo`
 /// dispatch path reads symmetrically with the zero-override
 /// [`run_ktstr_test`] library entry point.
-fn run_ktstr_test_with_topo(
-    entry: &KtstrTestEntry,
-    topo: &TopoOverride,
-) -> Result<AssertResult> {
+fn run_ktstr_test_with_topo(entry: &KtstrTestEntry, topo: &TopoOverride) -> Result<AssertResult> {
     run_ktstr_test_inner(entry, Some(topo))
 }
 
@@ -1160,10 +1157,7 @@ fn list_tests_all(ignored_only: bool) {
                     if suffix.is_empty() {
                         println!("gauntlet/{}/{}: test", entry.name, preset.name);
                     } else {
-                        println!(
-                            "gauntlet/{}/{}/{suffix}: test",
-                            entry.name, preset.name,
-                        );
+                        println!("gauntlet/{}/{}/{suffix}: test", entry.name, preset.name,);
                     }
                 }
             },
@@ -2289,8 +2283,7 @@ mod tests {
             sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
             kernel_dir: PathBuf::from("/a"),
         }];
-        let (stripped, entry) =
-            strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list).unwrap();
+        let (stripped, entry) = strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list).unwrap();
         assert_eq!(stripped, "gauntlet/eevdf/2llc");
         assert!(entry.is_none());
 

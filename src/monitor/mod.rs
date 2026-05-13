@@ -1073,6 +1073,28 @@ pub struct MonitorThresholds {
     /// sample and records every violation in the verdict's `details`,
     /// but returns `passed: true` regardless. When `true`, any
     /// recorded violation also fails the verdict.
+    ///
+    /// Test authors asserting `!verdict.passed` MUST opt into
+    /// enforcement:
+    /// - For inline `MonitorThresholds { ... }` literals: include
+    ///   `enforce: true` before `..Default::default()`.
+    /// - For [`Assert`](crate::assert::Assert) builder chains:
+    ///   terminate with
+    ///   [`.with_monitor_defaults()`](crate::assert::Assert::with_monitor_defaults)
+    ///   which fills unset threshold fields with canonical defaults
+    ///   AND sets the inner `enforce_monitor_thresholds` flag that
+    ///   propagates to this field via
+    ///   [`Assert::monitor_thresholds`](crate::assert::Assert::monitor_thresholds).
+    ///
+    /// Without this opt-in, a test that sets `fail_on_stall: true`
+    /// and asserts `!verdict.passed` will PASS despite the
+    /// violation: the violation is recorded in `details` and the
+    /// verdict's `summary` carries the report-only advisory
+    /// ("monitor flagged N violation(s) (report-only; pass
+    /// `Assert::with_monitor_defaults` to enforce)"), but `passed`
+    /// stays `true`. The advisory is the operator-visible signal
+    /// that flags missing enforcement; the test still passes
+    /// against `!verdict.passed`.
     pub enforce: bool,
 }
 

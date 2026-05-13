@@ -1424,8 +1424,7 @@ impl Dimension {
 /// only test fixtures use this constant directly, so it is gated
 /// behind `#[cfg(test)]`.
 #[cfg(test)]
-pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] =
-    &[Dimension::Topology, Dimension::WorkType];
+pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] = &[Dimension::Topology, Dimension::WorkType];
 
 /// Derive the set of dimensions on which `filter_a` and
 /// `filter_b` differ. These are the SLICING dimensions —

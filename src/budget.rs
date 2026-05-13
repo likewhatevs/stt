@@ -553,8 +553,7 @@ mod tests {
 
         // SMT-only: plain entry, SMT topo. Only SMT bit fires
         // among one-bit flags.
-        let smt_f =
-            extract_features(&KtstrTestEntry::DEFAULT, &smt_topo, false, "smt_test");
+        let smt_f = extract_features(&KtstrTestEntry::DEFAULT, &smt_topo, false, "smt_test");
         assert_only(smt_f, "SMT");
 
         // PERF_MODE-only: performance_mode entry, plain (non-SMT)
@@ -571,8 +570,7 @@ mod tests {
             host_only: true,
             ..KtstrTestEntry::DEFAULT
         };
-        let host_only_f =
-            extract_features(&host_only_entry, &plain_topo, false, "host_test");
+        let host_only_f = extract_features(&host_only_entry, &plain_topo, false, "host_test");
         assert_only(host_only_f, "HOST_ONLY");
 
         // EXPECT_ERR-only: expect_err entry, plain topo.

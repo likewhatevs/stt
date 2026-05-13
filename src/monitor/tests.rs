@@ -502,6 +502,29 @@ fn balanced_sample(elapsed_ms: u64, clock_base: u64) -> MonitorSample {
     }
 }
 
+/// Wire-format pin: `enforce` defaults to `false` (report-only
+/// mode). Tests that want hard pass/fail must explicitly set
+/// `enforce: true` in their `MonitorThresholds` literal OR use the
+/// `Assert` builder's `.with_monitor_defaults()` helper (which sets
+/// `enforce_monitor_thresholds = true`).
+///
+/// Without this canary, a future commit that flips the default back
+/// to `enforce: true` (or any other value) would silently re-enable
+/// enforcement for all tests using `..Default::default()` or
+/// `MonitorThresholds::DEFAULT` — masking real bugs that the
+/// report-only mode is designed to surface as warnings instead of
+/// failures.
+#[test]
+fn enforce_defaults_to_false() {
+    let t = MonitorThresholds::default();
+    assert!(
+        !t.enforce,
+        "enforce must default to false (report-only mode)"
+    );
+    let d = MonitorThresholds::DEFAULT;
+    assert!(!d.enforce, "DEFAULT.enforce must match default()");
+}
+
 #[test]
 fn thresholds_default_values() {
     // Regression guard for `MonitorThresholds::DEFAULT`. Every

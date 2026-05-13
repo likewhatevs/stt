@@ -257,9 +257,9 @@ fn classify_dmesg_corruption(text: &str) -> Option<&'static str> {
 /// Returns `None` when the file is missing (no freeze fired during
 /// repro), unreadable, or fails to parse — the JSON file itself
 /// stays on disk for any downstream consumer that needs the
-/// structured form. Schema-dispatch logic (single vs dual, absent
-/// schema fallback, unknown schema rejection) lives in
-/// `FailureDumpReportAny::from_json`; this helper is just the
+/// structured form. Schema-dispatch logic (single vs dual vs
+/// degraded discriminant; absent or unknown schema rejection) lives
+/// in `FailureDumpReportAny::from_json`; this helper is just the
 /// file-IO + tail-header wrapper.
 fn render_failure_dump_file(path: &std::path::Path) -> Option<String> {
     use crate::monitor::dump::FailureDumpReportAny;
