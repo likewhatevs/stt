@@ -570,15 +570,6 @@ impl Payload {
         }
     }
 
-    /// Scheduler flag declarations. Empty slice for binary-kind
-    /// payloads (binaries have no scheduler flags).
-    pub const fn flags(&self) -> &'static [&'static crate::scenario::flags::FlagDecl] {
-        match self.kind {
-            PayloadKind::Scheduler(s) => s.flags,
-            PayloadKind::Binary(_) => &[],
-        }
-    }
-
     /// Guest sysctls applied before the scheduler starts. Empty slice
     /// for binary-kind payloads.
     pub const fn sysctls(&self) -> &'static [crate::test_support::Sysctl] {
@@ -644,24 +635,6 @@ impl Payload {
         }
     }
 
-    /// Names of all scheduler flags the scheduler-kind payload
-    /// supports. Empty for binary-kind.
-    pub fn supported_flag_names(&self) -> Vec<&'static str> {
-        match self.kind {
-            PayloadKind::Scheduler(s) => s.supported_flag_names(),
-            PayloadKind::Binary(_) => Vec::new(),
-        }
-    }
-
-    /// Extra CLI args associated with a scheduler flag. Always
-    /// `None` for binary-kind.
-    pub fn flag_args(&self, name: &str) -> Option<&'static [&'static str]> {
-        match self.kind {
-            PayloadKind::Scheduler(s) => s.flag_args(name),
-            PayloadKind::Binary(_) => None,
-        }
-    }
-
     /// Default VM topology for this payload. Scheduler-kind payloads
     /// expose the topology declared on the inner `Scheduler` so tests
     /// that inherit from the scheduler slot stay consistent with the
@@ -685,22 +658,6 @@ impl Payload {
         match self.kind {
             PayloadKind::Scheduler(s) => s.constraints,
             PayloadKind::Binary(_) => crate::test_support::TopologyConstraints::DEFAULT,
-        }
-    }
-
-    /// Generate scheduler-flag profiles for gauntlet expansion.
-    /// Forwards to [`Scheduler::generate_profiles`] for scheduler-kind
-    /// payloads; returns a single empty profile for binary-kind (a
-    /// binary has no scheduler flags, and the gauntlet expander still
-    /// wants one profile to run the test under).
-    pub fn generate_profiles(
-        &self,
-        required: &[&'static str],
-        excluded: &[&'static str],
-    ) -> Vec<crate::scenario::FlagProfile> {
-        match self.kind {
-            PayloadKind::Scheduler(s) => s.generate_profiles(required, excluded),
-            PayloadKind::Binary(_) => vec![crate::scenario::FlagProfile { flags: Vec::new() }],
         }
     }
 }
