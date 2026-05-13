@@ -295,6 +295,178 @@ pub(super) fn format_truncation_marker(head_end: usize, total_len: usize) -> Str
     }
 }
 
+/// Atomically write a JSON dump payload to a sibling of `dump_path`
+/// keyed by `tag`, surfacing operator-visible stderr preservation
+/// when the configured sink fails. Used by every on-demand dispatch
+/// site (TLV CAPTURE / periodic / user-watchpoint / early-snapshot
+/// Degraded) so the 7 sites share one atomic-publish + stderr
+/// fallback contract.
+///
+/// Atomic-publish mirrors the [`KtstrVm`]-scope emit_json /
+/// emit_degraded_json cascade in steps 1-4 but DIVERGES from them on
+/// step-4 (parent-fsync) failure handling: this tagged-sibling helper
+/// rolls back the rename and returns `Err`, whereas the canonical-path
+/// closures log the durability gap and return `Ok` per user direction
+/// ("operator-has-the-data" discipline on the operator-facing main
+/// dump). The split is intentional and documented at both call sites
+/// (search "operator-has-the-data discipline" in this file).
+///
+/// 1. Write payload to a sibling `.json.tmp`.
+/// 2. `sync_all()` flushes file data + metadata to disk.
+/// 3. `rename()` atomically swaps `.json.tmp` into the tagged path
+///    (POSIX rename atomicity).
+/// 4. `sync_all()` on the parent-directory fd flushes the rename so a
+///    host crash post-rename does not lose the dump on ext4/xfs/btrfs.
+///    Per CF3 — POSIX rename(2) atomicity is about ordering visible
+///    to other processes, not durability across crashes; directory-
+///    entry durability requires fsync on the parent dir, matching
+///    the pattern database engines (SQLite, RocksDB) use for journal
+///    commits.
+///
+/// On failure (ENOSPC / EROFS / EACCES / EIO) the helper:
+///
+/// - Best-effort removes the leftover `.json.tmp` so a future
+///   operator does not see a stale sibling next to a stale dump.
+/// - If the failure was specifically at the post-rename parent-dir
+///   fsync (rename succeeded but durability could not be verified),
+///   the helper rolls back by removing the tagged file so the
+///   `Err` return remains consistent with "no dump visible to
+///   consumers" — keeping the caller's bridge bookkeeping aligned
+///   with the filesystem. If rollback itself fails, a warn fires
+///   carrying both errors plus the cue
+///   "tagged file may be visible on disk despite Err return —
+///   operator may need to reconcile bridge state with filesystem"
+///   so the operator can spot the rare asymmetric state and
+///   reconcile manually.
+/// - Fires `tracing::warn!` with `warn_msg` plus the atomic-publish
+///   path metadata (`path`, `tmp_path`) and the underlying
+///   `io::Error`.
+/// - Emits the caller-supplied `stderr_summary` line carrying the
+///   structured signals an operator needs for triage (per-site
+///   field set; the closure owns its own field choices since each
+///   site carries different fields — TLV CAPTURE has request_id +
+///   map_count + vcpu_regs_count, periodic has idx, Degraded has
+///   reason, etc.).
+/// - Emits a payload-head line with [`format_truncation_marker`]
+///   appended so the operator sees the structured summary AND a
+///   UTF-8-boundary-safe head of the JSON for forensic context.
+///
+/// Returns:
+/// - `Ok(None)` when `dump_path` is `None` — verifier / shell /
+///   template iteration that never wired a sink, per ADV V11-1's
+///   "no capture requested" case. `stderr_summary` is NOT invoked.
+/// - `Ok(Some(tagged))` on successful publish with the published
+///   path for the caller's bookkeeping.
+/// - `Err(io::Error)` after the stderr fallback has fired. Caller
+///   decides on bridge placeholder / reply status / consume-on-
+///   success bookkeeping — the helper only owns the file write
+///   and the stderr preservation. Today's 10 callers split:
+///   7 on-demand sites (TLV CAPTURE / periodic / user-watchpoint /
+///   early-snapshot Degraded) `let _ =` the Result because the
+///   stderr fallback is their entire recovery contract; the 3
+///   early-preservation sites (early-pre-late-degraded,
+///   early-only-late-suppressed, end-of-coord drain) destructure
+///   `Ok(Some(tagged))` to log a success info trace with the
+///   published path and the early-snapshot bookkeeping (consume
+///   on success, retain for drain retry on failure).
+///
+/// # Concurrency
+///
+/// Single-threaded caller per (dump_path, tag). The freeze
+/// coordinator's run-loop closure invokes the 7 on-demand sites
+/// sequentially, so the assumption holds today. Concurrent
+/// callers with the same tag would race on the `.json.tmp`
+/// sibling — `File::create(tmp_path)` with O_TRUNC would clobber
+/// the in-flight tmp write of the other caller, silently losing
+/// one thread's payload. A future caller dispatched from a
+/// different thread must either uniquify `tmp_path` (e.g. via
+/// `tempfile::NamedTempFile::new_in(parent)`) or serialize on
+/// `tag` before invoking this helper.
+pub(super) fn write_to_tagged_path(
+    dump_path: Option<&std::path::Path>,
+    tag: &str,
+    json: &str,
+    stderr_summary: impl FnOnce() -> String,
+    warn_msg: &'static str,
+) -> std::io::Result<Option<std::path::PathBuf>> {
+    // Same 16 KiB cap as the run_vm-scope `STDERR_DUMP_CAP` and the
+    // drain-scope `DRAIN_STDERR_DUMP_CAP`. Operator-grep stability:
+    // every stderr-fallback site emits a payload head bounded by the
+    // same cap, so an operator-side log parser observing the
+    // `truncated to {N} bytes` marker can pin the upper bound at
+    // 16 KiB across the whole stderr-fallback surface.
+    const ONDEMAND_STDERR_DUMP_CAP: usize = 16 * 1024;
+
+    let Some(base_path) = dump_path else {
+        return Ok(None);
+    };
+
+    let tagged = snapshot_tagged_path(base_path, tag);
+    if let Some(parent) = tagged.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = tagged.with_extension("json.tmp");
+    let write_atomic = || -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp_path, &tagged)?;
+        // After rename succeeds, parent-dir fsync failure means the
+        // file IS visible on disk but its directory entry is not
+        // durable across a host crash. To preserve the contract that
+        // `Err` means "no dump visible to consumers" (so the caller's
+        // bridge bookkeeping stays consistent with the filesystem
+        // state), roll back the rename by removing the tagged file.
+        // Best-effort: if the rollback itself fails, the operator-
+        // visible asymmetric state is logged and the original Err
+        // propagates.
+        if let Some(dir) = tagged.parent()
+            && let Err(parent_fsync_err) = std::fs::File::open(dir).and_then(|d| d.sync_all())
+        {
+            if let Err(rollback_err) = std::fs::remove_file(&tagged) {
+                tracing::warn!(
+                    path = %tagged.display(),
+                    parent_fsync_error = %parent_fsync_err,
+                    rollback_error = %rollback_err,
+                    "freeze-coord: parent-dir fsync failed AND rollback of tagged file also failed; tagged file may be visible on disk despite Err return — operator may need to reconcile bridge state with filesystem"
+                );
+            }
+            return Err(parent_fsync_err);
+        }
+        Ok(())
+    };
+    match write_atomic() {
+        Ok(()) => Ok(Some(tagged)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            tracing::warn!(
+                path = %tagged.display(),
+                tmp_path = %tmp_path.display(),
+                error = %e,
+                "{warn_msg}"
+            );
+            eprintln!("{}", stderr_summary());
+            let head_end = utf8_safe_truncate_len(json, ONDEMAND_STDERR_DUMP_CAP);
+            let truncated_marker = format_truncation_marker(head_end, json.len());
+            // Per-site context (which on-demand path, which retain-tag,
+            // why it fired) lives in the structured summary line above —
+            // the caller supplied it via `stderr_summary`. The payload-
+            // head line stays terse to match the run_vm-scope drain
+            // discipline at end-of-coord; an operator-grep on
+            // "STDERR-PRESERVED payload head" matches every stderr
+            // fallback site uniformly.
+            eprintln!(
+                "freeze-coord: STDERR-PRESERVED payload head{}: {}",
+                truncated_marker,
+                &json[..head_end]
+            );
+            Err(e)
+        }
+    }
+}
+
 /// Outcome of one freeze-and-capture cycle. Replaces the prior
 /// `Option<(FailureDumpReport, Instant)>` return so the late-trigger
 /// dispatch can distinguish three semantically distinct cases instead
@@ -5033,12 +5205,22 @@ impl KtstrVm {
                                 }
                                 // Atomic-publish pattern: write to a sibling
                                 // .tmp file, fsync the file, then rename into
-                                // place. Guarantees a reader of `p` either
-                                // sees the previous file (if any) or the
-                                // complete new dump — never a truncated /
-                                // mid-write JSON file. The fsync on the tmp
-                                // file holds the bytes against a host
-                                // crash between rename() and writeback.
+                                // place, then fsync the parent directory.
+                                // Guarantees a reader of `p` either sees the
+                                // previous file (if any) or the complete new
+                                // dump — never a truncated / mid-write JSON
+                                // file. The fsync on the tmp file holds the
+                                // bytes against a host crash between rename()
+                                // and writeback; the parent-dir fsync (CF3)
+                                // holds the directory-entry update against a
+                                // host crash post-rename so the operator
+                                // post-reboot sees the new file at `p`
+                                // rather than an empty parent. POSIX rename(2)
+                                // atomicity covers ordering visible to other
+                                // processes, NOT durability — directory-entry
+                                // durability requires fsync on the parent dir,
+                                // matching what database engines (SQLite,
+                                // RocksDB) do for journal commits.
                                 let tmp_path = p.with_extension("json.tmp");
                                 let write_atomic = || -> std::io::Result<()> {
                                     use std::io::Write as _;
@@ -5048,6 +5230,35 @@ impl KtstrVm {
                                     f.sync_all()?;
                                     drop(f);
                                     std::fs::rename(&tmp_path, p)?;
+                                    // Canonical-path parent-dir fsync (CF3):
+                                    // best-effort durability. If the parent
+                                    // fsync fails (ENOSPC / EROFS / EIO), do
+                                    // NOT roll back the rename — per user
+                                    // direction, the operator-facing
+                                    // failure-dump.json on disk is more
+                                    // valuable than bridge/FS contract
+                                    // symmetry. The file IS visible (rename
+                                    // succeeded); only the directory-entry
+                                    // durability across a host crash is in
+                                    // doubt. Log the durability gap and
+                                    // continue — operators inspecting the
+                                    // dump dir post-test see the file, with
+                                    // a warn flagging the missed fsync. The
+                                    // tagged-sibling helper write_to_tagged_path
+                                    // takes the opposite stance (it rolls
+                                    // back) because per-trigger sibling
+                                    // dumps don't have the same operator-
+                                    // signal preservation concern.
+                                    if let Some(dir) = p.parent()
+                                        && let Err(parent_fsync_err) =
+                                            std::fs::File::open(dir).and_then(|d| d.sync_all())
+                                    {
+                                        tracing::warn!(
+                                            path = %p.display(),
+                                            parent_fsync_error = %parent_fsync_err,
+                                            "freeze-coord: failure-dump parent-dir fsync failed after rename; file IS visible on disk but directory-entry durability across a host crash is not guaranteed — operator-facing dump preserved per operator-has-the-data discipline"
+                                        );
+                                    }
                                     Ok(())
                                 };
                                 match write_atomic() {
@@ -5167,6 +5378,32 @@ impl KtstrVm {
                                     f.sync_all()?;
                                     drop(f);
                                     std::fs::rename(&tmp_path, p)?;
+                                    // Canonical-path parent-dir fsync (CF3):
+                                    // best-effort durability — symmetric with
+                                    // emit_json above. On parent-fsync failure
+                                    // after a successful rename, do NOT roll
+                                    // back the renamed file: the operator-
+                                    // facing degraded dump on disk is more
+                                    // valuable than bridge/FS contract
+                                    // symmetry. Log the durability gap and
+                                    // continue; operators reading the dump
+                                    // dir post-test see the file with a warn
+                                    // flagging the missed fsync. The tagged-
+                                    // sibling helper write_to_tagged_path
+                                    // takes the opposite stance (rollback)
+                                    // because per-trigger siblings don't
+                                    // carry the same operator-signal
+                                    // preservation concern.
+                                    if let Some(dir) = p.parent()
+                                        && let Err(parent_fsync_err) =
+                                            std::fs::File::open(dir).and_then(|d| d.sync_all())
+                                    {
+                                        tracing::warn!(
+                                            path = %p.display(),
+                                            parent_fsync_error = %parent_fsync_err,
+                                            "freeze-coord: degraded-dump parent-dir fsync failed after rename; file IS visible on disk but directory-entry durability across a host crash is not guaranteed — operator-facing dump preserved per operator-has-the-data discipline"
+                                        );
+                                    }
                                     Ok(())
                                 };
                                 match write_atomic() {
@@ -5338,26 +5575,22 @@ impl KtstrVm {
                                     // the prior `report.clone()` deep
                                     // copy of hundreds-of-KB-scale
                                     // dump data.
-                                    if let Some(ref base_path) =
-                                        freeze_coord_dump_path
-                                    {
-                                        let tagged = snapshot_tagged_path(
-                                            base_path, &tag,
-                                        );
-                                        if let Some(parent) = tagged.parent() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
+                                    if freeze_coord_dump_path.is_some() {
                                         match serde_json::to_string(&report) {
                                             Ok(json) => {
-                                                if let Err(e) =
-                                                    std::fs::write(&tagged, &json)
-                                                {
-                                                    tracing::warn!(
-                                                        path = %tagged.display(),
-                                                        error = %e,
-                                                        "freeze-coord: on-demand dump file write failed"
-                                                    );
-                                                }
+                                                let _ = write_to_tagged_path(
+                                                    freeze_coord_dump_path.as_deref(),
+                                                    &tag,
+                                                    &json,
+                                                    || {
+                                                        format!(
+                                                            "freeze-coord: STDERR-PRESERVED summary (on-demand TLV CAPTURE, write failed): request_id={request_id} tag={tag} map_count={map_count} vcpu_regs_count={vcpu_regs_count} tasks_enriched={tasks_enriched} elapsed_ms={} json_bytes={}",
+                                                            capture_start.elapsed().as_millis() as u64,
+                                                            json.len(),
+                                                        )
+                                                    },
+                                                    "freeze-coord: on-demand TLV CAPTURE dump file write failed",
+                                                );
                                             }
                                             Err(e) => tracing::error!(
                                                 error = %e,
@@ -5401,26 +5634,22 @@ impl KtstrVm {
                                         // diagnostics survive even when
                                         // the bridge entry is a
                                         // legacy-shape placeholder.
-                                        if let Some(ref base_path) =
-                                            freeze_coord_dump_path
-                                        {
-                                            let tagged = snapshot_tagged_path(
-                                                base_path, &tag,
-                                            );
-                                            if let Some(parent) = tagged.parent() {
-                                                let _ = std::fs::create_dir_all(parent);
-                                            }
+                                        if freeze_coord_dump_path.is_some() {
                                             match serde_json::to_string(degraded.as_ref()) {
                                                 Ok(json) => {
-                                                    if let Err(e) =
-                                                        std::fs::write(&tagged, &json)
-                                                    {
-                                                        tracing::warn!(
-                                                            path = %tagged.display(),
-                                                            error = %e,
-                                                            "freeze-coord: on-demand degraded dump file write failed"
-                                                        );
-                                                    }
+                                                    let _ = write_to_tagged_path(
+                                                        freeze_coord_dump_path.as_deref(),
+                                                        &tag,
+                                                        &json,
+                                                        || {
+                                                            format!(
+                                                                "freeze-coord: STDERR-PRESERVED summary (on-demand TLV CAPTURE Degraded, write failed): request_id={request_id} tag={tag} reason={:?} json_bytes={}",
+                                                                degraded.reason,
+                                                                json.len(),
+                                                            )
+                                                        },
+                                                        "freeze-coord: on-demand TLV CAPTURE degraded dump file write failed",
+                                                    );
                                                 }
                                                 Err(e) => tracing::error!(
                                                     error = %e,
@@ -5801,22 +6030,29 @@ impl KtstrVm {
                                     let map_count = report.maps.len();
                                     let vcpu_regs_count = report.vcpu_regs.len();
                                     let tasks_enriched = report.task_enrichments.len();
-                                    if let Some(ref base_path) = freeze_coord_dump_path {
-                                        let tagged =
-                                            snapshot_tagged_path(base_path, &tag);
-                                        if let Some(parent) = tagged.parent() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                        if let Ok(json) =
-                                            serde_json::to_string(&report)
-                                            && let Err(e) =
-                                                std::fs::write(&tagged, &json)
-                                        {
-                                            tracing::warn!(
-                                                path = %tagged.display(),
+                                    if freeze_coord_dump_path.is_some() {
+                                        match serde_json::to_string(&report) {
+                                            Ok(json) => {
+                                                let _ = write_to_tagged_path(
+                                                    freeze_coord_dump_path.as_deref(),
+                                                    &tag,
+                                                    &json,
+                                                    || {
+                                                        format!(
+                                                            "freeze-coord: STDERR-PRESERVED summary (on-demand periodic, write failed): idx={next_periodic_idx} tag={tag} map_count={map_count} vcpu_regs_count={vcpu_regs_count} tasks_enriched={tasks_enriched} elapsed_ms={} json_bytes={}",
+                                                            capture_start.elapsed().as_millis() as u64,
+                                                            json.len(),
+                                                        )
+                                                    },
+                                                    "freeze-coord: on-demand periodic dump file write failed",
+                                                );
+                                            }
+                                            Err(e) => tracing::error!(
                                                 error = %e,
-                                                "freeze-coord: periodic dump file write failed"
-                                            );
+                                                map_count,
+                                                vcpu_regs_count,
+                                                "freeze-coord: on-demand periodic dump (JSON serialization failed)"
+                                            ),
                                         }
                                     }
                                     let elapsed_ms =
@@ -5859,19 +6095,27 @@ impl KtstrVm {
                                         // a temporal-pattern consumer sees
                                         // why the periodic sample is missing
                                         // BPF data.
-                                        if let Some(ref base_path) = freeze_coord_dump_path {
-                                            let tagged = snapshot_tagged_path(base_path, &tag);
-                                            if let Some(parent) = tagged.parent() {
-                                                let _ = std::fs::create_dir_all(parent);
-                                            }
-                                            if let Ok(json) = serde_json::to_string(degraded.as_ref())
-                                                && let Err(e) = std::fs::write(&tagged, &json)
-                                            {
-                                                tracing::warn!(
-                                                    path = %tagged.display(),
+                                        if freeze_coord_dump_path.is_some() {
+                                            match serde_json::to_string(degraded.as_ref()) {
+                                                Ok(json) => {
+                                                    let _ = write_to_tagged_path(
+                                                        freeze_coord_dump_path.as_deref(),
+                                                        &tag,
+                                                        &json,
+                                                        || {
+                                                            format!(
+                                                                "freeze-coord: STDERR-PRESERVED summary (on-demand periodic Degraded, write failed): idx={next_periodic_idx} tag={tag} reason={:?} json_bytes={}",
+                                                                degraded.reason,
+                                                                json.len(),
+                                                            )
+                                                        },
+                                                        "freeze-coord: on-demand periodic degraded dump file write failed",
+                                                    );
+                                                }
+                                                Err(e) => tracing::error!(
                                                     error = %e,
-                                                    "freeze-coord: periodic degraded dump file write failed"
-                                                );
+                                                    "freeze-coord: on-demand periodic degraded dump (JSON serialization failed)"
+                                                ),
                                             }
                                         }
                                         tracing::warn!(
@@ -6043,22 +6287,28 @@ impl KtstrVm {
                             // serialize-then-store ordering and the
                             // `to_string` vs `to_string_pretty`
                             // tradeoff.
-                            if let Some(ref base_path) = freeze_coord_dump_path
-                            {
-                                let tagged =
-                                    snapshot_tagged_path(base_path, &tag);
-                                if let Some(parent) = tagged.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                if let Ok(json) =
-                                    serde_json::to_string(&report)
-                                    && let Err(e) = std::fs::write(&tagged, &json)
-                                {
-                                    tracing::warn!(
-                                        path = %tagged.display(),
+                            if freeze_coord_dump_path.is_some() {
+                                match serde_json::to_string(&report) {
+                                    Ok(json) => {
+                                        let _ = write_to_tagged_path(
+                                            freeze_coord_dump_path.as_deref(),
+                                            &tag,
+                                            &json,
+                                            || {
+                                                format!(
+                                                    "freeze-coord: STDERR-PRESERVED summary (on-demand user-watchpoint, write failed): slot_idx={slot_idx} tag={tag} map_count={map_count} elapsed_ms={} json_bytes={}",
+                                                    capture_start.elapsed().as_millis() as u64,
+                                                    json.len(),
+                                                )
+                                            },
+                                            "freeze-coord: on-demand user-watchpoint dump file write failed",
+                                        );
+                                    }
+                                    Err(e) => tracing::error!(
                                         error = %e,
-                                        "freeze-coord: user-watchpoint dump file write failed"
-                                    );
+                                        map_count,
+                                        "freeze-coord: on-demand user-watchpoint dump (JSON serialization failed)"
+                                    ),
                                 }
                             }
                             let elapsed_ms =
@@ -6084,19 +6334,27 @@ impl KtstrVm {
                                 // `Op::WatchSnapshot` reads a
                                 // structured entry from the bridge
                                 // instead of silently missing data.
-                                if let Some(ref base_path) = freeze_coord_dump_path {
-                                    let tagged = snapshot_tagged_path(base_path, &tag);
-                                    if let Some(parent) = tagged.parent() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                    if let Ok(json) = serde_json::to_string(degraded.as_ref())
-                                        && let Err(e) = std::fs::write(&tagged, &json)
-                                    {
-                                        tracing::warn!(
-                                            path = %tagged.display(),
+                                if freeze_coord_dump_path.is_some() {
+                                    match serde_json::to_string(degraded.as_ref()) {
+                                        Ok(json) => {
+                                            let _ = write_to_tagged_path(
+                                                freeze_coord_dump_path.as_deref(),
+                                                &tag,
+                                                &json,
+                                                || {
+                                                    format!(
+                                                        "freeze-coord: STDERR-PRESERVED summary (on-demand user-watchpoint Degraded, write failed): slot_idx={slot_idx} tag={tag} reason={:?} json_bytes={}",
+                                                        degraded.reason,
+                                                        json.len(),
+                                                    )
+                                                },
+                                                "freeze-coord: on-demand user-watchpoint degraded dump file write failed",
+                                            );
+                                        }
+                                        Err(e) => tracing::error!(
                                             error = %e,
-                                            "freeze-coord: user-watchpoint degraded dump file write failed"
-                                        );
+                                            "freeze-coord: on-demand user-watchpoint degraded dump (JSON serialization failed)"
+                                        ),
                                     }
                                 }
                                 tracing::warn!(
@@ -6274,24 +6532,28 @@ impl KtstrVm {
                                     early_snapshot = Some(report);
                                 }
                                 LateCaptureOutcome::Degraded(degraded) => {
-                                    if let Some(ref base_path) = freeze_coord_dump_path {
-                                        let tagged = snapshot_tagged_path(
-                                            base_path,
-                                            crate::monitor::dump::SNAPSHOT_TAG_EARLY_DEGRADED,
-                                        );
-                                        if let Some(parent) = tagged.parent() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                        if let Ok(json) =
-                                            serde_json::to_string(degraded.as_ref())
-                                            && let Err(e) =
-                                                std::fs::write(&tagged, &json)
-                                        {
-                                            tracing::warn!(
-                                                path = %tagged.display(),
+                                    if freeze_coord_dump_path.is_some() {
+                                        match serde_json::to_string(degraded.as_ref()) {
+                                            Ok(json) => {
+                                                let _ = write_to_tagged_path(
+                                                    freeze_coord_dump_path.as_deref(),
+                                                    crate::monitor::dump::SNAPSHOT_TAG_EARLY_DEGRADED,
+                                                    &json,
+                                                    || {
+                                                        format!(
+                                                            "freeze-coord: STDERR-PRESERVED summary (on-demand early-snapshot Degraded, write failed): tag={} reason={:?} json_bytes={}",
+                                                            crate::monitor::dump::SNAPSHOT_TAG_EARLY_DEGRADED,
+                                                            degraded.reason,
+                                                            json.len(),
+                                                        )
+                                                    },
+                                                    "freeze-coord: on-demand early-snapshot degraded dump file write failed",
+                                                );
+                                            }
+                                            Err(e) => tracing::error!(
                                                 error = %e,
-                                                "freeze-coord: early-snapshot degraded dump file write failed"
-                                            );
+                                                "freeze-coord: on-demand early-snapshot degraded dump (JSON serialization failed)"
+                                            ),
                                         }
                                     }
                                     tracing::warn!(
@@ -6720,72 +6982,60 @@ impl KtstrVm {
                                 // captured snapshot must reach disk.
                                 // V6-F1 (advphd_qemu) + N7-1 (#70):
                                 // base_path check FIRST in the let-
-                                // chain (no take()), and `.take()`
-                                // only AFTER the write succeeds. Two
-                                // silent-drop windows closed:
-                                //   (V6-F1) Rust let-chain short-
-                                //     circuits left-to-right; an
-                                //     early take() before the
-                                //     dump_path check would consume
-                                //     the snapshot and skip the body
-                                //     when dump_path is None.
-                                //   (N7-1) std::fs::write can fail
-                                //     mid-call (ENOSPC / EROFS /
-                                //     EACCES). If we'd already
-                                //     consumed `early` via .take(),
-                                //     the failed write would drop the
-                                //     snapshot with only a
-                                //     tracing::warn! breadcrumb.
+                                // chain (no take()), and `.take()` only
+                                // AFTER the write succeeds. Two silent-
+                                // drop windows closed:
+                                //   - Rust let-chain short-circuits
+                                //     left-to-right; an early take()
+                                //     before the dump_path check would
+                                //     consume the snapshot and skip
+                                //     the body when dump_path is None.
+                                //   - std::fs::write can fail mid-call
+                                //     (ENOSPC / EROFS / EACCES). If
+                                //     we'd already consumed `early`
+                                //     via .take(), the failed write
+                                //     would drop the snapshot with
+                                //     only a tracing::warn! breadcrumb.
                                 //     Holding the snapshot in
-                                //     `early_snapshot` until the
-                                //     write returns Ok preserves a
-                                //     retry path via the end-of-
-                                //     coord drain below (different
-                                //     tag, but a wrong-tag emit
-                                //     beats a silent drop per
-                                //     `feedback_no_silent_drops`).
+                                //     `early_snapshot` until the write
+                                //     returns Ok preserves a retry
+                                //     path via the end-of-coord drain
+                                //     below (different tag, but a
+                                //     wrong-tag emit beats a silent
+                                //     drop).
                                 if freeze_coord_dual_snapshot
-                                    && let Some(ref base_path) =
-                                        freeze_coord_dump_path
+                                    && freeze_coord_dump_path.is_some()
                                     && let Some(early) =
                                         early_snapshot.as_ref()
                                 {
-                                    let tagged = snapshot_tagged_path(
-                                        base_path,
-                                        crate::monitor::dump::SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
-                                    );
-                                    if let Some(parent) = tagged.parent() {
-                                        // Best-effort mkdir: the
-                                        // parent already exists in
-                                        // the normal case (the main
-                                        // dump path was already
-                                        // created when
-                                        // emit_degraded_json ran
-                                        // above). Any failure here
-                                        // (EACCES, ENOSPC) re-
-                                        // surfaces with a useful
-                                        // path-bearing error from
-                                        // the std::fs::write below.
-                                        let _ =
-                                            std::fs::create_dir_all(parent);
-                                    }
                                     let write_succeeded = match serde_json::to_string(early) {
-                                        Ok(json) => match std::fs::write(&tagged, &json) {
-                                            Ok(()) => {
+                                        Ok(json) => match write_to_tagged_path(
+                                            freeze_coord_dump_path.as_deref(),
+                                            crate::monitor::dump::SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+                                            &json,
+                                            || {
+                                                let vcpu_none = vcpu_none_indices(&early.vcpu_regs);
+                                                format!(
+                                                    "freeze-coord: STDERR-PRESERVED summary (early-pre-late-degraded, write failed): schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
+                                                    early.schema,
+                                                    early.vcpu_regs.len(),
+                                                    vcpu_none,
+                                                    early.maps.len(),
+                                                    early.task_enrichments.len(),
+                                                    json.len(),
+                                                )
+                                            },
+                                            "freeze-coord: early-snapshot pre-late-degraded write failed (early retained for end-of-coord drain retry)",
+                                        ) {
+                                            Ok(Some(tagged)) => {
                                                 tracing::info!(
                                                     path = %tagged.display(),
                                                     "freeze-coord: early snapshot preserved alongside degraded late"
                                                 );
                                                 true
                                             }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    path = %tagged.display(),
-                                                    error = %e,
-                                                    "freeze-coord: early-snapshot pre-late-degraded write failed (early retained for end-of-coord drain retry)"
-                                                );
-                                                false
-                                            }
+                                            Ok(None) => false,
+                                            Err(_) => false,
                                         },
                                         Err(e) => {
                                             tracing::error!(
@@ -6902,45 +7152,38 @@ impl KtstrVm {
                                 // full silent-drop rationale (same
                                 // pattern applies here).
                                 if freeze_coord_dual_snapshot
-                                    && let Some(ref base_path) =
-                                        freeze_coord_dump_path
+                                    && freeze_coord_dump_path.is_some()
                                     && let Some(early) =
                                         early_snapshot.as_ref()
                                 {
-                                    let tagged = snapshot_tagged_path(
-                                        base_path,
-                                        crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
-                                    );
-                                    if let Some(parent) = tagged.parent() {
-                                        // Best-effort mkdir:
-                                        // structurally identical to
-                                        // the same call in the
-                                        // Degraded arm above and the
-                                        // end-of-coord drain below.
-                                        // Failure here re-surfaces
-                                        // with a useful path-bearing
-                                        // error from std::fs::write
-                                        // below.
-                                        let _ =
-                                            std::fs::create_dir_all(parent);
-                                    }
                                     let write_succeeded = match serde_json::to_string(early) {
-                                        Ok(json) => match std::fs::write(&tagged, &json) {
-                                            Ok(()) => {
+                                        Ok(json) => match write_to_tagged_path(
+                                            freeze_coord_dump_path.as_deref(),
+                                            crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+                                            &json,
+                                            || {
+                                                let vcpu_none = vcpu_none_indices(&early.vcpu_regs);
+                                                format!(
+                                                    "freeze-coord: STDERR-PRESERVED summary (early-only-late-suppressed, write failed): schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
+                                                    early.schema,
+                                                    early.vcpu_regs.len(),
+                                                    vcpu_none,
+                                                    early.maps.len(),
+                                                    early.task_enrichments.len(),
+                                                    json.len(),
+                                                )
+                                            },
+                                            "freeze-coord: early-only (late suppressed) write failed (early retained for end-of-coord drain retry)",
+                                        ) {
+                                            Ok(Some(tagged)) => {
                                                 tracing::info!(
                                                     path = %tagged.display(),
                                                     "freeze-coord: early snapshot preserved (late suppressed, clean exit)"
                                                 );
                                                 true
                                             }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    path = %tagged.display(),
-                                                    error = %e,
-                                                    "freeze-coord: early-only (late suppressed) write failed (early retained for end-of-coord drain retry)"
-                                                );
-                                                false
-                                            }
+                                            Ok(None) => false,
+                                            Err(_) => false,
                                         },
                                         Err(e) => {
                                             tracing::error!(
@@ -7143,7 +7386,7 @@ impl KtstrVm {
                 // silent-drop rationale as the Degraded + Suppressed
                 // arms above.
                 if freeze_coord_dual_snapshot
-                    && let Some(ref base_path) = freeze_coord_dump_path
+                    && freeze_coord_dump_path.is_some()
                     && let Some(early) = early_snapshot.take()
                 {
                     // N7-1 (#70) note: this drain is the TERMINAL
@@ -7182,74 +7425,42 @@ impl KtstrVm {
                     let drain_tag = early_retain_tag.unwrap_or(
                         crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
                     );
-                    let tagged = snapshot_tagged_path(base_path, drain_tag);
-                    if let Some(parent) = tagged.parent() {
-                        // Best-effort mkdir: if the directory
-                        // already exists (normal case) this is a
-                        // no-op. If it fails, the std::fs::write
-                        // below will surface a more useful error.
-                        let _ = std::fs::create_dir_all(parent);
-                    }
                     match serde_json::to_string(&early) {
                         Ok(json) => {
-                            if let Err(e) = std::fs::write(&tagged, &json) {
-                                tracing::warn!(
-                                    path = %tagged.display(),
-                                    error = %e,
-                                    "freeze-coord: early-only (coord exit drain) write failed; emitting structured summary + payload head to stderr as last-ditch preservation"
-                                );
-                                // N8-1 (#71): structured summary
-                                // line — schema discriminant, vcpu
-                                // count + which are None, map
-                                // count. Always emitted regardless
-                                // of payload size so the most
-                                // operator-critical signals (which
-                                // vCPUs stalled, did the schema
-                                // round-trip) reach stderr even
-                                // when the JSON head truncation
-                                // drops vcpu_regs.
-                                let vcpu_none_indices = vcpu_none_indices(&early.vcpu_regs);
-                                eprintln!(
-                                    "freeze-coord: STDERR-PRESERVED summary: schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
-                                    early.schema,
-                                    early.vcpu_regs.len(),
-                                    vcpu_none_indices,
-                                    early.maps.len(),
-                                    early.task_enrichments.len(),
-                                    json.len(),
-                                );
-                                // Truncate at 16 KiB to avoid
-                                // flooding the operator's terminal
-                                // with a multi-MB structured dump.
-                                // The summary above preserves the
-                                // critical signals even if the
-                                // head doesn't reach vcpu_regs.
-                                // ADV V8-1 (cloud_hypervisor) + N9-1
-                                // (#75): UTF-8-safe slicing delegated
-                                // to `utf8_safe_truncate_len` (see
-                                // module helper above) — the same
-                                // function used by the emit_json /
-                                // emit_degraded_json stderr fallbacks
-                                // earlier in run_vm. Single source of
-                                // truth for the algorithm + cap value.
-                                const DRAIN_STDERR_DUMP_CAP: usize = 16 * 1024;
-                                let head_end = utf8_safe_truncate_len(
-                                    &json,
-                                    DRAIN_STDERR_DUMP_CAP,
-                                );
-                                let truncated_marker =
-                                    format_truncation_marker(head_end, json.len());
-                                eprintln!(
-                                    "freeze-coord: STDERR-PRESERVED payload head{}: {}",
-                                    truncated_marker,
-                                    &json[..head_end]
-                                );
-                            } else {
-                                tracing::info!(
-                                    path = %tagged.display(),
-                                    retain_tag_used = early_retain_tag.is_some(),
-                                    "freeze-coord: early snapshot preserved at coord exit"
-                                );
+                            // Routed through write_to_tagged_path so the
+                            // drain reuses the atomic-publish + parent-
+                            // dir fsync + stderr-fallback contract the
+                            // on-demand sites also use. Pre-A2 this
+                            // drain used non-atomic std::fs::write;
+                            // A2 v2 closes the asymmetric crash-safety
+                            // surface across all tagged-dump paths.
+                            match write_to_tagged_path(
+                                freeze_coord_dump_path.as_deref(),
+                                drain_tag,
+                                &json,
+                                || {
+                                    let vcpu_none = vcpu_none_indices(&early.vcpu_regs);
+                                    format!(
+                                        "freeze-coord: STDERR-PRESERVED summary: schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
+                                        early.schema,
+                                        early.vcpu_regs.len(),
+                                        vcpu_none,
+                                        early.maps.len(),
+                                        early.task_enrichments.len(),
+                                        json.len(),
+                                    )
+                                },
+                                "freeze-coord: early-only (coord exit drain) write failed; emitting structured summary + payload head to stderr as last-ditch preservation",
+                            ) {
+                                Ok(Some(tagged)) => {
+                                    tracing::info!(
+                                        path = %tagged.display(),
+                                        retain_tag_used = early_retain_tag.is_some(),
+                                        "freeze-coord: early snapshot preserved at coord exit"
+                                    );
+                                }
+                                Ok(None) => {}
+                                Err(_) => {}
                             }
                         }
                         Err(e) => tracing::error!(
@@ -10189,7 +10400,10 @@ mod format_path_part_tests {
     /// summary.
     #[test]
     fn success_renders_path_arrow() {
-        assert_eq!(format_path_part(Some("/tmp/dump.json"), false), " -> /tmp/dump.json");
+        assert_eq!(
+            format_path_part(Some("/tmp/dump.json"), false),
+            " -> /tmp/dump.json"
+        );
     }
 
     /// Sink configured but atomic write failed (ENOSPC / EROFS /
@@ -10273,5 +10487,112 @@ mod format_truncation_marker_tests {
     #[test]
     fn defensive_head_above_total_returns_empty() {
         assert_eq!(format_truncation_marker(200, 100), "");
+    }
+}
+
+#[cfg(test)]
+mod write_to_tagged_path_tests {
+    //! Unit coverage for [`write_to_tagged_path`] — the on-demand
+    //! dispatch sites' atomic-publish helper. When an operator wires
+    //! `failure_dump_path`, the on-demand snapshot dispatch sites
+    //! (TLV CAPTURE / periodic / user-watchpoint / early-snapshot
+    //! Degraded) must surface visible signal regardless of whether
+    //! the FS write succeeds — same contract emit_json + the drain
+    //! enforce. Coverage here pins the no-sink, success, and
+    //! write-failure branches.
+    use super::write_to_tagged_path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// `dump_path: None` — verifier / shell / template iteration.
+    /// Helper returns `Ok(None)` without touching the stderr_summary
+    /// closure. Pins the "no capture requested" silent-skip
+    /// invariant — this case is NOT a silent drop because no capture
+    /// was ever requested.
+    #[test]
+    fn no_sink_returns_ok_none_without_invoking_stderr_summary() {
+        let summary_called = AtomicBool::new(false);
+        let result = write_to_tagged_path(
+            None,
+            "test_tag",
+            "{\"k\":\"v\"}",
+            || {
+                summary_called.store(true, Ordering::Relaxed);
+                String::from("test summary")
+            },
+            "test warn msg",
+        );
+        assert!(matches!(result, Ok(None)));
+        assert!(
+            !summary_called.load(Ordering::Relaxed),
+            "stderr_summary closure must NOT fire on no-sink path"
+        );
+    }
+
+    /// Happy path — sink wired, payload written atomically.
+    /// Returns `Ok(Some(tagged))`, file content matches the JSON
+    /// byte-for-byte, the stderr_summary closure is NOT invoked
+    /// (no fallback needed). Tagged path matches
+    /// `snapshot_tagged_path`'s output — the helper does not invent
+    /// its own naming scheme, so the on-demand sites' tag layout
+    /// stays consistent with what the existing late-trigger path
+    /// produces.
+    #[test]
+    fn successful_write_publishes_tagged_path_with_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("dump.failure-dump.json");
+        let payload = "{\"schema\":\"single\",\"k\":\"v\"}";
+        let summary_called = AtomicBool::new(false);
+        let result = write_to_tagged_path(
+            Some(&base),
+            "ondemand_test",
+            payload,
+            || {
+                summary_called.store(true, Ordering::Relaxed);
+                String::from("test summary")
+            },
+            "test warn msg",
+        );
+        let tagged = result.expect("write succeeds").expect("path returned");
+        assert!(
+            !summary_called.load(Ordering::Relaxed),
+            "stderr_summary must NOT fire on successful write"
+        );
+        let written = std::fs::read_to_string(&tagged).expect("read tagged");
+        assert_eq!(written, payload);
+        let expected = super::snapshot_tagged_path(&base, "ondemand_test");
+        assert_eq!(tagged, expected);
+        let tmp = tagged.with_extension("json.tmp");
+        assert!(!tmp.exists(), "tmp sibling must not linger after rename");
+    }
+
+    /// Write-failure path — sink wired, but the parent directory
+    /// can't be created because a regular file blocks the path.
+    /// `File::create` on the tmp returns ENOTDIR. Helper returns
+    /// `Err`, fires the stderr_summary closure so the operator sees
+    /// the structured signal even when the FS write didn't land.
+    /// Pins stderr-fallback discipline on the on-demand path:
+    /// configured-sink-failed never silently drops.
+    #[test]
+    fn write_failure_invokes_stderr_summary_and_returns_err() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_in_the_way = dir.path().join("not_a_dir");
+        std::fs::write(&file_in_the_way, b"").expect("create blocker file");
+        let base = file_in_the_way.join("sub").join("dump.failure-dump.json");
+        let summary_called = AtomicBool::new(false);
+        let result = write_to_tagged_path(
+            Some(&base),
+            "test_tag",
+            "{\"k\":\"v\"}",
+            || {
+                summary_called.store(true, Ordering::Relaxed);
+                String::from("test summary")
+            },
+            "test warn msg",
+        );
+        assert!(result.is_err(), "expected Err on write failure");
+        assert!(
+            summary_called.load(Ordering::Relaxed),
+            "stderr_summary closure MUST fire on write failure (no silent drop)"
+        );
     }
 }
