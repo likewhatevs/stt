@@ -269,6 +269,32 @@ pub(super) fn format_path_part(path_str: Option<&str>, write_failed: bool) -> St
     }
 }
 
+/// Format the trailing "(truncated to N bytes ...)" marker appended to
+/// stderr last-ditch preservation payload-head lines when the
+/// UTF-8-safe truncation actually dropped bytes. Returns empty when
+/// the truncated head reaches the full payload (no truncation
+/// happened) so the caller's `eprintln!` reads cleanly without a
+/// no-op clause.
+///
+/// Mirrors the `STDERR_DUMP_CAP` cascade pattern used by every
+/// stderr-fallback site (emit_json / emit_degraded_json / end-of-coord
+/// drain). The cap value is supplied by the caller because the drain
+/// site uses a distinct `DRAIN_STDERR_DUMP_CAP` constant for its own
+/// scope, but the truncation-marker format string is the same.
+///
+/// Centralised so the marker text lives in one place rather than three
+/// byte-identical inline copies; also exposes the truncation contract
+/// for unit testing.
+pub(super) fn format_truncation_marker(head_end: usize, total_len: usize) -> String {
+    if head_end < total_len {
+        format!(
+            " (truncated to {head_end} bytes at UTF-8 boundary; full {total_len} bytes lost — summary above)"
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Outcome of one freeze-and-capture cycle. Replaces the prior
 /// `Option<(FailureDumpReport, Instant)>` return so the late-trigger
 /// dispatch can distinguish three semantically distinct cases instead
@@ -5074,15 +5100,8 @@ impl KtstrVm {
                                 json,
                                 STDERR_DUMP_CAP,
                             );
-                            let truncated_marker = if head_end < json.len() {
-                                format!(
-                                    " (truncated to {} bytes at UTF-8 boundary; full {} bytes lost — summary above)",
-                                    head_end,
-                                    json.len()
-                                )
-                            } else {
-                                String::new()
-                            };
+                            let truncated_marker =
+                                format_truncation_marker(head_end, json.len());
                             eprintln!(
                                 "freeze-coord: STDERR-PRESERVED payload head (Captured, write failed){}: {}",
                                 truncated_marker,
@@ -5173,15 +5192,8 @@ impl KtstrVm {
                                 json.len(),
                             );
                             let head_end = utf8_safe_truncate_len(json, STDERR_DUMP_CAP);
-                            let truncated_marker = if head_end < json.len() {
-                                format!(
-                                    " (truncated to {} bytes at UTF-8 boundary; full {} bytes lost — summary above)",
-                                    head_end,
-                                    json.len()
-                                )
-                            } else {
-                                String::new()
-                            };
+                            let truncated_marker =
+                                format_truncation_marker(head_end, json.len());
                             eprintln!(
                                 "freeze-coord: STDERR-PRESERVED payload head (Degraded, write failed){}: {}",
                                 truncated_marker,
@@ -7225,15 +7237,8 @@ impl KtstrVm {
                                     &json,
                                     DRAIN_STDERR_DUMP_CAP,
                                 );
-                                let truncated_marker = if head_end < json.len() {
-                                    format!(
-                                        " (truncated to {} bytes at UTF-8 boundary; full {} bytes lost — summary above)",
-                                        head_end,
-                                        json.len()
-                                    )
-                                } else {
-                                    String::new()
-                                };
+                                let truncated_marker =
+                                    format_truncation_marker(head_end, json.len());
                                 eprintln!(
                                     "freeze-coord: STDERR-PRESERVED payload head{}: {}",
                                     truncated_marker,
@@ -10217,5 +10222,56 @@ mod format_path_part_tests {
     #[test]
     fn defensive_path_with_write_failed_renders_arrow() {
         assert_eq!(format_path_part(Some("/x"), true), " -> /x");
+    }
+}
+
+#[cfg(test)]
+mod format_truncation_marker_tests {
+    //! Unit coverage for [`format_truncation_marker`] — the stderr
+    //! payload-head suffix used by all 3 stderr-fallback sites
+    //! (emit_json / emit_degraded_json / end-of-coord drain). When
+    //! the safe-truncated head drops bytes, the operator must see a
+    //! marker that quantifies the loss ("truncated to N bytes; full
+    //! M bytes lost — summary above") so they know the preceding
+    //! summary line is the authoritative signal source, not the
+    //! (truncated) payload head.
+    use super::format_truncation_marker;
+
+    /// No truncation — head_end reached the full payload. Returns
+    /// empty so the caller's `eprintln!` reads cleanly without a
+    /// no-op clause cluttering the output.
+    #[test]
+    fn no_truncation_returns_empty() {
+        assert_eq!(format_truncation_marker(100, 100), "");
+    }
+
+    /// Truncation happened — head_end shorter than total. Renders
+    /// the "(truncated to N bytes ...; full M bytes lost ...)"
+    /// marker with both numbers populated.
+    #[test]
+    fn truncation_renders_byte_counts() {
+        let marker = format_truncation_marker(16, 1024);
+        assert_eq!(
+            marker,
+            " (truncated to 16 bytes at UTF-8 boundary; full 1024 bytes lost — summary above)"
+        );
+    }
+
+    /// Empty payload + zero head — degenerate case (no payload to
+    /// truncate). Returns empty (no-truncation branch).
+    #[test]
+    fn empty_payload_zero_head_returns_empty() {
+        assert_eq!(format_truncation_marker(0, 0), "");
+    }
+
+    /// Defensive case — head_end claims more bytes than total. UNREACHABLE
+    /// by construction: utf8_safe_truncate_len caps `bounded` at
+    /// `cap.min(s.len())` so the returned head_end is always ≤ total.
+    /// If a future refactor breaks that invariant, the helper returns
+    /// empty (no-truncation branch) rather than emitting a nonsense
+    /// marker with negative loss — the safer degradation.
+    #[test]
+    fn defensive_head_above_total_returns_empty() {
+        assert_eq!(format_truncation_marker(200, 100), "");
     }
 }
