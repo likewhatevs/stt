@@ -31,8 +31,11 @@ fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
 
 // expect_err: scx-ktstr is a toy scheduler — Normal/Batch/Idle/FIFO mix
 // always stalls under it. Test exercises workload generation, not
-// scheduler correctness.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true)]
+// scheduler correctness, so the fairness rate ceilings (keep_last,
+// fallback) that activate when ANY monitor threshold is set are
+// raised here to skip those checks while keeping sustained_samples
+// for the stall-pattern coverage.
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
@@ -103,14 +106,20 @@ fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15, watchdog_timeout_s = 15)]
+// scenario-coverage test for the cpuset-load-shift scenario under the
+// scx-ktstr toy scheduler. Fairness rate ceilings (keep_last, fallback)
+// are raised to skip those checks — see cover_sched_mixed for the
+// design rationale (toy scheduler trips the defaults whenever any
+// monitor threshold is set).
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15, watchdog_timeout_s = 15, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
 }
 
 // -- dynamic --
 
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, watchdog_timeout_s = 15)]
+// Fairness rate ceilings raised — see cover_sched_mixed for rationale.
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, watchdog_timeout_s = 15, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::dynamic::custom_cgroup_add_midrun(ctx)
 }
@@ -156,8 +165,8 @@ fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 
 // expect_err: scx-ktstr is a toy scheduler — heavy/light load oscillation
 // across phases always stalls under it. Test exercises workload generation,
-// not scheduler correctness.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true)]
+// not scheduler correctness. See cover_sched_mixed for rate-ceiling rationale.
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }

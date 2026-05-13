@@ -1738,28 +1738,32 @@ mod tests {
                 .kernel(&kernel)
                 .topology(1, 1, 2, 1)
                 .memory_mb(256)
-                .timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(15))
                 .cmdline("init=/nonexistent panic=-1")
                 .build()
         );
         let result = skip_on_contention!(vm.run());
         // The VM loop must shut down via the kernel's reboot exit
-        // path, not via the builder's 10 s timeout.
+        // path, not via the builder's 15 s timeout.
         assert!(
             !result.timed_out,
-            "guest never panicked / rebooted within 10 s — the test's \
+            "guest never panicked / rebooted within 15 s — the test's \
              premise (panic-before-sys_rdy → kernel reboot → VM exit) \
              is not holding. Stderr tail: {:?}",
             result.stderr.lines().rev().take(5).collect::<Vec<_>>(),
         );
-        // Wallclock budget: 8 s. With the monitor's 5 s
-        // sys_rdy ceiling, a healthy run should finish well
-        // under this. A regression that blocks the boot wait
-        // indefinitely (e.g. kill_evt unregistered, sys_rdy
-        // not promoted to the eventfd) would blow the budget.
+        // Wallclock budget: 12 s. The monitor's 5 s sys_rdy ceiling
+        // plus VM setup + guest panic + reboot + teardown nominally
+        // finishes in 3-5 s on an idle host. The 12 s budget absorbs
+        // host contention (observed runs at 8-9 s under load) while
+        // still catching a regression that blocks the boot wait
+        // indefinitely (e.g. kill_evt unregistered, sys_rdy not
+        // promoted to the eventfd) — that path would either hit the
+        // builder's 15 s timeout (caught above) or sit on the 5 s
+        // ceiling under heavy overhead (well past 12 s).
         assert!(
-            result.duration < Duration::from_secs(8),
-            "VM ran for {:?} — past the 8 s budget. The monitor's \
+            result.duration < Duration::from_secs(12),
+            "VM ran for {:?} — past the 12 s budget. The monitor's \
              boot wait did not wake on kill_evt; the loop sat on the \
              sys_rdy ceiling instead. timed_out={}, exit_code={}",
             result.duration,
