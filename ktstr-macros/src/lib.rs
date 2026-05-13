@@ -1700,9 +1700,12 @@ fn declare_scheduler_inner(
                 // cannot be reused. A `declare_scheduler!` whose
                 // `name = "eevdf"` would silently shadow the baseline
                 // in `find_scheduler` lookups and sidecar comparisons.
-                // Case-insensitive: `"EEVDF"`, `"Eevdf"`, etc. are all
-                // the same wire name to a consumer that lowercases.
-                let lit_lower = lit.to_lowercase();
+                // Trim+lowercase before the match so both whitespace
+                // padding (`"  eevdf  "`) and case (`"EEVDF"`, `"Eevdf"`)
+                // resolve to the same canonical reserved keyword —
+                // the reservation's intent is "don't shadow the baselines"
+                // regardless of how the user formatted the literal.
+                let lit_lower = lit.trim().to_lowercase();
                 if matches!(lit_lower.as_str(), "eevdf" | "kernel_default") {
                     return Err(syn::Error::new_spanned(
                         &value,
@@ -2151,9 +2154,10 @@ fn declare_scheduler_inner(
     // in `src/test_support/entry.rs`), so a user scheduler whose `name`
     // field also resolves to `"kernel"` would collide with the variant
     // label in failure-dump headers and sidecar comparisons. Reserve
-    // case-insensitively, matching the existing reservation of
-    // `"eevdf"` / `"kernel_default"`.
-    if kernel_builtin_set && sched_name.to_lowercase() == "kernel" {
+    // case-insensitively AND whitespace-insensitively (trim+lowercase),
+    // matching the trim+lowercase normalization the inline "name" arm
+    // applies to the `"eevdf"` / `"kernel_default"` reservation.
+    if kernel_builtin_set && sched_name.trim().to_lowercase() == "kernel" {
         return Err(syn::Error::new(
             const_name.span(),
             format!(
