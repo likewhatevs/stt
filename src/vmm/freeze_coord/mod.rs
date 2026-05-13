@@ -413,6 +413,19 @@ pub(super) const SNAPSHOT_SUMMARY_PREFIX: &str = "freeze-coord: STDERR-PRESERVED
 /// different thread must either uniquify `tmp_path` (e.g. via
 /// `tempfile::NamedTempFile::new_in(parent)`) or serialize on
 /// `tag` before invoking this helper.
+/// Same 16 KiB cap as the run_vm-scope `STDERR_DUMP_CAP` and the
+/// drain-scope `DRAIN_STDERR_DUMP_CAP`. Operator-grep stability:
+/// every stderr-fallback site emits a payload head bounded by the
+/// same cap, so an operator-side log parser observing the
+/// `truncated to {N} bytes` marker can pin the upper bound at
+/// 16 KiB across the whole stderr-fallback surface. Module-scoped
+/// (not nested inside [`write_to_tagged_path`]) so unit tests in
+/// the sibling test module can import the same value rather than
+/// duplicating the literal — a future bump to e.g. 32 KiB updates
+/// the production cap AND the test's boundary construction in
+/// lockstep.
+pub(super) const ONDEMAND_STDERR_DUMP_CAP: usize = 16 * 1024;
+
 pub(super) fn write_to_tagged_path(
     dump_path: Option<&std::path::Path>,
     tag: &str,
@@ -420,14 +433,6 @@ pub(super) fn write_to_tagged_path(
     stderr_summary: impl FnOnce() -> String,
     warn_msg: &'static str,
 ) -> std::io::Result<Option<std::path::PathBuf>> {
-    // Same 16 KiB cap as the run_vm-scope `STDERR_DUMP_CAP` and the
-    // drain-scope `DRAIN_STDERR_DUMP_CAP`. Operator-grep stability:
-    // every stderr-fallback site emits a payload head bounded by the
-    // same cap, so an operator-side log parser observing the
-    // `truncated to {N} bytes` marker can pin the upper bound at
-    // 16 KiB across the whole stderr-fallback surface.
-    const ONDEMAND_STDERR_DUMP_CAP: usize = 16 * 1024;
-
     let Some(base_path) = dump_path else {
         return Ok(None);
     };
@@ -10820,9 +10825,13 @@ mod write_to_tagged_path_tests {
 
     /// Rename-failure tmp-cleanup — File::create + sync_all succeed,
     /// but `rename(tmp, tagged)` fails because the tagged destination
-    /// already exists as a non-empty directory (POSIX rename
-    /// EISDIR/ENOTEMPTY when source is a file and dest is a non-empty
-    /// directory). Helper must clean up the tmp file so a future
+    /// already exists as a non-empty directory. Linux `rename(2)`
+    /// returns EISDIR when source is a file and dest is a directory
+    /// (empty/non-empty distinction does not matter); ENOTEMPTY
+    /// applies for the dir-replacing-non-empty-dir case (both sides
+    /// directories). A non-empty dir at the dest adds belt-and-
+    /// suspenders against any FS that allows file-over-empty-dir
+    /// rename. Helper must clean up the tmp file so a future
     /// operator does not see a stale `.json.tmp` alongside the
     /// blocker. Pins the invariant: tmp cleanup runs on EVERY
     /// failure path, not just File::create failures.
@@ -10877,13 +10886,18 @@ mod write_to_tagged_path_tests {
         let file_in_the_way = dir.path().join("not_a_dir");
         std::fs::write(&file_in_the_way, b"").expect("create blocker file");
         let base = file_in_the_way.join("sub").join("dump.failure-dump.json");
-        const CAP: usize = 16 * 1024;
-        let mut payload = String::with_capacity(CAP + 8);
-        // Fill to two bytes short of CAP, then push a 4-byte UTF-8
-        // sequence so bytes CAP-2..CAP+2 form U+1F600. Bytes CAP
-        // and CAP+1 are mid-char — naive slicing at CAP would
+        // Imports the production cap so a future bump (e.g. 16 KiB
+        // → 32 KiB) updates the production behavior AND this test's
+        // boundary construction in lockstep. Avoids the silent
+        // drift where the test still exercises the old 16 KiB
+        // boundary while production truncates at 32 KiB.
+        let cap = super::ONDEMAND_STDERR_DUMP_CAP;
+        let mut payload = String::with_capacity(cap + 8);
+        // Fill to two bytes short of cap, then push a 4-byte UTF-8
+        // sequence so bytes cap-2..cap+2 form U+1F600. Bytes cap
+        // and cap+1 are mid-char — naive slicing at cap would
         // panic.
-        for _ in 0..(CAP - 2) {
+        for _ in 0..(cap - 2) {
             payload.push('a');
         }
         payload.push('\u{1F600}');
