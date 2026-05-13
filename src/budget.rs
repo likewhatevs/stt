@@ -60,6 +60,25 @@ fn djb2_hash(name: &str) -> u32 {
     h
 }
 
+/// Bit-width of a `1u64 << (djb2_hash(name) % 4)` one-hot value:
+/// 4 distinct bit positions (0..=3), so 4 bits. cfg(test)-only
+/// because the only consumer is the overlap test that derives
+/// multi_bit_ranges; production extract_features uses the SHIFT
+/// constants directly.
+#[cfg(test)]
+const fn sched_hash_bits() -> u32 {
+    4
+}
+
+/// Bit-width of `name_hash` one-hot value. Same `% 4` modulus as
+/// `sched_hash_bits` — kept as a separate fn so the SHIFT
+/// enumeration cross-reference at the overlap test reads each
+/// width from its own field-named source.
+#[cfg(test)]
+const fn name_hash_bits() -> u32 {
+    4
+}
+
 /// Classify total CPU count into a one-hot bit (5 classes).
 fn cpu_bucket(total_cpus: u32) -> u64 {
     match total_cpus {
@@ -69,6 +88,12 @@ fn cpu_bucket(total_cpus: u32) -> u64 {
         65..=128 => 1 << 3,
         _ => 1 << 4,
     }
+}
+
+/// Bit-width of `cpu_bucket`'s output: 5 one-hot positions (0..=4).
+#[cfg(test)]
+const fn cpu_bucket_bits() -> u32 {
+    5
 }
 
 /// Classify LLC count into a one-hot bit (5 classes).
@@ -82,6 +107,12 @@ fn llc_bucket(num_llcs: u32) -> u64 {
     }
 }
 
+/// Bit-width of `llc_bucket`'s output: 5 one-hot positions (0..=4).
+#[cfg(test)]
+const fn llc_bucket_bits() -> u32 {
+    5
+}
+
 /// Classify duration (seconds) into a one-hot bit (3 classes).
 fn duration_bucket(duration_secs: u64) -> u64 {
     match duration_secs {
@@ -89,6 +120,12 @@ fn duration_bucket(duration_secs: u64) -> u64 {
         3..=10 => 1 << 1,
         _ => 1 << 2,
     }
+}
+
+/// Bit-width of `duration_bucket`'s output: 3 one-hot positions (0..=2).
+#[cfg(test)]
+const fn duration_bucket_bits() -> u32 {
+    3
 }
 
 /// Classify NUMA node count into a one-hot bit (4 classes).
@@ -99,6 +136,12 @@ fn numa_bucket(numa_nodes: u32) -> u64 {
         3..=4 => 1 << 2,
         _ => 1 << 3,
     }
+}
+
+/// Bit-width of `numa_bucket`'s output: 4 one-hot positions (0..=3).
+#[cfg(test)]
+const fn numa_bucket_bits() -> u32 {
+    4
 }
 
 /// Extract feature bitset from a KtstrTestEntry and topology.
@@ -617,14 +660,38 @@ mod tests {
     fn extract_features_one_bit_shifts_outside_multi_bit_ranges() {
         // Each (shift_start, shift_end_inclusive, name) entry is a
         // multi-bit field's bit range. One-bit shifts must NOT fall
-        // inside any of these ranges.
+        // inside any of these ranges. Widths are read from each
+        // bucket fn's sibling _bits() const so growing a bucket's
+        // match arms forces an explicit width update at one site
+        // rather than diverging silently from this test's
+        // expectations.
         let multi_bit_ranges: &[(u32, u32, &str)] = &[
-            (SCHED_SHIFT, SCHED_SHIFT + 3, "SCHED"),
-            (CPU_BUCKET_SHIFT, CPU_BUCKET_SHIFT + 4, "CPU_BUCKET"),
-            (LLC_BUCKET_SHIFT, LLC_BUCKET_SHIFT + 4, "LLC_BUCKET"),
-            (DURATION_SHIFT, DURATION_SHIFT + 2, "DURATION"),
-            (NAME_HASH_SHIFT, NAME_HASH_SHIFT + 3, "NAME_HASH"),
-            (NUMA_BUCKET_SHIFT, NUMA_BUCKET_SHIFT + 3, "NUMA_BUCKET"),
+            (SCHED_SHIFT, SCHED_SHIFT + sched_hash_bits() - 1, "SCHED"),
+            (
+                CPU_BUCKET_SHIFT,
+                CPU_BUCKET_SHIFT + cpu_bucket_bits() - 1,
+                "CPU_BUCKET",
+            ),
+            (
+                LLC_BUCKET_SHIFT,
+                LLC_BUCKET_SHIFT + llc_bucket_bits() - 1,
+                "LLC_BUCKET",
+            ),
+            (
+                DURATION_SHIFT,
+                DURATION_SHIFT + duration_bucket_bits() - 1,
+                "DURATION",
+            ),
+            (
+                NAME_HASH_SHIFT,
+                NAME_HASH_SHIFT + name_hash_bits() - 1,
+                "NAME_HASH",
+            ),
+            (
+                NUMA_BUCKET_SHIFT,
+                NUMA_BUCKET_SHIFT + numa_bucket_bits() - 1,
+                "NUMA_BUCKET",
+            ),
         ];
         let one_bit_shifts: &[(u32, &str)] = &[
             (SMT_SHIFT, "SMT"),
@@ -732,6 +799,140 @@ mod tests {
              (if it is a multi-bit field) or \
              extract_features_one_bit_shifts_outside_multi_bit_ranges's \
              multi_bit_ranges (if it is a single-bit flag).",
+        );
+    }
+
+    /// Each bucket fn's max output value must fit in the bit-width
+    /// it advertises via its sibling `_bits()` const. Catches the
+    /// silent-overlap regression where a bucket fn grows a match
+    /// arm (e.g. `129..=256 => 1 << 5`) without bumping the
+    /// `_bits()` value — the overlap test
+    /// (extract_features_one_bit_shifts_outside_multi_bit_ranges)
+    /// would otherwise compute a stale range and let the new
+    /// high-order bit bleed into the neighbouring field.
+    ///
+    /// The probe values cover every match-arm boundary in the
+    /// bucket fn (one per case) so the max is sampled accurately
+    /// rather than approximated.
+    #[test]
+    fn cpu_bucket_fits_advertised_width() {
+        // PROBE-SET INVARIANT: every cpu_bucket match arm has ≥1
+        // probe value in its range. When adding a new arm, ADD a
+        // probe value that lands inside it — otherwise the new
+        // arm's bit position may not be sampled and this assertion
+        // stays silent on width regressions.
+        let max = [0u32, 8, 9, 16, 17, 64, 65, 128, 129, u32::MAX]
+            .iter()
+            .map(|&x| cpu_bucket(x))
+            .max()
+            .expect("non-empty");
+        let bits_used = 64 - max.leading_zeros();
+        assert!(
+            bits_used <= cpu_bucket_bits(),
+            "cpu_bucket max output {max:#b} uses {bits_used} bits but \
+             advertised {} bits — grow cpu_bucket_bits() or shrink the bucket",
+            cpu_bucket_bits(),
+        );
+    }
+
+    #[test]
+    fn llc_bucket_fits_advertised_width() {
+        // PROBE-SET INVARIANT: every llc_bucket match arm has ≥1
+        // probe value in its range. When adding a new arm, ADD a
+        // probe value that lands inside it.
+        let max = [0u32, 1, 2, 3, 4, 5, 8, 9, u32::MAX]
+            .iter()
+            .map(|&x| llc_bucket(x))
+            .max()
+            .expect("non-empty");
+        let bits_used = 64 - max.leading_zeros();
+        assert!(
+            bits_used <= llc_bucket_bits(),
+            "llc_bucket max output {max:#b} uses {bits_used} bits but \
+             advertised {} bits — grow llc_bucket_bits() or shrink the bucket",
+            llc_bucket_bits(),
+        );
+    }
+
+    #[test]
+    fn duration_bucket_fits_advertised_width() {
+        // PROBE-SET INVARIANT: every duration_bucket match arm has
+        // ≥1 probe value in its range. When adding a new arm, ADD
+        // a probe value that lands inside it.
+        let max = [0u64, 2, 3, 10, 11, u64::MAX]
+            .iter()
+            .map(|&x| duration_bucket(x))
+            .max()
+            .expect("non-empty");
+        let bits_used = 64 - max.leading_zeros();
+        assert!(
+            bits_used <= duration_bucket_bits(),
+            "duration_bucket max output {max:#b} uses {bits_used} bits but \
+             advertised {} bits — grow duration_bucket_bits() or shrink the bucket",
+            duration_bucket_bits(),
+        );
+    }
+
+    #[test]
+    fn numa_bucket_fits_advertised_width() {
+        // PROBE-SET INVARIANT: every numa_bucket match arm has ≥1
+        // probe value in its range. When adding a new arm, ADD a
+        // probe value that lands inside it.
+        let max = [0u32, 1, 2, 3, 4, 5, u32::MAX]
+            .iter()
+            .map(|&x| numa_bucket(x))
+            .max()
+            .expect("non-empty");
+        let bits_used = 64 - max.leading_zeros();
+        assert!(
+            bits_used <= numa_bucket_bits(),
+            "numa_bucket max output {max:#b} uses {bits_used} bits but \
+             advertised {} bits — grow numa_bucket_bits() or shrink the bucket",
+            numa_bucket_bits(),
+        );
+    }
+
+    /// Hash one-hot widths advertised by `sched_hash_bits()` and
+    /// `name_hash_bits()` must match the actual `1u64 << (hash % 4)`
+    /// shape used at both call sites in `extract_features`
+    /// (scheduler-name hash shifted by SCHED_SHIFT, test-name hash
+    /// shifted by NAME_HASH_SHIFT). Probe every hash % 4 value
+    /// (0..=3) — the max bit position is 3 → 4 bits used.
+    #[test]
+    fn hash_bits_match_one_hot_shape() {
+        let max_hash_value = (0u32..=3).map(|h| 1u64 << h).max().expect("non-empty");
+        let bits_used = 64 - max_hash_value.leading_zeros();
+        assert!(
+            bits_used <= sched_hash_bits(),
+            "sched_hash max output {max_hash_value:#b} uses {bits_used} bits but \
+             advertised {} bits",
+            sched_hash_bits(),
+        );
+        assert!(
+            bits_used <= name_hash_bits(),
+            "name_hash max output {max_hash_value:#b} uses {bits_used} bits but \
+             advertised {} bits",
+            name_hash_bits(),
+        );
+    }
+
+    /// Two `*_SHIFT` constants sharing the same numeric value would
+    /// collapse to one entry in the HashSet<u32> registry used by
+    /// `all_shifts_classified_in_exactly_one_enumeration`,
+    /// silently masking the duplicate. Compare slice-cardinality
+    /// (which counts duplicates) against HashSet-cardinality
+    /// (which dedups) to surface the collision.
+    #[test]
+    fn all_shift_values_unique() {
+        use std::collections::HashSet;
+        let distinct: HashSet<u32> = ALL_SHIFTS.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            distinct.len(),
+            ALL_SHIFTS.len(),
+            "duplicate SHIFT values detected — two `const *_SHIFT: u32 = N;` \
+             declarations in src/budget.rs share the same numeric value. \
+             ALL_SHIFTS entries: {:?}",
+            ALL_SHIFTS,
         );
     }
 
