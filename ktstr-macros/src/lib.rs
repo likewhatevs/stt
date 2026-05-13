@@ -668,6 +668,16 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         }
                     }
+                    "workers_per_cgroup" => {
+                        return syn::Error::new_spanned(
+                            path,
+                            "`workers_per_cgroup` is no longer a `#[ktstr_test]` \
+                             attribute. Set workers per cgroup directly in the \
+                             scenario body via `CgroupDef::named(\"X\").workers(N)`.",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
                     _ => {
                         return syn::Error::new_spanned(
                             path,

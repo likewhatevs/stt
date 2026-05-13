@@ -945,7 +945,8 @@ pub struct CgroupDef {
     /// cpuset (typically the scenario's usable CPU set).
     pub cpuset: Option<CpusetSpec>,
     /// WorkSpec groups to spawn. Empty means use a single default WorkSpec
-    /// (SpinWait, Normal, ctx.workers_per_cgroup workers).
+    /// (SpinWait, Normal, `ctx.workers_per_cgroup` workers — defaults to 1
+    /// from `CtxBuilder` unless the scenario overrides it explicitly).
     pub works: Vec<WorkSpec>,
     /// When true, the gauntlet work_type override replaces each WorkSpec's
     /// work_type (applied per-WorkSpec via resolve_work_type).
@@ -1025,10 +1026,11 @@ impl CgroupDef {
     /// **Worker-spawning default:** `CgroupDef::named("cg_0")` alone
     /// still spawns workers at execution time — `apply_setup` fills
     /// an empty `works` slice with one default [`WorkSpec`] (SpinWait,
-    /// SCHED_NORMAL, `ctx.workers_per_cgroup` workers). To express
-    /// an empty move-target cgroup with NO workers, declare it via
-    /// [`Op::AddCgroup`] at step or Backdrop level instead of using
-    /// a `CgroupDef`.
+    /// SCHED_NORMAL, `ctx.workers_per_cgroup` workers, which defaults
+    /// to 1 from `CtxBuilder`). To express an empty move-target cgroup
+    /// with NO workers, declare it via [`Op::AddCgroup`] at step or
+    /// Backdrop level instead of using a `CgroupDef`. To run more than
+    /// one worker, call `.workers(N)` on the `CgroupDef` explicitly.
     #[must_use = "dropping a CgroupDef discards the cgroup specification"]
     pub fn named(name: impl Into<Cow<'static, str>>) -> Self {
         Self {
