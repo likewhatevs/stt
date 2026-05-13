@@ -1,0 +1,5 @@
+error: declare_scheduler!: `name = "eevdf"` is reserved for the built-in Scheduler::EEVDF baseline; pick a different name
+ --> tests/compile_fail/declare_scheduler_reserved_name_eevdf.rs:9:12
+  |
+9 |     name = "eevdf",
+  |            ^^^^^^^

@@ -1141,9 +1141,11 @@ impl KtstrTestEntry {
         // Mirror the payload-slot gate for every workload entry. The
         // `workloads` slot is for userspace binaries composed with
         // the primary payload under the scheduler; a scheduler-kind
-        // Payload here would be silently ignored at spawn time and
-        // is almost always a `Payload::KERNEL_DEFAULT`-shaped typo in a
-        // `workloads = [...]` attribute.
+        // Payload here would be silently ignored at spawn time. The
+        // narrow typo path post-`declare_scheduler!` rollout is
+        // pasting [`Payload::KERNEL_DEFAULT`] (the only Scheduler-kind
+        // Payload still in the prelude) into a `workloads = [...]`
+        // attribute instead of the `scheduler = ...` slot.
         for (idx, w) in self.workloads.iter().enumerate() {
             if w.is_scheduler() {
                 anyhow::bail!(

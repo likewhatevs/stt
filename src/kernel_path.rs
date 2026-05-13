@@ -1248,6 +1248,25 @@ mod tests {
         );
     }
 
+    /// `..=` (inclusive Rust syntax) is accepted as an alias for
+    /// `..` — both spellings produce the same Range with both
+    /// endpoints inclusive, per the parser's doc invariant
+    /// ("the endpoints are ALWAYS inclusive — both `..` and `..=`
+    /// spellings produce a closed range"). The `..=` arm is checked
+    /// first in `parse`, so even though `..=` contains `..` as a
+    /// substring the version-shaped split lands on `6.10` / `6.15`,
+    /// not on `6.10` / `=6.15`.
+    #[test]
+    fn kernel_id_parse_range_inclusive_eq_syntax() {
+        assert_eq!(
+            KernelId::parse("6.10..=6.15"),
+            KernelId::Range {
+                start: "6.10".to_string(),
+                end: "6.15".to_string(),
+            },
+        );
+    }
+
     #[test]
     fn kernel_id_parse_range_patch_versions() {
         assert_eq!(

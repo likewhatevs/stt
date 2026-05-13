@@ -1597,6 +1597,29 @@ fn declare_scheduler_inner(
         match key_str.as_str() {
             "name" => {
                 let lit = expect_str_lit(&value, &key, "name")?;
+                // Mirror the const-name reservation above: the string
+                // names of the built-in `Scheduler::EEVDF` (`"eevdf"`)
+                // and `Payload::KERNEL_DEFAULT` (`"kernel_default"`)
+                // cannot be reused. A `declare_scheduler!` whose
+                // `name = "eevdf"` would silently shadow the baseline
+                // in `find_scheduler` lookups and sidecar comparisons.
+                // Case-insensitive: `"EEVDF"`, `"Eevdf"`, etc. are all
+                // the same wire name to a consumer that lowercases.
+                let lit_lower = lit.to_lowercase();
+                if matches!(lit_lower.as_str(), "eevdf" | "kernel_default") {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "declare_scheduler!: `name = \"{lit}\"` is reserved \
+                             for the built-in {} baseline; pick a different name",
+                            if lit_lower == "eevdf" {
+                                "Scheduler::EEVDF"
+                            } else {
+                                "Payload::KERNEL_DEFAULT"
+                            }
+                        ),
+                    ));
+                }
                 sched_name = Some(lit);
             }
             "binary" => {

@@ -1,0 +1,5 @@
+error: declare_scheduler!: `name = "kernel_default"` is reserved for the built-in Payload::KERNEL_DEFAULT baseline; pick a different name
+  --> tests/compile_fail/declare_scheduler_reserved_name_kernel_default.rs:12:12
+   |
+12 |     name = "kernel_default",
+   |            ^^^^^^^^^^^^^^^^
