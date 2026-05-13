@@ -1524,6 +1524,35 @@ pub struct LocalSourceState {
 /// or commits that would otherwise let a racing-write build land in
 /// the cache under a stale identity. Both calls share the same gix
 /// path so the post-build comparison is apples-to-apples.
+///
+/// Non-atomic against concurrent git operations: the probe runs
+/// six sequential gix calls (`discover` → `head_id` → `head_tree`
+/// → `index_or_empty` → `tree_index_status` → `status`), each a
+/// separate filesystem read with no transactional bracket. A
+/// concurrent `git commit`, `git add`, or worktree write between
+/// any two calls can produce internally-inconsistent results —
+/// e.g. `head_id` reads commit C0, a peer commit lands C1, then
+/// `head_tree` reads C1's root tree and the diff against the
+/// post-add index reports unexpected dirt. Git itself serializes
+/// its own writes via per-resource lockfiles under `.git/`
+/// (`index.lock` for staging operations, `HEAD.lock` and
+/// `refs/heads/<branch>.lock` for ref updates), so peer `git`
+/// processes wait on whichever lockfile their operation touches;
+/// the genuinely-unsynchronized class is worktree-only writes
+/// (autoformatter, IDE-on-save) which the index-worktree status
+/// step catches regardless of timing.
+///
+/// The disposition is intentionally pessimistic so inconsistency is
+/// safe: any `Err` propagates to the caller, which treats it as a
+/// rebuild signal (`MidWaitState::ProbeFailed` in the mid-wait
+/// caller); any spurious dirty signal falls into DirtyEdit /
+/// HashAdvanced, both forcing a rebuild. The cost of a false-
+/// positive rebuild is one extra `make`; the cost of a false-
+/// negative would be a cache slot keyed on a HEAD that no longer
+/// describes the source — the asymmetry is the reason for the
+/// pessimistic disposition. Callers should treat the returned
+/// state as a best-effort approximation of probe-time, not an
+/// instantaneous snapshot.
 pub fn inspect_local_source_state(canonical: &Path) -> Result<LocalSourceState> {
     let (short_hash, is_dirty, is_git) = match gix::discover(canonical) {
         Ok(repo) => {

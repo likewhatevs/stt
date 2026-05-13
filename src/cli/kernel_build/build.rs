@@ -326,6 +326,23 @@ impl MidWaitState {
     }
 }
 
+/// Operator-facing diagnostic body emitted when the post-mid-wait
+/// `cache_lookup` short-circuit fires (without the `{cli_label}: `
+/// prefix — caller composes via `eprintln!("{cli_label}: {body}")`,
+/// matching the [`MidWaitState::diagnostic`] convention).
+///
+/// Separate from [`MidWaitState::diagnostic`] because the cache-hit
+/// is downstream of the variant classification — the message fires
+/// only when all three of `mid_wait_clean`, a populated cache slot,
+/// and an extant image file align. Tying the message to a single
+/// MidWaitState variant would misrepresent that conjunction.
+fn cache_hit_diagnostic(cache_key: &str) -> String {
+    format!(
+        "concurrent ktstr build populated cache slot {cache_key} during \
+         peer's build wait — skipping redundant rebuild"
+    )
+}
+
 /// Post-acquisition kernel build pipeline.
 ///
 /// Handles: clean, configure, build, validate config, generate
@@ -486,6 +503,35 @@ pub fn kernel_build_pipeline(
     // tree during the wait" (DirtyEdit). The split keeps the enum
     // variants honest about cause-attribution per the
     // [`MidWaitState::diagnostic`] dispatch below.
+    //
+    // TOCTOU acceptance: the source tree can mutate between this
+    // probe and the `cache_lookup` call below — a microsecond window
+    // (typically) where an operator edit, background autoformatter
+    // write, `git commit`, or IDE pre-commit hook would slip through
+    // both this guard AND the post-build dirty re-check at the
+    // cache-store site (the cache-hit return below short-circuits
+    // before `make`, so the post-build re-check never runs for the
+    // racing-into-hit path). Publication-side staleness is gated by
+    // the separate post-build dirty re-check at the cache-store
+    // site; this paragraph is about the consumer-side stale-serving
+    // window only. The cache slot is keyed on `acquired.cache_key`
+    // (frozen at acquire time inside `local_source`), so the served
+    // artifact's identity is the acquire-time HEAD — a mid-window
+    // mutation produces a cache hit that serves a slightly-stale
+    // source state without destroying the operator's later state.
+    // Bounded race; the operator's next invocation re-acquires and
+    // observes the new state.
+    //
+    // "Next invocation correct" is NOT a remediation for: single-shot
+    // CI pipelines without retry, `git bisect run` invocations (each
+    // commit is independent), or pipelined CI flows where one job
+    // builds the kernel and a downstream job consumes the cached
+    // image without re-probing the source tree. Operators in those
+    // workflows should treat cache hits as acquire-time-correct, not
+    // invocation-time correct. Holding an EX flock across [probe,
+    // cache_lookup] or re-probing after the lookup were considered
+    // and rejected as adding common-path latency for a microsecond-
+    // wide window.
     let mid_wait_state = if is_local_source && !acquired.is_dirty {
         match crate::fetch::inspect_local_source_state(source_dir) {
             Ok(post) => {
@@ -527,11 +573,7 @@ pub fn kernel_build_pipeline(
             crate::cli::resolve::cache_lookup(cache, &acquired.cache_key, cli_label)
         && entry.image_path().exists()
     {
-        eprintln!(
-            "{cli_label}: concurrent ktstr build populated cache slot {} during \
-             peer's build wait — skipping redundant rebuild",
-            acquired.cache_key,
-        );
+        eprintln!("{cli_label}: {}", cache_hit_diagnostic(&acquired.cache_key));
         let image_path = entry.image_path();
         return Ok(KernelBuildResult {
             entry: Some(entry),
@@ -1346,6 +1388,34 @@ mod tests {
                  build wait — rebuilding conservatively (re-run with \
                  RUST_LOG=warn for the probe error)"
             ),
+        );
+    }
+
+    /// Pins the exact diagnostic body emitted by the post-mid-wait
+    /// `cache_lookup` short-circuit so a future copywriting change
+    /// to the operator-facing message is a deliberate, reviewed
+    /// edit rather than silent drift — parallel to
+    /// [`mid_wait_state_diagnostics_pinned`] for the
+    /// [`MidWaitState`] family.
+    ///
+    /// Two assertions: a byte-for-byte match on the formatted body
+    /// with a representative cache_key, plus an inequality between
+    /// two distinct keys to prove the `{cache_key}` placeholder is
+    /// load-bearing (catches a regression that replaces the
+    /// substitution with a static label and would silently produce
+    /// a constant string regardless of input).
+    #[test]
+    fn cache_hit_diagnostic_pinned() {
+        let cache_key = "test-cache-key-7f8a9b";
+        assert_eq!(
+            cache_hit_diagnostic(cache_key),
+            "concurrent ktstr build populated cache slot test-cache-key-7f8a9b \
+             during peer's build wait — skipping redundant rebuild",
+        );
+        assert_ne!(
+            cache_hit_diagnostic(cache_key),
+            cache_hit_diagnostic("different-key-x86-64"),
+            "cache_key substitution must be load-bearing, not a no-op",
         );
     }
 
