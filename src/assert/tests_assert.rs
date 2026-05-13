@@ -354,7 +354,8 @@ fn has_monitor_thresholds_true_when_any_set() {
     // field set. Adding a new MonitorThresholds field requires
     // adding a closure here — that's the maintenance contract,
     // anchored by the struct-update above.
-    let setters: &[(&str, fn() -> Assert)] = &[
+    type FieldSetter = (&'static str, fn() -> Assert);
+    let setters: &[FieldSetter] = &[
         ("max_imbalance_ratio", || {
             Assert::NO_OVERRIDES.max_imbalance_ratio(3.0)
         }),

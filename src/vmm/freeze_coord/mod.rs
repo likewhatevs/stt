@@ -556,6 +556,132 @@ pub(super) enum LateCaptureOutcome {
     Suppressed,
 }
 
+/// Owns the dual-snapshot early-trigger `FailureDumpReport` plus the
+/// drain bookkeeping (retain tag from a failed late-trigger arm
+/// write, dump path, dual-snapshot gate). The guard exists to close
+/// a silent-drop window: the freeze coordinator's closure runs on
+/// a spawned thread, and a panic anywhere in the closure body would
+/// unwind past the end-of-coord drain that flushes a held
+/// `early_snapshot` to disk. Per memory `feedback_no_silent_drops`,
+/// every Captured early MUST reach disk regardless of how the
+/// closure exits.
+///
+/// The guard's [`Self::drain_to_disk`] runs the same emit logic the
+/// end-of-coord drain used to inline (atomic publish via
+/// [`write_to_tagged_path`] + stderr fallback on write failure).
+/// The [`Drop`] impl invokes the same drain so an unwinding panic
+/// flushes the snapshot before the thread tears down. Both paths
+/// are idempotent: `self.snapshot.take()` returns `None` on second
+/// call, making a normal-path drain followed by Drop a no-op.
+///
+/// Cross-cutting state captured at construction:
+/// - `dump_path`: cloned from the closure's `freeze_coord_dump_path`
+///   so the Drop body has its own owned PathBuf without lifetime
+///   dependencies on the closure's locals.
+/// - `dual_snapshot`: copy of `freeze_coord_dual_snapshot` so the
+///   drain honors the same gate the end-of-coord drain used to.
+/// - `retain_tag`: set by the late-trigger Degraded / Suppressed
+///   arms when their tagged-sibling write fails, so the drain
+///   lands the recovered file at the operator-correct path rather
+///   than the default NEVER_FIRED tag (per N8-2 / #72).
+///
+/// Excluded from the guard (verified to NOT need panic-safe
+/// preservation):
+/// - `early_max_age_jiffies` / `early_threshold_jiffies` — consumed
+///   only at the late-Captured `DualFailureDumpReport` assembly
+///   site; if lost on panic the on-disk drained file just lacks
+///   these annotations and the snapshot itself survives.
+/// - `early_degraded_reason` — consumed only at the late-trigger
+///   `early_skipped_reason` calculator; the underlying degraded
+///   JSON already landed on disk at the
+///   `SNAPSHOT_TAG_EARLY_DEGRADED` sibling regardless of panic.
+///
+/// Drop body must not panic (would abort the process via double-
+/// panic on the unwinding thread). The drain body uses only
+/// `serde_json::to_string` (panic-free for well-typed input),
+/// `write_to_tagged_path` (returns `io::Result`, never panics), and
+/// `vcpu_none_indices` (pure filter_map, panic-free). No additional
+/// catch_unwind wrap needed at first land.
+pub(super) struct EarlySnapshotGuard {
+    pub(super) snapshot: Option<crate::monitor::dump::FailureDumpReport>,
+    pub(super) retain_tag: Option<&'static str>,
+    pub(super) dump_path: Option<std::path::PathBuf>,
+    pub(super) dual_snapshot: bool,
+}
+
+impl EarlySnapshotGuard {
+    /// Flush the held snapshot to its tagged sibling via the shared
+    /// atomic-publish helper. Idempotent: a second call after the
+    /// first taken the snapshot returns immediately. No-op when
+    /// `dual_snapshot` is false, when `dump_path` is unset, or when
+    /// `snapshot` is already None.
+    ///
+    /// Invoked at two sites: the end-of-coord drain (terminal
+    /// normal-path flush) and the [`Drop`] impl (panic-unwind
+    /// flush). Both produce the same operator-visible artifact.
+    pub(super) fn drain_to_disk(&mut self) {
+        if !self.dual_snapshot {
+            return;
+        }
+        let Some(dump_path) = self.dump_path.as_deref() else {
+            return;
+        };
+        let Some(early) = self.snapshot.take() else {
+            return;
+        };
+        let drain_tag = self.retain_tag.unwrap_or(
+            crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+        );
+        match serde_json::to_string(&early) {
+            Ok(json) => {
+                match write_to_tagged_path(
+                    Some(dump_path),
+                    drain_tag,
+                    &json,
+                    || {
+                        let vcpu_none = vcpu_none_indices(&early.vcpu_regs);
+                        format!(
+                            "{SNAPSHOT_SUMMARY_PREFIX}: schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
+                            early.schema,
+                            early.vcpu_regs.len(),
+                            vcpu_none,
+                            early.maps.len(),
+                            early.task_enrichments.len(),
+                            json.len(),
+                        )
+                    },
+                    "freeze-coord: early-only (coord exit drain) write failed; emitting structured summary + payload head to stderr as last-ditch preservation",
+                ) {
+                    Ok(Some(tagged)) => {
+                        tracing::info!(
+                            path = %tagged.display(),
+                            retain_tag_used = self.retain_tag.is_some(),
+                            "freeze-coord: early snapshot preserved at coord exit"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
+                }
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                "freeze-coord: early-only (coord exit drain) JSON serialization failed"
+            ),
+        }
+    }
+}
+
+impl Drop for EarlySnapshotGuard {
+    fn drop(&mut self) {
+        // Fires on closure exit (normal OR panic-unwind). Normal path
+        // calls drain_to_disk() explicitly before exit, which takes()
+        // the snapshot — so this Drop is a no-op in the normal case.
+        // On panic-unwind, the normal drain didn't run; this Drop
+        // ensures the captured early reaches disk.
+        self.drain_to_disk();
+    }
+}
+
 impl KtstrVm {
     /// Spawn threads and run the BSP. Returns all state needed for
     /// `collect_results`.
@@ -2117,24 +2243,40 @@ impl KtstrVm {
                 // run, the end-of-coord drain at the bottom of this
                 // closure body emits the early to
                 // [`crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED`].
-                // Per `feedback_no_silent_drops`: every captured
-                // early reaches disk via one of the four paths.
-                let mut early_snapshot: Option<crate::monitor::dump::FailureDumpReport> = None;
-                // N8-2 (#72) fix: when the late-trigger Degraded /
+                // Every captured early reaches disk via one of the
+                // four paths.
+                //
+                // EarlySnapshotGuard wraps `early_snapshot` and
+                // `early_retain_tag` so a panic-unwind anywhere in the
+                // coord closure body still flushes a held Captured
+                // early to disk via the Drop impl. The normal-path
+                // end-of-coord drain (below) calls
+                // `early_guard.drain_to_disk()` explicitly; Drop's
+                // call is a no-op in the normal case because the
+                // snapshot.take() in the normal drain leaves the
+                // guard's `snapshot` field None.
+                //
+                // `retain_tag` field: when the late-trigger Degraded /
                 // Suppressed arm fails to write its tagged sibling
-                // and retains `early_snapshot` for the end-of-coord
-                // drain to retry, record the tag the failed arm
-                // INTENDED to use. The drain reads this on retry so
-                // the recovered file lands at the operator-correct
-                // path (e.g. `early-pre-late-degraded` for a failed
-                // Degraded-arm write) rather than the drain's
-                // default `early-only-late-never-fired` which would
+                // and retains the snapshot for the end-of-coord drain
+                // to retry, the failed arm sets
+                // `early_guard.retain_tag = Some(...)` so the drain
+                // reads it on retry and lands the recovered file at
+                // the operator-correct path (e.g.
+                // `early-pre-late-degraded` for a failed Degraded-arm
+                // write) rather than the default
+                // `early-only-late-never-fired` which would
                 // misrepresent the case. `None` means "no retry
                 // pending — the late never fired" (drain uses its
                 // default tag).
-                let mut early_retain_tag: Option<&'static str> = None;
-                // ADV6/NEW-V3-1 (#61): stash the early-trigger Degraded
-                // reason so the late-trigger emit can surface it via
+                let mut early_guard = EarlySnapshotGuard {
+                    snapshot: None,
+                    retain_tag: None,
+                    dump_path: freeze_coord_dump_path.clone(),
+                    dual_snapshot: freeze_coord_dual_snapshot,
+                };
+                // Stash the early-trigger Degraded reason so the
+                // late-trigger emit can surface it via
                 // `DualFailureDumpReport::early_skipped_reason`.
                 // Without this, an early-Degraded outcome leaves
                 // `early_snapshot` None AND `early_peak_max_age_jiffies`
@@ -6704,7 +6846,7 @@ impl KtstrVm {
                                 LateCaptureOutcome::Captured(report, _capture_start) => {
                                     early_max_age_jiffies = max_age;
                                     early_threshold_jiffies = half_threshold_jiffies;
-                                    early_snapshot = Some(report);
+                                    early_guard.snapshot = Some(report);
                                 }
                                 LateCaptureOutcome::Degraded(degraded) => {
                                     // Stash the degraded reason so the
@@ -6877,7 +7019,7 @@ impl KtstrVm {
                         // truth.
                         let mut backstop_max_age: u64 = 0;
                         if freeze_coord_dual_snapshot
-                            && early_snapshot.is_none()
+                            && early_guard.snapshot.is_none()
                             && half_threshold_jiffies > 0
                             && let LateCaptureOutcome::Captured(ref late, _) = late_capture
                             && let Some(ref ctx) = scan_ctx
@@ -6907,7 +7049,7 @@ impl KtstrVm {
                                      of frozen guest memory shows the \
                                      stall was real)"
                                 );
-                                early_snapshot = Some(late.clone());
+                                early_guard.snapshot = Some(late.clone());
                                 early_max_age_jiffies = backstop_max_age;
                                 early_threshold_jiffies = half_threshold_jiffies;
                             }
@@ -6923,7 +7065,7 @@ impl KtstrVm {
                         // a populated `early` keeps the JSON tight.
                         let early_skipped_reason: Option<String> =
                             if !freeze_coord_dual_snapshot
-                                || early_snapshot.is_some()
+                                || early_guard.snapshot.is_some()
                             {
                                 None
                             } else if let Some(reason) =
@@ -7053,7 +7195,7 @@ impl KtstrVm {
                                     let dual = crate::monitor::dump::DualFailureDumpReport {
                                         schema: crate::monitor::dump::SCHEMA_DUAL
                                             .to_string(),
-                                        early: early_snapshot.take(),
+                                        early: early_guard.snapshot.take(),
                                         late,
                                         early_max_age_jiffies,
                                         early_threshold_jiffies,
@@ -7219,7 +7361,7 @@ impl KtstrVm {
                                 if freeze_coord_dual_snapshot
                                     && freeze_coord_dump_path.is_some()
                                     && let Some(early) =
-                                        early_snapshot.as_ref()
+                                        early_guard.snapshot.as_ref()
                                 {
                                     let write_succeeded = match serde_json::to_string(early) {
                                         Ok(json) => match write_to_tagged_path(
@@ -7260,23 +7402,21 @@ impl KtstrVm {
                                     };
                                     if write_succeeded {
                                         // Consume only on success;
-                                        // failure leaves the
-                                        // snapshot for the end-of-
-                                        // coord drain below to
-                                        // retry (N7-1).
-                                        let _ = early_snapshot.take();
+                                        // failure leaves the snapshot
+                                        // for the end-of-coord drain
+                                        // below to retry.
+                                        let _ = early_guard.snapshot.take();
                                     } else {
-                                        // N8-2 (#72): record the
-                                        // tag this arm INTENDED so
-                                        // the drain's retry lands at
-                                        // the correct operator-
-                                        // readable path rather than
-                                        // the drain's default
-                                        // NEVER_FIRED tag (which
-                                        // would misrepresent this
-                                        // case — late DID fire as
-                                        // Degraded).
-                                        early_retain_tag = Some(
+                                        // Record the tag this arm
+                                        // INTENDED so the drain's
+                                        // retry lands at the correct
+                                        // operator-readable path
+                                        // rather than the drain's
+                                        // default NEVER_FIRED tag
+                                        // (which would misrepresent
+                                        // this case — late DID fire
+                                        // as Degraded).
+                                        early_guard.retain_tag = Some(
                                             crate::monitor::dump::SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
                                         );
                                     }
@@ -7376,7 +7516,7 @@ impl KtstrVm {
                                 if freeze_coord_dual_snapshot
                                     && freeze_coord_dump_path.is_some()
                                     && let Some(early) =
-                                        early_snapshot.as_ref()
+                                        early_guard.snapshot.as_ref()
                                 {
                                     let write_succeeded = match serde_json::to_string(early) {
                                         Ok(json) => match write_to_tagged_path(
@@ -7416,12 +7556,11 @@ impl KtstrVm {
                                         }
                                     };
                                     if write_succeeded {
-                                        let _ = early_snapshot.take();
+                                        let _ = early_guard.snapshot.take();
                                     } else {
-                                        // N8-2 (#72): see Degraded arm
-                                        // above for the retain-tag
-                                        // rationale.
-                                        early_retain_tag = Some(
+                                        // See Degraded arm above for
+                                        // the retain-tag rationale.
+                                        early_guard.retain_tag = Some(
                                             crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
                                         );
                                     }
@@ -7600,98 +7739,22 @@ impl KtstrVm {
                 //     for the run. freeze_state stayed at Idle or
                 //     TookEarly. Tag:
                 //     `SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED`.
-                // Different tags so an operator browsing the dump
-                // dir distinguishes "scheduler recovered AND
-                // reached clean late exit" from "scheduler recovered
-                // AND was terminated/killed before reaching the
-                // late stage."
-                // V6-F1 (advphd_qemu): base_path check FIRST — same
-                // silent-drop rationale as the Degraded + Suppressed
-                // arms above.
-                if freeze_coord_dual_snapshot
-                    && freeze_coord_dump_path.is_some()
-                    && let Some(early) = early_snapshot.take()
-                {
-                    // N7-1 (#70) note: this drain is the TERMINAL
-                    // attempt — coord exit follows immediately, no
-                    // retry path remains. The Degraded + Suppressed
-                    // arms above retain early on write-failure so
-                    // this drain can retry; if THIS write fails the
-                    // early snapshot is lost. On failure we emit a
-                    // structured summary line + the JSON head to
-                    // stderr in addition to the tracing::warn! so
-                    // test harnesses capture the payload via the
-                    // stderr stream — stderr is a separate channel
-                    // from the filesystem and typically survives
-                    // the kinds of failures (ENOSPC, EROFS, EACCES)
-                    // that fail file writes.
-                    //
-                    // N8-2 (#72): if a prior arm (Degraded /
-                    // Suppressed) failed its write and retained
-                    // early via `early_retain_tag`, use that arm's
-                    // intended tag rather than NEVER_FIRED. Without
-                    // this, the recovered file would land at
-                    // `early-only-late-never-fired` but the late
-                    // DID fire (and emitted via the main path) —
-                    // the wrong tag would mislead an operator into
-                    // believing late never ran.
-                    //
-                    // N8-1 (#71): the stderr fallback prefixes a
-                    // structured summary line (schema, vcpu count
-                    // and which were None, map count) BEFORE the
-                    // JSON head so that vcpu_regs — the most
-                    // operator-critical field for stall diagnosis,
-                    // which serde places AFTER `maps` in the
-                    // serialized layout and can be truncated by
-                    // the head-cap — are surfaced regardless of
-                    // payload size.
-                    let drain_tag = early_retain_tag.unwrap_or(
-                        crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
-                    );
-                    match serde_json::to_string(&early) {
-                        Ok(json) => {
-                            // Routed through write_to_tagged_path so the
-                            // drain reuses the atomic-publish + parent-
-                            // dir fsync + stderr-fallback contract the
-                            // on-demand sites also use. Pre-A2 this
-                            // drain used non-atomic std::fs::write;
-                            // A2 v2 closes the asymmetric crash-safety
-                            // surface across all tagged-dump paths.
-                            match write_to_tagged_path(
-                                freeze_coord_dump_path.as_deref(),
-                                drain_tag,
-                                &json,
-                                || {
-                                    let vcpu_none = vcpu_none_indices(&early.vcpu_regs);
-                                    format!(
-                                        "{SNAPSHOT_SUMMARY_PREFIX}: schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
-                                        early.schema,
-                                        early.vcpu_regs.len(),
-                                        vcpu_none,
-                                        early.maps.len(),
-                                        early.task_enrichments.len(),
-                                        json.len(),
-                                    )
-                                },
-                                "freeze-coord: early-only (coord exit drain) write failed; emitting structured summary + payload head to stderr as last-ditch preservation",
-                            ) {
-                                Ok(Some(tagged)) => {
-                                    tracing::info!(
-                                        path = %tagged.display(),
-                                        retain_tag_used = early_retain_tag.is_some(),
-                                        "freeze-coord: early snapshot preserved at coord exit"
-                                    );
-                                }
-                                Ok(None) => {}
-                                Err(_) => {}
-                            }
-                        }
-                        Err(e) => tracing::error!(
-                            error = %e,
-                            "freeze-coord: early-only (coord exit drain) JSON serialization failed"
-                        ),
-                    }
-                }
+                // Different tags so an operator browsing the dump dir
+                // distinguishes "scheduler recovered AND reached
+                // clean late exit" from "scheduler recovered AND was
+                // terminated/killed before reaching the late stage."
+                // base_path check FIRST — same silent-drop rationale
+                // as the Degraded + Suppressed arms above. The drain
+                // logic lives in `EarlySnapshotGuard::drain_to_disk`
+                // so the same emit runs on panic-unwind via the
+                // guard's Drop. The normal-path call here drains
+                // explicitly so a tracing::info! "preserved at coord
+                // exit" line surfaces in healthy runs; the Drop fires
+                // in the panic-unwind path with the same atomic-
+                // publish + stderr-fallback semantics (see the
+                // EarlySnapshotGuard doc for the full rationale on
+                // retain_tag carry, idempotence, and panic-safety).
+                early_guard.drain_to_disk();
                 // Flush any partial-frame bytes the bulk_assembler
                 // is still buffering back into the device's
                 // `port1_tx_buf`. The assembler retains tail bytes
