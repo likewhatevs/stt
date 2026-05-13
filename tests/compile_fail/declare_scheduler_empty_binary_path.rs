@@ -3,8 +3,8 @@
 // time so the diagnostic lands on the literal.
 use ktstr::declare_scheduler;
 
-declare_scheduler!(BINARY_PATH_EMPTY, {
-    name = "binary_path_empty",
+declare_scheduler!(EMPTY_BINARY_PATH, {
+    name = "empty_binary_path",
     binary_path = "",
 });
 
