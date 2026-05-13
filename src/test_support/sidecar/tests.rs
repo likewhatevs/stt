@@ -2346,6 +2346,32 @@ fn sidecar_variant_hash_distinguishes_payload() {
     );
 }
 
+/// Two sidecars that differ only in `topology` (the rendered preset
+/// label, e.g. `1n_1l_2c_1t` vs `1n_2l_4c_1t`) must produce distinct
+/// variant hashes so per-preset sidecar files don't clobber each
+/// other when a single test fans out across the gauntlet preset
+/// list. The sibling
+/// `sidecar_variant_hash_distinguishes_payload` /
+/// `..._distinguishes_work_types` tests pin the payload and
+/// work_type axes; this fills the preset / topology axis gap so a
+/// regression that dropped `topology` from
+/// [`sidecar_variant_hash`]'s canonical JSON object would surface
+/// here as a hash collision rather than silently producing N
+/// gauntlet variants under one filename.
+#[test]
+fn sidecar_variant_hash_distinguishes_presets() {
+    let mut sc = SidecarResult::test_fixture();
+    sc.topology = "1n_1l_2c_1t".to_string();
+    let h1 = sidecar_variant_hash(&sc);
+    sc.topology = "1n_2l_4c_1t".to_string();
+    let h2 = sidecar_variant_hash(&sc);
+    assert_ne!(
+        h1, h2,
+        "preset must influence sidecar variant hash so per-preset \
+         sidecar files don't clobber each other",
+    );
+}
+
 // -- format_verifier_stats tests --
 
 #[test]

@@ -29,13 +29,12 @@ fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_cgroup_pipe_io(ctx)
 }
 
-// expect_err: scx-ktstr is a toy scheduler — Normal/Batch/Idle/FIFO mix
-// always stalls under it. Test exercises workload generation, not
-// scheduler correctness, so the fairness rate ceilings (keep_last,
+// Test exercises workload generation (Normal/Batch/Idle/FIFO mix),
+// not scheduler correctness. Fairness rate ceilings (keep_last,
 // fallback) that activate when ANY monitor threshold is set are
 // raised here to skip those checks while keeping sustained_samples
 // for the stall-pattern coverage.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
@@ -163,10 +162,10 @@ fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_add_load_imbalance(ctx)
 }
 
-// expect_err: scx-ktstr is a toy scheduler — heavy/light load oscillation
-// across phases always stalls under it. Test exercises workload generation,
-// not scheduler correctness. See cover_sched_mixed for rate-ceiling rationale.
-#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
+// Test exercises workload generation (heavy/light load oscillation
+// across phases), not scheduler correctness. See cover_sched_mixed
+// for rate-ceiling rationale.
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, max_keep_last_rate = 1000000000.0, max_fallback_rate = 1000000000.0)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }

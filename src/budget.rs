@@ -475,6 +475,150 @@ mod tests {
         assert_ne!(features & (1 << GAUNTLET_SHIFT), 0);
     }
 
+    /// Bit-shift orthogonality + ground-truth pin: each one-bit
+    /// flag must land at its canonical bit position AND must set
+    /// ONLY that bit (no overlap with any other one-bit flag).
+    ///
+    /// Today's sibling tests (`extract_features_smt_set`,
+    /// `extract_features_gauntlet`) verify each bit fires when its
+    /// trigger is active but read both sides through the same
+    /// `*_SHIFT` constants — a coherent swap (SMT_SHIFT ↔
+    /// PERF_MODE_SHIFT swapped) passes both because writer + reader
+    /// move together. An overlap (one shift constant coincidentally
+    /// equal to another) silently degrades the feature vector's
+    /// one-hot guarantee.
+    ///
+    /// This test pins each one-bit shift against a literal ground
+    /// truth (catches swap + reassignment) AND asserts the
+    /// triggered features bit fires while every OTHER one-bit
+    /// flag stays clear by NAME-keyed comparison (catches overlap;
+    /// a value-keyed skip would silently exempt the colliding
+    /// neighbor along with the trigger itself).
+    #[test]
+    fn extract_features_bit_shifts_orthogonal() {
+        // Ground-truth pin: literal bit positions for every
+        // one-bit flag. If any *_SHIFT constant changes value, the
+        // change must land here too — making the renumber an
+        // explicit decision rather than a silent drift.
+        assert_eq!(SMT_SHIFT, 14, "SMT_SHIFT pinned");
+        assert_eq!(PERF_MODE_SHIFT, 15, "PERF_MODE_SHIFT pinned");
+        assert_eq!(HOST_ONLY_SHIFT, 16, "HOST_ONLY_SHIFT pinned");
+        assert_eq!(EXPECT_ERR_SHIFT, 17, "EXPECT_ERR_SHIFT pinned");
+        assert_eq!(WORKERS_SHIFT, 21, "WORKERS_SHIFT pinned");
+        assert_eq!(GAUNTLET_SHIFT, 22, "GAUNTLET_SHIFT pinned");
+
+        // Plain non-SMT topo so the SMT bit is naturally clear in
+        // every "trigger isolated" path. SMT requires its own
+        // topo (threads_per_core > 1).
+        let plain_topo = Topology {
+            llcs: 1,
+            cores_per_llc: 2,
+            threads_per_core: 1,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+        let smt_topo = Topology {
+            llcs: 1,
+            cores_per_llc: 2,
+            threads_per_core: 2,
+            numa_nodes: 1,
+            nodes: None,
+            distances: None,
+        };
+
+        // List every one-bit feature flag. Each row: (shift,
+        // human name). DURATION/CPU/LLC/NUMA/SCHED/NAME_HASH are
+        // multi-bit one-hot fields out of scope here.
+        let one_bit_shifts: &[(u32, &str)] = &[
+            (SMT_SHIFT, "SMT"),
+            (PERF_MODE_SHIFT, "PERF_MODE"),
+            (HOST_ONLY_SHIFT, "HOST_ONLY"),
+            (EXPECT_ERR_SHIFT, "EXPECT_ERR"),
+            (WORKERS_SHIFT, "WORKERS"),
+            (GAUNTLET_SHIFT, "GAUNTLET"),
+        ];
+
+        // Helper: assert ONLY the named one-bit flag fires; every
+        // other one-bit flag stays clear. Skip by NAME (identity),
+        // not by shift VALUE — a value-keyed skip would exempt any
+        // neighbor that coincidentally shares the trigger's shift,
+        // silently masking the overlap regression this test exists
+        // to catch.
+        let assert_only = |features: u64, trigger_label: &str| {
+            let trigger_shift = one_bit_shifts
+                .iter()
+                .find(|(_, name)| *name == trigger_label)
+                .map(|(shift, _)| *shift)
+                .expect("trigger_label must be present in one_bit_shifts");
+            assert_ne!(
+                features & (1 << trigger_shift),
+                0,
+                "{trigger_label}: triggered bit must be set",
+            );
+            for &(other_shift, other_name) in one_bit_shifts {
+                if other_name == trigger_label {
+                    continue;
+                }
+                assert_eq!(
+                    features & (1 << other_shift),
+                    0,
+                    "{trigger_label} trigger must leave {other_name} bit \
+                     (shift {other_shift}) clear — collision indicates \
+                     a shift-overlap regression",
+                );
+            }
+        };
+
+        // SMT-only: plain entry, SMT topo. Only SMT bit fires
+        // among one-bit flags.
+        let smt_f =
+            extract_features(&KtstrTestEntry::DEFAULT, &smt_topo, false, "smt_test");
+        assert_only(smt_f, "SMT");
+
+        // PERF_MODE-only: performance_mode entry, plain (non-SMT)
+        // topo, is_gauntlet=false.
+        let perf_entry = KtstrTestEntry {
+            performance_mode: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let perf_f = extract_features(&perf_entry, &plain_topo, false, "perf_test");
+        assert_only(perf_f, "PERF_MODE");
+
+        // HOST_ONLY-only: host_only entry, plain topo.
+        let host_only_entry = KtstrTestEntry {
+            host_only: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let host_only_f =
+            extract_features(&host_only_entry, &plain_topo, false, "host_test");
+        assert_only(host_only_f, "HOST_ONLY");
+
+        // EXPECT_ERR-only: expect_err entry, plain topo.
+        let expect_err_entry = KtstrTestEntry {
+            expect_err: true,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let expect_err_f =
+            extract_features(&expect_err_entry, &plain_topo, false, "expect_err_test");
+        assert_only(expect_err_f, "EXPECT_ERR");
+
+        // WORKERS-only: workers_per_cgroup > 2 (per workers_bucket
+        // threshold), plain topo.
+        let workers_entry = KtstrTestEntry {
+            workers_per_cgroup: 4,
+            ..KtstrTestEntry::DEFAULT
+        };
+        let workers_f =
+            extract_features(&workers_entry, &plain_topo, false, "workers_test");
+        assert_only(workers_f, "WORKERS");
+
+        // GAUNTLET-only: plain entry, plain topo, is_gauntlet=true.
+        let gauntlet_f =
+            extract_features(&KtstrTestEntry::DEFAULT, &plain_topo, true, "gauntlet_test");
+        assert_only(gauntlet_f, "GAUNTLET");
+    }
+
     #[test]
     fn estimate_duration_small_topo() {
         let entry = KtstrTestEntry {

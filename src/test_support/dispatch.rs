@@ -1994,30 +1994,39 @@ mod tests {
     }
 
     #[test]
-    fn for_each_gauntlet_variant_visits_every_fitting_preset() {
-        // With generous host capacity (u32::MAX cpus/llcs), every
-        // preset that the dummy entry's constraints accept yields
-        // exactly one visit — there is no longer a profile dimension
-        // multiplying preset count.
+    fn for_each_gauntlet_variant_visit_count_equals_accepted_preset_count() {
+        // With generous host capacity (u32::MAX cpus/llcs/per-LLC),
+        // every preset that `entry.constraints.accepts(...)` admits
+        // must yield exactly one visit — no profile multiplier, no
+        // duplicate visits per preset. Computing the expected count
+        // from the same `accepts` predicate the function calls means
+        // this assertion catches both directions of regression:
+        //
+        //   - a regression that double-visits each accepted preset
+        //     produces `count == 2 * expected` (the weaker `>= 1`
+        //     assertion this test replaced would have silently
+        //     passed),
+        //   - a regression that skips accepted presets (e.g. an
+        //     inverted condition) produces `count < expected`.
         let presets = crate::vm::gauntlet_presets();
+        let entry = find_test("__unit_test_dummy__").unwrap();
+        let expected: usize = presets
+            .iter()
+            .filter(|p| {
+                entry
+                    .constraints
+                    .accepts(&p.topology, u32::MAX, u32::MAX, u32::MAX)
+            })
+            .count();
         let mut count = 0;
-        for_each_gauntlet_variant(
-            find_test("__unit_test_dummy__").unwrap(),
-            &presets,
-            u32::MAX,
-            u32::MAX,
-            u32::MAX,
-            |_| count += 1,
+        for_each_gauntlet_variant(entry, &presets, u32::MAX, u32::MAX, u32::MAX, |_| {
+            count += 1
+        });
+        assert_eq!(
+            count, expected,
+            "post-flag-kill: visit count must equal the number of presets the \
+             entry's constraints accept; one visit per preset, no profile multiplier",
         );
-        // Asserting `count >= 1` proves at least one preset was
-        // accepted and visited. Coupling to the exact preset count
-        // would fail if the preset list changes.
-        if !presets.is_empty() {
-            assert!(
-                count >= 1,
-                "expected at least one visit with unlimited host capacity, got {count}"
-            );
-        }
     }
 
     #[test]
