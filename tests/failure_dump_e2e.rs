@@ -32,6 +32,7 @@ mod common;
 use anyhow::Result;
 use common::dump_paths::failure_dump_path;
 use ktstr::assert::AssertResult;
+use ktstr::prelude::SCHEMA_SINGLE;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
@@ -122,10 +123,11 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
             )
         })?;
     anyhow::ensure!(
-        schema == "single",
-        "happy-path dump must carry schema=\"single\"; got schema={schema} \
-         (a `degraded` schema here means the freeze coordinator's gate \
-         cross-reference or rendezvous-timeout path fired when it should not have)"
+        schema == SCHEMA_SINGLE,
+        "happy-path dump must carry schema=SCHEMA_SINGLE ({SCHEMA_SINGLE:?}); \
+         got schema={schema} (a `degraded` schema here means the freeze \
+         coordinator's gate cross-reference or rendezvous-timeout path fired \
+         when it should not have)"
     );
 
     // Top-level shape: {"maps": [...]}. `non_exhaustive` does not
