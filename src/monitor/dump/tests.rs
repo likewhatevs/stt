@@ -1462,53 +1462,101 @@ fn failure_dump_report_strict_schema_maps_required() {
 
 /// Omitting all optional fields (`vcpu_regs`, `sdt_allocations`,
 /// every diagnostic Option, every capture Vec) MUST succeed and
-/// produce a deserialized report whose absent fields take their
-/// `serde(default)` value. `schema` is REQUIRED — it has no
-/// `serde(default)`, so absent-schema JSON fails at serde directly
-/// (the proximate reason this test must provide it). At the
-/// wire-format level, [`FailureDumpReportAny::from_json`] also
+/// produce a deserialized report whose absent fields take the
+/// type's default value via `#[serde(default)]` (Vec → empty,
+/// Option → None, bool → false, ScxStaticSnapshot → struct Default
+/// with `ranges: []` + `skipped: 0`). `schema` is REQUIRED — it
+/// has no `serde(default)`, so absent-schema JSON fails at serde
+/// directly (the proximate reason this test must provide it). At
+/// the wire-format level, [`FailureDumpReportAny::from_json`] also
 /// rejects absent-schema JSON to avoid silently mis-routing a
 /// richer wrapper as a lossy single shape. The test provides
 /// `schema: "single"` explicitly and verifies the round-trip
 /// preserves it.
 #[test]
 fn failure_dump_report_optional_fields_round_trip_when_omitted() {
+    // 22-field default-shape assertions. Used twice below: once on
+    // the freshly-deserialized minimal JSON, once on the
+    // serialize-then-redeserialize round-trip. The double-leg
+    // catches a regression where serialize drops a non-default
+    // value via skip_serializing_if even though deserialize accepts
+    // it — without the second leg the test name's "round_trip"
+    // claim would be aspirational.
+    let assert_default_shape = |r: &FailureDumpReport, leg: &str| {
+        assert_eq!(
+            r.schema, SCHEMA_SINGLE,
+            "[{leg}] explicit `schema: single` field must round-trip; got: {:?}",
+            r.schema,
+        );
+        // Assertions follow FailureDumpReport struct-declaration order
+        // (dump/mod.rs). When a new field lands, add its default-shape
+        // assert at the matching position.
+        assert!(r.maps.is_empty(), "[{leg}] maps");
+        assert!(r.vcpu_regs.is_empty(), "[{leg}] vcpu_regs");
+        assert!(r.sdt_allocations.is_empty(), "[{leg}] sdt_allocations");
+        // scx_static_ranges is a struct (ScxStaticSnapshot), not Vec/Option.
+        // Pin Default::default() via ScxStaticSnapshot::is_empty() (both
+        // ranges.is_empty() AND skipped == 0); see
+        // monitor/scx_static_alloc.rs ScxStaticSnapshot::is_empty.
+        assert!(r.scx_static_ranges.is_empty(), "[{leg}] scx_static_ranges");
+        assert!(
+            r.sdt_alloc_unavailable.is_none(),
+            "[{leg}] sdt_alloc_unavailable"
+        );
+        assert!(r.prog_runtime_stats.is_empty(), "[{leg}] prog_runtime_stats");
+        assert!(
+            r.prog_runtime_stats_unavailable.is_none(),
+            "[{leg}] prog_runtime_stats_unavailable"
+        );
+        assert!(r.per_cpu_time.is_empty(), "[{leg}] per_cpu_time");
+        assert!(r.per_node_numa.is_empty(), "[{leg}] per_node_numa");
+        assert!(
+            r.per_node_numa_unavailable.is_none(),
+            "[{leg}] per_node_numa_unavailable"
+        );
+        assert!(r.task_enrichments.is_empty(), "[{leg}] task_enrichments");
+        assert!(
+            r.task_enrichments_unavailable.is_none(),
+            "[{leg}] task_enrichments_unavailable"
+        );
+        assert!(
+            r.event_counter_timeline.is_empty(),
+            "[{leg}] event_counter_timeline"
+        );
+        assert!(r.rq_scx_states.is_empty(), "[{leg}] rq_scx_states");
+        assert!(r.dsq_states.is_empty(), "[{leg}] dsq_states");
+        assert!(r.scx_sched_state.is_none(), "[{leg}] scx_sched_state");
+        assert!(
+            r.scx_walker_unavailable.is_none(),
+            "[{leg}] scx_walker_unavailable"
+        );
+        assert!(
+            r.vcpu_perf_at_freeze.is_empty(),
+            "[{leg}] vcpu_perf_at_freeze"
+        );
+        assert!(
+            r.dump_truncated_at_us.is_none(),
+            "[{leg}] dump_truncated_at_us"
+        );
+        assert!(r.probe_counters.is_none(), "[{leg}] probe_counters");
+        assert!(!r.is_placeholder, "[{leg}] is_placeholder");
+    };
+
     let minimal = serde_json::json!({ "schema": "single", "maps": [] });
     let report: FailureDumpReport = serde_json::from_value(minimal)
         .expect("deserialize must accept FailureDumpReport with `schema` + `maps`");
-    assert_eq!(
-        report.schema, SCHEMA_SINGLE,
-        "explicit `schema: single` field must round-trip; got: {:?}",
-        report.schema,
-    );
-    // Assertions follow FailureDumpReport struct-declaration order
-    // (dump/mod.rs). When a new field lands, add its default-shape
-    // assert at the matching position.
-    assert!(report.maps.is_empty());
-    assert!(report.vcpu_regs.is_empty());
-    assert!(report.sdt_allocations.is_empty());
-    // scx_static_ranges is a struct (ScxStaticSnapshot), not Vec/Option.
-    // Pin Default::default() via ScxStaticSnapshot::is_empty() (both
-    // ranges.is_empty() AND skipped == 0); see
-    // monitor/scx_static_alloc.rs ScxStaticSnapshot::is_empty.
-    assert!(report.scx_static_ranges.is_empty());
-    assert!(report.sdt_alloc_unavailable.is_none());
-    assert!(report.prog_runtime_stats.is_empty());
-    assert!(report.prog_runtime_stats_unavailable.is_none());
-    assert!(report.per_cpu_time.is_empty());
-    assert!(report.per_node_numa.is_empty());
-    assert!(report.per_node_numa_unavailable.is_none());
-    assert!(report.task_enrichments.is_empty());
-    assert!(report.task_enrichments_unavailable.is_none());
-    assert!(report.event_counter_timeline.is_empty());
-    assert!(report.rq_scx_states.is_empty());
-    assert!(report.dsq_states.is_empty());
-    assert!(report.scx_sched_state.is_none());
-    assert!(report.scx_walker_unavailable.is_none());
-    assert!(report.vcpu_perf_at_freeze.is_empty());
-    assert!(report.dump_truncated_at_us.is_none());
-    assert!(report.probe_counters.is_none());
-    assert!(!report.is_placeholder);
+    assert_default_shape(&report, "first-leg");
+
+    // Round-trip leg: serialize the default-shape report back to
+    // JSON and re-deserialize. Catches a future regression where a
+    // skip_serializing_if filter accidentally drops a non-default
+    // value, or a serde-rename mismatches the wire-format expected
+    // by from_value above. Without this leg the test name's
+    // "round_trip" claim is unenforced.
+    let v = serde_json::to_value(&report).expect("serialize default-shape report");
+    let report2: FailureDumpReport =
+        serde_json::from_value(v).expect("re-deserialize default-shape JSON");
+    assert_default_shape(&report2, "second-leg");
 }
 
 // -- Pin failure-dump error-message strings ----------------------
