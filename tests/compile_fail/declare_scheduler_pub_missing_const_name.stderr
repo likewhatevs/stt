@@ -1,0 +1,5 @@
+error: expected identifier
+ --> tests/compile_fail/declare_scheduler_pub_missing_const_name.rs:7:24
+  |
+7 | declare_scheduler!(pub , {
+  |                        ^

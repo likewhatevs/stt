@@ -1486,6 +1486,29 @@ fn camel_to_screaming_snake(s: &str) -> String {
 ///   via linkme so the verifier can discover the declaration by
 ///   spawning the test binary with `--ktstr-list-schedulers`.
 ///
+/// # Visibility prefix
+///
+/// An optional Rust visibility prefix may precede the const name:
+///
+/// ```rust,ignore
+/// declare_scheduler!(MY_SCHED, { ... });             // defaults to `pub`
+/// declare_scheduler!(pub MY_SCHED, { ... });          // explicit `pub`
+/// declare_scheduler!(pub(crate) MY_SCHED, { ... });   // crate-local
+/// declare_scheduler!(pub(super) MY_SCHED, { ... });   // parent-module
+/// declare_scheduler!(pub(in crate::test_support) MY_SCHED, { ... });
+/// ```
+///
+/// Omitting the prefix defaults to `pub` — schedulers are normally
+/// public so the verifier and other crates can reference them; an
+/// explicit prefix is needed only when the declaration sits inside
+/// a module that wants to narrow the exposed name. (Field content
+/// shown above as `{ ... }` is elided; consult the Syntax example
+/// for the required fields.) The hidden registry static (see
+/// Generated items above) is always `static` (private) regardless
+/// of the user-facing const's visibility — `linkme` gathers it via
+/// link-section walking, not Rust name resolution, so the slice
+/// mechanism works at every visibility level.
+///
 /// # Accepted fields
 ///
 /// | Field | Required | Description |
@@ -1521,12 +1544,19 @@ fn declare_scheduler_inner(
     input: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     struct DeclareSchedulerInput {
+        visibility: syn::Visibility,
         const_name: syn::Ident,
         fields: Vec<(syn::Ident, syn::Expr)>,
     }
 
     impl syn::parse::Parse for DeclareSchedulerInput {
         fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+            // Optional visibility prefix: `pub`, `pub(crate)`,
+            // `pub(super)`, `pub(in path)`, or none. `syn::Visibility`
+            // returns `Visibility::Inherited` when no prefix is given;
+            // the emit treats this as the default-pub case so call
+            // sites without a visibility prefix produce `pub static`.
+            let visibility: syn::Visibility = input.parse()?;
             let const_name: syn::Ident = input.parse()?;
             let _: syn::Token![,] = input.parse()?;
             let body;
@@ -1541,11 +1571,19 @@ fn declare_scheduler_inner(
                     let _: syn::Token![,] = body.parse()?;
                 }
             }
-            Ok(DeclareSchedulerInput { const_name, fields })
+            Ok(DeclareSchedulerInput {
+                visibility,
+                const_name,
+                fields,
+            })
         }
     }
 
-    let DeclareSchedulerInput { const_name, fields } = syn::parse2(input)?;
+    let DeclareSchedulerInput {
+        visibility,
+        const_name,
+        fields,
+    } = syn::parse2(input)?;
 
     // Validate const name: SCREAMING_SNAKE_CASE + not reserved.
     let const_name_str = const_name.to_string();
@@ -2033,6 +2071,15 @@ fn declare_scheduler_inner(
 
     let registry_ident = format_ident!("__KTSTR_SCHED_REG_{}", const_name);
 
+    // Default the emitted const's visibility to `pub` when the user
+    // omits a prefix. Explicit prefixes (`pub`, `pub(crate)`,
+    // `pub(super)`, `pub(in path)`) flow through verbatim via
+    // `quote!`'s `ToTokens` impl for `syn::Visibility`.
+    let effective_visibility = match &visibility {
+        syn::Visibility::Inherited => quote! { pub },
+        v => quote! { #v },
+    };
+
     let expanded = quote! {
         // Suppress `missing_docs` on the emitted static so consumer
         // crates that set `#![deny(missing_docs)]` can still invoke
@@ -2041,8 +2088,14 @@ fn declare_scheduler_inner(
         // point — requiring a doc comment per declaration would force
         // boilerplate at every call site.
         #[allow(missing_docs)]
-        pub static #const_name: ::ktstr::test_support::Scheduler = #builder_chain;
+        #effective_visibility static #const_name: ::ktstr::test_support::Scheduler = #builder_chain;
 
+        // The registry static stays plain `static` regardless of the
+        // user-facing const's visibility — linkme gathers it via
+        // link-section walking (not Rust name resolution), so its
+        // visibility is irrelevant to the slice mechanism. Keeping it
+        // private keeps the registry symbol opaque even when the
+        // user-facing const is `pub`.
         #[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_SCHEDULERS)]
         #[linkme(crate = ::ktstr::__private::linkme)]
         static #registry_ident: &'static ::ktstr::test_support::Scheduler = &#const_name;

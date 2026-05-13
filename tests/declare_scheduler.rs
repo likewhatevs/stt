@@ -303,6 +303,84 @@ fn config_fields_independent_defaults() {
     assert_eq!(ONLY_CONFIG_FILE_DEF.config_file, None);
 }
 
+// -- visibility prefix --
+//
+// The macro accepts an optional Rust visibility prefix before the
+// const name. Omitted defaults to `pub`. Explicit prefixes (`pub`,
+// `pub(crate)`, `pub(super)`, `pub(in path)`) flow through verbatim.
+// The registry static stays plain `static` regardless of the
+// user-facing const's visibility.
+
+declare_scheduler!(pub VIS_EXPLICIT_PUB, {
+    name = "vis_explicit_pub",
+    binary = "scx-vis-pub",
+});
+
+declare_scheduler!(pub(crate) VIS_PUB_CRATE, {
+    name = "vis_pub_crate",
+    binary = "scx-vis-crate",
+});
+
+mod vis_inner {
+    use ktstr::declare_scheduler;
+    declare_scheduler!(pub(super) VIS_PUB_SUPER, {
+        name = "vis_pub_super",
+        binary = "scx-vis-super",
+    });
+
+    // `pub(in path)` visibility — pinned via a nested module that
+    // exposes the const to a specific ancestor path.
+    pub mod vis_inner_inner {
+        use ktstr::declare_scheduler;
+        declare_scheduler!(pub(in super::super::vis_inner) VIS_PUB_IN_PATH, {
+            name = "vis_pub_in_path",
+            binary = "scx-vis-in-path",
+        });
+    }
+
+    // Re-export through a function that proves the in-path const is
+    // accessible from within `vis_inner`'s scope.
+    pub fn pub_in_path_name() -> &'static str {
+        vis_inner_inner::VIS_PUB_IN_PATH.name
+    }
+}
+
+#[test]
+fn visibility_prefixes_flow_through_to_emit() {
+    // `pub VIS_EXPLICIT_PUB` is reachable from this crate-internal
+    // test module — same accessibility as the default-pub case.
+    assert_eq!(VIS_EXPLICIT_PUB.name, "vis_explicit_pub");
+    // `pub(crate) VIS_PUB_CRATE` is reachable here (we ARE the crate).
+    assert_eq!(VIS_PUB_CRATE.name, "vis_pub_crate");
+    // `pub(super) VIS_PUB_SUPER` declared inside `vis_inner`; visible
+    // here as `vis_inner::VIS_PUB_SUPER` was promoted to the parent
+    // (this file) via pub(super). Access through the inner module
+    // path proves the visibility chain works.
+    assert_eq!(vis_inner::VIS_PUB_SUPER.name, "vis_pub_super");
+}
+
+#[test]
+fn visibility_prefixed_schedulers_still_register_in_slice() {
+    // All four visibility-prefixed declarations register in
+    // KTSTR_SCHEDULERS via linkme regardless of Rust visibility,
+    // because linkme gathers via link-section walking, not name
+    // resolution.
+    let names: Vec<&'static str> = KTSTR_SCHEDULERS.iter().map(|s| s.name).collect();
+    assert!(names.contains(&"vis_explicit_pub"));
+    assert!(names.contains(&"vis_pub_crate"));
+    assert!(names.contains(&"vis_pub_super"));
+    assert!(names.contains(&"vis_pub_in_path"));
+}
+
+#[test]
+fn pub_in_path_visibility_accessible_within_path_scope() {
+    // The `pub(in super::super::vis_inner)` declaration is reachable
+    // from inside `vis_inner` (via the `pub_in_path_name` helper).
+    // Confirms `pub(in path)` syntax flows through the macro parser
+    // + emit correctly.
+    assert_eq!(vis_inner::pub_in_path_name(), "vis_pub_in_path");
+}
+
 // -- KTSTR_SCHEDULERS registration --
 
 #[test]

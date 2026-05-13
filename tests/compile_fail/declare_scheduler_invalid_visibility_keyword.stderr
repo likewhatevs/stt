@@ -1,0 +1,5 @@
+error: expected identifier, found keyword `extern`
+ --> tests/compile_fail/declare_scheduler_invalid_visibility_keyword.rs:6:20
+  |
+6 | declare_scheduler!(extern MY_SCHED, {
+  |                    ^^^^^^
