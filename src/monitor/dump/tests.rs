@@ -1478,9 +1478,18 @@ fn failure_dump_report_optional_fields_round_trip_when_omitted() {
         "explicit `schema: single` field must round-trip; got: {:?}",
         report.schema,
     );
+    // Assertions follow FailureDumpReport struct-declaration order
+    // (dump/mod.rs). When a new field lands, add its default-shape
+    // assert at the matching position.
     assert!(report.maps.is_empty());
     assert!(report.vcpu_regs.is_empty());
     assert!(report.sdt_allocations.is_empty());
+    // scx_static_ranges is a struct (ScxStaticSnapshot), not Vec/Option.
+    // Pin Default::default() via ScxStaticSnapshot::is_empty() (both
+    // ranges.is_empty() AND skipped == 0); see
+    // monitor/scx_static_alloc.rs ScxStaticSnapshot::is_empty.
+    assert!(report.scx_static_ranges.is_empty());
+    assert!(report.sdt_alloc_unavailable.is_none());
     assert!(report.prog_runtime_stats.is_empty());
     assert!(report.prog_runtime_stats_unavailable.is_none());
     assert!(report.per_cpu_time.is_empty());
@@ -1494,6 +1503,9 @@ fn failure_dump_report_optional_fields_round_trip_when_omitted() {
     assert!(report.scx_sched_state.is_none());
     assert!(report.scx_walker_unavailable.is_none());
     assert!(report.vcpu_perf_at_freeze.is_empty());
+    assert!(report.dump_truncated_at_us.is_none());
+    assert!(report.probe_counters.is_none());
+    assert!(!report.is_placeholder);
 }
 
 // -- Pin failure-dump error-message strings ----------------------

@@ -30,6 +30,167 @@ fn assert_default_checks_is_no_overrides() {
     assert!(v.max_keep_last_rate.is_none());
 }
 
+/// Wire-format pin: `Assert::with_monitor_defaults()` MUST set
+/// `enforce_monitor_thresholds = true`. The propagation chain is:
+/// builder.with_monitor_defaults() → enforce_monitor_thresholds=true
+/// → monitor_thresholds().enforce=true → MonitorThresholds.enforce=true
+/// → evaluate() respects enforce.
+///
+/// Per `Assert::with_monitor_defaults` doc: opt into pass/fail
+/// enforcement for monitor thresholds. Without this call, monitor
+/// violations are reported in the verdict's details but do not
+/// fail the test. With it, any monitor threshold violation fails
+/// the test.
+///
+/// A regression that breaks the propagation (e.g. forgets to set
+/// enforce_monitor_thresholds in the auto-fill helper, OR changes
+/// the field name without updating the threshold extractor) would
+/// silently disable enforcement for every test using the builder
+/// pattern.
+#[test]
+fn with_monitor_defaults_propagates_enforce_true_to_thresholds() {
+    let assert = Assert::NO_OVERRIDES.with_monitor_defaults();
+    let t = assert.monitor_thresholds();
+    assert!(
+        t.enforce,
+        "with_monitor_defaults() must propagate enforce=true to MonitorThresholds"
+    );
+}
+
+/// Wire-format pin: without `.with_monitor_defaults()` the builder
+/// produces enforce=false. This is the post-enforce-default-flip
+/// report-only default that broke 19 tests when the default flipped
+/// — pin both polarities so a flip in either direction is caught.
+#[test]
+fn assert_default_without_monitor_defaults_yields_enforce_false() {
+    let assert = Assert::NO_OVERRIDES;
+    let t = assert.monitor_thresholds();
+    assert!(
+        !t.enforce,
+        "default Assert (no .with_monitor_defaults()) must yield enforce=false"
+    );
+}
+
+/// Direct-field pin: `Assert::NO_OVERRIDES.enforce_monitor_thresholds`
+/// MUST be `false`. Parallel to the `monitor_thresholds()` canary above —
+/// catches a regression where the helper is preserved but the underlying
+/// field default flips. NO_OVERRIDES is the runtime composition base
+/// (see the runtime composition documented on `Assert::merge`), so a
+/// flipped default here would silently enable enforcement for every
+/// scheduler that doesn't explicitly opt out.
+#[test]
+fn no_overrides_enforce_monitor_thresholds_field_is_false() {
+    let v = Assert::NO_OVERRIDES;
+    assert!(
+        !v.enforce_monitor_thresholds,
+        "NO_OVERRIDES.enforce_monitor_thresholds must be false (post-enforce-default-flip default)"
+    );
+}
+
+/// Merge semantics pin: `enforce_monitor_thresholds` uses sticky-OR
+/// (see the OR expression in `Assert::merge`:
+/// `self.enforce_monitor_thresholds || other.enforce_monitor_thresholds`).
+/// Distinct from every other field which uses last-Some-wins. The
+/// OR rule means a child Assert that opted into enforcement cannot
+/// be silently downgraded by merging over (or under) a non-enforcing
+/// peer.
+///
+/// This canary covers the false||false=false case — the baseline that
+/// guarantees a merge of two NO_OVERRIDES (the runtime no-op composition)
+/// stays in report-only mode.
+#[test]
+fn merge_enforce_monitor_thresholds_or_semantics_false_false() {
+    let merged = Assert::NO_OVERRIDES.merge(&Assert::NO_OVERRIDES);
+    assert!(
+        !merged.enforce_monitor_thresholds,
+        "false || false must yield false"
+    );
+}
+
+/// Merge semantics pin: true (self) || false (other) → true.
+/// A test-level `Assert::NO_OVERRIDES.with_monitor_defaults()` on the
+/// left merged with a NO_OVERRIDES override on the right keeps
+/// enforce=true. Without OR-semantics, a regression could silently
+/// flip back to last-Some-wins and drop enforcement on every test
+/// that uses a non-enforcing override layer.
+#[test]
+fn merge_enforce_monitor_thresholds_or_semantics_true_left() {
+    let left = Assert::NO_OVERRIDES.with_monitor_defaults();
+    let right = Assert::NO_OVERRIDES;
+    let merged = left.merge(&right);
+    assert!(
+        merged.enforce_monitor_thresholds,
+        "true (self) || false (other) must yield true (sticky OR)"
+    );
+}
+
+/// Merge semantics pin: false (self) || true (other) → true.
+/// Symmetric to the previous canary — a non-enforcing base layer
+/// merged with an enforcing override layer must yield enforce=true.
+/// Both directions matter because the runtime composes via
+/// `default_checks().merge(&scheduler.assert).merge(&test.assert)`
+/// (see `Assert::merge`), so the enforcing assert can appear on either
+/// side depending on which layer opted in.
+#[test]
+fn merge_enforce_monitor_thresholds_or_semantics_false_true() {
+    let left = Assert::NO_OVERRIDES;
+    let right = Assert::NO_OVERRIDES.with_monitor_defaults();
+    let merged = left.merge(&right);
+    assert!(
+        merged.enforce_monitor_thresholds,
+        "false (self) || true (other) must yield true (sticky OR)"
+    );
+}
+
+/// Behavior pin: `with_monitor_defaults()` fills ALL six unset
+/// monitor-threshold Option fields with `MonitorThresholds::DEFAULT`
+/// values, not just `enforce_monitor_thresholds`. Documented on
+/// `Assert::with_monitor_defaults` ("Also populates any unset
+/// monitor-threshold field with the canonical default"). Without
+/// this canary, a regression that drops the per-field auto-fill
+/// loop in `with_monitor_defaults` would silently let enforced
+/// tests run against `None` fields that
+/// downstream `monitor_thresholds()` would still default — same end
+/// behavior today, but a future API consumer reading the raw
+/// `Assert` fields would see misleading `None`s.
+#[test]
+fn with_monitor_defaults_fills_all_unset_threshold_fields() {
+    use crate::monitor::MonitorThresholds;
+    let assert = Assert::NO_OVERRIDES.with_monitor_defaults();
+    let d = MonitorThresholds::DEFAULT;
+    assert!(
+        (assert.max_imbalance_ratio.unwrap() - d.max_imbalance_ratio).abs() < f64::EPSILON,
+        "max_imbalance_ratio must be auto-filled with DEFAULT"
+    );
+    assert_eq!(
+        assert.max_local_dsq_depth,
+        Some(d.max_local_dsq_depth),
+        "max_local_dsq_depth must be auto-filled with DEFAULT"
+    );
+    assert_eq!(
+        assert.fail_on_stall,
+        Some(d.fail_on_stall),
+        "fail_on_stall must be auto-filled with DEFAULT"
+    );
+    assert_eq!(
+        assert.sustained_samples,
+        Some(d.sustained_samples),
+        "sustained_samples must be auto-filled with DEFAULT"
+    );
+    assert!(
+        (assert.max_fallback_rate.unwrap() - d.max_fallback_rate).abs() < f64::EPSILON,
+        "max_fallback_rate must be auto-filled with DEFAULT"
+    );
+    assert!(
+        (assert.max_keep_last_rate.unwrap() - d.max_keep_last_rate).abs() < f64::EPSILON,
+        "max_keep_last_rate must be auto-filled with DEFAULT"
+    );
+    assert!(
+        assert.enforce_monitor_thresholds,
+        "enforce_monitor_thresholds must be set to true"
+    );
+}
+
 #[test]
 fn assert_merge_other_overrides_self() {
     let base = Assert::NO_OVERRIDES;
