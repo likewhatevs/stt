@@ -1669,6 +1669,11 @@ fn declare_scheduler_inner(
     let mut sched_config_file: Option<String> = None;
     let mut sched_assert: Option<syn::Expr> = None;
     let mut sched_config_file_def: Option<(String, String)> = None;
+    // Carry the `name = "..."` expression out of the loop so the
+    // post-loop reservation checks can point the caret at the
+    // literal via `new_spanned` (mirroring the inline `name` arm's
+    // span style) instead of the const-name fallback.
+    let mut sched_name_expr: Option<syn::Expr> = None;
 
     let mut seen_fields = std::collections::HashSet::<String>::new();
     for (key, value) in fields {
@@ -1721,6 +1726,7 @@ fn declare_scheduler_inner(
                     ));
                 }
                 sched_name = Some(lit);
+                sched_name_expr = Some(value);
             }
             "binary" => {
                 let lit = expect_str_lit(&value, &key, "binary")?;
@@ -2158,8 +2164,11 @@ fn declare_scheduler_inner(
     // matching the trim+lowercase normalization the inline "name" arm
     // applies to the `"eevdf"` / `"kernel_default"` reservation.
     if kernel_builtin_set && sched_name.trim().to_lowercase() == "kernel" {
-        return Err(syn::Error::new(
-            const_name.span(),
+        let name_expr = sched_name_expr
+            .as_ref()
+            .expect("sched_name_expr is populated whenever sched_name is Some");
+        return Err(syn::Error::new_spanned(
+            name_expr,
             format!(
                 "declare_scheduler!: `name = \"{sched_name}\"` collides with \
                  the KernelBuiltin variant's display_name (`\"kernel\"`). \

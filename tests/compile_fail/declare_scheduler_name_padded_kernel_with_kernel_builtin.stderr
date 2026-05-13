@@ -1,5 +1,5 @@
 error: declare_scheduler!: `name = "  Kernel  "` collides with the KernelBuiltin variant's display_name (`"kernel"`). Pick a different name so failure dumps and sidecar entries can distinguish this scheduler from the variant label.
-  --> tests/compile_fail/declare_scheduler_name_padded_kernel_with_kernel_builtin.rs:10:20
+  --> tests/compile_fail/declare_scheduler_name_padded_kernel_with_kernel_builtin.rs:11:12
    |
-10 | declare_scheduler!(NAME_PADDED_KERNEL_WITH_KERNEL_BUILTIN, {
-   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+11 |     name = "  Kernel  ",
+   |            ^^^^^^^^^^^^
