@@ -263,6 +263,19 @@ ahash = "0.8"
 lto = "thin"
 panic = "abort"
 
+# Trim test-binary DWARF to line tables only. Test binaries are
+# large with full debug info, of which DWARF is the dominant
+# component; line-tables-only meaningfully shrinks the binary,
+# reducing cold-load page-fault traffic on CI runners. file:line
+# backtraces stay actionable (assert!/panic!/#[track_caller] all
+# print location), only debugger variable inspection is lost.
+# Override via `CARGO_PROFILE_TEST_DEBUG=full` for a one-off
+# interactive debug session. The nextest sched_stats timeout
+# override stays as defense-in-depth — this addresses the
+# binary-size root cause; the timeout is the symptom budget.
+[profile.test]
+debug = "line-tables-only"
+
 [features]
 integration = []
 
