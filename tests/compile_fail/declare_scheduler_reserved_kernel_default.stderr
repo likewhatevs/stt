@@ -1,0 +1,5 @@
+error: declare_scheduler!: const name `KERNEL_DEFAULT` is reserved for the built-in Payload::KERNEL_DEFAULT baseline; pick a different identifier
+ --> tests/compile_fail/declare_scheduler_reserved_kernel_default.rs:8:20
+  |
+8 | declare_scheduler!(KERNEL_DEFAULT, {
+  |                    ^^^^^^^^^^^^^^

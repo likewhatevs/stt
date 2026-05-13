@@ -1,5 +1,5 @@
-error: declare_scheduler!: `name` must be a non-empty string
- --> tests/compile_fail/declare_scheduler_empty_name.rs:3:20
+error: declare_scheduler!: `name` must be a non-empty string (whitespace-only is also rejected)
+ --> tests/compile_fail/declare_scheduler_empty_name.rs:4:12
   |
-3 | declare_scheduler!(MY_SCHED, {
-  |                    ^^^^^^^^
+4 |     name = "",
+  |            ^^

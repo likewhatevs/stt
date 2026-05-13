@@ -1,0 +1,5 @@
+error: declare_scheduler!: `binary` must be a non-empty string (whitespace-only is also rejected)
+  --> tests/compile_fail/declare_scheduler_whitespace_binary.rs:10:14
+   |
+10 |     binary = "   ",
+   |              ^^^^^

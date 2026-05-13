@@ -1,0 +1,5 @@
+error: declare_scheduler!: `name` must be a non-empty string (whitespace-only is also rejected)
+ --> tests/compile_fail/declare_scheduler_whitespace_name.rs:8:12
+  |
+8 |     name = "   ",
+  |            ^^^^^

@@ -1682,6 +1682,18 @@ fn declare_scheduler_inner(
         match key_str.as_str() {
             "name" => {
                 let lit = expect_str_lit(&value, &key, "name")?;
+                // Reject empty and whitespace-only names inline so the
+                // caret lands on the offending literal via new_spanned.
+                // A whitespace-only name (`" "`) passed the previous
+                // post-loop is_empty() check and flowed to runtime
+                // where sidecar lookups would fail confusingly.
+                if lit.trim().is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        "declare_scheduler!: `name` must be a non-empty \
+                         string (whitespace-only is also rejected)",
+                    ));
+                }
                 // Mirror the const-name reservation above: the string
                 // names of the built-in `Scheduler::EEVDF` (`"eevdf"`)
                 // and `Payload::KERNEL_DEFAULT` (`"kernel_default"`)
@@ -1709,17 +1721,15 @@ fn declare_scheduler_inner(
             }
             "binary" => {
                 let lit = expect_str_lit(&value, &key, "binary")?;
-                // An empty binary name flows into
-                // `SchedulerSpec::Discover("")` and fails confusingly
-                // at runtime inside `build_and_find_binary("")`. Reject
-                // at macro-time so the error surfaces at the call site
-                // — symmetric to the empty-name check below, except
-                // that this one underlines the offending literal via
-                // `new_spanned` so the caret lands on the empty `""`.
-                if lit.is_empty() {
+                // Reject empty and whitespace-only binary names. Both
+                // flow into `SchedulerSpec::Discover(...)` and fail
+                // confusingly at runtime inside `build_and_find_binary`.
+                // new_spanned points the caret at the offending literal.
+                if lit.trim().is_empty() {
                     return Err(syn::Error::new_spanned(
                         &value,
-                        "declare_scheduler!: `binary` must be a non-empty string",
+                        "declare_scheduler!: `binary` must be a non-empty \
+                         string (whitespace-only is also rejected)",
                     ));
                 }
                 sched_binary = Some(lit);
@@ -2046,12 +2056,6 @@ fn declare_scheduler_inner(
             "declare_scheduler!: missing required field `name`",
         )
     })?;
-    if sched_name.is_empty() {
-        return Err(syn::Error::new(
-            const_name.span(),
-            "declare_scheduler!: `name` must be a non-empty string",
-        ));
-    }
     // The two `kernel_builtin_*` fields are paired — setting one
     // without the other is always a typo. The KernelBuiltin variant
     // carries both `enable` and `disable` lists in the same struct, so
