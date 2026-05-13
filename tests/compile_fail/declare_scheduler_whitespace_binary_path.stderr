@@ -1,0 +1,5 @@
+error: declare_scheduler!: `binary_path` must contain at least one visible character (empty, whitespace-only, and invisible-only literals are rejected)
+  --> tests/compile_fail/declare_scheduler_whitespace_binary_path.rs:11:19
+   |
+11 |     binary_path = "   ",
+   |                   ^^^^^
