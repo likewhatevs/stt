@@ -296,6 +296,24 @@ pub(super) fn format_truncation_marker(head_end: usize, total_len: usize) -> Str
     }
 }
 
+/// Shared prefix for every stderr last-ditch preservation `summary`
+/// line emitted on a failed atomic-publish path. 9 emit sites carry
+/// the same `"freeze-coord: STDERR-PRESERVED summary"` literal at
+/// the head of their `eprintln!` / `stderr_summary` closure return
+/// (run_vm emit_json + emit_degraded_json, TLV CAPTURE +
+/// Degraded, on-demand periodic Captured + Degraded, user-
+/// watchpoint Captured + Degraded, early-snapshot Degraded). The
+/// suffix after this prefix varies per site:
+/// `" ({variant}, write failed): {body}"`.
+///
+/// Operator-grep contract: every stderr-fallback site emits a line
+/// matchable by this prefix so a log scraper can pin the entire
+/// stderr-preservation surface with one regex. The const exists so
+/// adding a new emit site (e.g. a future watchpoint class) reuses
+/// the prefix automatically + so a future prefix change updates one
+/// site instead of nine.
+pub(super) const SNAPSHOT_SUMMARY_PREFIX: &str = "freeze-coord: STDERR-PRESERVED summary";
+
 /// Atomically write a JSON dump payload to a sibling of `dump_path`
 /// keyed by `tag`, surfacing operator-visible stderr preservation
 /// when the configured sink fails. Used by every on-demand dispatch
@@ -5370,7 +5388,7 @@ impl KtstrVm {
                         // requested.
                         if write_failed {
                             eprintln!(
-                                "freeze-coord: STDERR-PRESERVED summary (Captured, write failed): map_count={} vcpu_regs_count={} vcpu_none_indices={:?} tasks_enriched={} elapsed_ms={} json_bytes={}",
+                                "{SNAPSHOT_SUMMARY_PREFIX} (Captured, write failed): map_count={} vcpu_regs_count={} vcpu_none_indices={:?} tasks_enriched={} elapsed_ms={} json_bytes={}",
                                 map_count,
                                 vcpu_regs_count,
                                 vcpu_none_indices,
@@ -5494,7 +5512,7 @@ impl KtstrVm {
                             });
                         if write_failed {
                             eprintln!(
-                                "freeze-coord: STDERR-PRESERVED summary (Degraded, write failed): reason={:?} elapsed_ms={} json_bytes={}",
+                                "{SNAPSHOT_SUMMARY_PREFIX} (Degraded, write failed): reason={:?} elapsed_ms={} json_bytes={}",
                                 reason,
                                 elapsed_ms,
                                 json.len(),
@@ -5655,7 +5673,7 @@ impl KtstrVm {
                                                     &json,
                                                     || {
                                                         format!(
-                                                            "freeze-coord: STDERR-PRESERVED summary (on-demand TLV CAPTURE, write failed): request_id={request_id} tag={tag} map_count={map_count} vcpu_regs_count={vcpu_regs_count} tasks_enriched={tasks_enriched} elapsed_ms={} json_bytes={}",
+                                                            "{SNAPSHOT_SUMMARY_PREFIX} (on-demand TLV CAPTURE, write failed): request_id={request_id} tag={tag} map_count={map_count} vcpu_regs_count={vcpu_regs_count} tasks_enriched={tasks_enriched} elapsed_ms={} json_bytes={}",
                                                             capture_start.elapsed().as_millis() as u64,
                                                             json.len(),
                                                         )
@@ -5714,7 +5732,7 @@ impl KtstrVm {
                                                         &json,
                                                         || {
                                                             format!(
-                                                                "freeze-coord: STDERR-PRESERVED summary (on-demand TLV CAPTURE Degraded, write failed): request_id={request_id} tag={tag} reason={:?} json_bytes={}",
+                                                                "{SNAPSHOT_SUMMARY_PREFIX} (on-demand TLV CAPTURE Degraded, write failed): request_id={request_id} tag={tag} reason={:?} json_bytes={}",
                                                                 degraded.reason,
                                                                 json.len(),
                                                             )
@@ -6110,7 +6128,7 @@ impl KtstrVm {
                                                     &json,
                                                     || {
                                                         format!(
-                                                            "freeze-coord: STDERR-PRESERVED summary (on-demand periodic, write failed): idx={next_periodic_idx} tag={tag} map_count={map_count} vcpu_regs_count={vcpu_regs_count} tasks_enriched={tasks_enriched} elapsed_ms={} json_bytes={}",
+                                                            "{SNAPSHOT_SUMMARY_PREFIX} (on-demand periodic, write failed): idx={next_periodic_idx} tag={tag} map_count={map_count} vcpu_regs_count={vcpu_regs_count} tasks_enriched={tasks_enriched} elapsed_ms={} json_bytes={}",
                                                             capture_start.elapsed().as_millis() as u64,
                                                             json.len(),
                                                         )
@@ -6175,7 +6193,7 @@ impl KtstrVm {
                                                         &json,
                                                         || {
                                                             format!(
-                                                                "freeze-coord: STDERR-PRESERVED summary (on-demand periodic Degraded, write failed): idx={next_periodic_idx} tag={tag} reason={:?} json_bytes={}",
+                                                                "{SNAPSHOT_SUMMARY_PREFIX} (on-demand periodic Degraded, write failed): idx={next_periodic_idx} tag={tag} reason={:?} json_bytes={}",
                                                                 degraded.reason,
                                                                 json.len(),
                                                             )
@@ -6367,7 +6385,7 @@ impl KtstrVm {
                                             &json,
                                             || {
                                                 format!(
-                                                    "freeze-coord: STDERR-PRESERVED summary (on-demand user-watchpoint, write failed): slot_idx={slot_idx} tag={tag} map_count={map_count} elapsed_ms={} json_bytes={}",
+                                                    "{SNAPSHOT_SUMMARY_PREFIX} (on-demand user-watchpoint, write failed): slot_idx={slot_idx} tag={tag} map_count={map_count} elapsed_ms={} json_bytes={}",
                                                     capture_start.elapsed().as_millis() as u64,
                                                     json.len(),
                                                 )
@@ -6414,7 +6432,7 @@ impl KtstrVm {
                                                 &json,
                                                 || {
                                                     format!(
-                                                        "freeze-coord: STDERR-PRESERVED summary (on-demand user-watchpoint Degraded, write failed): slot_idx={slot_idx} tag={tag} reason={:?} json_bytes={}",
+                                                        "{SNAPSHOT_SUMMARY_PREFIX} (on-demand user-watchpoint Degraded, write failed): slot_idx={slot_idx} tag={tag} reason={:?} json_bytes={}",
                                                         degraded.reason,
                                                         json.len(),
                                                     )
@@ -6612,7 +6630,7 @@ impl KtstrVm {
                                                     &json,
                                                     || {
                                                         format!(
-                                                            "freeze-coord: STDERR-PRESERVED summary (on-demand early-snapshot Degraded, write failed): tag={} reason={:?} json_bytes={}",
+                                                            "{SNAPSHOT_SUMMARY_PREFIX} (on-demand early-snapshot Degraded, write failed): tag={} reason={:?} json_bytes={}",
                                                             crate::monitor::dump::SNAPSHOT_TAG_EARLY_DEGRADED,
                                                             degraded.reason,
                                                             json.len(),
@@ -7087,7 +7105,7 @@ impl KtstrVm {
                                             || {
                                                 let vcpu_none = vcpu_none_indices(&early.vcpu_regs);
                                                 format!(
-                                                    "freeze-coord: STDERR-PRESERVED summary (early-pre-late-degraded, write failed): schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
+                                                    "{SNAPSHOT_SUMMARY_PREFIX} (early-pre-late-degraded, write failed): schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
                                                     early.schema,
                                                     early.vcpu_regs.len(),
                                                     vcpu_none,
@@ -7244,7 +7262,7 @@ impl KtstrVm {
                                             || {
                                                 let vcpu_none = vcpu_none_indices(&early.vcpu_regs);
                                                 format!(
-                                                    "freeze-coord: STDERR-PRESERVED summary (early-only-late-suppressed, write failed): schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
+                                                    "{SNAPSHOT_SUMMARY_PREFIX} (early-only-late-suppressed, write failed): schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
                                                     early.schema,
                                                     early.vcpu_regs.len(),
                                                     vcpu_none,
@@ -7521,7 +7539,7 @@ impl KtstrVm {
                                 || {
                                     let vcpu_none = vcpu_none_indices(&early.vcpu_regs);
                                     format!(
-                                        "freeze-coord: STDERR-PRESERVED summary: schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
+                                        "{SNAPSHOT_SUMMARY_PREFIX}: schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
                                         early.schema,
                                         early.vcpu_regs.len(),
                                         vcpu_none,
