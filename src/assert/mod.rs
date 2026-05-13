@@ -1655,6 +1655,15 @@ pub struct Assert {
     /// Max `keep_last` rate (events/sec). Fails if the scx event
     /// counter delta over the run exceeds this rate.
     pub max_keep_last_rate: Option<f64>,
+    /// Promote monitor threshold violations from report-only to
+    /// pass/fail. When `false` (the default), the monitor still walks
+    /// every sample and records every violation in the verdict's
+    /// `details`, but the verdict's `passed` stays `true`. Tests that
+    /// want monitor violations to fail the run call
+    /// [`Self::with_monitor_defaults`], which populates each monitor
+    /// threshold from [`crate::monitor::MonitorThresholds::DEFAULT`]
+    /// and sets this flag to `true`.
+    pub enforce_monitor_thresholds: bool,
 
     // NUMA checks
     /// Minimum fraction of pages on the expected NUMA node(s) (0.0-1.0).
@@ -1747,6 +1756,7 @@ impl Assert {
         sustained_samples: None,
         max_fallback_rate: None,
         max_keep_last_rate: None,
+        enforce_monitor_thresholds: false,
         min_page_locality: None,
         max_cross_node_migration_ratio: None,
         max_slow_tier_ratio: None,
@@ -2000,6 +2010,8 @@ impl Assert {
                 Some(v) => Some(v),
                 None => self.max_keep_last_rate,
             },
+            enforce_monitor_thresholds: self.enforce_monitor_thresholds
+                || other.enforce_monitor_thresholds,
             min_page_locality: match other.min_page_locality {
                 Some(v) => Some(v),
                 None => self.min_page_locality,
@@ -2108,7 +2120,43 @@ impl Assert {
             sustained_samples: self.sustained_samples.unwrap_or(d.sustained_samples),
             max_fallback_rate: self.max_fallback_rate.unwrap_or(d.max_fallback_rate),
             max_keep_last_rate: self.max_keep_last_rate.unwrap_or(d.max_keep_last_rate),
+            enforce: self.enforce_monitor_thresholds,
         }
+    }
+
+    /// Opt into pass/fail enforcement for monitor thresholds. Without
+    /// this call, monitor violations are reported in the verdict's
+    /// `details` but do not fail the test. With it, any monitor
+    /// threshold violation fails the test.
+    ///
+    /// Also populates any unset monitor-threshold field with the
+    /// canonical default from [`crate::monitor::MonitorThresholds::DEFAULT`]
+    /// — so a test that only cares about `max_keep_last_rate` can chain
+    /// `.max_keep_last_rate(N).with_monitor_defaults()` and get the
+    /// other four enforced at their canonical defaults.
+    pub const fn with_monitor_defaults(mut self) -> Self {
+        use crate::monitor::MonitorThresholds;
+        let d = MonitorThresholds::DEFAULT;
+        if self.max_imbalance_ratio.is_none() {
+            self.max_imbalance_ratio = Some(d.max_imbalance_ratio);
+        }
+        if self.max_local_dsq_depth.is_none() {
+            self.max_local_dsq_depth = Some(d.max_local_dsq_depth);
+        }
+        if self.fail_on_stall.is_none() {
+            self.fail_on_stall = Some(d.fail_on_stall);
+        }
+        if self.sustained_samples.is_none() {
+            self.sustained_samples = Some(d.sustained_samples);
+        }
+        if self.max_fallback_rate.is_none() {
+            self.max_fallback_rate = Some(d.max_fallback_rate);
+        }
+        if self.max_keep_last_rate.is_none() {
+            self.max_keep_last_rate = Some(d.max_keep_last_rate);
+        }
+        self.enforce_monitor_thresholds = true;
+        self
     }
 }
 

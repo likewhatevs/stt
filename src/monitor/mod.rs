@@ -1043,20 +1043,37 @@ impl MonitorSummary {
 }
 
 /// Configurable thresholds for monitor-based pass/fail verdicts.
+///
+/// Default behaviour is REPORT-ONLY: violations populate
+/// [`MonitorVerdict::details`] but [`MonitorVerdict::passed`] stays
+/// `true`. To make violations fail the test, opt into enforcement via
+/// [`crate::assert::Assert::with_monitor_defaults`] (which sets
+/// `enforce = true`) or by constructing `MonitorThresholds` with
+/// `enforce: true` explicitly.
+///
+/// The two-mode design lets a test attach monitor coverage for
+/// diagnostic purposes without inheriting a five-axis failure
+/// surface the test author did not opt into.
 #[derive(Debug, Clone, Copy)]
 pub struct MonitorThresholds {
     /// Max allowed imbalance ratio (max_nr_running / max(1, min_nr_running)).
     pub max_imbalance_ratio: f64,
     /// Max allowed local DSQ depth on any CPU in any sample.
     pub max_local_dsq_depth: u32,
-    /// Fail when any CPU's rq_clock does not advance between consecutive samples.
+    /// Flag when any CPU's rq_clock does not advance between consecutive samples.
     pub fail_on_stall: bool,
-    /// Number of consecutive samples that must violate a threshold before failing.
+    /// Number of consecutive samples that must violate a threshold before flagging.
     pub sustained_samples: usize,
     /// Max sustained select_cpu_fallback events/s across all CPUs.
     pub max_fallback_rate: f64,
     /// Max sustained dispatch_keep_last events/s across all CPUs.
     pub max_keep_last_rate: f64,
+    /// Promote violations from report-only to pass/fail. When `false`
+    /// (the default), [`MonitorThresholds::evaluate`] still walks every
+    /// sample and records every violation in the verdict's `details`,
+    /// but returns `passed: true` regardless. When `true`, any
+    /// recorded violation also fails the verdict.
+    pub enforce: bool,
 }
 
 impl MonitorThresholds {
@@ -1092,6 +1109,7 @@ impl MonitorThresholds {
         sustained_samples: 5,
         max_fallback_rate: 200.0,
         max_keep_last_rate: 100.0,
+        enforce: false,
     };
 }
 
@@ -1314,13 +1332,20 @@ impl MonitorThresholds {
         }
 
         let summary = if failed {
-            format!("monitor FAILED: {} violation(s)", details.len())
+            if self.enforce {
+                format!("monitor FAILED: {} violation(s)", details.len())
+            } else {
+                format!(
+                    "monitor flagged {} violation(s) (report-only; pass `Assert::with_monitor_defaults` to enforce)",
+                    details.len()
+                )
+            }
         } else {
             "monitor OK".into()
         };
 
         MonitorVerdict {
-            passed: !failed,
+            passed: !failed || !self.enforce,
             details,
             summary,
         }

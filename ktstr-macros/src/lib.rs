@@ -1086,6 +1086,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                 sustained_samples: #sustained_tokens,
                 max_fallback_rate: #fallback_rate_tokens,
                 max_keep_last_rate: #keep_last_rate_tokens,
+                enforce_monitor_thresholds: false,
                 min_page_locality: #page_locality_tokens,
                 max_cross_node_migration_ratio: #cross_node_mig_tokens,
                 max_slow_tier_ratio: #slow_tier_tokens,
