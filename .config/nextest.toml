@@ -81,6 +81,45 @@ filter = "test(acquire_llc_plan_) | test(resource_lock_exclusive_) | test(resour
 test-group = "llc-lock"
 threads-required = 1
 
+# vmm::sched_stats tests share a binary whose first-attempt load is
+# slow under cold page cache + concurrent test-runner contention.
+# Observed: try 1 hit profile.default's 60s x 2 = 120s slow-timeout;
+# try 2 passed in 0.014s once the binary was in the page cache. The
+# test logic itself is trivial — make_client + pre_populate +
+# request_raw — and both ends of the cvar handshake are race-safe:
+# pre_populate (sched_stats.rs:935-954) follows the standard cvar
+# producer pattern (acquire mutex, append bytes, notify_all WHILE
+# holding the mutex, release on guard drop), and request_raw's loop
+# at the response_buf check site re-inspects the buffer BEFORE
+# cvar.wait, so a populated buf is detected on first iteration even
+# if the producer's notify fires before the consumer enters wait.
+# 180s per attempt absorbs the cold binary load on the ARM64 runners
+# that observed the original 120s timeout; terminate-after=1 keeps
+# the per-attempt cap tight (one slow period elapsed = kill), and
+# retries=3 covers up-to-3 cold-cache instances per test. Worst-case
+# budget per test is 4 attempts x 180s = 720s = 12 min, vs the
+# 54-min budget a larger retries x terminate-after product would
+# create — tight enough that a real deadlock (e.g. an unanswered
+# cvar.wait) surfaces in single-digit minutes rather than masking
+# under retry. Override mirrored across profile.default AND
+# profile.ci so local dev cold-cache runs get the same budget as
+# CI (without it, `cargo ktstr test --kernel ../linux` would hit
+# profile.default's 60s x 2 budget locally). Filter targets every
+# test in the vmm::sched_stats compiled binary (module-path prefix,
+# trailing `::` bounds the match so a future `vmm::sched_stats_v2`
+# sibling would not accidentally inherit). Any current or future
+# sibling in the same binary picks up the budget — the cold-load
+# contention is binary-wide, not per-test.
+[[profile.default.overrides]]
+filter = "test(vmm::sched_stats::)"
+slow-timeout = { period = "180s", terminate-after = 1 }
+retries = 3
+
+[[profile.ci.overrides]]
+filter = "test(vmm::sched_stats::)"
+slow-timeout = { period = "180s", terminate-after = 1 }
+retries = 3
+
 [profile.quick]
 # Usage: cargo nextest run --profile quick
 slow-timeout = { period = "10s", terminate-after = 2 }
