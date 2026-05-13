@@ -210,6 +210,50 @@ fn early_snapshot_guard_drain_then_drop_is_idempotent() {
         "Drop after explicit drain must NOT touch the file mtime — \
          a non-equal mtime proves a second write happened"
     );
+
+    // Drain successfully outside catch_unwind to capture pre-panic
+    // mtime, then move guard into the closure and panic so Drop
+    // fires during unwind. Mtime equality across the unwind
+    // boundary is the load-bearing detection signal —
+    // synthetic_report() determinism makes a rewritten file
+    // byte-identical, so size equality alone is tautological. A
+    // regression that removes the `snapshot.take()` short-circuit
+    // in drain_to_disk would fire a second write during Drop with
+    // identical content; mtime moves forward, size stays equal —
+    // only the mtime check catches this.
+    let tmp2 = TempDir::new().expect("tempdir");
+    let dump_path2 = dump_base_path(&tmp2);
+    let expected2 = snapshot_tagged_path(&dump_path2, SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED);
+
+    let mut guard = EarlySnapshotGuard {
+        snapshot: Some(synthetic_report()),
+        retain_tag: None,
+        dump_path: Some(dump_path2.clone()),
+        dual_snapshot: true,
+    };
+    guard.drain_to_disk();
+    let md_before_unwind = std::fs::metadata(&expected2).expect("file landed by drain");
+    let mtime_before_unwind = md_before_unwind.modified().expect("mtime");
+
+    // Move guard into the closure so Drop fires during unwind.
+    let result = catch_unwind(AssertUnwindSafe(move || {
+        let _guard = guard;
+        panic!("inject: drain succeeded, now unwind with guard alive");
+    }));
+    assert!(
+        result.is_err(),
+        "injected panic must propagate after successful drain"
+    );
+
+    let md_after_unwind = std::fs::metadata(&expected2).expect("file still present after unwind");
+    let mtime_after_unwind = md_after_unwind.modified().expect("mtime");
+    assert_eq!(
+        mtime_before_unwind, mtime_after_unwind,
+        "Drop during unwind after explicit drain must NOT rewrite — \
+         mtime change proves a second write fired even though the snapshot \
+         was already consumed by the explicit drain (the snapshot.take() \
+         short-circuit in drain_to_disk was removed)"
+    );
 }
 
 /// Panic AFTER retain_tag was set lands the file at the operator-
@@ -230,6 +274,14 @@ fn early_snapshot_guard_drain_then_drop_is_idempotent() {
 /// The negative assertion (no file at NEVER_FIRED) catches a
 /// double-write regression where Drop accidentally writes to BOTH
 /// the retain_tag and the default path.
+///
+/// SNAPSHOT_TAG_EARLY_DEGRADED is deliberately excluded from the
+/// parametric variants: the early-snapshot Degraded handler writes
+/// to that tag DIRECTLY (not via the guard) in the early-Degraded
+/// arm of the late-trigger dispatch, so it never appears as a
+/// retain_tag value on the guard. The negative scan below asserts
+/// NEVER_FIRED AND the other two arm tags AND EARLY_DEGRADED are
+/// all absent — catches double-writes to any mismatched tag.
 #[test]
 fn early_snapshot_guard_drops_with_retain_tag_when_late_failed() {
     for &(tag, label) in &[
@@ -265,15 +317,28 @@ fn early_snapshot_guard_drops_with_retain_tag_when_late_failed() {
             expected.display()
         );
 
-        // Negative assertion: NEVER_FIRED must NOT have been used.
-        let never_fired =
-            snapshot_tagged_path(&dump_path, SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED);
-        assert!(
-            !never_fired.exists(),
-            "[{label}] retain_tag must override NEVER_FIRED — \
-             no file may exist at {} (double-write regression)",
-            never_fired.display()
-        );
+        // G-G3d: negative scan across ALL non-matching tags
+        // (NEVER_FIRED + the other arm's tag + EARLY_DEGRADED).
+        // Catches double-write regressions to any tag that
+        // shouldn't have fired. Loop builds the negative set
+        // from the 4-tag universe minus the expected tag.
+        for negative_tag in [
+            SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+            SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+            SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+            SNAPSHOT_TAG_EARLY_DEGRADED,
+        ] {
+            if negative_tag == tag {
+                continue;
+            }
+            let negative_path = snapshot_tagged_path(&dump_path, negative_tag);
+            assert!(
+                !negative_path.exists(),
+                "[{label}] retain_tag {tag:?} must override all others — \
+                 no file may exist at {} (double-write to {negative_tag:?})",
+                negative_path.display()
+            );
+        }
     }
 }
 
@@ -476,6 +541,71 @@ fn early_snapshot_guard_drop_swallows_write_failure_without_panic() {
         result.is_err(),
         "injected panic must propagate without Drop adding its own"
     );
+}
+
+/// retain_tag without snapshot is a silent no-op. Currently no
+/// production path sets retain_tag with snapshot=None — the late-
+/// trigger Suppressed and pre-late-degraded arms always set
+/// retain_tag while snapshot is still held. A future refactor
+/// that reorders these to take() the snapshot first then set
+/// retain_tag would silently produce a guard whose Drop fires
+/// the third `else { return }` arm (snapshot.take() returns None)
+/// and never reaches the retain_tag lookup at the
+/// `unwrap_or(NEVER_FIRED)` line.
+///
+/// This canary pins the API invariant explicitly: a guard with
+/// retain_tag=Some and snapshot=None lands zero files on disk even
+/// when dual_snapshot+dump_path are both wired.
+#[test]
+fn early_snapshot_guard_retain_tag_without_snapshot_no_op() {
+    let tmp = TempDir::new().expect("tempdir");
+    let dump_path = dump_base_path(&tmp);
+    let mut guard = EarlySnapshotGuard {
+        snapshot: None,
+        retain_tag: Some(SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED),
+        dump_path: Some(dump_path.clone()),
+        dual_snapshot: true,
+    };
+    guard.drain_to_disk();
+
+    for tag in [
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+        SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+        SNAPSHOT_TAG_EARLY_DEGRADED,
+    ] {
+        let path = snapshot_tagged_path(&dump_path, tag);
+        assert!(
+            !path.exists(),
+            "retain_tag=Some + snapshot=None must NOT write to {} \
+             after explicit drain (retain_tag is unreachable when \
+             the snapshot.take() gate returns None)",
+            path.display()
+        );
+    }
+
+    // Defense-in-depth: explicit drop(guard) + re-scan catches a
+    // future refactor that splits Drop's behavior from drain_to_disk
+    // (e.g. Drop adopts a retain_tag-bypass logic that writes despite
+    // snapshot=None). Today Drop just calls drain_to_disk so this
+    // re-scan is redundant — but a future Drop divergence would be
+    // caught here.
+    drop(guard);
+    for tag in [
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+        SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+        SNAPSHOT_TAG_EARLY_DEGRADED,
+    ] {
+        let path = snapshot_tagged_path(&dump_path, tag);
+        assert!(
+            !path.exists(),
+            "retain_tag=Some + snapshot=None must NOT write to {} \
+             after Drop fires (Drop must not diverge from drain_to_disk's \
+             gate behavior)",
+            path.display()
+        );
+    }
 }
 
 /// take() ordering matrix: `self.snapshot.take()` at the third

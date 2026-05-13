@@ -7227,6 +7227,28 @@ impl KtstrVm {
                                 // (sidecar tooling, repro probe) all
                                 // parse via serde_json which
                                 // tolerates either form identically.
+                                // Eager `early_guard.snapshot.take()`
+                                // here moves the early snapshot into
+                                // `dual` BEFORE serde_json runs. If
+                                // serde panicked OR returned Err mid-
+                                // serialization, the snapshot would
+                                // drop with `dual` — panic-unwind
+                                // drops it; an Err return exits the
+                                // if-block and `dual` drops there too.
+                                // Either way `early_guard.snapshot`
+                                // ends up None and the Drop is a no-op
+                                // — silent loss without even stderr
+                                // fallback (the Err arm below surfaces
+                                // LATE-capture data only, not the
+                                // early snapshot). The type-system
+                                // proof that FailureDumpReport
+                                // serialization is infallible for the
+                                // concrete shape (see test
+                                // `failure_dump_report_serialization_is_infallible_for_max_synthetic_input`
+                                // in src/monitor/dump/tests.rs) keeps
+                                // both paths safe today. A future
+                                // field with a fallible Serialize
+                                // impl would trip that test first.
                                 let json_result = if freeze_coord_dual_snapshot {
                                     let dual = crate::monitor::dump::DualFailureDumpReport {
                                         schema: crate::monitor::dump::SCHEMA_DUAL
