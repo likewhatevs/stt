@@ -750,10 +750,7 @@ mod tests {
         .into_iter()
         .collect();
 
-        let classified: HashSet<u32> = one_bit_values
-            .union(&multi_bit_values)
-            .copied()
-            .collect();
+        let classified: HashSet<u32> = one_bit_values.union(&multi_bit_values).copied().collect();
         let registry: HashSet<u32> = ALL_SHIFTS.iter().map(|(v, _)| *v).collect();
 
         let unclassified: Vec<(u32, &str)> = ALL_SHIFTS

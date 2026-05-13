@@ -512,8 +512,7 @@ fn generate_shift_registry(out_dir: &std::path::Path) {
         writeln!(out, "    ({v}, \"{name}\"),").expect("write shift entry");
     }
     out.push_str("];\n");
-    std::fs::write(out_dir.join("shift_registry.rs"), out)
-        .expect("write shift_registry.rs");
+    std::fs::write(out_dir.join("shift_registry.rs"), out).expect("write shift_registry.rs");
 }
 
 /// 64-bit SipHash-1-3 of `bytes`. Used to detect BTF content drift
