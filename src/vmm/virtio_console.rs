@@ -956,6 +956,17 @@ impl VirtioConsole {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
+    /// Test helper — inject bytes directly into port-2 TX buffer.
+    /// Used by the `sched_stats` stale-bytes race-close regression
+    /// test to simulate prior-request residue without a real guest
+    /// relay. Production code never injects directly; bytes arrive
+    /// via the guest's virtio TX queue processed by
+    /// `process_tx(2)`.
+    #[cfg(test)]
+    pub(crate) fn inject_port2_tx_for_test(&mut self, bytes: &[u8]) {
+        self.ports[2].tx_buf.extend(bytes);
+    }
+
     /// Test helper — return a copy of the pending port-0 RX bytes
     /// (host → guest direction) that have not yet been delivered to
     /// the guest. Tests that exercise the host-side wake-byte

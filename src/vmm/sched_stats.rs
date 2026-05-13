@@ -471,6 +471,82 @@ impl SchedStatsClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
+        // Drain any stale guest→host bytes from port2_tx_buf BEFORE
+        // flipping in_flight=true. This NARROWS the stale-bytes race
+        // window but does not fully close it.
+        //
+        // Closed portion — bytes already in port2_tx_buf at this
+        // point: pre-drain empties port[2].tx_buf under the same
+        // virtio_con lock the drainer's TOKEN_DATA arm
+        // (drainer_loop) takes, so the drainer's next wake sees an
+        // empty buffer and routes nothing to response_buf.
+        // discarded_bytes counter bumps so stuck-stats post-mortem
+        // can see this path firing.
+        //
+        // Residual portion — bytes that arrive after pre-drain release:
+        // `VirtioConsole::process_tx` (port-id 2, defined in
+        // virtio_console.rs) runs only when the vCPU services a
+        // QUEUE_NOTIFY MMIO write on port-2 TX (q7 per the multiport
+        // queue numbering in virtio_console.rs). The guest can
+        // publish a chain to the avail ring + issue NOTIFY BEFORE
+        // our pre-drain, but the vCPU MMIO handler may not have run
+        // yet (e.g. coming out of a freeze rendezvous that paused
+        // every vCPU via SIGRTMIN). After our pre-drain releases
+        // virtio_con, the vCPU services the queued NOTIFY, process_tx
+        // pushes stale guest bytes into port[2].tx_buf, kicks
+        // stats_tx_evt. If this lands AFTER our in_flight=true store
+        // below, the drainer wakes, sees in_flight=true, forwards the
+        // stale bytes as if they were the current request's response.
+        //
+        // The realistic trigger is cancellation-followed-by-immediate-
+        // new-request (freeze-rendezvous cancel, watchdog cancel)
+        // where the guest is still flushing a prior abandoned
+        // request's response. A hostile guest can also exploit this
+        // window deliberately.
+        //
+        // Fully closing this is NOT possible from host-side alone.
+        // Two protocol-level paths were investigated:
+        //   (A) per-request token echoed by the guest scheduler —
+        //       requires patching scx_stats (StatsResponse hardcodes
+        //       `{resp: ...}` with no echo of request fields) AND
+        //       every scheduler binary that uses it. Out of ktstr's
+        //       scope.
+        //   (B) generation counter on response_buf chunks — provably
+        //       fails: generation tracks DRAIN time (when the drainer
+        //       processes bytes), not PRODUCTION time (when the guest
+        //       emitted them). Stale-but-late bytes from a freeze /
+        //       cancel window get stamped with the current generation
+        //       at drain time, so the wait-loop accepts them.
+        // The residual class is a documentation note about an
+        // upstream-protocol limitation, not an actionable host-side
+        // follow-up.
+        //
+        // Race partner: the drainer's TOKEN_DATA arm in drainer_loop
+        // (`fn drainer_loop` later in this file) reads in_flight
+        // (Acquire) after the drain-under-virtio_con-lock completes
+        // and the lock is released — that's where the racing append
+        // happens.
+        {
+            let stale = {
+                let mut g = self.shared.virtio_con.lock();
+                g.drain_port2_bulk()
+            };
+            if !stale.is_empty() {
+                let stale_len = stale.len();
+                let total = self
+                    .shared
+                    .discarded_bytes
+                    .fetch_add(stale_len as u64, Ordering::Relaxed)
+                    .saturating_add(stale_len as u64);
+                tracing::debug!(
+                    stale_bytes = stale_len,
+                    total_discarded = total,
+                    "scx_stats request_raw: drained stale port2_tx_buf bytes \
+                     before flipping in_flight=true (stale-bytes race-close)"
+                );
+            }
+        }
+
         // Mark in-flight so the drainer routes drained bytes to the
         // response buffer instead of discarding them. RAII clear on
         // scope exit covers every error-return path below.
@@ -646,17 +722,31 @@ impl SchedStatsClient {
     }
 
     /// Cumulative number of bytes the client has discarded over its
-    /// lifetime. Two paths feed this counter:
+    /// lifetime. Four paths feed this counter:
     /// 1. The drainer thread receives port-2 bytes when no request
     ///    is in flight (a stale response from a torn prior call,
     ///    or relay-emitted bytes the host never asked for).
     /// 2. [`Self::request_raw`] clears stale bytes from the
-    ///    response buffer at request start.
+    ///    response buffer at request start (residue left in
+    ///    `response_buf` from prior request's partial-newline
+    ///    consumption — the post-newline tail per `split_off`
+    ///    semantics in the wait-loop's success arm).
+    /// 3. [`Self::request_raw`] clears stale `port2_pending_rx`
+    ///    (host→guest) at request start — bytes from a prior
+    ///    request abandoned mid-push would otherwise concatenate
+    ///    onto the new request line.
+    /// 4. [`Self::request_raw`] pre-drains `port2_tx_buf`
+    ///    (guest→host) BEFORE flipping `in_flight=true`
+    ///    (stale-bytes race-close — bytes already in the buffer
+    ///    that the drainer would otherwise misattribute to the
+    ///    current request).
     ///
-    /// Both paths bump `discarded_bytes`, so this accessor lets
+    /// All four paths bump `discarded_bytes`, so this accessor lets
     /// test code (and operators inspecting a stuck stats path)
     /// see whether bytes are leaking past the request/response
-    /// envelope.
+    /// envelope. The per-site `tracing::debug!` log lines carry
+    /// the per-path context (search for "scx_stats" in stats
+    /// logs to disambiguate which path bumped the counter).
     pub fn discarded_bytes(&self) -> u64 {
         self.shared.discarded_bytes.load(Ordering::Relaxed)
     }
@@ -985,6 +1075,77 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    /// Pre-existing bytes in port2_tx_buf at request start are
+    /// drained + discarded BEFORE in_flight=true flips, so the
+    /// drainer's next wake cannot route them to response_buf as
+    /// the current request's response. Pins the stale-bytes
+    /// race-close at the head of `request_raw`.
+    ///
+    /// Mechanism: inject stale bytes directly into port[2].tx_buf
+    /// via the cfg(test) helper, then call request_raw with a
+    /// pre_populate writer staged to deliver the legitimate
+    /// response. The pre-drain at request_raw entry must catch
+    /// the stale bytes (verified via `discarded_bytes` counter
+    /// increment); the wait-loop must return the legitimate
+    /// pre_populate response, NOT the stale bytes.
+    ///
+    /// The test bypasses stats_tx_evt (production drainer wake
+    /// signal) — injection is silent, so the drainer never
+    /// processes the stale bytes. The pre-drain at request_raw
+    /// entry is the load-bearing path. A regression that removes
+    /// the pre-drain would leave port[2].tx_buf populated when
+    /// in_flight=true flips; any subsequent drainer wake would
+    /// route the stale to response_buf. The test's
+    /// discarded_bytes assertion fails-loud if the pre-drain
+    /// stops firing.
+    ///
+    /// Pins the closed portion of the race-close (see the
+    /// closed-portion section of the race-close comment at the head
+    /// of `request_raw`). The residual portion — bytes arriving after
+    /// pre-drain release via lagging vCPU MMIO QUEUE_NOTIFY service —
+    /// is NOT exercised by this test; it is fundamentally unclosable
+    /// from host-side alone.
+    #[test]
+    fn request_raw_drains_stale_port2_tx_buf_before_in_flight() {
+        let client = make_client();
+        let initial_discarded = client.discarded_bytes();
+        let stale: &[u8] = b"prior-request-tail-garbage";
+
+        // Inject pre-existing stale bytes into port[2].tx_buf
+        // (simulates bytes from a prior request's tail still
+        // sitting in the device when the new request starts).
+        {
+            let mut g = client.shared.virtio_con.lock();
+            g.inject_port2_tx_for_test(stale);
+        }
+
+        let expected_response = b"new-request-response\n";
+        let writer = pre_populate(&client, expected_response);
+
+        let resp = client
+            .request_raw("dummy")
+            .expect("request_raw must return the legitimate response");
+
+        assert_eq!(
+            &resp, b"new-request-response",
+            "request_raw must return the legitimate pre_populate \
+             response, NOT the stale port[2].tx_buf bytes — the \
+             pre-drain at request_raw entry failed to catch the \
+             stale residue"
+        );
+
+        let discarded_delta = client.discarded_bytes() - initial_discarded;
+        assert!(
+            discarded_delta >= stale.len() as u64,
+            "discarded_bytes counter did not increment by the \
+             expected pre-drain amount: delta={discarded_delta} \
+             stale.len()={} (the pre-drain path did not fire)",
+            stale.len()
+        );
+
+        writer.join().unwrap();
     }
 
     /// A response that grows past [`MAX_RESPONSE_BYTES`] without a
