@@ -110,6 +110,16 @@ filter = "test(gauntlet/)"
 slow-timeout = { period = "120s", terminate-after = 2 }
 
 # Compile-fail tests: trybuild compiles the dependency tree on first run.
+#
+# Also flaky under parallel nextest exec — trybuild internally invokes
+# `cargo build` on each of 152 fixtures sharing the host's target/
+# directory with concurrent tests. A neighbour test's build can leave
+# stale dep artifacts that one trybuild fixture compiles cleanly even
+# when it should fail ("Expected test case to fail to compile, but it
+# succeeded"). Inherits retries = 5 from profile.default which
+# typically resolves the contention on try 2-3 after the concurrent
+# build settles. Per-fixture trybuild cache isolation is the
+# definitive fix (would require patching the test wrapper).
 [[profile.default.overrides]]
 filter = "test(compile_fail)"
 slow-timeout = { period = "180s", terminate-after = 2 }
