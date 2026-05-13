@@ -2128,6 +2128,22 @@ impl KtstrVm {
                 // pending — the late never fired" (drain uses its
                 // default tag).
                 let mut early_retain_tag: Option<&'static str> = None;
+                // ADV6/NEW-V3-1 (#61): stash the early-trigger Degraded
+                // reason so the late-trigger emit can surface it via
+                // `DualFailureDumpReport::early_skipped_reason`.
+                // Without this, an early-Degraded outcome leaves
+                // `early_snapshot` None AND `early_peak_max_age_jiffies`
+                // already populated (the max_age was read before the
+                // Degraded outcome was matched), so the late-arm's
+                // `early_skipped_reason` calculator falls through to
+                // the existing "max_age never crossed threshold"
+                // branch and surfaces an internally contradictory
+                // reason (peak >= threshold) — operator reads a
+                // misleading "max_age never crossed" when the actual
+                // cause was a rendezvous timeout in the early capture.
+                // Stashing the reason here makes the early-Degraded
+                // tagged sibling discoverable from the dual wrapper.
+                let mut early_degraded_reason: Option<String> = None;
                 // Per-snapshot scanner metadata, captured at the
                 // early-trigger site and threaded into the
                 // DualFailureDumpReport wrapper alongside the
@@ -6686,6 +6702,15 @@ impl KtstrVm {
                                     early_snapshot = Some(report);
                                 }
                                 LateCaptureOutcome::Degraded(degraded) => {
+                                    // Stash the degraded reason so the
+                                    // late-arm's early_skipped_reason
+                                    // calculator can surface it via the
+                                    // dual wrapper. Clone before the
+                                    // tagged-write block consumes
+                                    // `degraded.reason` via `{:?}` and
+                                    // the warn's `%` formatting.
+                                    early_degraded_reason =
+                                        Some(degraded.reason.clone());
                                     if freeze_coord_dump_path.is_some() {
                                         match serde_json::to_string(degraded.as_ref()) {
                                             Ok(json) => {
@@ -6896,6 +6921,35 @@ impl KtstrVm {
                                 || early_snapshot.is_some()
                             {
                                 None
+                            } else if let Some(reason) =
+                                early_degraded_reason.as_deref()
+                            {
+                                // Early-trigger DID fire (max_age
+                                // crossed the half threshold) but
+                                // freeze_and_capture(false) returned
+                                // Degraded. The early dump landed on
+                                // disk at the
+                                // SNAPSHOT_TAG_EARLY_DEGRADED sibling
+                                // (per the early-Degraded arm above);
+                                // surface that here so a dual-wrapper
+                                // consumer reading the JSON knows the
+                                // structured data exists out-of-band
+                                // and the reason field carries the
+                                // upstream cause. Branch precedence is
+                                // intentional: this fires only when the
+                                // early-Degraded arm actually ran, and
+                                // ordering BEFORE the
+                                // `scan_ctx_skip_reason` branch is safe
+                                // because an early-Degraded outcome
+                                // implies scan_ctx WAS Some (the
+                                // early-trigger guard requires it) —
+                                // scan_ctx_skip_reason cannot have
+                                // populated.
+                                Some(format!(
+                                    "early capture degraded ({reason}); \
+                                     see tagged sibling at \
+                                     SNAPSHOT_TAG_EARLY_DEGRADED"
+                                ))
                             } else if let Some(reason) = scan_ctx_skip_reason {
                                 Some(format!(
                                     "scan prerequisites unavailable: {reason}"
