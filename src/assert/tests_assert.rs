@@ -236,6 +236,37 @@ fn with_monitor_defaults_preserves_user_set_values() {
     let custom_sustained = d.sustained_samples * 2;
     let custom_fallback = d.max_fallback_rate * 0.5;
     let custom_keep_last = d.max_keep_last_rate * 0.5;
+    // Zero-default guard: if a future DEFAULT value happens to be 0,
+    // the `* 0.5` / `* 2` derivation lands at the same value
+    // (0 * 0.5 == 0; 0 * 2 == 0) and the test passes vacuously
+    // against a regression that drops the `is_none()` guard.
+    // Pre-check that each custom value DIFFERS from DEFAULT so a
+    // future DEFAULT-of-zero fails the test loudly here rather
+    // than silently elsewhere.
+    assert!(
+        (custom_imbalance - d.max_imbalance_ratio).abs() > f64::EPSILON,
+        "test derivation produced custom_imbalance == DEFAULT — DEFAULT.max_imbalance_ratio may have shifted to 0"
+    );
+    assert_ne!(
+        custom_local_dsq, d.max_local_dsq_depth,
+        "test derivation produced custom_local_dsq == DEFAULT — DEFAULT.max_local_dsq_depth may have shifted to 0"
+    );
+    assert_ne!(
+        custom_fail_on_stall, d.fail_on_stall,
+        "bool flip should always differ"
+    );
+    assert_ne!(
+        custom_sustained, d.sustained_samples,
+        "test derivation produced custom_sustained == DEFAULT — DEFAULT.sustained_samples may have shifted to 0"
+    );
+    assert!(
+        (custom_fallback - d.max_fallback_rate).abs() > f64::EPSILON,
+        "test derivation produced custom_fallback == DEFAULT — DEFAULT.max_fallback_rate may have shifted to 0"
+    );
+    assert!(
+        (custom_keep_last - d.max_keep_last_rate).abs() > f64::EPSILON,
+        "test derivation produced custom_keep_last == DEFAULT — DEFAULT.max_keep_last_rate may have shifted to 0"
+    );
     let assert = Assert::NO_OVERRIDES
         .max_imbalance_ratio(custom_imbalance)
         .max_local_dsq_depth(custom_local_dsq)
@@ -301,9 +332,28 @@ fn has_monitor_thresholds_false_when_all_none() {
 /// for tests that set only the missed field.
 #[test]
 fn has_monitor_thresholds_true_when_any_set() {
+    // Compile-time anchor for the maintenance
+    // contract. Adding a new MonitorThresholds field requires
+    // updating BOTH this struct-update literal (compile error
+    // otherwise) AND the closure list below. Without this anchor,
+    // the closure-list maintenance is doc-only and easy to miss
+    // when adding a field — Rust would let the test pass silently
+    // against the new field. The literal's _ binding discards the
+    // value; only the compile-time field enumeration matters.
+    use crate::monitor::MonitorThresholds;
+    let _ = MonitorThresholds {
+        max_imbalance_ratio: 0.0,
+        max_local_dsq_depth: 0,
+        fail_on_stall: false,
+        sustained_samples: 0,
+        max_fallback_rate: 0.0,
+        max_keep_last_rate: 0.0,
+        enforce: false,
+    };
     // Each closure returns an Assert with exactly one threshold
     // field set. Adding a new MonitorThresholds field requires
-    // adding a closure here — that's the maintenance contract.
+    // adding a closure here — that's the maintenance contract,
+    // anchored by the struct-update above.
     let setters: &[(&str, fn() -> Assert)] = &[
         ("max_imbalance_ratio", || {
             Assert::NO_OVERRIDES.max_imbalance_ratio(3.0)

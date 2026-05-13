@@ -371,18 +371,27 @@ fn bss_state_label_not_resolved() {
     assert_eq!(bss_state_label(BssReadState::NotResolved), "not_resolved");
 }
 
-/// Wildcard-trap anchor: bss_state_label MUST NOT emit "unknown"
-/// for any BssReadState variant. The production match at
+/// Wildcard-trap anchor: bss_state_label MUST only emit labels in
+/// the operator-known allowlist. The production match at
 /// mod.rs:188-195 is exhaustive, so a NEW BssReadState variant
 /// fails to compile until it gets an explicit label arm — but a
-/// future refactor that adds a wildcard `_ => "unknown"` arm
-/// would silently land "unknown" in the wire format for the new
-/// variant. The four bss_state_label_<variant> canaries above
-/// pin the existing arms; this canary catches the wildcard-
-/// refactor regression because no variant should ever map to
-/// the "unknown" string. Operator tooling (jq filters,
-/// auto-repro tail renderer) keys off the snake_case labels and
-/// has no behavior defined for "unknown".
+/// future refactor that adds any wildcard
+/// (`_ => "unknown"`, `_ => "other"`, `_ => "unhandled"`,
+/// `_ => "fallback"`, `_ => "default"`, ...) would silently land
+/// that string in the DegradedFailureDumpReport.bss_latch_state
+/// wire field for any unhandled variant. The four
+/// bss_state_label_<variant> canaries above pin the existing arms;
+/// this canary catches the wildcard-refactor regression class
+/// (not just the "unknown" sub-case) by asserting every variant's
+/// label appears in the operator-known allowlist. Operator tooling
+/// (jq filters, auto-repro tail renderer) keys off the snake_case
+/// labels and has no behavior defined for any string outside the
+/// allowlist.
+///
+/// Maintenance contract: a new BssReadState variant landing
+/// legitimately requires updating BOTH the production label arm
+/// AND this allowlist — same per-variant pin discipline the
+/// individual bss_state_label_<variant> canaries above use.
 #[test]
 fn bss_state_label_no_wildcard_unknown_fallback() {
     let variants = [
@@ -391,18 +400,22 @@ fn bss_state_label_no_wildcard_unknown_fallback() {
         BssReadState::OutOfBounds,
         BssReadState::NotResolved,
     ];
+    let allowlist = ["triggered", "not_triggered", "out_of_bounds", "not_resolved"];
     for v in variants {
         let label = bss_state_label(v);
         assert!(
             !label.is_empty(),
             "bss_state_label({v:?}) must be non-empty"
         );
-        assert_ne!(
-            label, "unknown",
-            "bss_state_label({v:?}) must NOT return \"unknown\" — a \
-             wildcard match arm regression would silently land this \
-             in the DegradedFailureDumpReport.bss_latch_state wire \
-             field for any unhandled variant"
+        assert!(
+            allowlist.contains(&label),
+            "bss_state_label({v:?}) returned {label:?} — not in the \
+             operator-known allowlist {allowlist:?}. Either an \
+             unintended wildcard-arm refactor landed (`_ => \"...\"`) \
+             or a new BssReadState variant was added without updating \
+             the allowlist here. Operator tooling (jq filters, \
+             auto-repro tail renderer) has no behavior defined for \
+             strings outside the allowlist."
         );
     }
 }
