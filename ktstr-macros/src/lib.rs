@@ -1567,6 +1567,21 @@ fn declare_scheduler_inner(
             // sites without a visibility prefix produce `pub static`.
             let visibility: syn::Visibility = input.parse()?;
             let const_name: syn::Ident = input.parse()?;
+            // Detect the trailing-visibility shape (`MY_SCHED pub,`)
+            // before the standard `,` parse emits the generic
+            // "expected `,`" diagnostic. A `pub` token in this
+            // position is always a misplaced visibility prefix —
+            // surface that explicitly so the operator knows where
+            // it should go.
+            if input.peek(syn::Token![pub]) {
+                return Err(syn::Error::new(
+                    input.span(),
+                    "declare_scheduler!: visibility prefix must precede \
+                     the const name (e.g. `pub MY_SCHED`, `pub(crate) MY_SCHED`), \
+                     not follow it. Move the `pub` token to before \
+                     the const name.",
+                ));
+            }
             let _: syn::Token![,] = input.parse()?;
             let body;
             syn::braced!(body in input);
@@ -2840,6 +2855,7 @@ fn u64_from_lit_expr(expr: &syn::Expr) -> Option<u64> {
 /// `None` for `None`, paths, or anything else — non-literal forms
 /// pass through unchecked.
 fn u64_from_option_some_lit(expr: &syn::Expr) -> Option<u64> {
+    let expr = unwrap_parens(expr);
     let syn::Expr::Call(call) = expr else {
         return None;
     };
@@ -2852,7 +2868,7 @@ fn u64_from_option_some_lit(expr: &syn::Expr) -> Option<u64> {
     if call.args.len() != 1 {
         return None;
     }
-    u64_from_lit_expr(&call.args[0])
+    u64_from_lit_expr(unwrap_parens(&call.args[0]))
 }
 
 /// Extract a `bool` from a literal boolean expression. Returns `None`

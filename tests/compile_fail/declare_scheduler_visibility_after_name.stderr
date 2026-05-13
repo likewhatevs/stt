@@ -1,4 +1,4 @@
-error: expected `,`
+error: declare_scheduler!: visibility prefix must precede the const name (e.g. `pub MY_SCHED`, `pub(crate) MY_SCHED`), not follow it. Move the `pub` token to before the const name.
  --> tests/compile_fail/declare_scheduler_visibility_after_name.rs:8:29
   |
 8 | declare_scheduler!(MY_SCHED pub, {

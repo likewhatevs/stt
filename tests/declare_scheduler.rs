@@ -211,6 +211,28 @@ fn assert_accepts_const_fn_call() {
     let _ = &DECLARE_SCHEDULER_DEFAULT_CHECKS.assert;
 }
 
+declare_scheduler!(DECLARE_SCHEDULER_BARE_NO_OVERRIDES, {
+    name = "declare_scheduler_bare_no_overrides",
+    binary = "scx-bare",
+    assert = Assert::NO_OVERRIDES,
+});
+
+#[test]
+fn assert_accepts_bare_const_path() {
+    // Pins the simplest valid assert shape: a bare const path with
+    // no method-chain or call. Validator must accept Expr::Path
+    // alongside the MethodCall and Call shapes the other
+    // declarations exercise.
+    assert_eq!(
+        DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.not_starved,
+        None
+    );
+    assert_eq!(
+        DECLARE_SCHEDULER_BARE_NO_OVERRIDES.assert.max_gap_ms,
+        None
+    );
+}
+
 #[test]
 fn omitted_assert_defaults_to_no_overrides() {
     // When the macro omits `assert = ...`, Scheduler::new's
@@ -526,6 +548,15 @@ fn slice_contains_every_declared_scheduler() {
     assert!(names.contains(&"declare_scheduler_kernel_multiline"));
     assert!(names.contains(&"declare_scheduler_kernel_enable_only"));
     assert!(names.contains(&"kernel"));
+    assert!(names.contains(&"declare_scheduler_with_assert"));
+    assert!(names.contains(&"declare_scheduler_default_checks"));
+    assert!(names.contains(&"declare_scheduler_bare_no_overrides"));
+    assert!(names.contains(&"declare_scheduler_cfg_def"));
+    assert!(names.contains(&"declare_scheduler_cfg_def_alt"));
+    assert!(names.contains(&"declare_scheduler_full_new"));
+    assert!(names.contains(&"both_configs"));
+    assert!(names.contains(&"only_cf"));
+    assert!(names.contains(&"only_cfd"));
 }
 
 #[test]
