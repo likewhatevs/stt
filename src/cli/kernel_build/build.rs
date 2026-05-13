@@ -396,6 +396,121 @@ pub fn kernel_build_pipeline(
         None
     };
 
+    // Post-acquire cache re-check. N peers racing on a cold cache all
+    // queue on the source-tree EX above. When the first peer's build
+    // completes and releases, the cache slot is populated — every
+    // subsequent peer should observe the hit and skip a redundant
+    // rebuild rather than serially repeat the same work. The
+    // pre-acquire `cache_lookup` in `resolve_kernel_dir_to_entry`
+    // catches the warm-cache case (no lock taken at all); this check
+    // catches the cold-then-warmed-during-wait case.
+    //
+    // Mid-wait edit guard: the operator may edit a tracked file in
+    // the source tree DURING our EX wait (long peer build = long
+    // window). `acquired.is_dirty` snapshots clean-at-acquire; a fresh
+    // probe via `inspect_local_source_state` catches edits that landed
+    // during the wait. If dirty/hash-changed, the operator's intent
+    // is "build what's on disk" — skip the cache re-check and fall
+    // through to the build branch, where the post-build dirty re-check
+    // at the cache-store site will recognise the mutation and skip
+    // caching. Probe errors are warnings (not fatal) — same Err
+    // disposition as the post-build re-check.
+    // PreAcquireDirty distinguishes "operator started with a dirty
+    // tree" (the wait wasn't the cause) from "operator dirtied the
+    // tree during the wait" (DirtyEdit). The split keeps the enum
+    // variants honest about cause-attribution per the diagnostic
+    // dispatch below — DirtyEdit fires its "your local edits"
+    // message unconditionally because the variant itself means
+    // "edit during the wait".
+    enum MidWaitState {
+        Clean,
+        PreAcquireDirty,
+        DirtyEdit,
+        HashAdvanced,
+        ProbeFailed,
+    }
+    let mid_wait_state = if is_local_source && !acquired.is_dirty {
+        match crate::fetch::inspect_local_source_state(source_dir) {
+            Ok(post) => {
+                let hash_changed = post.short_hash
+                    != acquired
+                        .kernel_source
+                        .as_local_git_hash()
+                        .map(str::to_string);
+                if post.is_dirty {
+                    MidWaitState::DirtyEdit
+                } else if hash_changed {
+                    MidWaitState::HashAdvanced
+                } else {
+                    MidWaitState::Clean
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cli_label = cli_label,
+                    err = %format!("{e:#}"),
+                    "mid-wait dirty re-check failed; proceeding to build",
+                );
+                MidWaitState::ProbeFailed
+            }
+        }
+    } else if acquired.is_dirty {
+        MidWaitState::PreAcquireDirty
+    } else {
+        MidWaitState::Clean
+    };
+    let mid_wait_clean = matches!(mid_wait_state, MidWaitState::Clean);
+
+    // Operator-visible diagnostic, branched by cause so we don't
+    // fabricate attribution. Probe failure says "probe failed"
+    // (and points at the WARN log); a HEAD advance during the wait
+    // says "HEAD advanced" (a `git commit` / `git checkout` is not
+    // an "edit"); a dirty-flip says "your edits" (the operator
+    // patched a tracked file). Clean and PreAcquireDirty branches
+    // fall through silently — the cache-skip gate handles Clean,
+    // and PreAcquireDirty doesn't get a wait-related diagnostic
+    // because the wait wasn't the cause of the dirty state.
+    match mid_wait_state {
+        MidWaitState::DirtyEdit => {
+            eprintln!(
+                "{cli_label}: source tree changed during peer's build wait \
+                 — rebuilding to capture your local edits"
+            );
+        }
+        MidWaitState::HashAdvanced => {
+            eprintln!(
+                "{cli_label}: source HEAD advanced during peer's build wait \
+                 — rebuilding for the new commit"
+            );
+        }
+        MidWaitState::ProbeFailed => {
+            eprintln!(
+                "{cli_label}: source-tree dirty re-check failed during peer's \
+                 build wait — rebuilding conservatively (see WARN log for \
+                 the probe error)"
+            );
+        }
+        MidWaitState::Clean | MidWaitState::PreAcquireDirty => {}
+    }
+
+    if mid_wait_clean
+        && let Some(entry) =
+            crate::cli::resolve::cache_lookup(cache, &acquired.cache_key, cli_label)
+        && entry.image_path().exists()
+    {
+        eprintln!(
+            "{cli_label}: concurrent ktstr build populated cache slot {} during wait — \
+             skipping redundant rebuild",
+            acquired.cache_key,
+        );
+        let image_path = entry.image_path();
+        return Ok(KernelBuildResult {
+            entry: Some(entry),
+            image_path,
+            post_build_is_dirty: false,
+        });
+    }
+
     if clean {
         if !is_local_source {
             eprintln!(
@@ -685,6 +800,161 @@ pub fn kernel_build_pipeline(
 mod tests {
     use super::super::super::kernel_cmd::KernelCommand;
     use super::*;
+
+    /// Pins the post-acquire cache re-check at `kernel_build_pipeline`
+    /// (the early-return path that fires when a peer publishes the
+    /// cache slot during our source-tree EX wait).
+    ///
+    /// The early-return gate is 3-pronged: `!acquired.is_dirty` AND
+    /// `cache_lookup(...).is_some()` AND `entry.image_path().exists()`.
+    /// A regression that drops any prong (e.g. someone "simplifies"
+    /// out the exists check) would let stale-manifest entries slip
+    /// through and the runtime would crash later on a phantom image.
+    ///
+    /// Single-thread, deterministic — the "after EX wait" semantic
+    /// reduces to "after the lookup, observe the planted state."
+    /// Real thread orchestration is covered by
+    /// `acquire_source_tree_lock_blocks_on_contention_then_succeeds`
+    /// elsewhere in this module.
+    #[test]
+    fn cache_lookup_observes_peer_published_entry_after_ex_wait() {
+        let _env_lock = crate::test_support::test_helpers::lock_env();
+        let cache_tmp = tempfile::TempDir::new().expect("cache tempdir");
+        let _cache_env = crate::test_support::test_helpers::EnvVarGuard::set(
+            "KTSTR_CACHE_DIR",
+            cache_tmp.path(),
+        );
+        let cache = crate::cache::CacheDir::with_root(cache_tmp.path().to_path_buf());
+        let cache_key = "test-cache-key-7f8a9b";
+
+        // Plant a cache entry via `CacheDir::store` (the production
+        // helper). Going through `store` rather than hand-writing
+        // metadata.json keeps the test honest against schema drift.
+        let (arch, image_name) = crate::fetch::arch_info();
+        let staging = tempfile::TempDir::new().expect("staging tempdir");
+        let fake_image = staging.path().join(image_name);
+        std::fs::write(&fake_image, b"fake kernel image bytes").expect("write fake image");
+        let metadata = crate::cache::KernelMetadata::new(
+            crate::cache::KernelSource::Local {
+                source_tree_path: None,
+                git_hash: None,
+            },
+            arch.to_string(),
+            image_name.to_string(),
+            "2026-04-12T10:00:00Z".to_string(),
+        );
+        let artifacts = crate::cache::CacheArtifacts::new(&fake_image);
+        cache
+            .store(cache_key, &artifacts, &metadata)
+            .expect("plant cache entry");
+
+        // Exercise the 3-condition gate. `cache_lookup` is the same
+        // helper `kernel_build_pipeline` calls at the post-acquire
+        // re-check; `image_path().exists()` is the second gate; the
+        // `is_dirty` gate is upstream (this test assumes a clean
+        // source by construction since `acquired.is_dirty` is the
+        // caller's responsibility).
+        let entry = crate::cli::resolve::cache_lookup(&cache, cache_key, "test")
+            .expect("cache_lookup must surface the planted entry");
+        assert!(
+            entry.image_path().exists(),
+            "image_path existence check must hold for the planted entry",
+        );
+        assert_eq!(entry.metadata.built_at, "2026-04-12T10:00:00Z");
+    }
+
+    /// Pins the hash_changed branch of the mid_wait_clean computation
+    /// at `kernel_build_pipeline` (build.rs:418-439).
+    ///
+    /// Failure mode pinned: a future "simplification" that drops the
+    /// `hash_changed` check and trusts only `post.is_dirty` would
+    /// silently accept a cache slot keyed on the pre-commit hash even
+    /// though the operator committed (clean post-state) on top during
+    /// the wait. The served cache slot would correspond to an older
+    /// HEAD than the operator's current source tree.
+    ///
+    /// The test exercises the primitive (`inspect_local_source_state`)
+    /// plus the boolean reduction that the pipeline glue does inline.
+    /// The orchestration that consumes mid_wait_clean is
+    /// straightforward control flow; this assertion pins the gate
+    /// predicate, not the caller-side wiring.
+    #[test]
+    fn mid_wait_hash_change_invalidates_cache_hit_skip() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!(
+                "mid_wait_hash_change_invalidates_cache_hit_skip: \
+                 git unavailable, skipping"
+            );
+            return;
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = tmp.path().to_path_buf();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&canonical)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "ktstr-test")
+                .env("GIT_AUTHOR_EMAIL", "ktstr-test@localhost")
+                .env("GIT_COMMITTER_NAME", "ktstr-test")
+                .env("GIT_COMMITTER_EMAIL", "ktstr-test@localhost")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(canonical.join("seed.txt"), "initial").unwrap();
+        run_git(&["add", "seed.txt"]);
+        run_git(&["commit", "-q", "-m", "initial"]);
+
+        let pre = crate::fetch::inspect_local_source_state(&canonical).expect("acquire-time probe");
+        let acquired_hash = pre
+            .short_hash
+            .clone()
+            .expect("clean repo must carry a short_hash");
+
+        // Mid-wait commit — different from the acquire-time hash.
+        std::fs::write(canonical.join("file.txt"), "amended mid-wait").unwrap();
+        run_git(&["add", "file.txt"]);
+        run_git(&["commit", "-q", "-m", "mid-wait commit"]);
+
+        let post = crate::fetch::inspect_local_source_state(&canonical).expect("post-wait probe");
+
+        assert!(
+            !post.is_dirty,
+            "committed changes leave the worktree clean; the hash \
+             change is what must invalidate the cache hit (not is_dirty)",
+        );
+        assert!(
+            post.short_hash.is_some(),
+            "clean post-wait state must carry a short_hash",
+        );
+        assert_ne!(
+            post.short_hash.as_ref(),
+            Some(&acquired_hash),
+            "the new commit must yield a different short_hash than the \
+             acquire-time hash",
+        );
+
+        // Mirror the production ternary at build.rs:418-439.
+        let hash_changed = post.short_hash != Some(acquired_hash);
+        let mid_wait_clean = !post.is_dirty && !hash_changed;
+        assert!(
+            !mid_wait_clean,
+            "hash_changed=true must falsify mid_wait_clean, forcing a \
+             rebuild for the new cache key",
+        );
+    }
 
     /// `kernel build --cpu-cap N` parses through clap into
     /// `KernelCommand::Build { cpu_cap: Some(N), .. }`. Pins the

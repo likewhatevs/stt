@@ -671,14 +671,35 @@ fn fsid_bytes(buf: &libc::statfs) -> [u8; std::mem::size_of::<libc::fsid_t>()] {
 
 /// Acquire an exclusive flock on the per-key cache lockfile.
 ///
-/// Held by [`ensure_template`] for the duration of a template build
-/// to serialize concurrent test starts that all want the same
-/// template. The lockfile lives under the cache root's `.locks/`
+/// **Held ONLY around the mkfs+publish branch of [`ensure_template`].**
+/// The pre-lock [`CacheDir::lookup`] at the top of `ensure_template`
+/// runs WITHOUT a flock — manifest read is atomic on the read side
+/// and the published template is read-only thereafter, so concurrent
+/// readers (including the per-test fan-out path via
+/// [`clone_to_per_test`]) coexist with each other and with an
+/// in-flight builder via Unix open-file semantics (an EX-holder's
+/// rename publishes a new inode; existing open fds keep the old
+/// inode alive until closed).
+///
+/// Read-only callers MUST NOT call this function. The per-key flock
+/// exists exclusively to serialize concurrent BUILDERS — two peers
+/// both observing the same cache miss must not both run mkfs and
+/// race their atomic renames. Calling from a read-only path would
+/// reintroduce the wasted-wait pathology this design avoids.
+///
+/// Held for the timeout window [`TEMPLATE_LOCK_TIMEOUT`]; bails with
+/// a holder list (PIDs, comms) on timeout so operators can triage a
+/// stuck peer. Lockfile lives under the cache root's `.locks/`
 /// subdirectory so the cache enumeration code skips it.
 ///
-/// Returns the flock fd; dropping releases the lock. Bails on
-/// timeout with a holder list (PIDs, comms) so operators can
-/// triage a stuck peer.
+/// Future writes that mutate the published template inode in place
+/// (e.g. `ftruncate`, `fallocate(PUNCH_HOLE)`) would invalidate the
+/// open-fd safety property concurrent readers rely on — any such
+/// path MUST acquire this lock and MUST be documented as the third
+/// caller of this function. Today the only writers are atomic-rename
+/// publishes (safe by inode-swap) and `clean_all`'s remove-tree
+/// walk (which uses a separate non-blocking EX probe to skip live
+/// peers — see [`clean_all`]).
 pub(crate) fn acquire_template_lock(key: &str) -> Result<std::os::fd::OwnedFd> {
     let lock_path = lock_path_for_key(key)?;
     acquire_flock_with_timeout(
