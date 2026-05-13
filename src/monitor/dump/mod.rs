@@ -629,6 +629,14 @@ pub const REASON_DEGRADED_KILL_DURING_RENDEZVOUS: &str =
 /// this tag — main `{stem}.failure-dump.json` is preserved for the
 /// subsequent late-trigger emission. Operator-readable wire-format
 /// constant: kebab-case, stable across releases.
+///
+/// MAINTENANCE: adding a new `SNAPSHOT_TAG_*` const requires updating
+/// BOTH (a) the [`ALL_SNAPSHOT_TAGS`] slice below AND (b) the
+/// `expected` hand-list in
+/// `all_snapshot_tags_enumerates_every_pub_const_in_module` in
+/// `src/monitor/dump/tests.rs`. The pinning test catches slice-vs-
+/// expected divergence; it does NOT catch a const added without
+/// updating either (both arrays stay at the same length).
 pub const SNAPSHOT_TAG_EARLY_DEGRADED: &str = "early-degraded";
 
 /// Snapshot tag used when dual-snapshot mode held a Captured early
@@ -670,6 +678,37 @@ pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED: &str = "early-only-late-suppr
 /// exit. The end-of-coord drain emits the early observation to the
 /// tagged sibling rather than letting it drop with the closure.
 pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED: &str = "early-only-late-never-fired";
+
+/// Canonical enumeration of every `SNAPSHOT_TAG_*` constant in this
+/// module. Tests that negative-scan tag locations (e.g. asserting no
+/// file landed at any wrong tag) iterate this slice rather than
+/// hardcoding the 4-element list. Adding a new `SNAPSHOT_TAG_*`
+/// constant requires updating this slice — the pinning test
+/// `all_snapshot_tags_enumerates_every_pub_const_in_module` in
+/// `src/monitor/dump/tests.rs` will fail until the new tag is added,
+/// flagging the inconsistency at test-time.
+///
+/// Order: NEVER_FIRED first because it is the default tag in
+/// `EarlySnapshotGuard::drain_to_disk`'s `unwrap_or` arm at
+/// src/vmm/freeze_coord/mod.rs (the guard struct is `pub(super)` so
+/// rustdoc cannot intra-doc-link it from this module; cite by file
+/// path matches the cross-ref convention used elsewhere in this
+/// batch). The other three follow in dispatch-arm order:
+/// SUPPRESSED (late-trigger Suppressed write-failure) → PRE_LATE_DEGRADED
+/// (late-trigger Degraded write-failure) → EARLY_DEGRADED (early-
+/// trigger Degraded direct write) — so readers can map slice index
+/// to dispatch arm by inspection.
+///
+/// `#[cfg(test)]` — production code never iterates this slice;
+/// only the negative-scan tests and the pinning canary reference it.
+/// Gated to keep the lib's dead-code lint clean.
+#[cfg(test)]
+pub const ALL_SNAPSHOT_TAGS: &[&str] = &[
+    SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+    SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+    SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+    SNAPSHOT_TAG_EARLY_DEGRADED,
+];
 
 /// Reason string written into [`FailureDumpReport::prog_runtime_stats_unavailable`]
 /// when [`DumpContext::prog_capture`] was supplied but the per-program

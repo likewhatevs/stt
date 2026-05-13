@@ -32,7 +32,7 @@ use super::snapshot::snapshot_tagged_path;
 use crate::monitor::bpf_map::BPF_MAP_TYPE_ARRAY;
 use crate::monitor::btf_render::RenderedValue;
 use crate::monitor::dump::{
-    FailureDumpMap, FailureDumpReport, SCHEMA_DUAL, SNAPSHOT_TAG_EARLY_DEGRADED,
+    ALL_SNAPSHOT_TAGS, FailureDumpMap, FailureDumpReport, SCHEMA_DUAL,
     SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED, SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
     SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
 };
@@ -317,18 +317,14 @@ fn early_snapshot_guard_drops_with_retain_tag_when_late_failed() {
             expected.display()
         );
 
-        // G-G3d: negative scan across ALL non-matching tags
-        // (NEVER_FIRED + the other arm's tag + EARLY_DEGRADED).
-        // Catches double-write regressions to any tag that
-        // shouldn't have fired. Loop builds the negative set
-        // from the 4-tag universe minus the expected tag.
-        for negative_tag in [
-            SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
-            SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
-            SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
-            SNAPSHOT_TAG_EARLY_DEGRADED,
-        ] {
-            if negative_tag == tag {
+        // Negative scan across ALL non-matching tags (NEVER_FIRED +
+        // the other arm's tag + EARLY_DEGRADED). Catches double-write
+        // regressions to any tag that shouldn't have fired. Iterates
+        // ALL_SNAPSHOT_TAGS so a future SNAPSHOT_TAG_* added to the
+        // dump module auto-flows into this negative scan without
+        // touching this test.
+        for negative_tag in ALL_SNAPSHOT_TAGS {
+            if *negative_tag == tag {
                 continue;
             }
             let negative_path = snapshot_tagged_path(&dump_path, negative_tag);
@@ -369,12 +365,7 @@ fn early_snapshot_guard_drop_no_op_when_dual_snapshot_disabled() {
         };
     } // Drop fires — must NOT write anything.
 
-    for tag in [
-        SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
-        SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
-        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
-        SNAPSHOT_TAG_EARLY_DEGRADED,
-    ] {
+    for tag in ALL_SNAPSHOT_TAGS {
         let path = snapshot_tagged_path(&dump_path_normal, tag);
         assert!(
             !path.exists(),
@@ -402,12 +393,7 @@ fn early_snapshot_guard_drop_no_op_when_dual_snapshot_disabled() {
         "panic must propagate even with dual_snapshot=false"
     );
 
-    for tag in [
-        SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
-        SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
-        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
-        SNAPSHOT_TAG_EARLY_DEGRADED,
-    ] {
+    for tag in ALL_SNAPSHOT_TAGS {
         let path = snapshot_tagged_path(&dump_path_panic, tag);
         assert!(
             !path.exists(),
@@ -568,12 +554,7 @@ fn early_snapshot_guard_retain_tag_without_snapshot_no_op() {
     };
     guard.drain_to_disk();
 
-    for tag in [
-        SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
-        SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
-        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
-        SNAPSHOT_TAG_EARLY_DEGRADED,
-    ] {
+    for tag in ALL_SNAPSHOT_TAGS {
         let path = snapshot_tagged_path(&dump_path, tag);
         assert!(
             !path.exists(),
@@ -591,12 +572,7 @@ fn early_snapshot_guard_retain_tag_without_snapshot_no_op() {
     // re-scan is redundant — but a future Drop divergence would be
     // caught here.
     drop(guard);
-    for tag in [
-        SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
-        SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
-        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
-        SNAPSHOT_TAG_EARLY_DEGRADED,
-    ] {
+    for tag in ALL_SNAPSHOT_TAGS {
         let path = snapshot_tagged_path(&dump_path, tag);
         assert!(
             !path.exists(),

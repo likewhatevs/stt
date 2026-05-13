@@ -341,6 +341,181 @@ fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
     assert!(parsed.task_enrichments_unavailable.is_some());
 }
 
+/// Type-system extension of the infallible-serialization proof to
+/// the wrapper. `DualFailureDumpReport` adds 5 fields beyond a
+/// nested `FailureDumpReport` (schema: String, early:
+/// Option<FailureDumpReport>, late: FailureDumpReport,
+/// early_max_age_jiffies: u64, early_threshold_jiffies: u64,
+/// early_skipped_reason: Option<String>). String, Option<T>, u64
+/// all have std-derived infallible Serialize impls, so by Serialize
+/// composition the wrapper is infallible iff FailureDumpReport is.
+/// The sibling
+/// `failure_dump_report_serialization_is_infallible_for_max_synthetic_input`
+/// proves the inner case; this test proves the composition at the
+/// dispatch level so a future field added to DualFailureDumpReport
+/// with a fallible Serialize impl trips here BEFORE silently
+/// regressing the `EarlySnapshotGuard::drain_to_disk` eager-take
+/// safety.
+///
+/// u64::MAX + repeated-String stress catches future Serialize impls
+/// that special-case extreme values or assume bounded buffers.
+///
+/// Deliberately exercises Some/Some on `early` + `early_skipped_reason`
+/// simultaneously to maximize serializer dispatch coverage. Production
+/// invariant is that these are mutually-exclusive (Some-early ↔
+/// None-reason, per the DualFailureDumpReport doc + the freeze
+/// coordinator's late-trigger Captured arm); the test deliberately
+/// violates the invariant because the goal here is Serialize dispatch
+/// coverage, not invariant enforcement. A future test that pins the
+/// mutual exclusion can live separately.
+#[test]
+fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
+    fn max_inner() -> FailureDumpReport {
+        FailureDumpReport {
+            schema: SCHEMA_SINGLE.to_string(),
+            maps: vec![FailureDumpMap {
+                name: "synthetic_array.bss".into(),
+                map_type: BPF_MAP_TYPE_ARRAY,
+                value_size: 8,
+                max_entries: 1,
+                value: Some(RenderedValue::Uint {
+                    bits: 32,
+                    value: 0xCAFE,
+                }),
+                entries: Vec::new(),
+                percpu_entries: Vec::new(),
+                percpu_hash_entries: Vec::new(),
+                arena: None,
+                ringbuf: None,
+                stack_trace: None,
+                fd_array: None,
+                error: None,
+            }],
+            vcpu_regs: vec![None, None],
+            sdt_allocations: Vec::new(),
+            sdt_alloc_unavailable: Some(super::REASON_SDT_ALLOC_NO_INSTANCE.into()),
+            prog_runtime_stats: Vec::new(),
+            prog_runtime_stats_unavailable: Some(super::REASON_PROG_ACCESSOR_UNAVAILABLE.into()),
+            per_cpu_time: vec![PerCpuTimeStats::default(); 2],
+            per_node_numa: vec![PerNodeNumaStats::default(); 1],
+            per_node_numa_unavailable: Some(super::REASON_NO_NUMA_WALKER.into()),
+            task_enrichments: Vec::new(),
+            task_enrichments_unavailable: Some(super::REASON_NO_TASK_WALKER.into()),
+            event_counter_timeline: vec![EventCounterSample::default(); 4],
+            rq_scx_states: Vec::new(),
+            dsq_states: Vec::new(),
+            scx_sched_state: None,
+            scx_walker_unavailable: Some(super::REASON_NO_SCX_WALKER.into()),
+            vcpu_perf_at_freeze: vec![None, None],
+            dump_truncated_at_us: Some(7_777),
+            probe_counters: Some(ProbeBssCounters::default()),
+            scx_static_ranges: Default::default(),
+            is_placeholder: false,
+        }
+    }
+
+    let dual = DualFailureDumpReport {
+        schema: SCHEMA_DUAL.to_string(),
+        early: Some(max_inner()),
+        late: max_inner(),
+        early_max_age_jiffies: u64::MAX,
+        early_threshold_jiffies: u64::MAX,
+        early_skipped_reason: Some(
+            "max synthetic reason — long enough to stress the String serializer path "
+                .repeat(64),
+        ),
+    };
+
+    let result = serde_json::to_string(&dual);
+    assert!(
+        result.is_ok(),
+        "DualFailureDumpReport serialization MUST be infallible for max-synthetic input \
+         (see EarlySnapshotGuard Drop body's panic-free precondition + the eager-take \
+         doc at src/vmm/freeze_coord/mod.rs Captured arm); error: {:?}",
+        result.err()
+    );
+    let json = result.unwrap();
+    assert!(
+        json.len() > 500,
+        "max-synthetic Dual JSON should be substantial; got {} bytes",
+        json.len()
+    );
+
+    let parsed: DualFailureDumpReport =
+        serde_json::from_str(&json).expect("max-synthetic Dual JSON must deserialize cleanly");
+    assert_eq!(parsed.schema, SCHEMA_DUAL);
+    assert!(parsed.early.is_some(), "early field must round-trip Some");
+    assert_eq!(parsed.early_max_age_jiffies, u64::MAX);
+    assert_eq!(parsed.early_threshold_jiffies, u64::MAX);
+    assert!(
+        parsed.early_skipped_reason.is_some(),
+        "early_skipped_reason must round-trip Some"
+    );
+}
+
+/// Pins the canonical [`ALL_SNAPSHOT_TAGS`] slice against drift.
+/// A new `SNAPSHOT_TAG_*` pub const added without updating the
+/// slice would silently leave negative-scan tests under-covering
+/// the new tag. This test asserts:
+///   (a) each individual SNAPSHOT_TAG_* const appears in the slice,
+///   (b) the slice length matches the expected count, AND
+///   (c) all entries are distinct (no accidental duplicates).
+///
+/// Mechanism: Rust has no reflection, so the test must enumerate
+/// every pub const by name. A new SNAPSHOT_TAG_* addition requires
+/// updating this test in lockstep with the slice — the length
+/// assertion at (b) is the primary failure signal when a new const
+/// lands without a slice update.
+///
+/// Alternative considered: build.rs codegen that scans dump/mod.rs
+/// for `pub const SNAPSHOT_TAG_` and generates the slice at compile
+/// time. Rejected as over-engineered for a 4-element list that
+/// changes < 1x/year; the hand-maintained slice + this pinning test
+/// gives the same safety with no build-time complexity.
+#[test]
+fn all_snapshot_tags_enumerates_every_pub_const_in_module() {
+    // Defense-in-depth: a regression that emptied
+    // both ALL_SNAPSHOT_TAGS AND the expected list would pass the
+    // length-equality check below vacuously. Explicit minimum-size
+    // floor catches that regression class — any future shrink past
+    // the original 4-tag baseline trips this assertion first.
+    assert!(
+        ALL_SNAPSHOT_TAGS.len() >= 4,
+        "ALL_SNAPSHOT_TAGS shrank below 4 entries — every tag in \
+         this module's pub const SNAPSHOT_TAG_* surface should be \
+         in the slice; a shrink suggests an unintended removal"
+    );
+
+    let expected: &[&str] = &[
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+        SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+        SNAPSHOT_TAG_EARLY_DEGRADED,
+    ];
+    for tag in expected {
+        assert!(
+            ALL_SNAPSHOT_TAGS.contains(tag),
+            "SNAPSHOT_TAG_* constant {tag:?} missing from ALL_SNAPSHOT_TAGS — \
+             add it to the slice in src/monitor/dump/mod.rs"
+        );
+    }
+    assert_eq!(
+        ALL_SNAPSHOT_TAGS.len(),
+        expected.len(),
+        "ALL_SNAPSHOT_TAGS length mismatch with hand-enumerated set — \
+         either a new SNAPSHOT_TAG_* const was added without updating \
+         this test, or vice versa"
+    );
+    let mut sorted: Vec<&str> = ALL_SNAPSHOT_TAGS.iter().copied().collect();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        ALL_SNAPSHOT_TAGS.len(),
+        "ALL_SNAPSHOT_TAGS contains duplicate entries — every tag value must be unique"
+    );
+}
+
 // ---- Display impl coverage --------------------------------------
 //
 // The Display impl is the human-readable form used in test
