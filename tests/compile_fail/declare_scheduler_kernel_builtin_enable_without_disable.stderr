@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_enable` set without `kernel_builtin_disable`. Both fields must be set together (or both omitted). Add a `kernel_builtin_disable = ["echo ..."]` line that restores the kernel default at teardown.
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_enable_without_disable.rs:6:20
+  |
+6 | declare_scheduler!(KERNEL_BUILTIN_ENABLE_ONLY_SET, {
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

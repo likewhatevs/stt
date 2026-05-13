@@ -1,0 +1,5 @@
+error: declare_scheduler!: element of `kernel_builtin_enable` must be a string literal
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_enable_non_string_element.rs:7:30
+  |
+7 |     kernel_builtin_enable = [42, "echo 1 > /proc/sys/kernel/sched_autogroup_enabled"],
+  |                              ^^

@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_enable` command `echo 1>/proc/sys/kernel/sched_autogroup_enabled` is missing the ` > ` (space-greater-space) redirect — the guest interpreter requires `echo VALUE > /path` with literal spaces around `>` (`exec_shell_line` in `src/vmm/rust_init.rs` uses `split_once(" > ")`).
+  --> tests/compile_fail/declare_scheduler_kernel_builtin_no_space_redirect.rs:10:30
+   |
+10 |     kernel_builtin_enable = ["echo 1>/proc/sys/kernel/sched_autogroup_enabled"],
+   |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

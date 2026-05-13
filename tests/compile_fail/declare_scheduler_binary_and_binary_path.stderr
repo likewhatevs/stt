@@ -1,0 +1,5 @@
+error: declare_scheduler!: more than one scheduler source declared. Pick exactly one of `binary`, `binary_path`, or the `kernel_builtin_enable` + `kernel_builtin_disable` pair. Each maps to a different `SchedulerSpec` variant (`Discover`, `Path`, `KernelBuiltin`) and they cannot stack.
+ --> tests/compile_fail/declare_scheduler_binary_and_binary_path.rs:6:20
+  |
+6 | declare_scheduler!(BINARY_AND_BINARY_PATH, {
+  |                    ^^^^^^^^^^^^^^^^^^^^^^

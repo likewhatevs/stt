@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_enable` command `sysctl -w kernel.sched_autogroup_enabled=1` does not start with `echo ` — the guest interpreter accepts only `echo VALUE > /path` (plus blank lines and `#` comments). Other shell syntax (`>>`, pipes, `;`, variable expansion, sysctl) silently no-ops at runtime.
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_non_echo.rs:9:30
+  |
+9 |     kernel_builtin_enable = ["sysctl -w kernel.sched_autogroup_enabled=1"],
+  |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: declare_scheduler!: `binary_path = "scx_relative_sched"` must be absolute (start with `/`). For discovery-by-name, use `binary = "..."` instead; for a specific file, write the absolute path.
+ --> tests/compile_fail/declare_scheduler_binary_path_relative.rs:8:19
+  |
+8 |     binary_path = "scx_relative_sched",
+  |                   ^^^^^^^^^^^^^^^^^^^^

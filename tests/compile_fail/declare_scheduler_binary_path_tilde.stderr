@@ -1,0 +1,5 @@
+error: declare_scheduler!: `binary_path = "~/scx_tilde_sched"` starts with `~` — tilde paths are not expanded at compile time or by the runtime. Use an absolute path (e.g. `"/home/user/bin/scx_foo"`).
+ --> tests/compile_fail/declare_scheduler_binary_path_tilde.rs:8:19
+  |
+8 |     binary_path = "~/scx_tilde_sched",
+  |                   ^^^^^^^^^^^^^^^^^^^

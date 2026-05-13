@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_enable` command `echo 1 >> /proc/sys/kernel/sched_autogroup_enabled` uses `>>` (append) — the guest interpreter only handles single-`>` truncating writes. Use `>` instead.
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_append_redirect.rs:8:30
+  |
+8 |     kernel_builtin_enable = ["echo 1 >> /proc/sys/kernel/sched_autogroup_enabled"],
+  |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: declare_scheduler!: `binary_path` must be a string literal
+ --> tests/compile_fail/declare_scheduler_binary_path_non_string.rs:7:5
+  |
+7 |     binary_path = 42,
+  |     ^^^^^^^^^^^

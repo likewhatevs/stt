@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_enable` command `echo 1 > relative/path` writes to relative path `relative/path` — the guest interpreter writes via `std::fs::write`, which resolves relative to the guest init's cwd (`/`). Use an absolute path to be explicit.
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_relative_path.rs:8:30
+  |
+8 |     kernel_builtin_enable = ["echo 1 > relative/path"],
+  |                              ^^^^^^^^^^^^^^^^^^^^^^^^

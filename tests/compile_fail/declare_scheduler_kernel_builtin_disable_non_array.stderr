@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_disable` must be an array literal `[..]`
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_disable_non_array.rs:8:5
+  |
+8 |     kernel_builtin_disable = "echo 0 > /proc/sys/kernel/sched_autogroup_enabled",
+  |     ^^^^^^^^^^^^^^^^^^^^^^

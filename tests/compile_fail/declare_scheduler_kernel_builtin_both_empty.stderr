@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_enable = []` paired with `kernel_builtin_disable = []` has no commands on either side — that is functionally identical to the kernel-default baseline. Reference `ktstr::test_support::Scheduler::EEVDF` directly instead of declaring a KernelBuiltin scheduler with no commands.
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_both_empty.rs:6:20
+  |
+6 | declare_scheduler!(KERNEL_BUILTIN_BOTH_EMPTY, {
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^

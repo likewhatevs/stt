@@ -1511,10 +1511,19 @@ fn camel_to_screaming_snake(s: &str) -> String {
 ///
 /// # Accepted fields
 ///
+/// Exactly one scheduler-source must be declared: `binary`,
+/// `binary_path`, or the `kernel_builtin_enable` + `kernel_builtin_disable`
+/// pair. The three options select between the matching
+/// [`SchedulerSpec`] variants. To run under the kernel default
+/// instead, reference [`ktstr::test_support::Scheduler::EEVDF`]
+/// directly rather than declaring a new scheduler.
+///
 /// | Field | Required | Description |
 /// |---|---|---|
 /// | `name = "..."` | yes | Scheduler name (sidecar / logs). |
-/// | `binary = "..."` | yes | Binary name → `SchedulerSpec::Discover(...)`. Matched against `[[bin]]` names in `target/{debug,release}/`, the test binary's directory, or `KTSTR_SCHEDULER` env var. Often equal to the cargo package name but not required to be. To target the EEVDF baseline, reference [`ktstr::test_support::Scheduler::EEVDF`] directly instead of declaring a new scheduler. |
+/// | `binary = "..."` | one source | Binary name → `SchedulerSpec::Discover(...)`. Matched against `[[bin]]` names in `target/{debug,release}/`, the test binary's directory, or `KTSTR_SCHEDULER` env var. Often equal to the cargo package name but not required to be. |
+/// | `binary_path = "/abs/path"` | one source | Absolute filesystem path → `SchedulerSpec::Path(...)`. The runtime does not auto-build this variant: the file must already exist at the path when the test runs. Use for prebuilt binaries that live outside the cargo discovery cascade. Macro-time validation rejects empty strings, relative paths, and `~`-prefixed paths (no compile-time tilde expansion); existence is the runtime's job. |
+/// | `kernel_builtin_enable = [..]` + `kernel_builtin_disable = [..]` | one source | Two string-array literals that together select `SchedulerSpec::KernelBuiltin { enable: &[..], disable: &[..] }`. The framework writes the enable commands to the guest's `/sched_enable` and the disable commands to `/sched_disable` (see `src/vmm/initramfs.rs`), and the guest interpreter runs each entry once at scenario start / teardown. Both fields must be set together — setting only one is rejected. The interpreter (`src/vmm/rust_init.rs`) accepts EXACTLY ONE shell-line shape: `echo VALUE > /path` (plus blank lines and `#` comments). Pipes, `>>`, `;`, variable expansion, and any other syntax silently no-ops at runtime, so the macro rejects entries that don't match `echo … > /…` at expand time. At least one of the two arrays must be non-empty: a pair that supplies neither enable nor disable commands is equivalent to the EEVDF baseline — reference [`Scheduler::EEVDF`] for that. Note: `cargo ktstr export` currently bails on KernelBuiltin schedulers (`src/export.rs`); declarations using this variant cannot be reproduced via the export-to-shar workflow until that limitation is lifted. |
 /// | `topology = (numa, llcs, cores, threads)` | no | Default VM topology. Default: `(1, 1, 2, 1)` (from `Scheduler::new`). Validated at compile time: each value must be non-zero, and `llcs` must be a multiple of `numa`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path (must begin with `/`). |
 /// | `sched_args = [..]` | no | Scheduler CLI args prepended before per-test `extra_sched_args`. |
@@ -1628,6 +1637,9 @@ fn declare_scheduler_inner(
     // Parse fields.
     let mut sched_name: Option<String> = None;
     let mut sched_binary: Option<String> = None;
+    let mut sched_binary_path: Option<String> = None;
+    let mut sched_kernel_builtin_enable: Option<Vec<String>> = None;
+    let mut sched_kernel_builtin_disable: Option<Vec<String>> = None;
     let mut sched_topology: Option<(u32, u32, u32, u32)> = None;
     let mut sched_cgroup_parent: Option<String> = None;
     let mut sched_args: Vec<String> = Vec::new();
@@ -1696,6 +1708,71 @@ fn declare_scheduler_inner(
                     ));
                 }
                 sched_binary = Some(lit);
+            }
+            "binary_path" => {
+                let lit = expect_str_lit(&value, &key, "binary_path")?;
+                // Empty path flows into `SchedulerSpec::Path("")` and
+                // fails confusingly at `resolve_scheduler` (anyhow
+                // ensure on path.exists()). Reject at macro time.
+                if lit.is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        "declare_scheduler!: `binary_path` must be a \
+                         non-empty string",
+                    ));
+                }
+                // Tilde expansion does not happen at compile time and
+                // the runtime does not expand it either — `path.exists()`
+                // checks the literal `~/foo` against the filesystem, which
+                // never matches. Reject up-front with the actionable fix.
+                if lit.starts_with('~') {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "declare_scheduler!: `binary_path = \"{lit}\"` \
+                             starts with `~` — tilde paths are not expanded \
+                             at compile time or by the runtime. Use an \
+                             absolute path (e.g. `\"/home/user/bin/scx_foo\"`)."
+                        ),
+                    ));
+                }
+                // Relative paths are ambiguous between "sibling file" and
+                // "discover-by-name" intent. Force the operator to commit:
+                // if they want discovery, use `binary = "name"`; if they
+                // want a specific file, write the absolute path.
+                if !lit.starts_with('/') {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        format!(
+                            "declare_scheduler!: `binary_path = \"{lit}\"` \
+                             must be absolute (start with `/`). For \
+                             discovery-by-name, use `binary = \"...\"` \
+                             instead; for a specific file, write the \
+                             absolute path."
+                        ),
+                    ));
+                }
+                sched_binary_path = Some(lit);
+            }
+            "kernel_builtin_enable" => {
+                let arr = expect_array(&value, &key, "kernel_builtin_enable")?;
+                let mut cmds = Vec::with_capacity(arr.elems.len());
+                for elem in &arr.elems {
+                    let s = expect_str_lit_element(elem, "kernel_builtin_enable")?;
+                    validate_kernel_builtin_cmd(elem, &s, "enable")?;
+                    cmds.push(s);
+                }
+                sched_kernel_builtin_enable = Some(cmds);
+            }
+            "kernel_builtin_disable" => {
+                let arr = expect_array(&value, &key, "kernel_builtin_disable")?;
+                let mut cmds = Vec::with_capacity(arr.elems.len());
+                for elem in &arr.elems {
+                    let s = expect_str_lit_element(elem, "kernel_builtin_disable")?;
+                    validate_kernel_builtin_cmd(elem, &s, "disable")?;
+                    cmds.push(s);
+                }
+                sched_kernel_builtin_disable = Some(cmds);
             }
             "topology" => {
                 if let syn::Expr::Tuple(t) = &value {
@@ -1960,24 +2037,115 @@ fn declare_scheduler_inner(
             "declare_scheduler!: `name` must be a non-empty string",
         ));
     }
-    // Require `binary = ...`. Omitting binary previously defaulted the
-    // emitted Scheduler to `SchedulerSpec::Eevdf` (the kernel-default
-    // baseline). Now that `name = "eevdf"` is reserved, the omit-binary
-    // path always silently registered a user scheduler as the EEVDF
-    // baseline — wrong for every user. Reject at expand time so the
-    // diagnostic surfaces at the call site.
-    let sched_binary = sched_binary.ok_or_else(|| {
-        syn::Error::new(
+    // The two `kernel_builtin_*` fields are paired — setting one
+    // without the other is always a typo. The KernelBuiltin variant
+    // carries both `enable` and `disable` lists in the same struct, so
+    // requiring both fields at the macro site mirrors the type-level
+    // invariant and prevents a half-specified scheduler from compiling.
+    match (
+        sched_kernel_builtin_enable.is_some(),
+        sched_kernel_builtin_disable.is_some(),
+    ) {
+        (true, false) => {
+            return Err(syn::Error::new(
+                const_name.span(),
+                "declare_scheduler!: `kernel_builtin_enable` set without \
+                 `kernel_builtin_disable`. Both fields must be set \
+                 together (or both omitted). Add a `kernel_builtin_disable \
+                 = [\"echo ...\"]` line that restores the kernel default \
+                 at teardown.",
+            ));
+        }
+        (false, true) => {
+            return Err(syn::Error::new(
+                const_name.span(),
+                "declare_scheduler!: `kernel_builtin_disable` set without \
+                 `kernel_builtin_enable`. Both fields must be set \
+                 together (or both omitted). Add a `kernel_builtin_enable \
+                 = [\"echo ...\"]` line that switches the kernel into the \
+                 chosen policy at scenario start.",
+            ));
+        }
+        _ => {}
+    }
+    let kernel_builtin_set =
+        sched_kernel_builtin_enable.is_some() || sched_kernel_builtin_disable.is_some();
+    // Both arrays empty would register a KernelBuiltin scheduler that
+    // does nothing — functionally identical to the EEVDF baseline.
+    if let (Some(en), Some(di)) = (
+        sched_kernel_builtin_enable.as_ref(),
+        sched_kernel_builtin_disable.as_ref(),
+    ) && en.is_empty()
+        && di.is_empty()
+    {
+        return Err(syn::Error::new(
             const_name.span(),
-            "declare_scheduler!: missing required field `binary`. \
-             Every user scheduler must declare its binary (e.g. \
-             `binary = \"scx_mitosis\"`) — omitting it would register \
-             the scheduler as the kernel-default EEVDF baseline. \
-             To test under the kernel-default scheduler, reference \
-             `ktstr::test_support::Scheduler::EEVDF` directly \
-             instead of declaring a new scheduler.",
-        )
-    })?;
+            "declare_scheduler!: `kernel_builtin_enable = []` paired \
+             with `kernel_builtin_disable = []` has no commands on \
+             either side — that is functionally identical to the \
+             kernel-default baseline. Reference \
+             `ktstr::test_support::Scheduler::EEVDF` directly instead \
+             of declaring a KernelBuiltin scheduler with no commands.",
+        ));
+    }
+    // Exactly one scheduler-source must be set. The three options are
+    // `binary` (SchedulerSpec::Discover), `binary_path` (Path), and
+    // the paired `kernel_builtin_enable` + `kernel_builtin_disable`
+    // (KernelBuiltin). Setting more than one is ambiguous; setting
+    // none is rejected so any user wanting the kernel-default baseline
+    // references `Scheduler::EEVDF` directly rather than declaring
+    // a scheduler with no source.
+    let source_count = [
+        sched_binary.is_some(),
+        sched_binary_path.is_some(),
+        kernel_builtin_set,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if source_count == 0 {
+        return Err(syn::Error::new(
+            const_name.span(),
+            "declare_scheduler!: no scheduler source declared. Pick one of:\n  \
+             - `binary = \"scx_my_sched\"` (discover the binary by name)\n  \
+             - `binary_path = \"/abs/path/to/scx_custom\"` (absolute filesystem path)\n  \
+             - `kernel_builtin_enable = [\"echo 1 > /sys/...\"]` + \
+             `kernel_builtin_disable = [\"echo 0 > /sys/...\"]` \
+             (in-kernel scheduling policy toggled via shell commands)\n\
+             To test under the kernel-default EEVDF baseline, reference \
+             `ktstr::test_support::Scheduler::EEVDF` directly instead \
+             of declaring a new scheduler.",
+        ));
+    }
+    if source_count > 1 {
+        return Err(syn::Error::new(
+            const_name.span(),
+            "declare_scheduler!: more than one scheduler source declared. \
+             Pick exactly one of `binary`, `binary_path`, or the \
+             `kernel_builtin_enable` + `kernel_builtin_disable` pair. \
+             Each maps to a different `SchedulerSpec` variant \
+             (`Discover`, `Path`, `KernelBuiltin`) and they cannot stack.",
+        ));
+    }
+    // String-name reservation extension for KernelBuiltin: the variant's
+    // display_name is the literal `"kernel"` (see `SchedulerSpec::display_name`
+    // in `src/test_support/entry.rs`), so a user scheduler whose `name`
+    // field also resolves to `"kernel"` would collide with the variant
+    // label in failure-dump headers and sidecar comparisons. Reserve
+    // case-insensitively, matching the existing reservation of
+    // `"eevdf"` / `"kernel_default"`.
+    if kernel_builtin_set && sched_name.to_lowercase() == "kernel" {
+        return Err(syn::Error::new(
+            const_name.span(),
+            format!(
+                "declare_scheduler!: `name = \"{sched_name}\"` collides with \
+                 the KernelBuiltin variant's display_name (`\"kernel\"`). \
+                 Pick a different name so failure dumps and sidecar \
+                 entries can distinguish this scheduler from the \
+                 variant label."
+            ),
+        ));
+    }
 
     // Validate topology.
     if let Some((n, l, c, t)) = sched_topology {
@@ -2034,8 +2202,29 @@ fn declare_scheduler_inner(
         ::ktstr::test_support::Scheduler::new(#sched_name_str)
     };
 
+    let binary_spec = if let Some(name) = &sched_binary {
+        quote! { ::ktstr::test_support::SchedulerSpec::Discover(#name) }
+    } else if let Some(path) = &sched_binary_path {
+        quote! { ::ktstr::test_support::SchedulerSpec::Path(#path) }
+    } else if kernel_builtin_set {
+        // Both fields are guaranteed set together by the pair check above.
+        let enable = sched_kernel_builtin_enable
+            .as_ref()
+            .expect("kernel_builtin pair check requires both fields set");
+        let disable = sched_kernel_builtin_disable
+            .as_ref()
+            .expect("kernel_builtin pair check requires both fields set");
+        quote! {
+            ::ktstr::test_support::SchedulerSpec::KernelBuiltin {
+                enable: &[#(#enable),*],
+                disable: &[#(#disable),*],
+            }
+        }
+    } else {
+        unreachable!("source_count check above proves at least one source set")
+    };
     builder_chain = quote! {
-        #builder_chain.binary(::ktstr::test_support::SchedulerSpec::Discover(#sched_binary))
+        #builder_chain.binary(#binary_spec)
     };
     if let Some((n, l, c, t)) = sched_topology {
         builder_chain = quote! { #builder_chain.topology(#n, #l, #c, #t) };
@@ -2156,6 +2345,95 @@ fn expect_array<'a>(
             format!("declare_scheduler!: `{field}` must be an array literal `[..]`"),
         ))
     }
+}
+
+/// Validate a single `kernel_builtin_enable` or `kernel_builtin_disable`
+/// command string against the grammar accepted by the guest
+/// interpreter at `src/vmm/rust_init.rs`'s `exec_shell_line`. Anything
+/// else (`>>`, pipes, `;`, variable expansion, sysctl -w, etc.) silently
+/// no-ops at runtime, so the macro rejects up-front. Accepted shapes:
+///
+/// - `echo VALUE > /path` — writes VALUE+newline to /path
+/// - blank line (skipped)
+/// - `#`-prefixed comment (skipped)
+fn validate_kernel_builtin_cmd(
+    elem: &syn::Expr,
+    cmd: &str,
+    slot: &str,
+) -> syn::Result<()> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Ok(());
+    }
+    if !trimmed.starts_with("echo ") {
+        return Err(syn::Error::new_spanned(
+            elem,
+            format!(
+                "declare_scheduler!: `kernel_builtin_{slot}` command \
+                 `{cmd}` does not start with `echo ` — the guest \
+                 interpreter accepts only `echo VALUE > /path` (plus \
+                 blank lines and `#` comments). Other shell syntax \
+                 (`>>`, pipes, `;`, variable expansion, sysctl) \
+                 silently no-ops at runtime."
+            ),
+        ));
+    }
+    // Reject append `>>` explicitly. The guest's split_once(\" > \") would
+    // miss the substring on `echo X >> /path` (no space between `>>`)
+    // and fall through to the unsupported-command no-op; surface the
+    // intent at expand time with the append-specific diagnostic.
+    if trimmed.contains(">>") {
+        return Err(syn::Error::new_spanned(
+            elem,
+            format!(
+                "declare_scheduler!: `kernel_builtin_{slot}` command \
+                 `{cmd}` uses `>>` (append) — the guest interpreter \
+                 only handles single-`>` truncating writes. Use `>` \
+                 instead."
+            ),
+        ));
+    }
+    let rest = &trimmed["echo ".len()..];
+    let (value, path) = match rest.split_once(" > ") {
+        Some((v, p)) => (v.trim(), p.trim()),
+        None => {
+            return Err(syn::Error::new_spanned(
+                elem,
+                format!(
+                    "declare_scheduler!: `kernel_builtin_{slot}` command \
+                     `{cmd}` is missing the ` > ` (space-greater-space) \
+                     redirect — the guest interpreter requires \
+                     `echo VALUE > /path` with literal spaces around \
+                     `>` (`exec_shell_line` in `src/vmm/rust_init.rs` \
+                     uses `split_once(\" > \")`)."
+                ),
+            ));
+        }
+    };
+    if value.is_empty() {
+        return Err(syn::Error::new_spanned(
+            elem,
+            format!(
+                "declare_scheduler!: `kernel_builtin_{slot}` command \
+                 `{cmd}` writes an empty value — `echo > /path` is \
+                 valid shell but useless. Provide the value to write \
+                 (e.g. `echo 1 > /sys/...`)."
+            ),
+        ));
+    }
+    if !path.starts_with('/') {
+        return Err(syn::Error::new_spanned(
+            elem,
+            format!(
+                "declare_scheduler!: `kernel_builtin_{slot}` command \
+                 `{cmd}` writes to relative path `{path}` — the guest \
+                 interpreter writes via `std::fs::write`, which resolves \
+                 relative to the guest init's cwd (`/`). Use an absolute \
+                 path to be explicit."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Policy axis for `validate_const_eligible`. Different

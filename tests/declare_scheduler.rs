@@ -381,6 +381,122 @@ fn pub_in_path_visibility_accessible_within_path_scope() {
     assert_eq!(vis_inner::pub_in_path_name(), "vis_pub_in_path");
 }
 
+// -- binary_path (SchedulerSpec::Path) --
+
+declare_scheduler!(DECLARE_SCHEDULER_BINARY_PATH, {
+    name = "declare_scheduler_binary_path",
+    binary_path = "/usr/local/bin/scx_custom_binary",
+});
+
+#[test]
+fn binary_path_emits_path_variant() {
+    assert!(matches!(
+        DECLARE_SCHEDULER_BINARY_PATH.binary,
+        SchedulerSpec::Path("/usr/local/bin/scx_custom_binary"),
+    ));
+    assert_eq!(
+        DECLARE_SCHEDULER_BINARY_PATH.binary.display_name(),
+        "/usr/local/bin/scx_custom_binary",
+    );
+    assert!(DECLARE_SCHEDULER_BINARY_PATH.binary.has_active_scheduling());
+}
+
+// -- kernel_builtin_enable + kernel_builtin_disable (SchedulerSpec::KernelBuiltin) --
+
+declare_scheduler!(DECLARE_SCHEDULER_KERNEL_BUILTIN, {
+    name = "declare_scheduler_kernel_builtin",
+    kernel_builtin_enable = ["echo 1 > /proc/sys/kernel/sched_autogroup_enabled"],
+    kernel_builtin_disable = ["echo 0 > /proc/sys/kernel/sched_autogroup_enabled"],
+});
+
+#[test]
+fn kernel_builtin_pair_emits_kernel_builtin_variant() {
+    let SchedulerSpec::KernelBuiltin { enable, disable } =
+        DECLARE_SCHEDULER_KERNEL_BUILTIN.binary
+    else {
+        panic!(
+            "expected KernelBuiltin, got display_name {}",
+            DECLARE_SCHEDULER_KERNEL_BUILTIN.binary.display_name(),
+        );
+    };
+    assert_eq!(
+        enable,
+        &["echo 1 > /proc/sys/kernel/sched_autogroup_enabled"],
+    );
+    assert_eq!(
+        disable,
+        &["echo 0 > /proc/sys/kernel/sched_autogroup_enabled"],
+    );
+    assert_eq!(
+        DECLARE_SCHEDULER_KERNEL_BUILTIN.binary.display_name(),
+        "kernel",
+    );
+    assert!(DECLARE_SCHEDULER_KERNEL_BUILTIN.binary.has_active_scheduling());
+}
+
+declare_scheduler!(DECLARE_SCHEDULER_KERNEL_MULTILINE, {
+    name = "declare_scheduler_kernel_multiline",
+    kernel_builtin_enable = [
+        "# enable both autogroup and schedstats",
+        "echo 1 > /proc/sys/kernel/sched_autogroup_enabled",
+        "echo 1 > /proc/sys/kernel/sched_schedstats",
+    ],
+    kernel_builtin_disable = [
+        "echo 0 > /proc/sys/kernel/sched_schedstats",
+        "echo 0 > /proc/sys/kernel/sched_autogroup_enabled",
+    ],
+});
+
+#[test]
+fn kernel_builtin_accepts_comments_and_multiple_commands() {
+    let SchedulerSpec::KernelBuiltin { enable, disable } =
+        DECLARE_SCHEDULER_KERNEL_MULTILINE.binary
+    else {
+        panic!("expected KernelBuiltin");
+    };
+    assert_eq!(enable.len(), 3);
+    assert_eq!(enable[0], "# enable both autogroup and schedstats");
+    assert_eq!(disable.len(), 2);
+}
+
+declare_scheduler!(DECLARE_SCHEDULER_KERNEL_ENABLE_ONLY, {
+    name = "declare_scheduler_kernel_enable_only",
+    kernel_builtin_enable = ["echo 1 > /proc/sys/kernel/sched_autogroup_enabled"],
+    // The disable list may be empty when the enable side has commands.
+    // The macro rejects only the both-empty case (functionally identical
+    // to the EEVDF baseline); a one-sided pair expresses "set this kernel
+    // policy and leave it set."
+    kernel_builtin_disable = [],
+});
+
+#[test]
+fn kernel_builtin_allows_empty_disable_slot() {
+    let SchedulerSpec::KernelBuiltin { enable: _, disable } =
+        DECLARE_SCHEDULER_KERNEL_ENABLE_ONLY.binary
+    else {
+        panic!("expected KernelBuiltin");
+    };
+    assert!(disable.is_empty());
+}
+
+declare_scheduler!(DECLARE_SCHEDULER_NAME_KERNEL_WITH_DISCOVER, {
+    name = "kernel",
+    binary = "scx-name-kernel-discover",
+});
+
+#[test]
+fn name_kernel_accepted_when_source_is_discover() {
+    // The `name = "kernel"` reservation only fires when the
+    // `kernel_builtin_*` pair is set (the variant whose display_name
+    // is `"kernel"`). With `binary = ...` the name carries no
+    // collision risk and the macro accepts it.
+    assert_eq!(DECLARE_SCHEDULER_NAME_KERNEL_WITH_DISCOVER.name, "kernel");
+    assert!(matches!(
+        DECLARE_SCHEDULER_NAME_KERNEL_WITH_DISCOVER.binary,
+        SchedulerSpec::Discover("scx-name-kernel-discover"),
+    ));
+}
+
 // -- KTSTR_SCHEDULERS registration --
 
 #[test]
@@ -405,6 +521,11 @@ fn slice_contains_every_declared_scheduler() {
     assert!(names.contains(&"declare_scheduler_explicit_empty"));
     assert!(names.contains(&"declare_scheduler_no_docs"));
     assert!(names.contains(&"declare_scheduler_kernel_variants"));
+    assert!(names.contains(&"declare_scheduler_binary_path"));
+    assert!(names.contains(&"declare_scheduler_kernel_builtin"));
+    assert!(names.contains(&"declare_scheduler_kernel_multiline"));
+    assert!(names.contains(&"declare_scheduler_kernel_enable_only"));
+    assert!(names.contains(&"kernel"));
 }
 
 #[test]

@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_disable` set without `kernel_builtin_enable`. Both fields must be set together (or both omitted). Add a `kernel_builtin_enable = ["echo ..."]` line that switches the kernel into the chosen policy at scenario start.
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_disable_without_enable.rs:6:20
+  |
+6 | declare_scheduler!(KERNEL_BUILTIN_DISABLE_ONLY_SET, {
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

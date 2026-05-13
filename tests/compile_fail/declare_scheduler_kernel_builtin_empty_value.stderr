@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernel_builtin_enable` command `echo  > /proc/sys/kernel/sched_autogroup_enabled` writes an empty value — `echo > /path` is valid shell but useless. Provide the value to write (e.g. `echo 1 > /sys/...`).
+ --> tests/compile_fail/declare_scheduler_kernel_builtin_empty_value.rs:7:30
+  |
+7 |     kernel_builtin_enable = ["echo  > /proc/sys/kernel/sched_autogroup_enabled"],
+  |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
