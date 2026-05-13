@@ -47,7 +47,7 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 /// `scx-ktstr` is the workspace's fixture scheduler. It boots a real
 /// sched_ext BPF program, attaches, and runs a dispatch loop — i.e.
@@ -60,8 +60,6 @@ use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
 const CFG_E2E_SCHED: Scheduler = Scheduler::new("config_file_def_e2e_sched")
     .binary(SchedulerSpec::Discover("scx-ktstr"))
     .config_file_def("--config {file}", "/include-files/config_file_def_e2e.json");
-
-const CFG_E2E_PAYLOAD: Payload = Payload::from_scheduler(&CFG_E2E_SCHED);
 
 /// Inline scheduler config built via the `ktstr::json!` proc-macro.
 /// The macro lowers Rust tokens to a `&'static str` at compile time,
@@ -87,7 +85,7 @@ const CFG_E2E_CONTENT: &str = ktstr::json!({
 const GUEST_CFG_PATH: &str = "/include-files/config_file_def_e2e.json";
 
 #[ktstr_test(
-    scheduler = CFG_E2E_PAYLOAD,
+    scheduler = CFG_E2E_SCHED,
     config = CFG_E2E_CONTENT,
     duration_s = 3,
     watchdog_timeout_s = 15,

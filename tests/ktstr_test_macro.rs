@@ -203,7 +203,7 @@ enum FlagAttrsTestFlag {
 
 /// Test with required_flags and excluded_flags attributes.
 #[ktstr_test(
-    scheduler = FLAG_ATTRS_TEST_PAYLOAD,
+    scheduler = FLAG_ATTRS_TEST,
     required_flags = ["borrow", "rebal"],
     excluded_flags = ["steal"]
 )]
@@ -281,7 +281,7 @@ fn entry_max_constraints_match_attrs() {
 enum ConstrainedSchedFlag {}
 
 /// Inherits constraints from CONSTRAINED_SCHED without overriding.
-#[ktstr_test(scheduler = CONSTRAINED_SCHED_PAYLOAD)]
+#[ktstr_test(scheduler = CONSTRAINED_SCHED)]
 fn inherit_sched_constraints(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -301,7 +301,7 @@ fn entry_inherit_sched_constraints() {
 }
 
 /// Overrides max_llcs from the scheduler while inheriting everything else.
-#[ktstr_test(scheduler = CONSTRAINED_SCHED_PAYLOAD, max_llcs = 16)]
+#[ktstr_test(scheduler = CONSTRAINED_SCHED, max_llcs = 16)]
 fn override_sched_constraint(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -321,11 +321,9 @@ fn entry_override_sched_constraint() {
 /// not scheduler behavior.
 const TOPO_SCHED: ktstr::test_support::Scheduler =
     ktstr::test_support::Scheduler::new("topo_test").topology(1, 2, 3, 1);
-const TOPO_SCHED_PAYLOAD: ktstr::test_support::Payload =
-    ktstr::test_support::Payload::from_scheduler(&TOPO_SCHED);
 
 /// Full topology inheritance: all three dimensions from TOPO_SCHED.
-#[ktstr_test(scheduler = TOPO_SCHED_PAYLOAD)]
+#[ktstr_test(scheduler = TOPO_SCHED)]
 fn topo_inherit_full(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -333,7 +331,7 @@ fn topo_inherit_full(ctx: &Ctx) -> Result<AssertResult> {
 
 /// Partial topology inheritance: threads overridden, LLCs and cores
 /// inherited from TOPO_SCHED.
-#[ktstr_test(scheduler = TOPO_SCHED_PAYLOAD, threads = 2)]
+#[ktstr_test(scheduler = TOPO_SCHED, threads = 2)]
 fn topo_inherit_partial(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -496,7 +494,7 @@ fn derive_profiles_respect_requires() {
 
 /// Check typed flag refs work in #[ktstr_test] required_flags.
 #[ktstr_test(
-    scheduler = TEST_DERIVE_PAYLOAD,
+    scheduler = TEST_DERIVE,
     required_flags = [TestDeriveFlag::ALPHA, TestDeriveFlag::BETA],
     excluded_flags = [TestDeriveFlag::GAMMA_DELTA]
 )]
@@ -515,7 +513,7 @@ fn entry_typed_flags_match() {
 
 /// Check mixed string/path flag refs work.
 #[ktstr_test(
-    scheduler = TEST_DERIVE_PAYLOAD,
+    scheduler = TEST_DERIVE,
     required_flags = ["alpha", TestDeriveFlag::BETA]
 )]
 fn mixed_flags_compile(ctx: &Ctx) -> Result<AssertResult> {
@@ -531,7 +529,7 @@ fn entry_mixed_flags_match() {
 }
 
 /// Check topology inheritance from derived scheduler.
-#[ktstr_test(scheduler = TEST_DERIVE_PAYLOAD)]
+#[ktstr_test(scheduler = TEST_DERIVE)]
 fn derive_topo_inherit(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -902,14 +900,12 @@ fn macro_defaults_leave_payload_none_workloads_empty(ctx: &Ctx) -> Result<Assert
 const CFG_PAIRING_SCHED: ktstr::test_support::Scheduler =
     ktstr::test_support::Scheduler::new("cfg_pairing_test")
         .config_file_def("--config {file}", "/include-files/cfg.json");
-const CFG_PAIRING_PAYLOAD: ktstr::test_support::Payload =
-    ktstr::test_support::Payload::from_scheduler(&CFG_PAIRING_SCHED);
 
 /// Inline-literal form: `config = "..."` lands as `Some("...")` in the
 /// emitted entry's `config_content` field, paired with a scheduler that
 /// declares `config_file_def`.
 #[ktstr_test(
-    scheduler = CFG_PAIRING_PAYLOAD,
+    scheduler = CFG_PAIRING_SCHED,
     host_only = true,
     config = "{\"layers\":[]}",
 )]
@@ -925,7 +921,7 @@ fn config_literal_compiles(ctx: &Ctx) -> Result<AssertResult> {
 const PATH_CONFIG: &str = "{\"path\":true}";
 
 #[ktstr_test(
-    scheduler = CFG_PAIRING_PAYLOAD,
+    scheduler = CFG_PAIRING_SCHED,
     host_only = true,
     config = PATH_CONFIG,
 )]
@@ -946,7 +942,7 @@ fn entry_config_literal_propagates() {
         "config = \"...\" must wire onto KtstrTestEntry.config_content as Some(...)",
     );
     assert!(
-        entry.scheduler.config_file_def().is_some(),
+        entry.scheduler.config_file_def.is_some(),
         "fixture scheduler must declare config_file_def",
     );
 }

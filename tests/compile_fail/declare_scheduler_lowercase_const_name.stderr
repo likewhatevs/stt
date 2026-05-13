@@ -1,0 +1,5 @@
+error: declare_scheduler!: const name `my_sched` must be SCREAMING_SNAKE_CASE
+ --> tests/compile_fail/declare_scheduler_lowercase_const_name.rs:3:20
+  |
+3 | declare_scheduler!(my_sched, {
+  |                    ^^^^^^^^

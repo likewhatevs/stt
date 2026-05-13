@@ -26,7 +26,7 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::scenario::Ctx;
-use ktstr::test_support::{KtstrTestEntry, Payload};
+use ktstr::test_support::KtstrTestEntry;
 
 fn external_context_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
@@ -43,7 +43,6 @@ fn external_context_test_fn(_ctx: &Ctx) -> Result<AssertResult> {
 static EXTERNAL_CONTEXT_MARKER: KtstrTestEntry = KtstrTestEntry {
     name: "external_context_marker",
     func: external_context_test_fn,
-    scheduler: &Payload::KERNEL_DEFAULT,
     auto_repro: false,
     ..KtstrTestEntry::DEFAULT
 };

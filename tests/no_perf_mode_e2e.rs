@@ -35,11 +35,10 @@ use ktstr::ktstr_test;
 use ktstr::prelude::VmResult;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Host-side gate: a clean run means `acquire_llc_plan` reserved a
 /// host CPU pool, KVM oversubscribed 64 vCPUs onto it, and the
@@ -89,7 +88,7 @@ fn assert_no_perf_mode_ran_clean(result: &VmResult) -> Result<()> {
 /// is sufficient to exercise the LLC plan path without requiring
 /// excessive boot time on contended hosts.
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     no_perf_mode = true,
     llcs = 2,
     cores = 2,

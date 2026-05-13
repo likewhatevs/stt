@@ -88,8 +88,9 @@ pub use dispatch::{
 };
 pub(crate) use entry::validate_entry_flags;
 pub use entry::{
-    BpfMapWrite, CgroupPath, KTSTR_TESTS, KtstrTestEntry, MemSideCache, NumaDistance, NumaNode,
-    Scheduler, SchedulerSpec, Sysctl, Topology, TopologyConstraints, find_test,
+    BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache,
+    NumaDistance, NumaNode, Scheduler, SchedulerJson, SchedulerSpec, Sysctl, Topology,
+    TopologyConstraints, TopologyConstraintsJson, find_scheduler, find_test,
 };
 pub use eval::{KernelUnavailable, ResolveSource, resolve_scheduler, resolve_test_kernel};
 pub(crate) use eval::{record_skip_sidecar, run_ktstr_test_inner};

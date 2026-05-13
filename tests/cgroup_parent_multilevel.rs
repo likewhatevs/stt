@@ -28,7 +28,7 @@ use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 use std::fs;
 
 /// Scheduler with a 3-level cgroup_parent. The leaf
@@ -39,7 +39,6 @@ use std::fs;
 const MULTI_LEVEL_SCHED: Scheduler = Scheduler::new("ktstr_sched")
     .binary(SchedulerSpec::Discover("scx-ktstr"))
     .cgroup_parent("/ktstr-multi-l1/l2/l3");
-const MULTI_LEVEL_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&MULTI_LEVEL_SCHED);
 
 /// Verify every intermediate cgroup directory exists and its
 /// `cgroup.subtree_control` advertises both controllers
@@ -65,7 +64,7 @@ const MULTI_LEVEL_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&MULTI_LEVEL_
 /// path and observed contents so a regression has actionable
 /// diagnostic context without a host-side log dive.
 #[ktstr_test(
-    scheduler = MULTI_LEVEL_SCHED_PAYLOAD,
+    scheduler = MULTI_LEVEL_SCHED,
     llcs = 1,
     cores = 1,
     threads = 1,

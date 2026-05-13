@@ -87,11 +87,12 @@ impl KernelId {
     /// - `git+URL#REF` → [`KernelId::Git`] (the `git+` prefix takes
     ///   precedence over the `/`-contains test below, since URLs
     ///   contain `/`).
-    /// - `START..END` where both endpoints are version-shaped →
-    ///   [`KernelId::Range`] with both endpoints inclusive. The `..`
-    ///   spelling is fixed regardless of inclusivity (Rust's
-    ///   exclusive-`..` / inclusive-`..=` distinction does not apply
-    ///   here — the range is always closed).
+    /// - `START..=END` or `START..END` where both endpoints are
+    ///   version-shaped → [`KernelId::Range`]. The endpoints are
+    ///   ALWAYS inclusive — both `..` and `..=` spellings produce a
+    ///   closed range, regardless of Rust's exclusive-`..` /
+    ///   inclusive-`..=` distinction. Both forms are accepted so test
+    ///   authors and CLI users can write whichever feels natural.
     /// - `/`-containing or `.`/`~`-prefixed → [`KernelId::Path`].
     /// - Version-shaped → [`KernelId::Version`].
     /// - Anything else → [`KernelId::CacheKey`].
@@ -104,6 +105,15 @@ impl KernelId {
             return KernelId::Git {
                 url: url.to_string(),
                 git_ref: git_ref.to_string(),
+            };
+        }
+        if let Some((start, end)) = s.split_once("..=")
+            && _is_version_string(start)
+            && _is_version_string(end)
+        {
+            return KernelId::Range {
+                start: start.to_string(),
+                end: end.to_string(),
             };
         }
         if let Some((start, end)) = s.split_once("..")

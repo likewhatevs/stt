@@ -41,7 +41,7 @@ use ktstr::prelude::{
 };
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec, sidecar_dir};
+use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 use ktstr::topology::TestTopology;
 
 #[test]
@@ -250,7 +250,6 @@ fn watch_snapshot_op_unresolvable_symbol_bails_immediately() {
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Synthetic single-`.bss`-map `FailureDumpReport` used by the
 /// no-stall snapshot scenario. Hand-built JSON — out-of-crate code
@@ -388,7 +387,7 @@ static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "snapshot_op_captures_in_vm",
         func: scenario_snapshot_op_captures_in_vm,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // No stall — exercise the no-error scenario path. duration
         // matches the scx-ktstr default-load tests in
         // `tests/ktstr_sched_tests.rs`.
@@ -558,7 +557,7 @@ static __KTSTR_ENTRY_WATCH_SNAPSHOT_EXIT: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "watch_snapshot_op_captures_exit_state",
         func: scenario_watch_snapshot_op_captures_exit_state,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // --stall-after=1 forces SCX_EXIT_ERROR_STALL after 1s of
         // dispatching, mirroring `tests/failure_dump_e2e.rs`'s
         // mechanism for triggering a host-side dump.

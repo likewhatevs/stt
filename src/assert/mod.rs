@@ -1679,7 +1679,7 @@ impl Assert {
     /// field renders as `  name: value` (`none` when the option is
     /// `None`, i.e. inherited or unset). Used by
     /// `cargo ktstr show-thresholds <test>` to expose the resolved
-    /// merged `Assert` (`default_checks().merge(entry.scheduler.assert()).
+    /// merged `Assert` (`default_checks().merge(&entry.scheduler.assert).
     /// merge(&entry.assert)`) without forcing the operator to read
     /// the Debug impl or source. Output is a sequence of indented
     /// `row` lines ending with a newline; the caller owns any

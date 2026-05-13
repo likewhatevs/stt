@@ -1,0 +1,5 @@
+error: declare_scheduler!: element of `sched_args` must be a string literal
+ --> tests/compile_fail/declare_scheduler_element_non_string.rs:6:19
+  |
+6 |     sched_args = [42],
+  |                   ^^

@@ -26,11 +26,10 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::VmResult;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Host-side check: every periodic capture stored on the bridge
 /// has the expected tag shape, ordering, and non-empty content
@@ -118,7 +117,7 @@ fn assert_periodic_captures(result: &VmResult) -> Result<()> {
 /// the captures would still happen (periodic capture is not gated
 /// on the scanner) but the reports would be sparse.
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     duration_s = 10,
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,

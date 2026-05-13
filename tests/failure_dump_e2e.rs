@@ -30,11 +30,10 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec, sidecar_dir};
+use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Compute the per-test failure-dump path. Mirrors the path
 /// `test_support::eval::run_ktstr_test_inner` configures on the
@@ -537,7 +536,7 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_bss_fields",
         func: scenario_failure_dump_renders_bss_fields,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // --stall-after=1 makes the scheduler return early from
         // dispatch after 1 second of operation, triggering
         // SCX_EXIT_ERROR_STALL via the kernel watchdog.
@@ -798,7 +797,7 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_capture_modules",
         func: scenario_failure_dump_renders_capture_modules,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // --stall-after=1 makes the scheduler return early from
         // dispatch after 1 second of operation, triggering
         // SCX_EXIT_ERROR_STALL via the kernel watchdog.
@@ -970,7 +969,7 @@ static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTest
     ktstr::test_support::KtstrTestEntry {
         name: "failure_dump_renders_probe_counters",
         func: scenario_failure_dump_renders_probe_counters,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // --stall-after=1 fires SCX_EXIT_ERROR_STALL on watchdog
         // timeout. The probe's tp_btf/sched_ext_exit handler
         // bumps `KTSTR_PCPU_TRIGGER_COUNT` on every fire, so a

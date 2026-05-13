@@ -62,11 +62,10 @@
 
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// btrfs `statfs.f_type` magic per `linux/magic.h`. Pinned here
 /// (rather than imported from `disk_template`'s private `const`)
@@ -319,7 +318,7 @@ static __KTSTR_ENTRY_BTRFS_TEMPLATE_BUILD: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "disk_template_e2e_btrfs_template_build",
         func: scenario_btrfs_filesystem_visible_at_dev_vda,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &[],
         watchdog_timeout: std::time::Duration::from_secs(3),
         // Short duration — the assertion is a single statfs syscall.
@@ -336,7 +335,7 @@ static __KTSTR_ENTRY_FICLONE_CLONE_ISOLATED: ktstr::test_support::KtstrTestEntry
     ktstr::test_support::KtstrTestEntry {
         name: "disk_template_e2e_ficlone_clone_isolated",
         func: scenario_ficlone_clone_writable_and_fresh,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &[],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_millis(500),

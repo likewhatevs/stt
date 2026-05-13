@@ -35,11 +35,10 @@ use ktstr::assert::{AssertResult, Verdict};
 use ktstr::ktstr_test;
 use ktstr::prelude::{SampleSeries, VmResult};
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Generous per-sample ceiling for `nr_dispatched`. A 10 s
 /// scx-ktstr run on a small guest tops out far below this — the
@@ -143,7 +142,7 @@ fn assert_temporal_patterns(result: &VmResult) -> Result<()> {
 /// both the BPF .bss `nr_dispatched` field and the scx_stats
 /// `nr_dispatched` field advance at every boundary.
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     duration_s = 10,
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,

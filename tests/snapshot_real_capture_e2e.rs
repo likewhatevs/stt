@@ -11,11 +11,10 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::prelude::{RenderedValue, VmResult};
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Op, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Host-side content assertion: verify the bridge has a capture
 /// with the scheduler's .bss containing real BTF-rendered globals.
@@ -61,7 +60,7 @@ fn assert_bridge_has_real_capture(result: &VmResult) -> Result<()> {
 }
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     duration_s = 10,
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,
@@ -83,7 +82,7 @@ fn snapshot_real_capture_op_snapshot(ctx: &ktstr::scenario::Ctx) -> Result<Asser
 }
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     duration_s = 10,
     watchdog_timeout_s = 30,
     workers_per_cgroup = 2,

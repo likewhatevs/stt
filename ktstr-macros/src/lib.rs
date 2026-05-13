@@ -58,12 +58,12 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///     cap (`MAX_STORED_SNAPSHOTS`), `host_only = true`, and
 ///     duration / `N` settings that would land boundaries closer
 ///     than 100 ms apart.
-///   - `scheduler = PATH` — path to a `const Payload` (typically
-///     produced by `Payload::from_scheduler(&...)`). Maps onto
-///     `KtstrTestEntry::scheduler`, which is typed
-///     `&'static Payload`. Default: `&Payload::KERNEL_DEFAULT`,
-///     the no-scx placeholder that runs under the kernel's
-///     default scheduler.
+///   - `scheduler = PATH` — path to a `const Scheduler` (typically
+///     produced by `declare_scheduler!(...)` or `#[derive(Scheduler)]`).
+///     Maps onto `KtstrTestEntry::scheduler`, which is typed
+///     `&'static Scheduler`. Default: `&Scheduler::EEVDF`, the
+///     no-scx placeholder that runs under the kernel's default
+///     scheduler.
 ///   - `payload = PATH` — path to a `const Payload` used as the
 ///     primary binary workload (must be `PayloadKind::Binary`;
 ///     runtime-enforced). Default: `None` (scheduler-only test).
@@ -933,30 +933,28 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Build the scheduler reference token. The `scheduler` slot on
-    // `KtstrTestEntry` is `&'static Payload`; callers pass either a
-    // `{NAME}_PAYLOAD` wrapper emitted by `#[derive(Scheduler)]` or
-    // `Payload::KERNEL_DEFAULT` directly. The default is the
-    // kernel-default placeholder.
+    // `KtstrTestEntry` is `&'static Scheduler`; callers pass either a
+    // `NAME` const emitted by `declare_scheduler!`/`#[derive(Scheduler)]`
+    // or `Scheduler::EEVDF` directly. The default is the kernel-default
+    // EEVDF placeholder.
     let scheduler_tokens = match &scheduler {
         Some(p) => {
             quote! { &#p }
         }
         None => {
-            quote! { &::ktstr::test_support::Payload::KERNEL_DEFAULT }
+            quote! { &::ktstr::test_support::Scheduler::EEVDF }
         }
     };
 
     // Build topology tokens. Each dimension independently inherits from
-    // the scheduler payload's topology when not explicitly set.
-    // `Payload::topology()` is a `const fn` that returns the inner
-    // scheduler's `Topology` for scheduler-kind payloads and
-    // `Topology::DEFAULT_FOR_PAYLOAD` for binary-kind, so the field
+    // the scheduler's topology when not explicitly set. `Scheduler.topology`
+    // is a direct field (a `Topology` struct), so the field-of-field
     // access below remains valid inside a `const` initializer.
     let llcs_tokens = if llcs_set {
         let l = llcs;
         quote! { #l }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology().llcs }
+        quote! { #p.topology.llcs }
     } else {
         let l = llcs;
         quote! { #l }
@@ -965,7 +963,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let c = cores;
         quote! { #c }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology().cores_per_llc }
+        quote! { #p.topology.cores_per_llc }
     } else {
         let c = cores;
         quote! { #c }
@@ -974,7 +972,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = threads;
         quote! { #t }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology().threads_per_core }
+        quote! { #p.topology.threads_per_core }
     } else {
         let t = threads;
         quote! { #t }
@@ -983,7 +981,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let n = numa_nodes;
         quote! { #n }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.topology().numa_nodes }
+        quote! { #p.topology.numa_nodes }
     } else {
         let n = numa_nodes;
         quote! { #n }
@@ -1239,7 +1237,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
     let pairing_assert = quote! {
         const #pairing_assert_const_name: () = {
-            let has_def = (#scheduler_tokens).config_file_def().is_some();
+            let has_def = (#scheduler_tokens).config_file_def.is_some();
             let has_content: bool = #config_set_lit;
             if has_def && !has_content {
                 panic!(
@@ -1354,7 +1352,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let v = min_numa_nodes;
         quote! { #v }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints().min_numa_nodes }
+        quote! { #p.constraints.min_numa_nodes }
     } else {
         let v = min_numa_nodes;
         quote! { #v }
@@ -1363,7 +1361,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = option_tokens(&max_numa_nodes);
         quote! { #t }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints().max_numa_nodes }
+        quote! { #p.constraints.max_numa_nodes }
     } else {
         let t = option_tokens(&max_numa_nodes);
         quote! { #t }
@@ -1372,7 +1370,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let v = min_llcs;
         quote! { #v }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints().min_llcs }
+        quote! { #p.constraints.min_llcs }
     } else {
         let v = min_llcs;
         quote! { #v }
@@ -1381,7 +1379,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = option_tokens(&max_llcs);
         quote! { #t }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints().max_llcs }
+        quote! { #p.constraints.max_llcs }
     } else {
         let t = option_tokens(&max_llcs);
         quote! { #t }
@@ -1389,7 +1387,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let requires_smt_tokens = if requires_smt_set {
         quote! { #requires_smt }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints().requires_smt }
+        quote! { #p.constraints.requires_smt }
     } else {
         quote! { #requires_smt }
     };
@@ -1397,7 +1395,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let v = min_cpus;
         quote! { #v }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints().min_cpus }
+        quote! { #p.constraints.min_cpus }
     } else {
         let v = min_cpus;
         quote! { #v }
@@ -1406,7 +1404,7 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         let t = option_tokens(&max_cpus);
         quote! { #t }
     } else if let Some(ref p) = scheduler {
-        quote! { #p.constraints().max_cpus }
+        quote! { #p.constraints.max_cpus }
     } else {
         let t = option_tokens(&max_cpus);
         quote! { #t }
@@ -1421,9 +1419,9 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         static #entry_name: ::ktstr::test_support::KtstrTestEntry = ::ktstr::test_support::KtstrTestEntry {
             // Always-emit fields. `name`/`func` are macro-generated;
             // `topology`/`constraints` inherit from the scheduler
-            // payload via const accessors that the spread cannot
+            // via field access that the spread cannot
             // recover; `scheduler` substitutes
-            // `Payload::KERNEL_DEFAULT` when no `scheduler = ...`
+            // `Scheduler::EEVDF` when no `scheduler = ...`
             // attribute was supplied. Every remaining field below
             // (memory_mb, payload, workloads, auto_repro, assert,
             // extra_sched_args, ..., disk, and any future addition)
@@ -2124,6 +2122,369 @@ fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenS
     };
 
     Ok(expanded)
+}
+
+/// Function-style macro that registers a `Scheduler` const without
+/// requiring an enum vehicle.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// use ktstr::prelude::*;
+///
+/// declare_scheduler!(MITOSIS, {
+///     name = "mitosis",
+///     binary = "scx_mitosis",
+///     cgroup_parent = "/ktstr",
+///     sched_args = ["--exit-dump-len", "1048576"],
+///     kernels = ["6.14", "7.0..=7.2"],
+///     constraints = TopologyConstraints {
+///         min_llcs: 1, max_llcs: Some(8), max_cpus: Some(64),
+///         ..TopologyConstraints::DEFAULT
+///     },
+/// });
+/// ```
+///
+/// # Generated items
+///
+/// Given `declare_scheduler!(MITOSIS, { ... })`:
+///
+/// - `pub static MITOSIS: ::ktstr::test_support::Scheduler` — the declared
+///   scheduler value. No `_PAYLOAD` suffix; the const IS the
+///   `Scheduler`.
+/// - A hidden `static __KTSTR_SCHED_REG_MITOSIS: &'static Scheduler`
+///   registered in [`KTSTR_SCHEDULERS`](ktstr::test_support::KTSTR_SCHEDULERS)
+///   via linkme so the verifier can discover the declaration by
+///   spawning the test binary with `--ktstr-list-schedulers`.
+///
+/// # Accepted fields
+///
+/// | Field | Required | Description |
+/// |---|---|---|
+/// | `name = "..."` | yes | Scheduler name (sidecar / logs). |
+/// | `binary = "..."` | no | Binary name → `SchedulerSpec::Discover(...)`. Matched against `[[bin]]` names in `target/{debug,release}/`, the test binary's directory, or `KTSTR_SCHEDULER` env var. Often equal to the cargo package name but not required to be. Omit for the EEVDF baseline. |
+/// | `topology = (numa, llcs, cores, threads)` | no | Default VM topology. Default: `(1, 1, 2, 1)` (from `Scheduler::new`). Validated at compile time: each value must be non-zero, and `llcs` must be a multiple of `numa`. |
+/// | `cgroup_parent = "..."` | no | Cgroup parent path (must begin with `/`). |
+/// | `sched_args = [..]` | no | Scheduler CLI args prepended before per-test `extra_sched_args`. |
+/// | `sysctls = [Sysctl::new("k", "v"), ..]` | no | Guest sysctls. |
+/// | `kargs = [..]` | no | Extra guest kernel cmdline args. |
+/// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#REF`), paths, and cache keys. |
+/// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto [`Scheduler::constraints`]. Filters which gauntlet topology presets exercise this scheduler. |
+/// | `config_file = "..."` | no | Host-side config file path. |
+///
+/// # Fields not yet supported
+///
+/// `assert` and `config_file_def` are real [`Scheduler`] fields but
+/// the macro does not currently accept them. To set either, hand-write
+/// the const using the builder chain:
+///
+/// ```rust,ignore
+/// pub static MY_SCHED: Scheduler = Scheduler::new("my_sched")
+///     .binary(SchedulerSpec::Discover("scx_my_sched"))
+///     .assert(Assert::default_checks().max_gap_ms(50))
+///     .config_file_def("--config", "/include-files/my.json");
+/// ```
+///
+/// Macro support is tracked as a follow-up. The macro rejects these
+/// keys with `unknown field` so the diagnostic points at the gap
+/// rather than silently dropping the value.
+///
+/// # Const naming rules
+///
+/// The first argument must be a SCREAMING_SNAKE_CASE identifier and
+/// must NOT be one of the reserved built-in names (`EEVDF`,
+/// `KERNEL_DEFAULT`). The macro emits a `compile_error!` if either rule
+/// is violated.
+#[proc_macro]
+pub fn declare_scheduler(input: TokenStream) -> TokenStream {
+    match declare_scheduler_inner(input.into()) {
+        Ok(ts) => ts.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn declare_scheduler_inner(
+    input: proc_macro2::TokenStream,
+) -> syn::Result<proc_macro2::TokenStream> {
+    struct DeclareSchedulerInput {
+        const_name: syn::Ident,
+        fields: Vec<(syn::Ident, syn::Expr)>,
+    }
+
+    impl syn::parse::Parse for DeclareSchedulerInput {
+        fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+            let const_name: syn::Ident = input.parse()?;
+            let _: syn::Token![,] = input.parse()?;
+            let body;
+            syn::braced!(body in input);
+            let mut fields = Vec::new();
+            while !body.is_empty() {
+                let key: syn::Ident = body.parse()?;
+                let _: syn::Token![=] = body.parse()?;
+                let value: syn::Expr = body.parse()?;
+                fields.push((key, value));
+                if body.peek(syn::Token![,]) {
+                    let _: syn::Token![,] = body.parse()?;
+                }
+            }
+            Ok(DeclareSchedulerInput { const_name, fields })
+        }
+    }
+
+    let DeclareSchedulerInput { const_name, fields } = syn::parse2(input)?;
+
+    // Validate const name: SCREAMING_SNAKE_CASE + not reserved.
+    let const_name_str = const_name.to_string();
+    if const_name_str != const_name_str.to_uppercase() {
+        return Err(syn::Error::new(
+            const_name.span(),
+            format!(
+                "declare_scheduler!: const name `{const_name_str}` must be SCREAMING_SNAKE_CASE"
+            ),
+        ));
+    }
+    if matches!(const_name_str.as_str(), "EEVDF" | "KERNEL_DEFAULT") {
+        return Err(syn::Error::new(
+            const_name.span(),
+            format!(
+                "declare_scheduler!: `{const_name_str}` is reserved as a built-in scheduler name; pick a different identifier"
+            ),
+        ));
+    }
+
+    // Parse fields.
+    let mut sched_name: Option<String> = None;
+    let mut sched_binary: Option<String> = None;
+    let mut sched_topology: Option<(u32, u32, u32, u32)> = None;
+    let mut sched_cgroup_parent: Option<String> = None;
+    let mut sched_args: Vec<String> = Vec::new();
+    let mut sched_args_set = false;
+    let mut sched_sysctls: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut sched_sysctls_set = false;
+    let mut sched_kargs: Vec<String> = Vec::new();
+    let mut sched_kargs_set = false;
+    let mut sched_kernels: Vec<String> = Vec::new();
+    let mut sched_kernels_set = false;
+    let mut sched_constraints: Option<syn::Expr> = None;
+    let mut sched_config_file: Option<String> = None;
+
+    let mut seen_fields = std::collections::HashSet::<String>::new();
+    for (key, value) in fields {
+        let key_str = key.to_string();
+        if !seen_fields.insert(key_str.clone()) {
+            return Err(syn::Error::new(
+                key.span(),
+                format!("declare_scheduler!: duplicate field `{key_str}`"),
+            ));
+        }
+        match key_str.as_str() {
+            "name" => {
+                let lit = expect_str_lit(&value, &key, "name")?;
+                sched_name = Some(lit);
+            }
+            "binary" => {
+                let lit = expect_str_lit(&value, &key, "binary")?;
+                sched_binary = Some(lit);
+            }
+            "topology" => {
+                if let syn::Expr::Tuple(t) = &value {
+                    let mut parts = [0u32; 4];
+                    if t.elems.len() != 4 {
+                        return Err(syn::Error::new_spanned(
+                            t,
+                            "topology must be a 4-tuple (numa_nodes, llcs, cores, threads)",
+                        ));
+                    }
+                    for (i, e) in t.elems.iter().enumerate() {
+                        parts[i] = expect_u32_lit(e, &key, "topology")?;
+                    }
+                    sched_topology = Some((parts[0], parts[1], parts[2], parts[3]));
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        "topology must be a tuple expression: topology = (numa_nodes, llcs, cores, threads)",
+                    ));
+                }
+            }
+            "cgroup_parent" => {
+                let lit = expect_str_lit(&value, &key, "cgroup_parent")?;
+                sched_cgroup_parent = Some(lit);
+            }
+            "sched_args" => {
+                sched_args_set = true;
+                let arr = expect_array(&value, &key, "sched_args")?;
+                for elem in &arr.elems {
+                    sched_args.push(expect_str_lit_element(elem, "sched_args")?);
+                }
+            }
+            "sysctls" => {
+                sched_sysctls_set = true;
+                let arr = expect_array(&value, &key, "sysctls")?;
+                for elem in &arr.elems {
+                    sched_sysctls.push(elem.to_token_stream());
+                }
+            }
+            "kargs" => {
+                sched_kargs_set = true;
+                let arr = expect_array(&value, &key, "kargs")?;
+                for elem in &arr.elems {
+                    sched_kargs.push(expect_str_lit_element(elem, "kargs")?);
+                }
+            }
+            "kernels" => {
+                sched_kernels_set = true;
+                let arr = expect_array(&value, &key, "kernels")?;
+                for elem in &arr.elems {
+                    sched_kernels.push(expect_str_lit_element(elem, "kernels")?);
+                }
+            }
+            "constraints" => {
+                sched_constraints = Some(value);
+            }
+            "config_file" => {
+                let lit = expect_str_lit(&value, &key, "config_file")?;
+                sched_config_file = Some(lit);
+            }
+            other => {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!("declare_scheduler!: unknown field `{other}`"),
+                ));
+            }
+        }
+    }
+
+    let sched_name = sched_name.ok_or_else(|| {
+        syn::Error::new(
+            const_name.span(),
+            "declare_scheduler!: missing required field `name`",
+        )
+    })?;
+    if sched_name.is_empty() {
+        return Err(syn::Error::new(
+            const_name.span(),
+            "declare_scheduler!: `name` must be a non-empty string",
+        ));
+    }
+
+    // Validate topology (matches derive's validation).
+    if let Some((n, l, c, t)) = sched_topology {
+        if n == 0 || l == 0 || c == 0 || t == 0 {
+            return Err(syn::Error::new(
+                const_name.span(),
+                "topology values must all be > 0",
+            ));
+        }
+        if l % n != 0 {
+            return Err(syn::Error::new(
+                const_name.span(),
+                format!("topology: llcs ({l}) must be divisible by numa_nodes ({n})"),
+            ));
+        }
+    }
+
+    // Build the Scheduler const expression via the builder chain.
+    let sched_name_str = sched_name;
+    let mut builder_chain = quote! {
+        ::ktstr::test_support::Scheduler::new(#sched_name_str)
+    };
+
+    if let Some(binary) = &sched_binary {
+        builder_chain = quote! {
+            #builder_chain.binary(::ktstr::test_support::SchedulerSpec::Discover(#binary))
+        };
+    }
+    if let Some((n, l, c, t)) = sched_topology {
+        builder_chain = quote! { #builder_chain.topology(#n, #l, #c, #t) };
+    }
+    if let Some(parent) = &sched_cgroup_parent {
+        builder_chain = quote! { #builder_chain.cgroup_parent(#parent) };
+    }
+    if sched_args_set {
+        builder_chain = quote! { #builder_chain.sched_args(&[#(#sched_args),*]) };
+    }
+    if sched_sysctls_set {
+        let entries = &sched_sysctls;
+        builder_chain = quote! { #builder_chain.sysctls(&[#(#entries),*]) };
+    }
+    if sched_kargs_set {
+        builder_chain = quote! { #builder_chain.kargs(&[#(#sched_kargs),*]) };
+    }
+    if sched_kernels_set {
+        builder_chain = quote! { #builder_chain.kernels(&[#(#sched_kernels),*]) };
+    }
+    if let Some(tc) = &sched_constraints {
+        builder_chain = quote! { #builder_chain.constraints(#tc) };
+    }
+    if let Some(cf) = &sched_config_file {
+        builder_chain = quote! { #builder_chain.config_file(#cf) };
+    }
+
+    let registry_ident = format_ident!("__KTSTR_SCHED_REG_{}", const_name);
+
+    let expanded = quote! {
+        pub static #const_name: ::ktstr::test_support::Scheduler = #builder_chain;
+
+        #[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_SCHEDULERS)]
+        #[linkme(crate = ::ktstr::__private::linkme)]
+        static #registry_ident: &'static ::ktstr::test_support::Scheduler = &#const_name;
+    };
+
+    Ok(expanded)
+}
+
+fn expect_str_lit(expr: &syn::Expr, key: &syn::Ident, field: &str) -> syn::Result<String> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(ls),
+            ..
+        }) => Ok(ls.value()),
+        _ => Err(syn::Error::new(
+            key.span(),
+            format!("declare_scheduler!: `{field}` must be a string literal"),
+        )),
+    }
+}
+
+fn expect_str_lit_element(expr: &syn::Expr, field: &str) -> syn::Result<String> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(ls),
+            ..
+        }) => Ok(ls.value()),
+        _ => Err(syn::Error::new_spanned(
+            expr,
+            format!("declare_scheduler!: element of `{field}` must be a string literal"),
+        )),
+    }
+}
+
+fn expect_u32_lit(expr: &syn::Expr, key: &syn::Ident, field: &str) -> syn::Result<u32> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(li),
+            ..
+        }) => li.base10_parse(),
+        _ => Err(syn::Error::new(
+            key.span(),
+            format!("declare_scheduler!: `{field}` element must be an integer literal"),
+        )),
+    }
+}
+
+fn expect_array<'a>(
+    expr: &'a syn::Expr,
+    key: &syn::Ident,
+    field: &str,
+) -> syn::Result<&'a syn::ExprArray> {
+    if let syn::Expr::Array(arr) = expr {
+        Ok(arr)
+    } else {
+        Err(syn::Error::new(
+            key.span(),
+            format!("declare_scheduler!: `{field}` must be an array literal `[..]`"),
+        ))
+    }
 }
 
 /// Derive macro that generates a `Payload` const from an annotated

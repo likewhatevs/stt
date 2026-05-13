@@ -2736,11 +2736,9 @@ fn scheduler_fingerprint_formats_sysctls_with_prefix() {
     ];
     static SCHED: super::super::entry::Scheduler =
         super::super::entry::Scheduler::new("s").sysctls(SYSCTLS);
-    static SCHED_PAYLOAD: super::super::payload::Payload =
-        super::super::payload::Payload::from_scheduler(&SCHED);
     let entry = KtstrTestEntry {
         name: "s_test",
-        scheduler: &SCHED_PAYLOAD,
+        scheduler: &SCHED,
         ..KtstrTestEntry::DEFAULT
     };
     let SchedulerFingerprint {
@@ -2764,11 +2762,9 @@ fn scheduler_fingerprint_formats_sysctls_with_prefix() {
 fn scheduler_fingerprint_forwards_kargs_verbatim() {
     static SCHED: super::super::entry::Scheduler =
         super::super::entry::Scheduler::new("s").kargs(&["quiet", "splash"]);
-    static SCHED_PAYLOAD: super::super::payload::Payload =
-        super::super::payload::Payload::from_scheduler(&SCHED);
     let entry = KtstrTestEntry {
         name: "s_test",
-        scheduler: &SCHED_PAYLOAD,
+        scheduler: &SCHED,
         ..KtstrTestEntry::DEFAULT
     };
     let SchedulerFingerprint {
@@ -2786,11 +2782,9 @@ fn scheduler_fingerprint_uses_display_name_for_discover() {
     use super::super::entry::SchedulerSpec;
     static SCHED: super::super::entry::Scheduler =
         super::super::entry::Scheduler::new("s").binary(SchedulerSpec::Discover("scx_relaxed"));
-    static SCHED_PAYLOAD: super::super::payload::Payload =
-        super::super::payload::Payload::from_scheduler(&SCHED);
     let entry = KtstrTestEntry {
         name: "rel_test",
-        scheduler: &SCHED_PAYLOAD,
+        scheduler: &SCHED,
         ..KtstrTestEntry::DEFAULT
     };
     let SchedulerFingerprint {
@@ -2811,30 +2805,23 @@ fn scheduler_fingerprint_uses_display_name_for_discover() {
     );
 }
 
-/// `scheduler_fingerprint` on a binary-kind `Payload`
-/// (constructed via `Payload::binary`) must produce
-/// `commit: None`. The `and_then` chain in `scheduler_fingerprint`
-/// (`entry.scheduler.scheduler_binary().and_then(|s|
-/// s.scheduler_commit())`) relies on `Payload::scheduler_binary`
-/// returning `None` for `PayloadKind::Binary` to short-circuit
-/// the commit lookup — a regression that accidentally returned
-/// `Some(&some_default)` from `scheduler_binary` for
-/// binary-kind payloads would skip this short-circuit and
-/// populate `scheduler_commit` with a value that has nothing
-/// to do with a scheduler. This test pins that short-circuit
-/// end-to-end.
+/// Pin that `scheduler_fingerprint` reports `scheduler_commit: None`
+/// for the EEVDF baseline (the no-scx-scheduler placeholder).
 ///
-/// Complements the `scheduler_commit_*` variant tests on
-/// `SchedulerSpec` itself (which cover the scheduler-kind
-/// branches) by exercising the binary-kind fallthrough that
-/// never touches `SchedulerSpec` at all.
+/// `scheduler_fingerprint` reads `entry.scheduler.binary.scheduler_commit()`
+/// directly. `SchedulerSpec::scheduler_commit` returns `None` for every
+/// variant (Eevdf, Discover, Path, KernelBuiltin) — the commit string is
+/// not carried in the static spec. A regression that returned `Some(...)`
+/// from `scheduler_commit` for any variant would silently populate the
+/// sidecar's `scheduler_commit` field with a value not tied to an actual
+/// binary commit; this test pins the `None` contract for the EEVDF
+/// baseline end-to-end and confirms the `Scheduler::EEVDF` const reports
+/// its `name` field (`"eevdf"`) into the sidecar verbatim.
 #[test]
-fn scheduler_fingerprint_binary_payload_has_no_commit() {
-    static BINARY_PAYLOAD: super::super::payload::Payload =
-        super::super::payload::Payload::binary("bin_test", "some_binary");
+fn scheduler_fingerprint_eevdf_has_no_commit() {
     let entry = KtstrTestEntry {
-        name: "bin_test",
-        scheduler: &BINARY_PAYLOAD,
+        name: "eevdf_test",
+        scheduler: &super::super::entry::Scheduler::EEVDF,
         ..KtstrTestEntry::DEFAULT
     };
     let SchedulerFingerprint {
@@ -2843,30 +2830,22 @@ fn scheduler_fingerprint_binary_payload_has_no_commit() {
         sysctls,
         kargs,
     } = scheduler_fingerprint(&entry);
-    // Per `Payload::scheduler_name`, binary-kind payloads
-    // carry the intent-level label `"kernel_default"` — pinning
-    // this alongside the None-commit keeps the binary-kind
-    // contract visible in one place.
     assert_eq!(
-        name, "kernel_default",
-        "binary-kind payload must report the intent-level \
-         scheduler label; got: {name:?}",
+        name, "eevdf",
+        "Scheduler::EEVDF carries the compile-time-fixed name \
+         \"eevdf\"; got: {name:?}",
     );
     assert!(
         commit.is_none(),
-        "binary-kind payload has no scheduler binary at all — \
-         scheduler_commit must be None via the `and_then` \
-         short-circuit on `scheduler_binary() == None`. Got: \
-         {commit:?}",
+        "EEVDF has no binary at all — scheduler_commit must be \
+         None via the SchedulerSpec::scheduler_commit short-circuit \
+         (every variant returns None). Got: {commit:?}",
     );
     assert!(
         sysctls.is_empty(),
-        "binary-kind payload reports no sysctls; got: {sysctls:?}",
+        "EEVDF declares no sysctls; got: {sysctls:?}",
     );
-    assert!(
-        kargs.is_empty(),
-        "binary-kind payload reports no kargs; got: {kargs:?}",
-    );
+    assert!(kargs.is_empty(), "EEVDF declares no kargs; got: {kargs:?}",);
 }
 
 mod commits;

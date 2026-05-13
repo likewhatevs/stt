@@ -846,18 +846,12 @@ fn run_ktstr_test_inner_impl(
     // blocked during the multi-second extraction phase. `None`
     // on non-cache kernels — those don't need coordination.
     let kernel_lock = acquire_test_kernel_lock_if_cached(&kernel)?;
-    let scheduler = match entry.scheduler.scheduler_binary() {
-        Some(b) => {
-            // Drop the ResolveSource on this path — the downstream
-            // sites (VM builder, auto_repro) only need the PathBuf.
-            // Consumers that want provenance (sidecar stamping,
-            // cache-key construction) must call resolve_scheduler
-            // directly on the same spec; the source is stable across
-            // identical inputs within a single process run.
-            resolve_scheduler(b)?.0
-        }
-        None => None,
-    };
+    // Drop the ResolveSource on this path — the downstream sites (VM
+    // builder, auto_repro) only need the PathBuf. Consumers that want
+    // provenance (sidecar stamping, cache-key construction) must call
+    // resolve_scheduler directly on the same spec; the source is
+    // stable across identical inputs within a single process run.
+    let scheduler = resolve_scheduler(&entry.scheduler.binary)?.0;
     let ktstr_bin = crate::resolve_current_exe()?;
 
     let guest_args = vec![
@@ -929,12 +923,10 @@ fn run_ktstr_test_inner_impl(
 
     // Merge order: default_checks -> scheduler.assert -> per-test assert.
     let merged_assert = crate::assert::Assert::default_checks()
-        .merge(entry.scheduler.assert())
+        .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
 
-    if let Some(SchedulerSpec::KernelBuiltin { enable, disable }) =
-        entry.scheduler.scheduler_binary()
-    {
+    if let SchedulerSpec::KernelBuiltin { enable, disable } = &entry.scheduler.binary {
         builder = builder.sched_enable_cmds(enable);
         builder = builder.sched_disable_cmds(disable);
     }
@@ -1678,10 +1670,7 @@ fn evaluate_vm_result(
         .as_ref()
         .map(|m| crate::timeline::Timeline::build(stimulus_events, &m.samples));
 
-    let sched_label = match entry.scheduler.scheduler_binary() {
-        Some(b) => scheduler_label(b),
-        None => String::new(),
-    };
+    let sched_label = scheduler_label(&entry.scheduler.binary);
     let output = &result.output;
     let dump_section = extract_sched_ext_dump(&result.stderr)
         .map(|d| format!("\n\n--- sched_ext dump ---\n{d}"))
@@ -1728,7 +1717,7 @@ fn evaluate_vm_result(
     let tl_ctx = crate::timeline::TimelineContext {
         kernel: extract_kernel_version(&result.stderr),
         topology: Some(format!("{topo} ({} cpus)", topo.total_cpus())),
-        scheduler: Some(entry.scheduler.scheduler_name().to_string()),
+        scheduler: Some(entry.scheduler.name.to_string()),
         scenario: Some(entry.name.to_string()),
         duration_s: Some(result.duration.as_secs_f64()),
     };

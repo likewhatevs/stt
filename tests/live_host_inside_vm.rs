@@ -45,8 +45,6 @@ use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 
 const KTSTR_SCHED: ktstr::prelude::Scheduler = ktstr::prelude::Scheduler::new("ktstr_sched")
     .binary(ktstr::prelude::SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: ktstr::prelude::Payload =
-    ktstr::prelude::Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Discover the running kernel + every BPF map visible to it,
 /// then assert the pipeline produced the expected shape:
@@ -63,7 +61,7 @@ const KTSTR_SCHED_PAYLOAD: ktstr::prelude::Payload =
 /// lengthens the boot. Duration short — the assertions run on the
 /// captured pipeline state, not on scheduler-level behavior over
 /// time.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 10, watchdog_timeout_s = 60, scheduler = KTSTR_SCHED_PAYLOAD)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, duration_s = 10, watchdog_timeout_s = 60, scheduler = KTSTR_SCHED)]
 fn live_host_pipeline_inside_guest_produces_expected_shape(ctx: &Ctx) -> Result<AssertResult> {
     // Run a brief workload so the scheduler is exercised and any
     // lazily-populated BPF maps (event counters, struct_ops state)

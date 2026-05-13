@@ -49,24 +49,20 @@
 //! # Scheduler definition
 //!
 //! Tests work with just topology parameters (as above). When multiple
-//! tests share a scheduler, use `#[derive(Scheduler)]` to declare it
-//! once with typed flags and a default topology. Tests reference the
-//! generated const and inherit its configuration:
+//! tests share a scheduler, use `declare_scheduler!` to declare it
+//! once with a binary, default topology, and any always-on args. Tests
+//! reference the generated const and inherit its configuration:
 //!
 //! ```rust
 //! use ktstr::prelude::*;
 //!
-//! #[derive(Scheduler)]
-//! #[scheduler(name = "my_sched", binary = "scx_my_sched", topology(1, 2, 4, 1))]
-//! #[allow(dead_code)]
-//! enum MySchedFlag {
-//!     #[flag(args = ["--enable-llc"])]
-//!     Llc,
-//!     #[flag(args = ["--enable-stealing"], requires = [Llc])]
-//!     Steal,
-//! }
+//! declare_scheduler!(MY_SCHED, {
+//!     name = "my_sched",
+//!     binary = "scx_my_sched",
+//!     topology = (1, 2, 4, 1),
+//! });
 //!
-//! #[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
+//! #[ktstr_test(scheduler = MY_SCHED)]
 //! fn basic(ctx: &Ctx) -> Result<AssertResult> {
 //!     execute_defs(ctx, vec![
 //!         CgroupDef::named("cg_0").workers(2),
@@ -568,6 +564,7 @@ pub fn merge_kconfig_fragments<'a>(
 pub use ktstr_macros::Claim;
 pub use ktstr_macros::Payload;
 pub use ktstr_macros::Scheduler;
+pub use ktstr_macros::declare_scheduler;
 pub use ktstr_macros::json;
 pub use ktstr_macros::ktstr_test;
 
@@ -620,6 +617,7 @@ pub mod prelude {
     };
     pub use crate::cgroup::CgroupManager;
     pub use crate::claim;
+    pub use crate::declare_scheduler;
     pub use crate::host_context::HostContext;
     pub use crate::host_heap::HostHeapState;
     pub use crate::ktstr_test;
@@ -655,7 +653,8 @@ pub mod prelude {
     pub use crate::test_support::{
         BpfMapWrite, CgroupPath, MemSideCache, Metric, MetricBounds, MetricCheck, MetricHint,
         MetricSource, NumaDistance, NumaNode, OutputFormat, Payload, PayloadKind, PayloadMetrics,
-        Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, extract_metrics,
+        Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, TopologyConstraints,
+        extract_metrics,
     };
     pub use crate::{Payload, Scheduler};
     // `FlagDecl` is already re-exported via `crate::scenario::flags::FlagDecl`

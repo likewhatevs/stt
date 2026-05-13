@@ -558,15 +558,15 @@ pub(crate) fn attempt_auto_repro(
         .dual_snapshot(true)
         .performance_mode(entry.performance_mode);
 
-    if let Some(crate::test_support::entry::SchedulerSpec::KernelBuiltin { enable, disable }) =
-        entry.scheduler.scheduler_binary()
+    if let crate::test_support::entry::SchedulerSpec::KernelBuiltin { enable, disable } =
+        &entry.scheduler.binary
     {
         builder = builder.sched_enable_cmds(enable);
         builder = builder.sched_disable_cmds(disable);
     }
 
     let merged_assert = crate::assert::Assert::default_checks()
-        .merge(entry.scheduler.assert())
+        .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
     if entry.scheduler.has_active_scheduling() {
         builder = builder.monitor_thresholds(merged_assert.monitor_thresholds());
@@ -1355,7 +1355,7 @@ fn build_dispatch_ctx_parts(
     let sched_pid = crate::vmm::rust_init::sched_pid();
     // Three-layer merge: default_checks → scheduler.assert → entry.assert.
     let merged_assert = crate::assert::Assert::default_checks()
-        .merge(entry.scheduler.assert())
+        .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
     (topo, cgroups, sched_pid, merged_assert)
 }

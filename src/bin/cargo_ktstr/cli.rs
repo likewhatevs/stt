@@ -354,7 +354,7 @@ pub(crate) enum KtstrCommand {
     /// Print the resolved assertion thresholds for the named test.
     ///
     /// Dumps the merged `Assert` produced by the runtime merge chain
-    /// `Assert::default_checks().merge(entry.scheduler.assert()).merge(&entry.assert)`
+    /// `Assert::default_checks().merge(&entry.scheduler.assert).merge(&entry.assert)`
     /// — the same value `run_ktstr_test_inner` evaluates against
     /// worker reports. Surfaces every threshold field (or `none`
     /// when inherited / unset) so an operator can see what the test

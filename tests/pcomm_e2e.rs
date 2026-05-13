@@ -23,11 +23,10 @@ use ktstr::ktstr_test;
 use ktstr::prelude::{VmResult, WorkSpec};
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Host-side gate: a clean run means the in-VM dispatch processed
 /// the pcomm-tagged WorkSpec without crashing. Any regression in
@@ -77,7 +76,7 @@ fn assert_pcomm_ran_clean(result: &VmResult) -> Result<()> {
 /// any regression that crashes, times out, or exits non-zero
 /// collapses one of the host-visible signals checked there.
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     duration_s = 3,
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,

@@ -3,13 +3,12 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, CpusetSpec, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{BpfMapWrite, Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{BpfMapWrite, Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
@@ -23,7 +22,7 @@ fn sched_basic_proportional(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
 fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![
@@ -37,7 +36,7 @@ fn sched_cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, steps)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn sched_dynamic_add(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![
         Step {
@@ -78,7 +77,7 @@ static __KTSTR_ENTRY_BPF_API: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "sched_bpf_map_api_integration",
         func: scenario_bpf_api,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         auto_repro: false,
         assert: ktstr::assert::Assert::NO_OVERRIDES.fail_on_stall(false),
         bpf_map_write: &[&BPF_NOOP],
@@ -130,7 +129,7 @@ static __KTSTR_ENTRY_BPF_HOST_WRITE_STALLS: ktstr::test_support::KtstrTestEntry 
     ktstr::test_support::KtstrTestEntry {
         name: "sched_host_bpf_map_write_stalls_scheduler",
         func: scenario_bpf_api,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         auto_repro: false,
         bpf_map_write: &[&BPF_STALL_HOST_WRITE],
         watchdog_timeout: std::time::Duration::from_secs(2),
@@ -143,7 +142,7 @@ static __KTSTR_ENTRY_BPF_HOST_WRITE_STALLS: ktstr::test_support::KtstrTestEntry 
 /// Positive benchmarking test: scx-ktstr under performance_mode passes
 /// min_iteration_rate and max_gap_ms gates.
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     llcs = 1,
     cores = 2,
     threads = 1,
@@ -183,7 +182,7 @@ static __KTSTR_ENTRY_PERF_NEG: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "sched_perf_negative",
         func: scenario_perf_negative,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         auto_repro: false,
         extra_sched_args: &["--degrade"],
         performance_mode: true,
@@ -220,7 +219,7 @@ static __KTSTR_ENTRY_SCATTER: ktstr::test_support::KtstrTestEntry =
             nodes: None,
             distances: None,
         },
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--scattershot"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(5),
@@ -249,7 +248,7 @@ static __KTSTR_ENTRY_SLOW: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_throughput_regression",
         func: scenario_throughput_regression,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--slow"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(5),
@@ -273,7 +272,7 @@ static __KTSTR_ENTRY_AUTO_REPRO: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_auto_repro",
         func: scenario_auto_repro,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
@@ -428,7 +427,7 @@ static __KTSTR_ENTRY_WATCHDOG_TIMING: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "watchdog_override_timing_precision",
         func: scenario_watchdog_timing_precision,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(2),
         duration: std::time::Duration::from_secs(15),
@@ -465,7 +464,7 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_baseline_scx",
         func: scenario_baseline,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         performance_mode: true,
         duration: std::time::Duration::from_secs(3),
         workers_per_cgroup: 4,
@@ -485,7 +484,7 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
 /// (`kernel/sched/ext.c:check_rq_for_timeouts`) flags this as
 /// `SCX_EXIT_ERROR_STALL`. 15 s matches `sched_bpf_api` above, which
 /// runs the same scheduler against a similar workload shape.
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1, duration_s = 2, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1, duration_s = 2, watchdog_timeout_s = 15, max_spread_pct = 80.0)]
 fn sched_verifier_stats_populated(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
@@ -523,7 +522,7 @@ static __KTSTR_ENTRY_MID_DEGRADE: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "demo_mid_run_degrade",
         func: scenario_mid_degrade,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--degrade-after=3"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(10),

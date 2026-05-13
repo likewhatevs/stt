@@ -123,7 +123,7 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
     // running the .run file on a host without applying those
     // settings would silently mis-launch the scheduler. Reject with
     // an actionable diagnostic.
-    if let Some(SchedulerSpec::KernelBuiltin { .. }) = entry.scheduler.scheduler_binary() {
+    if let SchedulerSpec::KernelBuiltin { .. } = &entry.scheduler.binary {
         bail!(
             "test '{test_name}' uses a KernelBuiltin scheduler — it activates via \
              host-side shell commands (`enable` / `disable` slots) rather than a \
@@ -166,11 +166,7 @@ pub fn export_test(test_name: &str, output: Option<PathBuf>) -> Result<()> {
 /// The cascade walks both target dirs regardless of which build
 /// profile invoked cargo-ktstr.
 fn resolve_scheduler_for_export(entry: &KtstrTestEntry) -> Result<Option<PathBuf>> {
-    let Some(spec) = entry.scheduler.scheduler_binary() else {
-        // Binary-kind payload — no scheduler.
-        return Ok(None);
-    };
-    let (path, _source) = resolve_scheduler(spec)
+    let (path, _source) = resolve_scheduler(&entry.scheduler.binary)
         .with_context(|| format!("resolve scheduler binary for test '{}'", entry.name))?;
     Ok(path)
 }
@@ -379,7 +375,7 @@ fn generate_preamble(entry: &KtstrTestEntry, has_scheduler: bool) -> String {
     // Quoting at the producer is cheap and matches the same defense
     // applied to extra_sched_args / flag_args above.
     let test_name = shell_quote(entry.name);
-    let scheduler_name = shell_quote(entry.scheduler.scheduler_name());
+    let scheduler_name = shell_quote(entry.scheduler.name);
     let git_hash = shell_quote(&git_provenance());
 
     let duration_secs = entry.duration.as_secs();

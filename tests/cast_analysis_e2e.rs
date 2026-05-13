@@ -76,11 +76,10 @@
 use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec, sidecar_dir};
+use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Mirror of `tests/failure_dump_e2e.rs::failure_dump_path` — the
 /// freeze coordinator writes per-test failure dumps under the same
@@ -586,7 +585,7 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_KERNEL_KPTR: ktstr::test_support::KtstrTestEn
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_chases_kernel_kptr",
         func: scenario_cast_analysis_chases_kernel_kptr,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // `--stall-after=1` triggers SCX_EXIT_ERROR_STALL via the
         // kernel watchdog, which fires the freeze coordinator's
         // dump_state path. Same mechanism the existing
@@ -996,7 +995,7 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestE
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_chases_bss_to_arena",
         func: scenario_cast_analysis_chases_bss_to_arena,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // Same trigger as the kernel-kptr scenario: SCX_EXIT_ERROR_STALL
         // fires the freeze coordinator's dump_state path. The .bss-side
         // fixture is exercised inside ktstr_init_task on every task
@@ -1499,7 +1498,7 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_CROSS_SUBPROG: ktstr::test_support::KtstrTest
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_cross_subprog_arena_chase",
         func: scenario_cast_analysis_cross_subprog_arena_chase,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
@@ -1514,7 +1513,7 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_SDT_ALLOC_BRIDGE: ktstr::test_support::KtstrT
     ktstr::test_support::KtstrTestEntry {
         name: "cast_analysis_sdt_alloc_bridge_resolves_fwd",
         func: scenario_cast_analysis_sdt_alloc_bridge_resolves_fwd,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // Same trigger as the sibling scenarios: SCX_EXIT_ERROR_STALL
         // latches the freeze-and-dump path so the bridge index is
         // populated AND the surface-struct render sees a Fwd-pointee

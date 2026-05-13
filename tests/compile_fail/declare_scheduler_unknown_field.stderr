@@ -1,0 +1,5 @@
+error: declare_scheduler!: unknown field `bogus`
+ --> tests/compile_fail/declare_scheduler_unknown_field.rs:6:5
+  |
+6 |     bogus = "value",
+  |     ^^^^^

@@ -41,11 +41,10 @@
 use anyhow::Result;
 use ktstr::assert::{AssertDetail, AssertResult, DetailKind};
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec, sidecar_dir};
+use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Mirror `failure_dump_e2e.rs::failure_dump_path`. Both sites must
 /// agree with `test_support::eval::run_ktstr_test_inner`'s naming
@@ -816,7 +815,7 @@ static __KTSTR_ENTRY_DSQ_RQ_WALKER: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_dsq_and_rq_walker",
         func: scenario_dsq_and_rq_walker_populates_failure_dump,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
@@ -831,7 +830,7 @@ static __KTSTR_ENTRY_PERF_COUNTERS: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_perf_counters_capture",
         func: scenario_perf_counters_capture_populates_dump,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
@@ -846,7 +845,7 @@ static __KTSTR_ENTRY_EVENT_TIMELINE: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_event_counter_timeline",
         func: scenario_event_counter_timeline_populates_dump,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         // Longer duration so the per-tick monitor loop accumulates
@@ -863,7 +862,7 @@ static __KTSTR_ENTRY_DEADLINE: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_sched_deadline",
         func: scenario_sched_deadline_real_setattr,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // No --stall-after: this test just exercises the
         // sched_setattr ABI; no freeze required.
         extra_sched_args: &[],
@@ -884,7 +883,7 @@ static __KTSTR_ENTRY_DUMP_TRIGGER: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_failure_dump_trigger",
         func: scenario_failure_dump_trigger_minimal_invariants,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
@@ -1085,7 +1084,7 @@ static __KTSTR_ENTRY_DISK_DEFAULT: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_disk_default_appears",
         func: scenario_disk_default_appears_at_dev_vda,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         // No --stall-after: this test exercises only the disk
         // attach path, not the failure-dump pipeline.
         extra_sched_args: &[],
@@ -1105,7 +1104,7 @@ static __KTSTR_ENTRY_DISK_ROUNDTRIP: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_disk_write_read_roundtrip",
         func: scenario_disk_write_read_roundtrip,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &[],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_millis(500),
@@ -1121,7 +1120,7 @@ static __KTSTR_ENTRY_DISK_READ_ONLY: ktstr::test_support::KtstrTestEntry =
     ktstr::test_support::KtstrTestEntry {
         name: "vm_integration_disk_read_only_rejects_write",
         func: scenario_disk_read_only_rejects_write,
-        scheduler: &KTSTR_SCHED_PAYLOAD,
+        scheduler: &KTSTR_SCHED,
         extra_sched_args: &[],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_millis(500),

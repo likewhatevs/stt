@@ -225,7 +225,7 @@ pub(super) fn suggest_closest_test_name(query: &str) -> Option<&'static str> {
 /// Render the resolved, merged `Assert` thresholds for the named
 /// test — the same merge chain evaluated at run time in
 /// `run_ktstr_test_inner`:
-/// `Assert::default_checks().merge(entry.scheduler.assert()).merge(&entry.assert)`.
+/// `Assert::default_checks().merge(&entry.scheduler.assert).merge(&entry.assert)`.
 ///
 /// Returns `Err` when no registered test matches `test_name`. The
 /// CLI wiring (`cargo ktstr show-thresholds <test>`) surfaces this
@@ -245,13 +245,10 @@ pub fn show_thresholds(test_name: &str) -> Result<String> {
         )
     })?;
     let merged = crate::assert::Assert::default_checks()
-        .merge(entry.scheduler.assert())
+        .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
     let mut out = format!("Test: {}\n", entry.name);
-    out.push_str(&format!(
-        "Scheduler: {}\n",
-        entry.scheduler.scheduler_name(),
-    ));
+    out.push_str(&format!("Scheduler: {}\n", entry.scheduler.name,));
     out.push_str("Resolved assertion thresholds:\n");
     out.push_str(&merged.format_human());
     Ok(out)

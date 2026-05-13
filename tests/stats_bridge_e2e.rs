@@ -30,11 +30,10 @@ use ktstr::ktstr_test;
 use ktstr::prelude::{SampleSeries, VmResult};
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Drain the bridge's periodic captures and assert the
 /// scheduler-stats path delivered a non-zero `nr_dispatched` count
@@ -102,7 +101,7 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
 }
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     num_snapshots = 1,
     duration_s = 5,
     watchdog_timeout_s = 15,

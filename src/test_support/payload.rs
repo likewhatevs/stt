@@ -344,22 +344,22 @@ impl Payload {
     /// - `"eevdf"` answers "what scheduler actually ran?" — the
     ///   concrete scheduling class in effect.
     ///
-    /// **From the scheduler slot, only `scheduler_name()` reaches
-    /// the sidecar.** The `SidecarResult.scheduler` field
-    /// (src/test_support/sidecar.rs) is populated via
-    /// `entry.scheduler.scheduler_name()` — the method is called on
-    /// the payload in the scheduler slot, not on payload / workload
-    /// slots, which route through separate serialization paths — and
-    /// emits `"eevdf"` when the scheduler slot holds `KERNEL_DEFAULT`.
-    /// The outer `Payload.name` (`"kernel_default"`) is NOT written
-    /// to the sidecar — it stays in-memory only, used by logs,
-    /// `#[ktstr_test]`-declaration lookups, and
-    /// `Payload::display_name()`. Cross-kernel-version comparisons
-    /// via sidecar `scheduler` therefore see `"eevdf"` today and
-    /// whatever future scheduling class replaces EEVDF tomorrow;
-    /// author-intent filtering on `"kernel_default"` requires
-    /// consulting the in-memory `Payload::name` directly, not the
-    /// sidecar.
+    /// **Sidecar serialization reads the scheduler-slot `Scheduler`
+    /// directly.** The `SidecarResult.scheduler` field
+    /// (src/test_support/sidecar/mod.rs) is populated by reading
+    /// `entry.scheduler.name` — a field access on the
+    /// `&'static Scheduler` held in the entry's scheduler slot, with
+    /// no Payload indirection. When the scheduler slot holds
+    /// `&Scheduler::EEVDF` (the framework default), the sidecar
+    /// records `"eevdf"`. The outer `KERNEL_DEFAULT.name`
+    /// (`"kernel_default"`) is NOT written to the sidecar — it stays
+    /// in-memory only, used by logs, `#[ktstr_test]`-declaration
+    /// lookups, and `Payload::display_name()` on the payload-slot
+    /// surface. Cross-kernel-version comparisons via sidecar
+    /// `scheduler` therefore see `"eevdf"` today and whatever future
+    /// scheduling class replaces EEVDF tomorrow; author-intent
+    /// filtering on `"kernel_default"` requires consulting the
+    /// in-memory `Payload::name` directly, not the sidecar.
     pub const KERNEL_DEFAULT: Payload = Payload::new(
         "kernel_default",
         PayloadKind::Scheduler(&Scheduler::EEVDF),

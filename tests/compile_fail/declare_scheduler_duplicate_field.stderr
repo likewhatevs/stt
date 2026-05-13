@@ -1,0 +1,5 @@
+error: declare_scheduler!: duplicate field `name`
+ --> tests/compile_fail/declare_scheduler_duplicate_field.rs:6:5
+  |
+6 |     name = "second",
+  |     ^^^^

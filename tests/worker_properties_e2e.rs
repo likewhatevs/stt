@@ -26,11 +26,10 @@ use ktstr::ktstr_test;
 use ktstr::prelude::VmResult;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 /// Host-side gate: a clean run means the in-VM spawn pipeline
 /// processed the cgroup-level `comm`/`nice` defaults without
@@ -77,7 +76,7 @@ fn assert_workers_ran_clean(result: &VmResult) -> Result<()> {
 /// — is the assertion: any propagation regression collapses one of
 /// the host-visible signals checked there.
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     duration_s = 3,
     watchdog_timeout_s = 15,
     workers_per_cgroup = 2,

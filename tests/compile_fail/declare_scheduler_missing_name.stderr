@@ -1,0 +1,5 @@
+error: declare_scheduler!: missing required field `name`
+ --> tests/compile_fail/declare_scheduler_missing_name.rs:3:20
+  |
+3 | declare_scheduler!(MY_SCHED, {
+  |                    ^^^^^^^^

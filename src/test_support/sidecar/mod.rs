@@ -1945,27 +1945,27 @@ pub(crate) struct SchedulerFingerprint {
 /// field) extends this function + [`SchedulerFingerprint`] in
 /// one place and every writer picks it up automatically.
 fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
-    let scheduler = entry.scheduler.scheduler_name().to_string();
-    // `entry.scheduler` is a `&Payload` wrapper, not a `&Scheduler`
-    // directly — routing through `scheduler_binary()` returns the
-    // underlying `Option<&SchedulerSpec>` (None for binary-kind
-    // payloads). Flatten with `and_then` so a binary-kind payload
-    // naturally yields `None` without duplicating the
-    // binary-vs-scheduler dispatch logic here.
+    let scheduler = entry.scheduler.name.to_string();
+    // `SchedulerSpec::scheduler_commit()` returns `None` for every
+    // variant (Eevdf, Discover, Path, KernelBuiltin) — the commit
+    // string is not carried in the static spec; it comes from the
+    // sidecar's run-time git probe instead. This call is here only
+    // to surface the slot in the fingerprint so a future spec
+    // variant carrying a commit would flow through automatically.
     let scheduler_commit = entry
         .scheduler
-        .scheduler_binary()
-        .and_then(|s| s.scheduler_commit())
+        .binary
+        .scheduler_commit()
         .map(|s| s.to_string());
     let sysctls: Vec<String> = entry
         .scheduler
-        .sysctls()
+        .sysctls
         .iter()
         .map(|s| format!("sysctl.{}={}", s.key, s.value))
         .collect();
     let kargs: Vec<String> = entry
         .scheduler
-        .kargs()
+        .kargs
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -2024,6 +2024,18 @@ fn scheduler_fingerprint(entry: &KtstrTestEntry) -> SchedulerFingerprint {
 /// reason it skips pre-clear: operator-chosen directories are
 /// owned by the operator, so we do not place a `.locks/` sibling
 /// inside (or above) their custom layout.
+///
+/// EX-around-the-whole-cycle (not just pre-clear) is the correct
+/// choice. A skip-the-lock-after-pre_clear optimization is unsafe
+/// without additional machinery: `pre_clear_run_dir_once`'s
+/// process-local `OnceLock` keeps pre-clear from re-firing within
+/// the SAME process, but a sibling ktstr process arriving later
+/// has its own `OnceLock` and would re-run pre-clear, walking the
+/// first process's freshly-written sidecars and removing them. A
+/// safe SH-after-pre_clear fast path would need a cross-process
+/// session marker (e.g. boot_id + run epoch) to prove pre-clear
+/// already ran for this `{kernel}-{project_commit}` session —
+/// that's a future optimization, not a current correctness gap.
 ///
 /// PER-FILE ATOMICITY (both branches): the JSON is written to a
 /// `<final>.tmp.<pid>.<run_id>` sibling and then `rename(2)`'d into

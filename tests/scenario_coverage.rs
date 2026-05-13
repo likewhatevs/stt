@@ -2,13 +2,10 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::test_support::{
-    BpfMapWrite, KtstrTestEntry, Payload, Scheduler, SchedulerSpec, Topology,
-};
+use ktstr::test_support::{BpfMapWrite, KtstrTestEntry, Scheduler, SchedulerSpec, Topology};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const KTSTR_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&KTSTR_SCHED);
 
 const TOPO_1L_4C_1T: Topology = Topology {
     llcs: 1,
@@ -35,7 +32,7 @@ fn cover_cgroup_pipe_io(ctx: &Ctx) -> Result<AssertResult> {
 // expect_err: scx-ktstr is a toy scheduler — Normal/Batch/Idle/FIFO mix
 // always stalls under it. Test exercises workload generation, not
 // scheduler correctness.
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true)]
 fn cover_sched_mixed(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::basic::custom_sched_mixed(ctx)
 }
@@ -106,14 +103,14 @@ fn cover_cgroup_cpuset_change_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_change_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15, watchdog_timeout_s = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, max_imbalance_ratio = 20.0, sustained_samples = 15, watchdog_timeout_s = 15)]
 fn cover_cgroup_cpuset_load_shift(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::cpuset::custom_cgroup_cpuset_load_shift(ctx)
 }
 
 // -- dynamic --
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, watchdog_timeout_s = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, watchdog_timeout_s = 15)]
 fn cover_cgroup_add_midrun(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::dynamic::custom_cgroup_add_midrun(ctx)
 }
@@ -160,7 +157,7 @@ fn cover_cgroup_add_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
 // expect_err: scx-ktstr is a toy scheduler — heavy/light load oscillation
 // across phases always stalls under it. Test exercises workload generation,
 // not scheduler correctness.
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, expect_err = true)]
 fn cover_cgroup_load_oscillation(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_load_oscillation(ctx)
 }
@@ -200,7 +197,7 @@ fn cover_cgroup_no_ctrl_load_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_no_ctrl_load_imbalance(ctx)
 }
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, watchdog_timeout_s = 15)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 4, threads = 1, memory_mb = 2048, sustained_samples = 25, watchdog_timeout_s = 15)]
 fn cover_cgroup_io_compute_imbalance(ctx: &Ctx) -> Result<AssertResult> {
     ktstr::scenario::interaction::custom_cgroup_io_compute_imbalance(ctx)
 }
@@ -330,7 +327,7 @@ fn cover_fan_out_compute(ctx: &Ctx) -> Result<AssertResult> {
 // -- watchdog timeout overwrite --
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     llcs = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_s = 60,
     duration_s = 30,
@@ -383,7 +380,7 @@ static __KTSTR_ENTRY_FORCED_STALL: KtstrTestEntry = KtstrTestEntry {
     name: "cover_watchdog_forced_stall",
     func: scenario_sched_mixed,
     topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED_PAYLOAD,
+    scheduler: &KTSTR_SCHED,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(2),
     performance_mode: true,
@@ -397,7 +394,7 @@ static __KTSTR_ENTRY_STALL_DETECT: KtstrTestEntry = KtstrTestEntry {
     name: "neg_stall_detection_scx_exit",
     func: scenario_sched_mixed,
     topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED_PAYLOAD,
+    scheduler: &KTSTR_SCHED,
     auto_repro: false,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(3),
@@ -411,7 +408,7 @@ static __KTSTR_ENTRY_SCHED_DEATH: KtstrTestEntry = KtstrTestEntry {
     name: "neg_sched_death_no_check_result",
     func: scenario_sched_mixed,
     topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED_PAYLOAD,
+    scheduler: &KTSTR_SCHED,
     extra_sched_args: &["--stall-after", "1"],
     watchdog_timeout: std::time::Duration::from_secs(3),
     duration: std::time::Duration::from_secs(10),
@@ -425,7 +422,7 @@ static __KTSTR_ENTRY_AUTO_REPRO_CHECK: KtstrTestEntry = KtstrTestEntry {
     name: "neg_auto_repro_on_check_failure",
     func: scenario_forced_failure,
     topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED_PAYLOAD,
+    scheduler: &KTSTR_SCHED,
     expect_err: true,
     ..KtstrTestEntry::DEFAULT
 };
@@ -436,7 +433,7 @@ static __KTSTR_ENTRY_CRASH_AFTER: KtstrTestEntry = KtstrTestEntry {
     name: "neg_crash_after_auto_repro",
     func: scenario_sched_mixed,
     topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED_PAYLOAD,
+    scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
     expect_err: true,
     ..KtstrTestEntry::DEFAULT
@@ -448,7 +445,7 @@ static __KTSTR_ENTRY_DEMO_BPF_CRASH: KtstrTestEntry = KtstrTestEntry {
     name: "demo_bpf_crash_auto_repro",
     func: scenario_sched_mixed,
     topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED_PAYLOAD,
+    scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
     ..KtstrTestEntry::DEFAULT
 };
@@ -459,7 +456,7 @@ static __KTSTR_ENTRY_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     name: "neg_host_crash_auto_repro",
     func: scenario_yield_heavy,
     topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED_PAYLOAD,
+    scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
     expect_err: true,
     ..KtstrTestEntry::DEFAULT
@@ -471,7 +468,7 @@ static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
     name: "demo_host_crash_auto_repro",
     func: scenario_yield_heavy,
     topology: TOPO_1L_4C_1T,
-    scheduler: &KTSTR_SCHED_PAYLOAD,
+    scheduler: &KTSTR_SCHED,
     bpf_map_write: &[&BPF_CRASH],
     ..KtstrTestEntry::DEFAULT
 };
@@ -479,7 +476,7 @@ static __KTSTR_ENTRY_DEMO_HOST_CRASH: KtstrTestEntry = KtstrTestEntry {
 // -- monitor evaluation path with default thresholds --
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     llcs = 1, cores = 4, threads = 1, memory_mb = 2048,
     watchdog_timeout_s = 60,
     max_imbalance_ratio = 20.0,

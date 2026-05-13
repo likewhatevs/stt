@@ -2,11 +2,10 @@ use anyhow::Result;
 use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
-use ktstr::test_support::{Payload, Scheduler, SchedulerSpec};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const SCX_CLEANUP_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-const SCX_CLEANUP_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SCX_CLEANUP_SCHED);
 
 /// Boots a VM with the scx-ktstr scheduler attached, runs no
 /// workload, and exits cleanly. Counterpart to
@@ -34,7 +33,7 @@ const SCX_CLEANUP_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&SCX_CLEANUP_
 /// budget is exceeded the framework folds a failing detail into
 /// the verdict.
 #[ktstr_test(
-    scheduler = SCX_CLEANUP_SCHED_PAYLOAD,
+    scheduler = SCX_CLEANUP_SCHED,
     llcs = 1,
     cores = 1,
     threads = 1,
