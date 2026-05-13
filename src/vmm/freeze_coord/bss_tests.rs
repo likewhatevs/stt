@@ -34,7 +34,7 @@
 //!       `struct btf` synthesis and add no signal beyond the in-tree
 //!       btf_offsets coverage.
 
-use super::{BssReadState, bss_read_state};
+use super::{BssReadState, bss_read_state, bss_state_label};
 use crate::monitor::reader::GuestMem;
 
 /// Build a `GuestMem` of `size` bytes whose contents are initially
@@ -317,4 +317,56 @@ fn pa_at_region_start() {
     buf[0..4].copy_from_slice(&7u32.to_le_bytes());
     let state = bss_read_state(Some(&mem), Some(0));
     assert_eq!(state, BssReadState::Triggered);
+}
+
+// -- bss_state_label wire-format pins ---------------------------
+//
+// The [`bss_state_label`] helper produces the snake-case string
+// embedded in
+// [`crate::monitor::dump::DegradedFailureDumpReport::bss_latch_state`].
+// Operators grep, `jq`-filter, and auto-repro renderers match
+// against these exact strings — drift here breaks downstream
+// tooling silently (the dump still writes, just with the new label,
+// and the operator's matcher looks for the old one). Each variant
+// gets its own pin so a regression that drops one arm or returns
+// the wrong label is caught BEFORE shipping rather than after the
+// dump consumer fails to recognise the post-mortem.
+
+/// `BssReadState::Triggered` → "triggered". Pins the sticky-latch-
+/// flipped variant — produced when the probe's
+/// `ktstr_err_exit_detected` CAS succeeded and the host poll
+/// observed the non-zero u32.
+#[test]
+fn bss_state_label_triggered() {
+    assert_eq!(bss_state_label(BssReadState::Triggered), "triggered");
+}
+
+/// `BssReadState::NotTriggered` → "not_triggered". Pins the
+/// quiescent-probe variant — cached PA in-bounds, u32 still zero.
+#[test]
+fn bss_state_label_not_triggered() {
+    assert_eq!(
+        bss_state_label(BssReadState::NotTriggered),
+        "not_triggered"
+    );
+}
+
+/// `BssReadState::OutOfBounds` → "out_of_bounds". Pins the stale-
+/// cache variant — cached PA falls outside every live DRAM region
+/// (probe map freed mid-run + vmalloc page recycled, or BTF Datasec
+/// returned a corrupt offset whose `wrapping_add` overflowed).
+#[test]
+fn bss_state_label_out_of_bounds() {
+    assert_eq!(
+        bss_state_label(BssReadState::OutOfBounds),
+        "out_of_bounds"
+    );
+}
+
+/// `BssReadState::NotResolved` → "not_resolved". Pins the
+/// not-yet-cached variant — probe never discovered in `map_idr`,
+/// or pre-boot window with no `GuestMem` published.
+#[test]
+fn bss_state_label_not_resolved() {
+    assert_eq!(bss_state_label(BssReadState::NotResolved), "not_resolved");
 }

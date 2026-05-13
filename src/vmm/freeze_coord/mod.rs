@@ -287,8 +287,9 @@ pub(super) fn format_path_part(path_str: Option<&str>, write_failed: bool) -> St
 /// for unit testing.
 pub(super) fn format_truncation_marker(head_end: usize, total_len: usize) -> String {
     if head_end < total_len {
+        let dropped = total_len - head_end;
         format!(
-            " (truncated to {head_end} bytes at UTF-8 boundary; full {total_len} bytes lost — summary above)"
+            " (truncated to {head_end} bytes at UTF-8 boundary; {dropped} of {total_len} payload bytes dropped — summary above)"
         )
     } else {
         String::new()
@@ -10539,14 +10540,18 @@ mod format_truncation_marker_tests {
     }
 
     /// Truncation happened — head_end shorter than total. Renders
-    /// the "(truncated to N bytes ...; full M bytes lost ...)"
-    /// marker with both numbers populated.
+    /// the "(truncated to N bytes at UTF-8 boundary; D of M payload
+    /// bytes dropped — summary above)" marker with the head size,
+    /// dropped byte count, and total payload size populated. The
+    /// dropped count is `total - head_end` and is rendered explicitly
+    /// so an operator does not have to do mental arithmetic to
+    /// recover how much of the dump was lost.
     #[test]
     fn truncation_renders_byte_counts() {
         let marker = format_truncation_marker(16, 1024);
         assert_eq!(
             marker,
-            " (truncated to 16 bytes at UTF-8 boundary; full 1024 bytes lost — summary above)"
+            " (truncated to 16 bytes at UTF-8 boundary; 1008 of 1024 payload bytes dropped — summary above)"
         );
     }
 
@@ -10673,5 +10678,89 @@ mod write_to_tagged_path_tests {
             summary_called.load(Ordering::Relaxed),
             "stderr_summary closure MUST fire on write failure (no silent drop)"
         );
+    }
+
+    /// Rename-failure tmp-cleanup — File::create + sync_all succeed,
+    /// but `rename(tmp, tagged)` fails because the tagged destination
+    /// already exists as a non-empty directory (POSIX rename
+    /// EISDIR/ENOTEMPTY when source is a file and dest is a non-empty
+    /// directory). Helper must clean up the tmp file so a future
+    /// operator does not see a stale `.json.tmp` alongside the
+    /// blocker. Pins the invariant: tmp cleanup runs on EVERY
+    /// failure path, not just File::create failures.
+    #[test]
+    fn rename_failure_cleans_up_tmp_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path().join("dump.failure-dump.json");
+        let tagged = super::snapshot_tagged_path(&base, "rename_fail_test");
+        // Pre-create the tagged path as a non-empty directory so
+        // rename(tmp, tagged) fails. Empty-dir rename behavior
+        // varies across filesystems (Linux ext4/xfs/btrfs accept
+        // file-over-empty-dir on the source side via EISDIR; some
+        // older kernels rejected it). A non-empty dir is a stable
+        // rename failure across every supported FS.
+        std::fs::create_dir_all(&tagged).expect("create blocker dir");
+        std::fs::write(tagged.join("blocker"), b"").expect("populate dir");
+        let summary_called = AtomicBool::new(false);
+        let result = write_to_tagged_path(
+            Some(&base),
+            "rename_fail_test",
+            "{\"k\":\"v\"}",
+            || {
+                summary_called.store(true, Ordering::Relaxed);
+                String::from("rename failure summary")
+            },
+            "rename failure warn",
+        );
+        assert!(result.is_err(), "expected Err on rename failure");
+        assert!(
+            summary_called.load(Ordering::Relaxed),
+            "stderr_summary closure MUST fire on rename failure"
+        );
+        let tmp = tagged.with_extension("json.tmp");
+        assert!(
+            !tmp.exists(),
+            "tmp sibling must be cleaned up after rename failure"
+        );
+    }
+
+    /// UTF-8 boundary at cap — payload contains a 4-byte UTF-8
+    /// sequence (U+1F600 GRINNING FACE, encoded as `0xF0 0x9F 0x98
+    /// 0x80`) straddling the 16 KiB `ONDEMAND_STDERR_DUMP_CAP`
+    /// boundary so the naive `&s[..CAP]` would split mid-char and
+    /// panic. The helper's stderr-fallback walks back to a safe
+    /// UTF-8 boundary via `utf8_safe_truncate_len`. Pins the UTF-8
+    /// char-boundary panic fix on the on-demand path: the payload-
+    /// head eprintln! must not panic when truncation lands inside a
+    /// multi-byte sequence.
+    #[test]
+    fn write_failure_handles_utf8_boundary_at_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_in_the_way = dir.path().join("not_a_dir");
+        std::fs::write(&file_in_the_way, b"").expect("create blocker file");
+        let base = file_in_the_way.join("sub").join("dump.failure-dump.json");
+        const CAP: usize = 16 * 1024;
+        let mut payload = String::with_capacity(CAP + 8);
+        // Fill to two bytes short of CAP, then push a 4-byte UTF-8
+        // sequence so bytes CAP-2..CAP+2 form U+1F600. Bytes CAP
+        // and CAP+1 are mid-char — naive slicing at CAP would
+        // panic.
+        for _ in 0..(CAP - 2) {
+            payload.push('a');
+        }
+        payload.push('\u{1F600}');
+        let result = write_to_tagged_path(
+            Some(&base),
+            "utf8_test",
+            &payload,
+            || String::from("utf8 boundary test summary"),
+            "utf8 boundary test warn",
+        );
+        // Helper must return Err (write failed) WITHOUT panicking.
+        // A regression in utf8_safe_truncate_len or the
+        // format_truncation_marker integration would surface here as
+        // a panic from the payload-head eprintln! rather than a
+        // clean Err return.
+        assert!(result.is_err(), "expected Err on write failure path");
     }
 }
