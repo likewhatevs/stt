@@ -345,10 +345,7 @@ fn bss_state_label_triggered() {
 /// quiescent-probe variant — cached PA in-bounds, u32 still zero.
 #[test]
 fn bss_state_label_not_triggered() {
-    assert_eq!(
-        bss_state_label(BssReadState::NotTriggered),
-        "not_triggered"
-    );
+    assert_eq!(bss_state_label(BssReadState::NotTriggered), "not_triggered");
 }
 
 /// `BssReadState::OutOfBounds` → "out_of_bounds". Pins the stale-
@@ -357,10 +354,7 @@ fn bss_state_label_not_triggered() {
 /// returned a corrupt offset whose `wrapping_add` overflowed).
 #[test]
 fn bss_state_label_out_of_bounds() {
-    assert_eq!(
-        bss_state_label(BssReadState::OutOfBounds),
-        "out_of_bounds"
-    );
+    assert_eq!(bss_state_label(BssReadState::OutOfBounds), "out_of_bounds");
 }
 
 /// `BssReadState::NotResolved` → "not_resolved". Pins the
@@ -400,7 +394,12 @@ fn bss_state_label_no_wildcard_unknown_fallback() {
         BssReadState::OutOfBounds,
         BssReadState::NotResolved,
     ];
-    let allowlist = ["triggered", "not_triggered", "out_of_bounds", "not_resolved"];
+    let allowlist = [
+        "triggered",
+        "not_triggered",
+        "out_of_bounds",
+        "not_resolved",
+    ];
     for v in variants {
         let label = bss_state_label(v);
         assert!(

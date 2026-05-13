@@ -642,9 +642,9 @@ impl EarlySnapshotGuard {
         let Some(early) = self.snapshot.take() else {
             return;
         };
-        let drain_tag = self.retain_tag.unwrap_or(
-            crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
-        );
+        let drain_tag = self
+            .retain_tag
+            .unwrap_or(crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED);
         match serde_json::to_string(&early) {
             Ok(json) => {
                 match write_to_tagged_path(

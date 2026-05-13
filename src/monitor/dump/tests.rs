@@ -421,8 +421,7 @@ fn dual_failure_dump_report_serialization_is_infallible_for_max_synthetic_input(
         early_max_age_jiffies: u64::MAX,
         early_threshold_jiffies: u64::MAX,
         early_skipped_reason: Some(
-            "max synthetic reason — long enough to stress the String serializer path "
-                .repeat(64),
+            "max synthetic reason — long enough to stress the String serializer path ".repeat(64),
         ),
     };
 
@@ -506,7 +505,7 @@ fn all_snapshot_tags_enumerates_every_pub_const_in_module() {
          either a new SNAPSHOT_TAG_* const was added without updating \
          this test, or vice versa"
     );
-    let mut sorted: Vec<&str> = ALL_SNAPSHOT_TAGS.iter().copied().collect();
+    let mut sorted: Vec<&str> = ALL_SNAPSHOT_TAGS.to_vec();
     sorted.sort();
     sorted.dedup();
     assert_eq!(
@@ -1812,7 +1811,10 @@ fn failure_dump_report_optional_fields_round_trip_when_omitted() {
             r.sdt_alloc_unavailable.is_none(),
             "[{leg}] sdt_alloc_unavailable"
         );
-        assert!(r.prog_runtime_stats.is_empty(), "[{leg}] prog_runtime_stats");
+        assert!(
+            r.prog_runtime_stats.is_empty(),
+            "[{leg}] prog_runtime_stats"
+        );
         assert!(
             r.prog_runtime_stats_unavailable.is_none(),
             "[{leg}] prog_runtime_stats_unavailable"

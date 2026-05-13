@@ -435,9 +435,7 @@ fn early_snapshot_guard_drain_no_op_when_dump_path_unset() {
          snapshot is now lost"
     );
 
-    let entries_after_drain: Vec<_> = std::fs::read_dir(tmp.path())
-        .expect("readdir")
-        .collect();
+    let entries_after_drain: Vec<_> = std::fs::read_dir(tmp.path()).expect("readdir").collect();
     assert!(
         entries_after_drain.is_empty(),
         "no file may be created when dump_path is unset — found {} entries",
@@ -446,9 +444,7 @@ fn early_snapshot_guard_drain_no_op_when_dump_path_unset() {
 
     drop(guard);
 
-    let entries_after_drop: Vec<_> = std::fs::read_dir(tmp.path())
-        .expect("readdir")
-        .collect();
+    let entries_after_drop: Vec<_> = std::fs::read_dir(tmp.path()).expect("readdir").collect();
     assert!(
         entries_after_drop.is_empty(),
         "Drop must also no-op when dump_path is unset — found {} entries",
@@ -656,8 +652,7 @@ fn early_snapshot_guard_drain_preserves_snapshot_when_gated_off() {
             row.expect_snapshot_consumed
         );
 
-        let expected =
-            snapshot_tagged_path(&dump_path, SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED);
+        let expected = snapshot_tagged_path(&dump_path, SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED);
         assert_eq!(
             expected.exists(),
             row.expect_file_written,
