@@ -951,7 +951,7 @@ impl VirtioConsole {
 
     /// Test helper — return all accumulated port-0 TX output as a string.
     #[cfg(test)]
-    pub fn output(&self) -> String {
+    pub(crate) fn output_for_test(&self) -> String {
         let bytes: Vec<u8> = self.ports[0].tx_buf.iter().copied().collect();
         String::from_utf8_lossy(&bytes).to_string()
     }
@@ -973,7 +973,7 @@ impl VirtioConsole {
     /// pushers without a fully-wired guest queue use this to inspect
     /// what would have been delivered.
     #[cfg(test)]
-    pub fn pending_rx_bytes(&self) -> Vec<u8> {
+    pub(crate) fn pending_rx_bytes_for_test(&self) -> Vec<u8> {
         self.ports[0].pending_rx.iter().copied().collect()
     }
 
@@ -2427,7 +2427,7 @@ mod tests {
     #[test]
     fn output_empty_initially() {
         let dev = VirtioConsole::new();
-        assert!(dev.output().is_empty());
+        assert!(dev.output_for_test().is_empty());
     }
 
     #[test]

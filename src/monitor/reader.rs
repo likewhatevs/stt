@@ -3069,7 +3069,7 @@ mod tests {
 
     /// Test helper: build a virtio_console handle wrapped in
     /// `Arc<PiMutex<...>>` so DumpTrigger tests can pass a real
-    /// device and inspect its `pending_rx_bytes()` after the loop
+    /// device and inspect its `pending_rx_bytes_for_test()` after the loop
     /// runs. Without DRIVER_OK on the queue the wake byte stays in
     /// `port0_pending_rx`, so the test can assert on byte equality
     /// without driving a full guest handshake.
@@ -4085,7 +4085,7 @@ mod tests {
         // Check `SIGNAL_VC_DUMP` was queued for the guest. Without
         // DRIVER_OK on the queue the byte stays in `port0_pending_rx`
         // — that's the observable for tests.
-        let pending = virtio_con.lock().pending_rx_bytes();
+        let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
             pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
             "imbalance threshold violation should queue SIGNAL_VC_DUMP; \
@@ -4156,7 +4156,7 @@ mod tests {
             samples.len()
         );
         // Dump should have fired due to sustained stall.
-        let pending = virtio_con.lock().pending_rx_bytes();
+        let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
             pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
             "stall should trigger SIGNAL_VC_DUMP after sustained_samples=2; \
@@ -4222,7 +4222,7 @@ mod tests {
             samples.len()
         );
         // Dump should NOT have fired — idle CPU is exempt.
-        let pending = virtio_con.lock().pending_rx_bytes();
+        let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
             !pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
             "idle CPU should not queue SIGNAL_VC_DUMP; pending RX bytes: {pending:?}"
@@ -4305,7 +4305,7 @@ mod tests {
             "need >= 2 samples, got {}",
             samples.len()
         );
-        let pending = virtio_con.lock().pending_rx_bytes();
+        let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
             !pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
             "preempted vCPU should not queue SIGNAL_VC_DUMP; pending RX bytes: {pending:?}"
@@ -4390,7 +4390,7 @@ mod tests {
             "need >= 3 samples for 2 stall pairs, got {}",
             samples.len()
         );
-        let pending = virtio_con.lock().pending_rx_bytes();
+        let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
             pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
             "real stall (vCPU running, clock stuck, nr_running>0) should queue \
@@ -4468,7 +4468,7 @@ mod tests {
 
         // Reactive path result: check if dump fired (via the
         // SIGNAL_VC_DUMP wake byte queued for the guest).
-        let pending = virtio_con.lock().pending_rx_bytes();
+        let pending = virtio_con.lock().pending_rx_bytes_for_test();
         let reactive_stall = pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP);
 
         // Post-hoc evaluate path on the same samples.
@@ -4554,7 +4554,7 @@ mod tests {
         );
 
         // Reactive: dump should NOT fire — no SIGNAL_VC_DUMP queued.
-        let pending = virtio_con.lock().pending_rx_bytes();
+        let pending = virtio_con.lock().pending_rx_bytes_for_test();
         assert!(
             !pending.contains(&crate::vmm::virtio_console::SIGNAL_VC_DUMP),
             "reactive: idle CPU should not queue SIGNAL_VC_DUMP; pending RX: {pending:?}"
