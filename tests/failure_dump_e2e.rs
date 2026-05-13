@@ -109,11 +109,32 @@ fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Resul
         }
     };
 
-    // Parse as a generic JSON value to avoid an unbounded
-    // dependency on the (pub(crate)) `FailureDumpReport` type from
-    // outside the crate.
+    // Parse as a generic JSON value. The dump schema is now an
+    // explicit discriminant — `FailureDumpReportAny::from_json`
+    // rejects any blob without a `schema` field — so the test
+    // short-circuits on the schema before reaching the variant-
+    // specific shape. The full-dump happy path expects
+    // [`SCHEMA_SINGLE`]; SCHEMA_DEGRADED on this happy-path test
+    // indicates a regression in the freeze coordinator's
+    // capture-vs-degraded dispatch.
     let value: serde_json::Value = serde_json::from_str(&json)
         .map_err(|e| anyhow::anyhow!("dump file is not valid JSON: {e}"))?;
+    let schema = value
+        .get("schema")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "dump JSON missing top-level `schema` field — the dispatcher \
+                 at `FailureDumpReportAny::from_json` requires an explicit \
+                 discriminant"
+            )
+        })?;
+    anyhow::ensure!(
+        schema == "single",
+        "happy-path dump must carry schema=\"single\"; got schema={schema} \
+         (a `degraded` schema here means the freeze coordinator's gate \
+         cross-reference or rendezvous-timeout path fired when it should not have)"
+    );
 
     // Top-level shape: {"maps": [...]}. `non_exhaustive` does not
     // affect serde output, so the field name is stable.

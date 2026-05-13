@@ -156,23 +156,170 @@ pub(super) fn compute_err_triggered(watchpoint_hit: bool, bss_state: BssReadStat
     watchpoint_hit || matches!(bss_state, BssReadState::Triggered)
 }
 
-/// Predicate the post-rendezvous re-read uses to detect a
-/// watchpoint-only trigger: the hardware watchpoint fired but the
-/// bss latch did NOT — the rendezvous either gate-suppressed the
-/// dump (non-error exit_kind value, see the SCX_EXIT_ERROR threshold)
-/// or timed out before a sticky bss flip could land. The caller
-/// resets `watchpoint.hit` and keeps watching instead of marking
-/// Done so a subsequent genuine error-class write retriggers cleanly.
+/// Predicate that distinguishes a watchpoint-only trigger from a
+/// bss-confirmed trigger. Returns `true` when the hardware watchpoint
+/// fired but the BPF `.bss` latch did NOT — the trigger is
+/// "watchpoint sees a write to `*scx_root->exit_kind`, probe hasn't
+/// latched the error class (yet)".
 ///
-/// A bss flip observed during the rendezvous window (the post-read
-/// returns `BssReadState::Triggered`) routes via the bss-or-mixed
-/// arm — that path marks Done because the kernel-side latch is
-/// sticky and retrying would just hit the same timeout.
+/// Used at the `freeze_and_capture` call site (a closure inside
+/// the run-loop, not a free fn) to compute the `gate_on_exit_kind`
+/// argument: a watchpoint-only trigger sets
+/// the gate because the watchpoint catches every write (including the
+/// init/teardown clean values `SCX_EXIT_NONE` / `SCX_EXIT_DONE` that
+/// would synthesise a bogus dump without the gate); a bss-confirmed
+/// trigger skips the gate because `probe.bpf.c:687`'s
+/// `__sync_val_compare_and_swap(&ktstr_err_exit_detected, 0, 1)`
+/// already proved the kernel observed `kind >= SCX_EXIT_ERROR` at the
+/// tp_btf hook firing instant.
 pub(super) fn compute_watchpoint_only_trigger(
     watchpoint_hit: bool,
     bss_state: BssReadState,
 ) -> bool {
     watchpoint_hit && !matches!(bss_state, BssReadState::Triggered)
+}
+
+/// Snake-case label for a [`BssReadState`] suitable for embedding in
+/// the [`crate::monitor::dump::DegradedFailureDumpReport::bss_latch_state`]
+/// wire field. Stable wire format: callers (auto-repro tail renderer,
+/// operator `jq` inspection) match against the exact strings returned
+/// here — adding a new state requires a new label rather than mutating
+/// an existing one.
+pub(super) fn bss_state_label(state: BssReadState) -> &'static str {
+    match state {
+        BssReadState::Triggered => "triggered",
+        BssReadState::NotTriggered => "not_triggered",
+        BssReadState::OutOfBounds => "out_of_bounds",
+        BssReadState::NotResolved => "not_resolved",
+    }
+}
+
+/// Walk back from `cap` to the largest valid UTF-8 char boundary
+/// `<= cap` (and `<= s.len()`). Returns the safe slice length: the
+/// caller may then do `&s[..returned]` without panicking.
+///
+/// Used by the stderr last-ditch preservation paths (`emit_json` /
+/// `emit_degraded_json` closure fallbacks + end-of-coord drain) where
+/// the naive `&s[..cap]` would panic if `cap` lands inside a multi-
+/// byte UTF-8 sequence. The serde-serialized FailureDumpReport carries
+/// non-ASCII bytes in any `String` field — task `comm` via
+/// `String::from_utf8_lossy` yields U+FFFD (3 bytes) for invalid input,
+/// and operator-supplied tags or kernel symbol strings can include
+/// Unicode. Without this walk, an ENOSPC/EROFS-triggered stderr emit
+/// can panic instead of preserving the payload — exactly the silent-
+/// drop failure mode the fallback exists to prevent.
+///
+/// Worst-case retreat is 3 bytes (UTF-8 sequences are 1-4 bytes; the
+/// boundary at byte 0 of a valid sequence is always a char boundary,
+/// and 0 itself is always a boundary). Returns 0 for an empty input
+/// or when `cap == 0`.
+pub(super) fn utf8_safe_truncate_len(s: &str, cap: usize) -> usize {
+    let bounded = cap.min(s.len());
+    (0..=bounded)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0)
+}
+
+/// Indices of vCPUs whose register snapshot is `None` — the vCPUs
+/// that either failed to park during the freeze rendezvous or whose
+/// `KVM_GET_REGS` ioctl errored mid-shutdown. Surfaced alongside the
+/// structured summary in every stderr last-ditch preservation path
+/// (`emit_json` fallback, end-of-coord drain) so an operator sees
+/// WHICH vCPUs failed — not just the count.
+///
+/// Pre-computed once at each caller (Captured arm, drain) and passed
+/// by `&[usize]` reference into the emit closure. Centralised here
+/// so the filter_map pattern lives at one location — a future change
+/// to "what counts as a stalled vCPU" updates this one fn rather than
+/// every emit site.
+pub(super) fn vcpu_none_indices(
+    vcpu_regs: &[Option<crate::monitor::dump::VcpuRegSnapshot>],
+) -> Vec<usize> {
+    vcpu_regs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| if r.is_none() { Some(i) } else { None })
+        .collect()
+}
+
+/// Format the trailing `path_part` clause for the emit closures'
+/// tracing summary line. Disambiguates 3 states an operator needs
+/// to distinguish at-a-glance:
+///
+/// - `(Some(p), _)` — sink configured AND write succeeded; renders
+///   ` -> {p}` so the operator sees the on-disk dump path inline.
+/// - `(None, true)` — sink configured but the atomic write failed;
+///   renders ` (atomic write failed; see preceding warn)` so the
+///   operator knows to scroll up for the warn carrying the underlying
+///   `io::Error`. The preceding warn fires at the and_then Err arm
+///   in both [`emit_json`]-class closures.
+/// - `(None, false)` — operator never wired `failure_dump_path`;
+///   renders ` (no file sink)` — the quiet expected-behavior case
+///   for verifier/shell/template builders.
+///
+/// Centralised here so emit_json and emit_degraded_json don't each
+/// carry the same 3-arm match inline; future emit-site additions reuse
+/// the disambiguation rule for free.
+pub(super) fn format_path_part(path_str: Option<&str>, write_failed: bool) -> String {
+    match (path_str, write_failed) {
+        (Some(p), _) => format!(" -> {p}"),
+        (None, true) => " (atomic write failed; see preceding warn)".to_string(),
+        (None, false) => " (no file sink)".to_string(),
+    }
+}
+
+/// Outcome of one freeze-and-capture cycle. Replaces the prior
+/// `Option<(FailureDumpReport, Instant)>` return so the late-trigger
+/// dispatch can distinguish three semantically distinct cases instead
+/// of conflating "aborted with reason worth recording" and
+/// "legit no-dump suppression" into a single `None`:
+///
+/// - [`Self::Captured`] — full dump assembled; emit as
+///   [`crate::monitor::dump::SCHEMA_SINGLE`] (or wrapped into
+///   [`crate::monitor::dump::SCHEMA_DUAL`] by the dual-snapshot path).
+/// - [`Self::Degraded`] — trigger fired but capture aborted in a way
+///   the operator needs to see (rendezvous timed out, etc.). Carries a
+///   pre-built [`crate::monitor::dump::DegradedFailureDumpReport`] for
+///   immediate emission via the
+///   [`crate::monitor::dump::SCHEMA_DEGRADED`] schema. Per memory
+///   `feedback_no_silent_drops`: the trigger fired, an operator must
+///   see something — the degraded JSON IS that something.
+/// - [`Self::Suppressed`] — exit_kind gate decided the trigger was a
+///   benign init / teardown write (kind &lt; SCX_EXIT_ERROR) and the
+///   BPF `.bss` latch agreed it was not an error. Legit "no dump
+///   needed" — no JSON emitted. The watchpoint hit flag is reset and
+///   the coordinator transitions to [`FreezeState::Done`] so the
+///   late-trigger machine stops watching for further error-class
+///   triggers on this rebind cycle. On-demand captures (TLV,
+///   periodic, user-watchpoint) remain serviceable since they don't
+///   gate on `freeze_state`.
+// `Captured` carries a full [`crate::monitor::dump::FailureDumpReport`]
+// inline (~680 bytes of map / vcpu_regs / walker data); the other
+// variants are small. Boxing the dominant variant would double-
+// allocate on the success path — the closure returns the outcome to
+// a single immediate consumer (the late-trigger dispatch at one
+// site, the on-demand sites at three sites) which destructures and
+// drops the box right away. Stack-passing the unboxed
+// FailureDumpReport reuses the closure's already-allocated frame.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum LateCaptureOutcome {
+    /// Successfully captured a full failure dump.
+    Captured(crate::monitor::dump::FailureDumpReport, Instant),
+    /// Aborted in a way that warrants surfacing a degraded JSON.
+    /// Boxed to keep the enum's discriminant size bounded — the
+    /// degraded report carries per-vCPU register data inline.
+    Degraded(Box<crate::monitor::dump::DegradedFailureDumpReport>),
+    /// Legit suppression: gate decided clean exit. The watchpoint
+    /// hit is reset and the coordinator transitions to
+    /// [`FreezeState::Done`]. No late dump emitted. In dual-snapshot
+    /// mode, if an early Captured snapshot was previously held, it
+    /// is preserved to the
+    /// [`crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED`]
+    /// tagged sibling path so the operator can read the early
+    /// observation; see the late-trigger `Suppressed` arm in
+    /// `run_bsp_loop` for the emit detail.
+    Suppressed,
 }
 
 impl KtstrVm {
@@ -1710,11 +1857,31 @@ impl KtstrVm {
                 // Cached early snapshot from a midway-trigger freeze.
                 // Held until the late freeze fires; then both early
                 // and late are wrapped into a DualFailureDumpReport
-                // and emitted as one file. Discarded silently when
-                // the run ends without a late freeze (the run passed
-                // and the early sample is not useful as a standalone
-                // artifact).
+                // and emitted as one file. The late-trigger Captured
+                // / Degraded / Suppressed arms each consume the early
+                // via `.take()` and emit it alongside the late as a
+                // tagged sibling per the
+                // [`crate::monitor::dump::SNAPSHOT_TAG_EARLY_*`]
+                // constants; if the late trigger never fires for the
+                // run, the end-of-coord drain at the bottom of this
+                // closure body emits the early to
+                // [`crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED`].
+                // Per `feedback_no_silent_drops`: every captured
+                // early reaches disk via one of the four paths.
                 let mut early_snapshot: Option<crate::monitor::dump::FailureDumpReport> = None;
+                // N8-2 (#72) fix: when the late-trigger Degraded /
+                // Suppressed arm fails to write its tagged sibling
+                // and retains `early_snapshot` for the end-of-coord
+                // drain to retry, record the tag the failed arm
+                // INTENDED to use. The drain reads this on retry so
+                // the recovered file lands at the operator-correct
+                // path (e.g. `early-pre-late-degraded` for a failed
+                // Degraded-arm write) rather than the drain's
+                // default `early-only-late-never-fired` which would
+                // misrepresent the case. `None` means "no retry
+                // pending — the late never fired" (drain uses its
+                // default tag).
+                let mut early_retain_tag: Option<&'static str> = None;
                 // Per-snapshot scanner metadata, captured at the
                 // early-trigger site and threaded into the
                 // DualFailureDumpReport wrapper alongside the
@@ -1823,8 +1990,9 @@ impl KtstrVm {
                 //                                isn't a stall, e.g.
                 //                                scx_bpf_error()).
                 //
-                // The Display fallback at dump/display.rs:65 already
-                // points operators at RUST_LOG=ktstr=debug for scan
+                // The `FailureDumpReport` Display impl in
+                // `crate::monitor::dump::display` already points
+                // operators at `RUST_LOG=ktstr=debug` for scan
                 // resolution; this trajectory snapshot is the more
                 // actionable signal because it's emitted at the
                 // moment of failure with structured fields rather
@@ -2053,9 +2221,35 @@ impl KtstrVm {
                 let mut scan_tick: bool;
                 let mut first_iter = true;
                 let mut bsp_done_final_pass = false;
+                // Mirror of `bsp_done_final_pass` for the SCHED_EXIT
+                // kill-promotion-without-bsp-done case: kill can be
+                // promoted by sources other than a clean BSP_DONE —
+                // e.g. the guest's
+                // sched-exit-monitor fires `send_sched_exit` on
+                // scheduler-binary pidfd POLLIN, the host bulk-port
+                // dispatch flips `freeze_coord_kill` — but the BPF
+                // tp_btf/sched_ext_exit handler that latches
+                // `ktstr_err_exit_detected` in `.bss` fires from
+                // inside the kernel before the userspace pidfd
+                // POLLIN. Without a sched-exit final pass the coord
+                // loop exits on the kill edge BEFORE the next BSS
+                // read at the iteration top, so the sticky kernel-
+                // side latch never gets observed and the failure
+                // dump is silently dropped. Granting one more
+                // iteration when kill is set (any source) closes
+                // that race — the BSS read at the iteration top
+                // catches the already-flipped latch and the
+                // late-trigger path emits a normal dump. The BSS
+                // write happens before the SCHED_EXIT msg arrives
+                // on the host (kernel tp_btf precedes userspace
+                // pidfd POLLIN), so one final-pass iteration is
+                // sufficient.
+                let mut sched_exit_final_pass = false;
                 'coord: while !freeze_coord_kill.load(Ordering::Acquire)
                     || (freeze_coord_bsp_done.load(Ordering::Acquire)
                         && !bsp_done_final_pass)
+                    || (!freeze_coord_bsp_done.load(Ordering::Acquire)
+                        && !sched_exit_final_pass)
                 {
                     if freeze_coord_bsp_done.load(Ordering::Acquire) {
                         if bsp_done_final_pass {
@@ -2071,6 +2265,22 @@ impl KtstrVm {
                             );
                         }
                         bsp_done_final_pass = true;
+                    } else if freeze_coord_kill.load(Ordering::Acquire) {
+                        // Kill is set but BSP_DONE is not — SCHED_EXIT
+                        // or other external kill source. Grant one
+                        // more iteration so the BSS-latch read at
+                        // the iteration top observes any sticky
+                        // kernel-side flip that landed in the same
+                        // window the kill promotion did. Second
+                        // iteration through this branch (sched_exit_
+                        // final_pass already true) exits immediately
+                        // — no deferred-capture-stay-alive semantics
+                        // here because the scheduler has crashed,
+                        // not exited cleanly.
+                        if sched_exit_final_pass {
+                            break 'coord;
+                        }
+                        sched_exit_final_pass = true;
                     }
                     // Unified event dispatch: epoll.wait on EVERY
                     // iteration. iter1 uses timeout=0 (non-blocking)
@@ -2086,7 +2296,7 @@ impl KtstrVm {
                     } else {
                         scan_tick = false;
                     }
-                    if bsp_done_final_pass {
+                    if bsp_done_final_pass || sched_exit_final_pass {
                         scan_tick = true;
                     }
                     {
@@ -2719,6 +2929,19 @@ impl KtstrVm {
                                      attach"
                                 );
                                 last_sched_kva = 0;
+                                // Clear cached_exit_kind_pa: the kernel
+                                // RCU-freed the prior scx_sched (per
+                                // kernel/sched/ext.c::scx_root_disable
+                                // → RCU_INIT_POINTER(scx_root, NULL)),
+                                // so the cached PA now points at slab
+                                // memory subject to allocator reuse. A
+                                // subsequent rendezvous-timeout
+                                // Degraded report would read garbage
+                                // from the recycled page. Invalidate
+                                // here; the next Published arm will
+                                // republish a fresh PA once the
+                                // scheduler re-attaches.
+                                cached_exit_kind_pa = None;
                             }
                             WatchpointPublishResult::RebindDisarmed {
                                 previous,
@@ -2733,6 +2956,13 @@ impl KtstrVm {
                                      vCPUs clear DR0"
                                 );
                                 last_sched_kva = 0;
+                                // Same rationale as the Detached arm:
+                                // the prior scx_sched is RCU-pending-
+                                // free and the cached PA can begin
+                                // reading recycled slab data. The
+                                // next iteration's Published arm
+                                // republishes for the new scheduler.
+                                cached_exit_kind_pa = None;
                             }
                             WatchpointPublishResult::Published {
                                 exit_kind_kva,
@@ -3015,7 +3245,7 @@ impl KtstrVm {
                         }
                     }
                     if !err_triggered
-                        && bsp_done_final_pass
+                        && (bsp_done_final_pass || sched_exit_final_pass)
                         && freeze_state != FreezeState::Done
                         && let (Some(owned), Some(mem)) =
                             (owned_accessor.as_ref(), freeze_coord_mem.as_deref())
@@ -3094,7 +3324,7 @@ impl KtstrVm {
                     // read would be redundant overhead.
                     let freeze_and_capture =
                         |gate_on_exit_kind: bool|
-                            -> Option<(crate::monitor::dump::FailureDumpReport, Instant)> {
+                            -> LateCaptureOutcome {
                             let skip_freeze =
                                 freeze_coord_bsp_done.load(Ordering::Acquire);
                             if skip_freeze {
@@ -3247,6 +3477,34 @@ impl KtstrVm {
                             use std::os::fd::AsRawFd;
                             let _ = freeze_coord_parked_evt.read();
                             let _ = freeze_coord_thaw_evt.read();
+                            // Reset every per-vCPU regs slot to None
+                            // before the freeze kicks. Without this
+                            // clear, regs slots written during a
+                            // PRIOR successful capture (periodic /
+                            // user-watchpoint / late-trigger) stay
+                            // `Some(stale_snapshot)` across cycles —
+                            // and a vCPU that DOES NOT park this
+                            // cycle (the rendezvous-timeout case the
+                            // Degraded report is meant to surface)
+                            // shows up as `Some(stale)` instead of
+                            // the contracted `None`. That violates
+                            // the
+                            // [`crate::monitor::dump::DegradedFailureDumpReport::vcpu_regs`]
+                            // doc invariant ("None identifies vCPUs
+                            // that never parked") and silently
+                            // misleads the operator about which
+                            // vCPUs stalled. The Mutex acquisitions
+                            // are cheap (single-digit microseconds);
+                            // the writer is the vCPU's SIGRTMIN
+                            // handler which only runs AFTER the
+                            // freeze kicks below, so this clear
+                            // races nothing.
+                            *freeze_coord_bsp_regs
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = None;
+                            for ap in &freeze_coord_ap_regs {
+                                *ap.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            }
                             // Snapshot virtio-blk worker liveness
                             // BEFORE pause(). When the device exists
                             // but the worker thread is not yet
@@ -3293,8 +3551,9 @@ impl KtstrVm {
                             // and stays in the SAME `handle_freeze`
                             // invocation — `parked.store(true)` plus
                             // `parked_evt.write(1)` only run on
-                            // ENTRY to `handle_freeze`
-                            // (exit_dispatch.rs:1051 / :1067), NOT
+                            // ENTRY to `handle_freeze` (the
+                            // freeze-park ack path in
+                            // `crate::vmm::exit_dispatch`), NOT
                             // per `freeze=true` flip while parked.
                             // Without pre-seeding, the rendezvous
                             // countdown latch never receives an ack
@@ -3645,8 +3904,48 @@ impl KtstrVm {
                                 if freeze_coord_bsp_done.load(Ordering::Acquire) {
                                     break;
                                 }
+                                // Short-circuit on kill (e.g. SCHED_EXIT
+                                // promoted kill mid-rendezvous). Without
+                                // this, the loop burns the full
+                                // FREEZE_RENDEZVOUS_TIMEOUT (~30s) before
+                                // exiting via the deadline branch, then
+                                // the Degraded path reports a misleading
+                                // ~30s elapsed_ms when the actual cause
+                                // was an external kill landing during the
+                                // wait. Breaking here routes through the
+                                // existing !all_parked branch — which
+                                // re-checks bsp_done (the kill may have
+                                // been promoted by the BSP exit) and
+                                // emits Degraded with a meaningful
+                                // elapsed_ms reflecting how long the
+                                // rendezvous actually ran. The bss/
+                                // watchpoint state in the Degraded
+                                // report still surfaces whatever the
+                                // trigger source observed before kill
+                                // landed.
+                                // Check parked-count BEFORE kill so a
+                                // coalesced wake (kill_evt + the final
+                                // parked_evt arriving in the same epoll
+                                // batch) doesn't misattribute a
+                                // successful rendezvous as a Degraded
+                                // "rendezvous timed out" — the drain
+                                // above can bump parked_count to
+                                // expected_parks before the kill check
+                                // runs, and we want to record the
+                                // ground-truth Captured outcome rather
+                                // than emit a misleading Degraded
+                                // reason that says vCPUs didn't park
+                                // when they did.
                                 if parked_count >= expected_parks {
                                     all_parked = true;
+                                    break;
+                                }
+                                // Kill check follows parked-count by
+                                // design — see the "Check parked-count
+                                // BEFORE kill" comment above for the
+                                // coalesced-wake misattribution that
+                                // motivates this ordering.
+                                if freeze_coord_kill.load(Ordering::Acquire) {
                                     break;
                                 }
                                 // Worker sub-timeout. Only fires
@@ -3859,18 +4158,102 @@ impl KtstrVm {
                                 regs
                             };
                             if !all_parked {
-                                if skip_freeze {
+                                // Re-check bsp_done AFTER the rendezvous
+                                // loop exits. The loop has a
+                                // `if freeze_coord_bsp_done.load(...) { break; }`
+                                // guard near its top, so a clean BSP
+                                // exit mid-rendezvous breaks out with
+                                // `all_parked = false` even though the
+                                // cause was NOT a rendezvous timeout.
+                                // Without this re-check, the Degraded
+                                // path below would misattribute the
+                                // clean shutdown as
+                                // "rendezvous timed out at <Nms>;
+                                // 0/N vCPUs parked" — confusing to the
+                                // operator because the run is
+                                // terminating normally. The pre-cycle
+                                // `skip_freeze` snapshot (taken at
+                                // cycle entry) is stale for this case:
+                                // bsp_done was false at entry but
+                                // flipped during the wait.
+                                let bsp_done_late =
+                                    freeze_coord_bsp_done.load(Ordering::Acquire);
+                                if skip_freeze || bsp_done_late {
                                     tracing::info!(
+                                        skip_freeze,
+                                        bsp_done_late,
                                         "freeze-coord: skip_freeze — vCPUs \
                                          exited, proceeding with dump on \
                                          quiesced memory"
                                     );
                                 } else {
-                                    tracing::debug!(
-                                        "freeze-coord: dump skipped: \
-                                         rendezvous timed out"
+                                    // Per memory `feedback_no_silent_drops`:
+                                    // the trigger fired (the watchpoint hit
+                                    // and/or the BPF `.bss` latch flipped),
+                                    // so the operator must see something —
+                                    // a debug! log alone hides the
+                                    // attempted-but-aborted state. Emit a
+                                    // [`crate::monitor::dump::SCHEMA_DEGRADED`]
+                                    // report carrying the partial
+                                    // `vcpu_regs` (the regs slots for vCPUs
+                                    // that DID park before the timeout,
+                                    // `None` for the ones that stalled),
+                                    // the live watchpoint + bss-latch
+                                    // state, the `exit_kind` value when
+                                    // the cached PA still resolves, and
+                                    // the elapsed milliseconds the
+                                    // coordinator spent trying.
+                                    let vcpu_regs = collect_vcpu_regs();
+                                    let watchpoint_hit = freeze_coord_watchpoint
+                                        .hit
+                                        .load(Ordering::Acquire);
+                                    let bss_state = bss_read_state(
+                                        freeze_coord_mem.as_deref(),
+                                        cached_bss_pa,
                                     );
-                                    break 'capture None;
+                                    let exit_kind = match (
+                                        cached_exit_kind_pa,
+                                        freeze_coord_mem.as_deref(),
+                                    ) {
+                                        (Some(pa), Some(mem)) => {
+                                            Some(mem.read_u32(pa, 0))
+                                        }
+                                        _ => None,
+                                    };
+                                    let elapsed_ms =
+                                        capture_start.elapsed().as_millis() as u64;
+                                    let total = expected_parks;
+                                    let stuck = total.saturating_sub(parked_count);
+                                    let reason = format!(
+                                        "{}: {}ms; {}/{} vCPUs parked",
+                                        crate::monitor::dump::REASON_DEGRADED_RENDEZVOUS_TIMEOUT,
+                                        elapsed_ms,
+                                        parked_count,
+                                        total,
+                                    );
+                                    tracing::warn!(
+                                        elapsed_ms,
+                                        parked_count,
+                                        expected_parks = total,
+                                        stuck,
+                                        watchpoint_hit,
+                                        bss_latch_state = bss_state_label(bss_state),
+                                        exit_kind,
+                                        "freeze-coord: dump degraded — vCPU rendezvous timed out"
+                                    );
+                                    let degraded = crate::monitor::dump::DegradedFailureDumpReport {
+                                        schema: crate::monitor::dump::SCHEMA_DEGRADED.to_string(),
+                                        reason,
+                                        vcpu_regs,
+                                        watchpoint_hit,
+                                        bss_latch_state:
+                                            bss_state_label(bss_state).to_string(),
+                                        exit_kind,
+                                        elapsed_ms,
+                                    };
+                                    break 'capture LateCaptureOutcome::Degraded(
+                                        Box::new(degraded),
+                                    );
                                 }
                             }
                             // Exit-kind gate. The hardware watchpoint
@@ -4000,7 +4383,59 @@ impl KtstrVm {
                                     }
                                 };
                                 if !gate_decision {
-                                    break 'capture None;
+                                    // Cross-reference with the BPF probe
+                                    // `.bss` latch before suppressing.
+                                    // probe.bpf.c sets
+                                    // `ktstr_err_exit_detected = 1` via
+                                    // a `__sync_val_compare_and_swap`
+                                    // 0→1 with release semantics over
+                                    // the preceding `ktstr_exit_kind_snap`
+                                    // and `ktstr_exit_*` stores — once
+                                    // observed Triggered, the kernel
+                                    // recorded an error-class exit even
+                                    // if the live `*scx_root->exit_kind`
+                                    // currently reads as a transient
+                                    // clean value (the slab page was
+                                    // freed mid-teardown, or the
+                                    // kernel overwrote with NONE/DONE
+                                    // during scx_ops_disable_workfn
+                                    // teardown after firing
+                                    // tp_btf/sched_ext_exit). In that
+                                    // race window the gate would
+                                    // silently drop a real failure
+                                    // dump; the BPF latch is the
+                                    // historical authority and wins.
+                                    let bss_state = bss_read_state(
+                                        freeze_coord_mem.as_deref(),
+                                        cached_bss_pa,
+                                    );
+                                    // The cross-reference Triggered
+                                    // override is only safe when the
+                                    // cached `.bss` PA has not been
+                                    // observed OOB in this run. Once
+                                    // OOB fires (probe map freed mid-
+                                    // run, vmalloc page recycled),
+                                    // any subsequent non-zero read on
+                                    // the cached PA could come from
+                                    // page-allocator reuse with
+                                    // unrelated data — synthesising
+                                    // a phantom dump. Trust the gate
+                                    // suppression in that case rather
+                                    // than overriding on potentially
+                                    // recycled bytes.
+                                    if matches!(bss_state, BssReadState::Triggered)
+                                        && !bss_oob_warn_logged
+                                    {
+                                        tracing::warn!(
+                                            "freeze-coord: exit_kind gate \
+                                             would suppress dump but BPF \
+                                             `.bss` latch reports error \
+                                             exit — proceeding with dump \
+                                             (latch is historical authority)"
+                                        );
+                                    } else {
+                                        break 'capture LateCaptureOutcome::Suppressed;
+                                    }
                                 }
                             }
                             if let Some(owned) = owned_accessor
@@ -4273,7 +4708,7 @@ impl KtstrVm {
                                     report.per_node_numa = stats;
                                     report.per_node_numa_unavailable = None;
                                 }
-                                Some((report, capture_start))
+                                LateCaptureOutcome::Captured(report, capture_start)
                             } else {
                                 // Partial dump: vcpu_regs only.
                                 let report = crate::monitor::dump::FailureDumpReport {
@@ -4316,7 +4751,7 @@ impl KtstrVm {
                                     "freeze-coord: dump prerequisites unavailable; \
                                      emitting partial report with vcpu_regs only"
                                 );
-                                Some((report, capture_start))
+                                LateCaptureOutcome::Captured(report, capture_start)
                             }
                         } // end 'capture labeled block (the closure
                           // returns this block's value; the caller
@@ -4507,13 +4942,64 @@ impl KtstrVm {
                     // KB and floods every downstream sink (file
                     // logger, journald, stderr) with a payload that
                     // is already on disk at the dump path.
+                    //
+                    // On atomic-write failure, emit a structured
+                    // summary line + truncated JSON head to stderr
+                    // as last-ditch preservation. stderr is a
+                    // separate channel from the filesystem and
+                    // typically survives the kinds of failures
+                    // (ENOSPC, EROFS, EACCES) that fail file
+                    // writes. The summary uses the operator-
+                    // friendly stats this closure already receives
+                    // (map_count, vcpu_regs_count, tasks_enriched,
+                    // elapsed_ms, json_bytes) so the structural
+                    // signal survives independently of the 16 KiB
+                    // head truncation that may drop late fields in
+                    // the serde-ordered payload. Per
+                    // `feedback_no_silent_drops`: silent loss of a
+                    // Captured failure-dump on disk-full is the
+                    // exact silent-drop class to prevent.
+                    // ADV V8-1 (cloud_hypervisor) + N9-1 (#75):
+                    // STDERR last-ditch preservation cap shared by
+                    // the 3 stderr-fallback sites (emit_json,
+                    // emit_degraded_json, end-of-coord drain). UTF-
+                    // 8-safe slicing delegated to the module-level
+                    // `utf8_safe_truncate_len` helper above so the
+                    // 3 sites share one implementation rather than
+                    // each carrying an inline copy that could drift.
+                    const STDERR_DUMP_CAP: usize = 16 * 1024;
                     #[allow(clippy::too_many_arguments)]
                     let emit_json = |json: &str,
                                      map_count: usize,
                                      vcpu_regs_count: usize,
+                                     vcpu_none_indices: &[usize],
                                      tasks_enriched: usize,
                                      elapsed_ms: u64,
                                      truncated_at_us: Option<u64>| {
+                        // Stderr fallback gates on `write_failed`
+                        // ONLY — sink configured AND write_atomic
+                        // failed (ENOSPC / EROFS / EACCES).
+                        // Production callers that don't wire
+                        // `failure_dump_path` (verifier, shell,
+                        // template build per builder default = None)
+                        // never asked for failure-dump preservation,
+                        // so an err-class scheduler exit there is
+                        // not a silent drop — it's "no capture was
+                        // ever requested." Only the test-dispatch
+                        // path in
+                        // `test_support::eval::run_ktstr_test_inner`
+                        // (search `failure_dump_path(primary_dump_path)`)
+                        // and the auto-repro path in
+                        // `test_support::probe::attempt_auto_repro`
+                        // (search `failure_dump_path(&repro_dump_path)`)
+                        // wire the sink; those are the call sites
+                        // where silent-drop avoidance applies. The
+                        // tracing::info! summary line at the end of
+                        // this closure (path = None branch) remains
+                        // the operator-visible signal in the no-sink
+                        // case, with no stderr noise for verifier /
+                        // shell / template iteration.
+                        let mut write_failed = false;
                         let path_str: Option<String> =
                             freeze_coord_dump_path.as_ref().and_then(|p| {
                                 if let Some(parent) = p.parent() {
@@ -4541,6 +5027,7 @@ impl KtstrVm {
                                 match write_atomic() {
                                     Ok(()) => Some(p.display().to_string()),
                                     Err(e) => {
+                                        write_failed = true;
                                         // Best-effort cleanup of the leftover
                                         // tmp file so a future operator
                                         // doesn't see a stale `.json.tmp`
@@ -4550,17 +5037,62 @@ impl KtstrVm {
                                             path = %p.display(),
                                             tmp_path = %tmp_path.display(),
                                             error = %e,
-                                            "freeze-coord: failure-dump atomic write failed"
+                                            "freeze-coord: failure-dump atomic write failed; stderr fallback below"
                                         );
                                         None
                                     }
                                 }
                             });
+                        // Stderr last-ditch preservation fires ONLY
+                        // when a configured sink failed
+                        // (`write_failed`). The structured summary
+                        // line surfaces the operator-critical
+                        // signals (vcpu count + none-indices, map
+                        // count, payload bytes) regardless of
+                        // payload size, then the truncated JSON head
+                        // provides forensic context.
+                        // `vcpu_none_indices` shows the operator
+                        // WHICH vCPUs were never parked — same
+                        // signal the drain summary surfaces.
+                        // Callers that never wired
+                        // `failure_dump_path` (verifier / shell /
+                        // template) get the closure's tail
+                        // tracing::info! "no file sink" line and no
+                        // stderr noise — no capture was ever
+                        // requested.
+                        if write_failed {
+                            eprintln!(
+                                "freeze-coord: STDERR-PRESERVED summary (Captured, write failed): map_count={} vcpu_regs_count={} vcpu_none_indices={:?} tasks_enriched={} elapsed_ms={} json_bytes={}",
+                                map_count,
+                                vcpu_regs_count,
+                                vcpu_none_indices,
+                                tasks_enriched,
+                                elapsed_ms,
+                                json.len(),
+                            );
+                            let head_end = utf8_safe_truncate_len(
+                                json,
+                                STDERR_DUMP_CAP,
+                            );
+                            let truncated_marker = if head_end < json.len() {
+                                format!(
+                                    " (truncated to {} bytes at UTF-8 boundary; full {} bytes lost — summary above)",
+                                    head_end,
+                                    json.len()
+                                )
+                            } else {
+                                String::new()
+                            };
+                            eprintln!(
+                                "freeze-coord: STDERR-PRESERVED payload head (Captured, write failed){}: {}",
+                                truncated_marker,
+                                &json[..head_end]
+                            );
+                        }
                         let json_bytes = json.len();
-                        let path_part = path_str
-                            .as_deref()
-                            .map(|p| format!(" -> {p}"))
-                            .unwrap_or_else(|| " (no file sink)".to_string());
+                        // Disambiguation and consolidation. See
+                        // [`format_path_part`] for the 3-state rule.
+                        let path_part = format_path_part(path_str.as_deref(), write_failed);
                         let trunc_part = truncated_at_us
                             .map(|us| format!(" (truncated at {us}us)"))
                             .unwrap_or_default();
@@ -4574,6 +5106,99 @@ impl KtstrVm {
                             truncated_at_us,
                             path = path_str.as_deref(),
                             "freeze-coord: dump complete{trunc_part}, {map_count} maps, {tasks_enriched} tasks enriched, {elapsed_ms}ms freeze, {json_bytes} bytes{path_part}"
+                        );
+                    };
+                    // Persist a SCHEMA_DEGRADED JSON via the same
+                    // atomic-publish dance `emit_json` uses. Separate
+                    // closure so the log target / message identifies
+                    // the degraded shape distinctly from a full dump
+                    // — an operator reading the log sees "dump
+                    // degraded" rather than the "dump complete"
+                    // banner the full-dump path emits. The reason +
+                    // elapsed_ms surface in the log line so a quick
+                    // scan of trace output answers the operator's
+                    // first question ("what went wrong?") without
+                    // opening the JSON.
+                    let emit_degraded_json = |json: &str,
+                                              reason: &str,
+                                              elapsed_ms: u64| {
+                        // Symmetric with emit_json: stderr fallback
+                        // hoisted OUT of the and_then closure so a
+                        // Degraded-path write_atomic failure
+                        // surfaces to stderr regardless of the
+                        // closure short-circuit, AND gated on
+                        // `write_failed` so callers that never
+                        // wired `failure_dump_path` (verifier /
+                        // shell / template) don't get a stderr
+                        // blast for "no capture was requested."
+                        // See emit_json above for the full
+                        // rationale.
+                        let mut write_failed = false;
+                        let path_str: Option<String> =
+                            freeze_coord_dump_path.as_ref().and_then(|p| {
+                                if let Some(parent) = p.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let tmp_path = p.with_extension("json.tmp");
+                                let write_atomic = || -> std::io::Result<()> {
+                                    use std::io::Write as _;
+                                    let mut f =
+                                        std::fs::File::create(&tmp_path)?;
+                                    f.write_all(json.as_bytes())?;
+                                    f.sync_all()?;
+                                    drop(f);
+                                    std::fs::rename(&tmp_path, p)?;
+                                    Ok(())
+                                };
+                                match write_atomic() {
+                                    Ok(()) => Some(p.display().to_string()),
+                                    Err(e) => {
+                                        write_failed = true;
+                                        let _ = std::fs::remove_file(&tmp_path);
+                                        tracing::warn!(
+                                            path = %p.display(),
+                                            tmp_path = %tmp_path.display(),
+                                            error = %e,
+                                            "freeze-coord: degraded-dump atomic write failed; stderr fallback below"
+                                        );
+                                        None
+                                    }
+                                }
+                            });
+                        if write_failed {
+                            eprintln!(
+                                "freeze-coord: STDERR-PRESERVED summary (Degraded, write failed): reason={:?} elapsed_ms={} json_bytes={}",
+                                reason,
+                                elapsed_ms,
+                                json.len(),
+                            );
+                            let head_end = utf8_safe_truncate_len(json, STDERR_DUMP_CAP);
+                            let truncated_marker = if head_end < json.len() {
+                                format!(
+                                    " (truncated to {} bytes at UTF-8 boundary; full {} bytes lost — summary above)",
+                                    head_end,
+                                    json.len()
+                                )
+                            } else {
+                                String::new()
+                            };
+                            eprintln!(
+                                "freeze-coord: STDERR-PRESERVED payload head (Degraded, write failed){}: {}",
+                                truncated_marker,
+                                &json[..head_end]
+                            );
+                        }
+                        let json_bytes = json.len();
+                        // Same as emit_json. See [`format_path_part`]
+                        // for the rule.
+                        let path_part = format_path_part(path_str.as_deref(), write_failed);
+                        tracing::warn!(
+                            target: "ktstr::failure_dump",
+                            reason,
+                            json_bytes,
+                            elapsed_ms,
+                            path = path_str.as_deref(),
+                            "freeze-coord: degraded dump emitted, {reason}, {elapsed_ms}ms, {json_bytes} bytes{path_part}"
                         );
                     };
                     // On-demand snapshot handler. Drains every
@@ -4679,7 +5304,8 @@ impl KtstrVm {
                                 let mut reply_status =
                                     crate::vmm::wire::SNAPSHOT_STATUS_OK;
                                 let mut reply_reason = String::new();
-                                if let Some((report, capture_start)) = on_demand {
+                                match on_demand {
+                                    LateCaptureOutcome::Captured(report, capture_start) => {
                                     let map_count = report.maps.len();
                                     let vcpu_regs_count =
                                         report.vcpu_regs.len();
@@ -4750,18 +5376,81 @@ impl KtstrVm {
                                     // via the public `Snapshot`
                                     // accessor.
                                     freeze_coord_snapshot_bridge.store(&tag, report);
-                                } else {
-                                    reply_status =
-                                        crate::vmm::wire::SNAPSHOT_STATUS_ERR;
-                                    reply_reason =
-                                        "freeze rendezvous timed out (vCPU stuck \
-                                         in KVM_RUN past FREEZE_RENDEZVOUS_TIMEOUT)"
-                                            .to_string();
-                                    tracing::warn!(
-                                        request_id,
-                                        %tag,
-                                        "freeze-coord: on-demand capture failed (rendezvous timeout)"
-                                    );
+                                    }
+                                    LateCaptureOutcome::Degraded(degraded) => {
+                                        // Rendezvous timed out building
+                                        // the on-demand capture. Write
+                                        // the degraded JSON to the same
+                                        // tagged dump path and store a
+                                        // placeholder on the bridge
+                                        // carrying the partial vcpu_regs
+                                        // + the degraded reason —
+                                        // operator's structured
+                                        // diagnostics survive even when
+                                        // the bridge entry is a
+                                        // legacy-shape placeholder.
+                                        if let Some(ref base_path) =
+                                            freeze_coord_dump_path
+                                        {
+                                            let tagged = snapshot_tagged_path(
+                                                base_path, &tag,
+                                            );
+                                            if let Some(parent) = tagged.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            match serde_json::to_string(degraded.as_ref()) {
+                                                Ok(json) => {
+                                                    if let Err(e) =
+                                                        std::fs::write(&tagged, &json)
+                                                    {
+                                                        tracing::warn!(
+                                                            path = %tagged.display(),
+                                                            error = %e,
+                                                            "freeze-coord: on-demand degraded dump file write failed"
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => tracing::error!(
+                                                    error = %e,
+                                                    "freeze-coord: on-demand degraded dump (JSON serialization failed)"
+                                                ),
+                                            }
+                                        }
+                                        let placeholder = crate::monitor::dump::FailureDumpReport {
+                                            vcpu_regs: degraded.vcpu_regs.clone(),
+                                            ..crate::monitor::dump::FailureDumpReport::placeholder(
+                                                degraded.reason.clone(),
+                                            )
+                                        };
+                                        freeze_coord_snapshot_bridge.store(&tag, placeholder);
+                                        reply_status =
+                                            crate::vmm::wire::SNAPSHOT_STATUS_ERR;
+                                        reply_reason = degraded.reason.clone();
+                                        tracing::warn!(
+                                            request_id,
+                                            %tag,
+                                            reason = %degraded.reason,
+                                            "freeze-coord: on-demand capture degraded (rendezvous timeout)"
+                                        );
+                                    }
+                                    LateCaptureOutcome::Suppressed => {
+                                        // Unreachable in practice: the gate
+                                        // only runs when gate_on_exit_kind=true
+                                        // and the on-demand path always
+                                        // passes false. Defensive: reply
+                                        // ERR so a future code path that
+                                        // changes the gate flag can't
+                                        // silently drop the request.
+                                        reply_status =
+                                            crate::vmm::wire::SNAPSHOT_STATUS_ERR;
+                                        reply_reason =
+                                            "on-demand capture suppressed (gate decision)".to_string();
+                                        tracing::warn!(
+                                            request_id,
+                                            %tag,
+                                            "freeze-coord: on-demand capture unexpectedly suppressed by gate"
+                                        );
+                                    }
                                 }
                                 let reply = frame_snapshot_reply(
                                     request_id,
@@ -5095,7 +5784,8 @@ impl KtstrVm {
                                 let on_demand = freeze_and_capture(false);
                                 thaw_and_barrier();
                                 extend_watchdog_for_freeze(freeze_start);
-                                if let Some((report, capture_start)) = on_demand {
+                                match on_demand {
+                                    LateCaptureOutcome::Captured(report, capture_start) => {
                                     let map_count = report.maps.len();
                                     let vcpu_regs_count = report.vcpu_regs.len();
                                     let tasks_enriched = report.task_enrichments.len();
@@ -5145,45 +5835,74 @@ impl KtstrVm {
                                     // threshold for unrelated future
                                     // boundaries.
                                     periodic_consecutive_timeouts = 0;
-                                } else {
-                                    tracing::warn!(
-                                        idx = next_periodic_idx,
-                                        %tag,
-                                        "freeze-coord: periodic capture failed \
-                                         (freeze_and_capture returned None — most \
-                                         commonly a parked-vCPU rendezvous \
-                                         timeout); storing placeholder report"
-                                    );
-                                    let placeholder =
-                                        crate::monitor::dump::FailureDumpReport::placeholder(
-                                            "freeze rendezvous timed out",
+                                    }
+                                    LateCaptureOutcome::Degraded(degraded) => {
+                                        // Periodic rendezvous timed out.
+                                        // Preserve the structured trigger
+                                        // state by writing the degraded JSON
+                                        // to the periodic tagged path AND
+                                        // storing a placeholder on the
+                                        // bridge that carries the partial
+                                        // vcpu_regs + the degraded reason so
+                                        // a temporal-pattern consumer sees
+                                        // why the periodic sample is missing
+                                        // BPF data.
+                                        if let Some(ref base_path) = freeze_coord_dump_path {
+                                            let tagged = snapshot_tagged_path(base_path, &tag);
+                                            if let Some(parent) = tagged.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            if let Ok(json) = serde_json::to_string(degraded.as_ref())
+                                                && let Err(e) = std::fs::write(&tagged, &json)
+                                            {
+                                                tracing::warn!(
+                                                    path = %tagged.display(),
+                                                    error = %e,
+                                                    "freeze-coord: periodic degraded dump file write failed"
+                                                );
+                                            }
+                                        }
+                                        tracing::warn!(
+                                            idx = next_periodic_idx,
+                                            %tag,
+                                            reason = %degraded.reason,
+                                            "freeze-coord: periodic capture degraded (rendezvous timeout); storing placeholder + degraded file"
                                         );
-                                    // Even when the freeze fails the
-                                    // pre-freeze stats response (when
-                                    // available) plus the workload-
-                                    // relative timestamp ARE valid —
-                                    // they sample the running
-                                    // scheduler and the wall-clock
-                                    // instant at which we attempted
-                                    // the boundary. Bundle them into
-                                    // the placeholder so a Sample
-                                    // view at least carries the
-                                    // stats axis and timing for this
-                                    // boundary; the BPF axis falls
-                                    // through to the placeholder
-                                    // report and any temporal
-                                    // pattern projecting BPF data
-                                    // surfaces it as the upstream
-                                    // missing-data error variant.
-                                    freeze_coord_snapshot_bridge.store_with_stats(
-                                        &tag,
-                                        placeholder,
-                                        stats_value,
-                                        Some(sample_elapsed_ms_anchor),
-                                    );
-                                    periodic_consecutive_timeouts =
-                                        periodic_consecutive_timeouts
-                                            .saturating_add(1);
+                                        let placeholder = crate::monitor::dump::FailureDumpReport {
+                                            vcpu_regs: degraded.vcpu_regs.clone(),
+                                            ..crate::monitor::dump::FailureDumpReport::placeholder(
+                                                degraded.reason.clone(),
+                                            )
+                                        };
+                                        freeze_coord_snapshot_bridge.store_with_stats(
+                                            &tag,
+                                            placeholder,
+                                            stats_value,
+                                            Some(sample_elapsed_ms_anchor),
+                                        );
+                                        periodic_consecutive_timeouts =
+                                            periodic_consecutive_timeouts.saturating_add(1);
+                                    }
+                                    LateCaptureOutcome::Suppressed => {
+                                        // Unreachable: gate only runs with
+                                        // gate_on_exit_kind=true and the
+                                        // periodic path always passes false.
+                                        tracing::warn!(
+                                            idx = next_periodic_idx,
+                                            %tag,
+                                            "freeze-coord: periodic capture unexpectedly suppressed by gate"
+                                        );
+                                        let placeholder =
+                                            crate::monitor::dump::FailureDumpReport::placeholder(
+                                                "periodic capture suppressed (gate decision)",
+                                            );
+                                        freeze_coord_snapshot_bridge.store_with_stats(
+                                            &tag,
+                                            placeholder,
+                                            stats_value,
+                                            Some(sample_elapsed_ms_anchor),
+                                        );
+                                    }
                                 }
                                 freeze_coord_on_demand_in_flight
                                     .store(false, Ordering::Release);
@@ -5302,7 +6021,8 @@ impl KtstrVm {
                         // so thaw immediately.
                         let on_demand = freeze_and_capture(false);
                         thaw_and_barrier();
-                        if let Some((report, capture_start)) = on_demand {
+                        match on_demand {
+                            LateCaptureOutcome::Captured(report, capture_start) => {
                             let map_count = report.maps.len();
                             // File mirror via `&report` (no clone),
                             // then move the report into the bridge.
@@ -5341,40 +6061,63 @@ impl KtstrVm {
                                 "freeze-coord: user-watchpoint snapshot captured"
                             );
                             freeze_coord_snapshot_bridge.store(&tag, report);
-                        } else {
-                            // Rendezvous timeout (or any other path
-                            // through `freeze_and_capture` that
-                            // returns None). Without an entry on the
-                            // bridge here, the user's
-                            // `Op::WatchSnapshot` fire is silently
-                            // lost: the in-loop `hit.swap(false)`
-                            // above already cleared the latch, so the
-                            // teardown final-drain placeholder loop
-                            // (search for `final-drain placeholder`
-                            // in this file) skips this slot too.
-                            // Publish a degraded placeholder under
-                            // the same tag so a test that registered
-                            // `Op::WatchSnapshot` sees an entry on
-                            // the bridge with an `_unavailable`
-                            // reason instead of a missing snapshot
-                            // that's indistinguishable from "the
-                            // watched KVA was never written." Mirrors
-                            // the teardown placeholder's shape with
-                            // a different reason string so an
-                            // operator can tell the two paths apart.
-                            tracing::warn!(
-                                slot_idx,
-                                %tag,
-                                "freeze-coord: user-watchpoint capture failed \
-                                 (freeze_and_capture returned None — most \
-                                 commonly a parked-vCPU rendezvous timeout); \
-                                 storing placeholder report"
-                            );
-                            let placeholder =
-                                crate::monitor::dump::FailureDumpReport::placeholder(
-                                    "freeze rendezvous timed out",
+                            }
+                            LateCaptureOutcome::Degraded(degraded) => {
+                                // User-watchpoint rendezvous timeout.
+                                // Preserve the trigger state by writing
+                                // the degraded JSON to the tagged path
+                                // AND storing a placeholder carrying
+                                // partial vcpu_regs + the degraded
+                                // reason so a test that registered
+                                // `Op::WatchSnapshot` reads a
+                                // structured entry from the bridge
+                                // instead of silently missing data.
+                                if let Some(ref base_path) = freeze_coord_dump_path {
+                                    let tagged = snapshot_tagged_path(base_path, &tag);
+                                    if let Some(parent) = tagged.parent() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
+                                    if let Ok(json) = serde_json::to_string(degraded.as_ref())
+                                        && let Err(e) = std::fs::write(&tagged, &json)
+                                    {
+                                        tracing::warn!(
+                                            path = %tagged.display(),
+                                            error = %e,
+                                            "freeze-coord: user-watchpoint degraded dump file write failed"
+                                        );
+                                    }
+                                }
+                                tracing::warn!(
+                                    slot_idx,
+                                    %tag,
+                                    reason = %degraded.reason,
+                                    "freeze-coord: user-watchpoint capture degraded (rendezvous timeout); storing placeholder + degraded file"
                                 );
-                            freeze_coord_snapshot_bridge.store(&tag, placeholder);
+                                let placeholder = crate::monitor::dump::FailureDumpReport {
+                                    vcpu_regs: degraded.vcpu_regs.clone(),
+                                    ..crate::monitor::dump::FailureDumpReport::placeholder(
+                                        degraded.reason.clone(),
+                                    )
+                                };
+                                freeze_coord_snapshot_bridge.store(&tag, placeholder);
+                            }
+                            LateCaptureOutcome::Suppressed => {
+                                // Unreachable: user-watchpoint passes
+                                // gate_on_exit_kind=false. Defensive:
+                                // publish a placeholder so the test
+                                // sees an entry rather than a missing
+                                // snapshot.
+                                tracing::warn!(
+                                    slot_idx,
+                                    %tag,
+                                    "freeze-coord: user-watchpoint capture unexpectedly suppressed by gate"
+                                );
+                                let placeholder =
+                                    crate::monitor::dump::FailureDumpReport::placeholder(
+                                        "user-watchpoint capture suppressed (gate decision)",
+                                    );
+                                freeze_coord_snapshot_bridge.store(&tag, placeholder);
+                            }
                         }
                         // Release the slot for future arm requests.
                         // `arm_user_watchpoint` finds a free slot by
@@ -5501,15 +6244,79 @@ impl KtstrVm {
                             // `false` to skip the gate. Early
                             // snapshot has no while-frozen work, so
                             // thaw immediately after the dump
-                            // returns (whether or not it produced a
-                            // report — a stuck rendezvous already
-                            // logged inside the closure).
-                            if let Some((report, _capture_start)) =
-                                freeze_and_capture(false)
-                            {
-                                early_max_age_jiffies = max_age;
-                                early_threshold_jiffies = half_threshold_jiffies;
-                                early_snapshot = Some(report);
+                            // returns. A degraded outcome here
+                            // (rendezvous timed out during the early
+                            // capture) must surface structured
+                            // diagnostics rather than be dropped. The
+                            // late path will follow up
+                            // (FreezeState::TookEarly → Late) so the
+                            // dual-snapshot wrapper can still emit a
+                            // Single+Degraded composite from the late
+                            // arm; here we write a tagged degraded
+                            // JSON so the early-half trigger evidence
+                            // survives to disk.
+                            match freeze_and_capture(false) {
+                                LateCaptureOutcome::Captured(report, _capture_start) => {
+                                    early_max_age_jiffies = max_age;
+                                    early_threshold_jiffies = half_threshold_jiffies;
+                                    early_snapshot = Some(report);
+                                }
+                                LateCaptureOutcome::Degraded(degraded) => {
+                                    if let Some(ref base_path) = freeze_coord_dump_path {
+                                        let tagged = snapshot_tagged_path(
+                                            base_path,
+                                            crate::monitor::dump::SNAPSHOT_TAG_EARLY_DEGRADED,
+                                        );
+                                        if let Some(parent) = tagged.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        if let Ok(json) =
+                                            serde_json::to_string(degraded.as_ref())
+                                            && let Err(e) =
+                                                std::fs::write(&tagged, &json)
+                                        {
+                                            tracing::warn!(
+                                                path = %tagged.display(),
+                                                error = %e,
+                                                "freeze-coord: early-snapshot degraded dump file write failed"
+                                            );
+                                        }
+                                    }
+                                    tracing::warn!(
+                                        reason = %degraded.reason,
+                                        "freeze-coord: early-snapshot degraded (rendezvous timeout); late path will retry"
+                                    );
+                                }
+                                LateCaptureOutcome::Suppressed => {
+                                    // Symmetric with the other three
+                                    // `LateCaptureOutcome::Suppressed`
+                                    // arms in this file (TLV CAPTURE
+                                    // / periodic / user-watchpoint
+                                    // dispatch sites — grep
+                                    // `LateCaptureOutcome::Suppressed`
+                                    // to find them), which all log +
+                                    // continue rather than panic.
+                                    // Suppressed is only producible by
+                                    // `freeze_and_capture(true)` (the
+                                    // exit_kind gate path); the early
+                                    // path passes false so this arm is
+                                    // unreachable under the current
+                                    // invariant. But a future refactor
+                                    // changing the bool default — or
+                                    // any flag-passing bug — would
+                                    // crash the entire VM here instead
+                                    // of degrading gracefully. Log
+                                    // loudly + continue: early_snapshot
+                                    // stays None for this cycle, the
+                                    // late path runs normally. `warn`
+                                    // matches the other three sites'
+                                    // "defensive log + continue" level
+                                    // so a monitoring rule catches all
+                                    // four uniformly.
+                                    tracing::warn!(
+                                        "freeze-coord: invariant violated — early-snapshot freeze_and_capture(false) returned Suppressed (expected only when gate_on_exit_kind=true). Continuing without early snapshot."
+                                    );
+                                }
                             }
                             thaw_and_barrier();
                             freeze_state = FreezeState::TookEarly;
@@ -5614,7 +6421,7 @@ impl KtstrVm {
                         if freeze_coord_dual_snapshot
                             && early_snapshot.is_none()
                             && half_threshold_jiffies > 0
-                            && let Some((ref late, _)) = late_capture
+                            && let LateCaptureOutcome::Captured(ref late, _) = late_capture
                             && let Some(ref ctx) = scan_ctx
                             && let Some(ref mem) = freeze_coord_mem
                         {
@@ -5689,81 +6496,63 @@ impl KtstrVm {
                         // is safe because every site that depends
                         // on quiesced state has completed.
                         thaw_and_barrier();
-                        // Re-read both trigger flags AFTER
-                        // freeze_and_capture returned. The capture
-                        // path can sit in rendezvous up to the
-                        // configured watchdog (~30 s) while vCPUs
-                        // ack SIGRTMIN; during that window the BPF
-                        // tp_btf handler running on a not-yet-parked
-                        // vCPU can latch ktstr_err_exit_detected in
-                        // .bss (sticky kernel-side), and another
-                        // vCPU's hardware watchpoint can fire on a
-                        // fresh exit_kind write. The
-                        // suppression-vs-Done decision below must
-                        // use post-rendezvous truth: a
-                        // mid-rendezvous bss flip means the kernel
-                        // latch will keep reporting Triggered, and
-                        // taking the watchpoint-only suppression
-                        // path (reset hit, keep watching) would
-                        // re-fire the late-trigger every iteration
-                        // forever (re-rendezvous, re-suppress, ...
-                        // — the original bug). The pre-rendezvous
-                        // value at the freeze_and_capture call site
-                        // above is still correct for the
-                        // gate_on_exit_kind argument: that gate
-                        // filters spurious init/teardown writes,
-                        // which is independent of whether the bss
-                        // latch flipped during the rendezvous.
-                        // Acquire ordering matches the iteration-
-                        // top reads — paired with the vCPU-thread
-                        // Release on `hit`. The bss read goes
-                        // through the same bss_read_state helper as
-                        // the iteration-top read; parked vCPUs at
-                        // the time of the post-thaw read are
-                        // already running again, but the kernel-
-                        // side bss latch is monotonic-rising
-                        // (probe.bpf.c only stores 1, never clears),
-                        // so any flip observed at this point will
-                        // remain observable on subsequent reads.
-                        let watchpoint_hit_post =
-                            freeze_coord_watchpoint.hit.load(Ordering::Acquire);
-                        let bss_state_post = bss_read_state(
-                            freeze_coord_mem.as_deref(),
-                            cached_bss_pa,
-                        );
-                        let watchpoint_only_trigger_post =
-                            compute_watchpoint_only_trigger(
-                                watchpoint_hit_post,
-                                bss_state_post,
-                            );
-                        // Branch on three outcomes:
-                        //   Some(...)             → dump, mark Done
-                        //   None + watchpoint-only → gate-suppressed
-                        //                            (or rendezvous
-                        //                            timeout); reset
-                        //                            `watchpoint.hit`
-                        //                            and DO NOT mark
-                        //                            Done so the
-                        //                            coordinator keeps
-                        //                            watching for an
-                        //                            error-class
-                        //                            exit_kind
-                        //   None + bss-or-mixed    → rendezvous timed
-                        //                            out under a
-                        //                            sticky bss
-                        //                            latch; mark Done
-                        //                            because the
-                        //                            kernel-side
-                        //                            latch isn't
-                        //                            going to retract
+                        // Branch on three outcomes of `freeze_and_capture`:
+                        //   Captured(report, _) → emit the full dump,
+                        //                         mark Done, kick kill
+                        //                         so the run tears down
+                        //                         promptly.
+                        //   Degraded(boxed)     → rendezvous timed out;
+                        //                         emit SCHEMA_DEGRADED
+                        //                         JSON with partial
+                        //                         vcpu_regs + trigger-
+                        //                         state diagnostics
+                        //                         (per memory
+                        //                         `feedback_no_silent_drops`),
+                        //                         then mark Done + kick
+                        //                         kill — retrying a
+                        //                         timed-out rendezvous
+                        //                         under a sticky bss
+                        //                         latch would just hit
+                        //                         the same timeout.
+                        //   Suppressed          → gate cross-reference
+                        //                         confirmed clean exit
+                        //                         (kind &lt; SCX_EXIT_ERROR
+                        //                         AND bss not Triggered);
+                        //                         reset `watchpoint.hit`
+                        //                         and mark Done. The
+                        //                         original three-arm
+                        //                         shape (separate "reset
+                        //                         hit + keep watching"
+                        //                         vs "mark Done")
+                        //                         collapsed once #51's
+                        //                         cross-reference
+                        //                         eliminated the bss-
+                        //                         flipped-during-
+                        //                         rendezvous race
+                        //                         (Triggered bss now
+                        //                         routes through
+                        //                         Captured/Degraded
+                        //                         upstream).
                         match late_capture {
-                            Some((late, capture_start)) => {
+                            LateCaptureOutcome::Captured(late, capture_start) => {
                                 // capture_start anchors the freeze→emit
                                 // timing summary; emit_json reads
                                 // Instant::now() - capture_start at log
                                 // time so it covers serialise + write.
                                 let map_count = late.maps.len();
                                 let vcpu_regs_count = late.vcpu_regs.len();
+                                // NEW-V9-2 (advphd_firecracker):
+                                // pre-compute vcpu_none_indices so
+                                // emit_json's stderr fallback can
+                                // surface WHICH vCPUs stalled — same
+                                // operator-critical signal the drain's
+                                // stderr summary emits. The emit_json
+                                // closure receives this as &[usize]
+                                // regardless of whether the file write
+                                // succeeds; on failure (or no sink)
+                                // the indices reach stderr alongside
+                                // the structured summary.
+                                let vcpu_none_indices = vcpu_none_indices(&late.vcpu_regs);
                                 let tasks_enriched = late.task_enrichments.len();
                                 let truncated_at_us = late.dump_truncated_at_us;
                                 // `to_string` (compact) replaces
@@ -5792,16 +6581,49 @@ impl KtstrVm {
                                         &json,
                                         map_count,
                                         vcpu_regs_count,
+                                        &vcpu_none_indices,
                                         tasks_enriched,
                                         capture_start.elapsed().as_millis() as u64,
                                         truncated_at_us,
                                     ),
-                                    Err(e) => tracing::error!(
-                                        error = %e,
-                                        map_count,
-                                        vcpu_regs_count,
-                                        "freeze-coord: failure dump (JSON serialization failed)"
-                                    ),
+                                    Err(e) => {
+                                        // Serialize failure of a
+                                        // well-typed FailureDumpReport
+                                        // is near-zero probability
+                                        // (only non-string-keys in maps
+                                        // or custom Serialize errors —
+                                        // neither applies here). The
+                                        // structured summary is loud-
+                                        // emitted to stderr when the
+                                        // user wired a sink (so the data
+                                        // loss represents a captured
+                                        // observation that the user
+                                        // asked for); skipped when no
+                                        // sink (verifier / shell /
+                                        // template paths never asked
+                                        // for preservation).
+                                        tracing::error!(
+                                            error = %e,
+                                            map_count,
+                                            vcpu_regs_count,
+                                            "freeze-coord: failure dump (JSON serialization failed)"
+                                        );
+                                        if freeze_coord_dump_path.is_some() {
+                                            let elapsed_ms = capture_start
+                                                .elapsed()
+                                                .as_millis()
+                                                as u64;
+                                            eprintln!(
+                                                "freeze-coord: STDERR-PRESERVED summary (Captured, serialize failed): map_count={} vcpu_regs_count={} vcpu_none_indices={:?} tasks_enriched={} elapsed_ms={} serde_error={:?}",
+                                                map_count,
+                                                vcpu_regs_count,
+                                                vcpu_none_indices,
+                                                tasks_enriched,
+                                                elapsed_ms,
+                                                e.to_string(),
+                                            );
+                                        }
+                                    }
                                 }
                                 freeze_state = FreezeState::Done;
                                 // Error-class exit dump complete: tear
@@ -5817,34 +6639,319 @@ impl KtstrVm {
                                 // the run-level kill AtomicBool and kick
                                 // the eventfd so the BSP run loop
                                 // (kill.load) and this coord loop
-                                // (freeze_coord_kill.load at line 2026)
-                                // both observe the edge on the next
-                                // wake.
+                                // (freeze_coord_kill.load at the
+                                // top of the `'coord:` while-guard
+                                // above) both observe the edge on
+                                // the next wake.
                                 tracing::info!(
                                     "freeze-coord: kill triggered after \
                                      error-exit dump capture"
                                 );
                                 freeze_coord_kill
                                     .store(true, Ordering::Release);
+                                // The Result is intentionally dropped:
+                                // the only failure modes for eventfd
+                                // write are EAGAIN (counter at u64::MAX
+                                // — implies the wake is already
+                                // signaled past saturation) and EBADF
+                                // (fd torn down — implies coord is
+                                // already exiting). Both shapes mean
+                                // "kill is already observed or about
+                                // to be"; no recovery is meaningful.
                                 let _ = freeze_coord_kill_evt.write(1);
                             }
-                            None if watchpoint_only_trigger_post => {
+                            LateCaptureOutcome::Degraded(degraded) => {
+                                // Rendezvous timeout: emit the
+                                // pre-built degraded JSON via the same
+                                // atomic-publish helper used for full
+                                // dumps so the consumer either sees a
+                                // complete degraded file or nothing —
+                                // never a torn write. After emit, mark
+                                // Done and kick kill: retrying a
+                                // rendezvous that already timed out
+                                // would just hit the same timeout
+                                // (sticky kernel-side bss latch).
+                                let elapsed_ms = degraded.elapsed_ms;
+                                match serde_json::to_string(degraded.as_ref()) {
+                                    Ok(json) => emit_degraded_json(
+                                        &json,
+                                        &degraded.reason,
+                                        elapsed_ms,
+                                    ),
+                                    Err(e) => tracing::error!(
+                                        error = %e,
+                                        reason = %degraded.reason,
+                                        "freeze-coord: degraded dump (JSON serialization failed)"
+                                    ),
+                                }
+                                // NEW-V4-2 symmetry: late Degraded
+                                // doesn't invalidate a Captured early
+                                // either — the early was a runnable-
+                                // age spike observation while the late
+                                // is "rendezvous timed out". Both
+                                // signals matter to an operator. The
+                                // main dump path already holds the
+                                // degraded JSON (atomic-published
+                                // above), so we drop the early to a
+                                // tagged sibling path. The WRITE
+                                // pattern (snapshot_tagged_path +
+                                // std::fs::write) mirrors the
+                                // `LateCaptureOutcome::Degraded` arm
+                                // of the early-snapshot dispatch
+                                // above, but the tag and signal
+                                // differ: early-Degraded means the
+                                // early itself was Degraded; early-
+                                // pre-late-degraded means the early
+                                // was Captured and the LATE was
+                                // Degraded — distinct cases. Per
+                                // `feedback_no_silent_drops`: any
+                                // captured snapshot must reach disk.
+                                // V6-F1 (advphd_qemu) + N7-1 (#70):
+                                // base_path check FIRST in the let-
+                                // chain (no take()), and `.take()`
+                                // only AFTER the write succeeds. Two
+                                // silent-drop windows closed:
+                                //   (V6-F1) Rust let-chain short-
+                                //     circuits left-to-right; an
+                                //     early take() before the
+                                //     dump_path check would consume
+                                //     the snapshot and skip the body
+                                //     when dump_path is None.
+                                //   (N7-1) std::fs::write can fail
+                                //     mid-call (ENOSPC / EROFS /
+                                //     EACCES). If we'd already
+                                //     consumed `early` via .take(),
+                                //     the failed write would drop the
+                                //     snapshot with only a
+                                //     tracing::warn! breadcrumb.
+                                //     Holding the snapshot in
+                                //     `early_snapshot` until the
+                                //     write returns Ok preserves a
+                                //     retry path via the end-of-
+                                //     coord drain below (different
+                                //     tag, but a wrong-tag emit
+                                //     beats a silent drop per
+                                //     `feedback_no_silent_drops`).
+                                if freeze_coord_dual_snapshot
+                                    && let Some(ref base_path) =
+                                        freeze_coord_dump_path
+                                    && let Some(early) =
+                                        early_snapshot.as_ref()
+                                {
+                                    let tagged = snapshot_tagged_path(
+                                        base_path,
+                                        crate::monitor::dump::SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+                                    );
+                                    if let Some(parent) = tagged.parent() {
+                                        // Best-effort mkdir: the
+                                        // parent already exists in
+                                        // the normal case (the main
+                                        // dump path was already
+                                        // created when
+                                        // emit_degraded_json ran
+                                        // above). Any failure here
+                                        // (EACCES, ENOSPC) re-
+                                        // surfaces with a useful
+                                        // path-bearing error from
+                                        // the std::fs::write below.
+                                        let _ =
+                                            std::fs::create_dir_all(parent);
+                                    }
+                                    let write_succeeded = match serde_json::to_string(early) {
+                                        Ok(json) => match std::fs::write(&tagged, &json) {
+                                            Ok(()) => {
+                                                tracing::info!(
+                                                    path = %tagged.display(),
+                                                    "freeze-coord: early snapshot preserved alongside degraded late"
+                                                );
+                                                true
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    path = %tagged.display(),
+                                                    error = %e,
+                                                    "freeze-coord: early-snapshot pre-late-degraded write failed (early retained for end-of-coord drain retry)"
+                                                );
+                                                false
+                                            }
+                                        },
+                                        Err(e) => {
+                                            tracing::error!(
+                                                error = %e,
+                                                "freeze-coord: early-snapshot pre-late-degraded JSON serialization failed (early retained for end-of-coord drain retry)"
+                                            );
+                                            false
+                                        }
+                                    };
+                                    if write_succeeded {
+                                        // Consume only on success;
+                                        // failure leaves the
+                                        // snapshot for the end-of-
+                                        // coord drain below to
+                                        // retry (N7-1).
+                                        let _ = early_snapshot.take();
+                                    } else {
+                                        // N8-2 (#72): record the
+                                        // tag this arm INTENDED so
+                                        // the drain's retry lands at
+                                        // the correct operator-
+                                        // readable path rather than
+                                        // the drain's default
+                                        // NEVER_FIRED tag (which
+                                        // would misrepresent this
+                                        // case — late DID fire as
+                                        // Degraded).
+                                        early_retain_tag = Some(
+                                            crate::monitor::dump::SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+                                        );
+                                    }
+                                }
+                                freeze_state = FreezeState::Done;
+                                tracing::info!(
+                                    "freeze-coord: kill triggered after \
+                                     degraded dump capture"
+                                );
+                                freeze_coord_kill
+                                    .store(true, Ordering::Release);
+                                // The Result is intentionally dropped —
+                                // same rationale as the Captured
+                                // arm's `freeze_coord_kill_evt.write`
+                                // kick above (EAGAIN at counter
+                                // saturation = already-signaled;
+                                // EBADF = coord exiting). Both
+                                // shapes mean "kill is already
+                                // observed or about to be"; no
+                                // recovery is meaningful.
+                                let _ = freeze_coord_kill_evt.write(1);
+                            }
+                            LateCaptureOutcome::Suppressed => {
+                                // Gate cross-reference decided no dump
+                                // is warranted: the live
+                                // `*scx_root->exit_kind` read is below
+                                // SCX_EXIT_ERROR (clean shutdown), and
+                                // any BPF `.bss` Triggered observation
+                                // was either absent (probe never
+                                // latched an error-class exit) or
+                                // suppressed via the
+                                // `bss_oob_warn_logged` exception
+                                // (probe's PA stale post-rebind, so
+                                // the cross-reference declined the
+                                // override on potentially-recycled
+                                // vmalloc bytes — see the `bss_state =
+                                // bss_read_state(...)` block inside
+                                // `freeze_and_capture` above for the
+                                // gate decision). Either way the
+                                // scheduler shut down cleanly; no late
+                                // failure dump is warranted. Reset the
+                                // watchpoint hit so the per-iteration
+                                // latch read at the top of the loop
+                                // does not re-fire on this stale edge;
+                                // mark Done so the run terminates
+                                // promptly.
+                                //
+                                // In dual_snapshot mode, an early-
+                                // trigger capture may already be in
+                                // hand (runnable_at exceeded half-
+                                // threshold during the stall, the
+                                // early-trigger
+                                // `freeze_and_capture(false)` returned
+                                // Captured — see the
+                                // `LateCaptureOutcome::Captured` arm
+                                // of the early-snapshot dispatch
+                                // above). The late gate-Suppressed
+                                // decision does NOT invalidate the
+                                // early observation — they're
+                                // independent events: the early was a
+                                // runnable-age spike, the late is the
+                                // watchpoint fire interpreted as a
+                                // clean exit. Dropping the early
+                                // snapshot here would be a silent
+                                // drop of captured data.
+                                //
+                                // Emit to a tagged sibling path rather
+                                // than the main dump path. Symmetric
+                                // with the Degraded-arm early-pre-
+                                // late-degraded emit above: the main
+                                // `{stem}.failure-dump.json` is
+                                // reserved for "the scheduler had a
+                                // failure-class late exit; here's the
+                                // dump" semantics — a Suppressed late
+                                // means no failure-class late exit
+                                // happened, so the main path stays
+                                // empty. The tagged sibling carries
+                                // the early observation under
+                                // [`crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED`]
+                                // so an operator browsing the dump
+                                // directory immediately sees the case
+                                // from the file name.
+                                // base_path check FIRST + `.take()`
+                                // only after successful write — see
+                                // the Degraded arm above for the
+                                // full silent-drop rationale (same
+                                // pattern applies here).
+                                if freeze_coord_dual_snapshot
+                                    && let Some(ref base_path) =
+                                        freeze_coord_dump_path
+                                    && let Some(early) =
+                                        early_snapshot.as_ref()
+                                {
+                                    let tagged = snapshot_tagged_path(
+                                        base_path,
+                                        crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+                                    );
+                                    if let Some(parent) = tagged.parent() {
+                                        // Best-effort mkdir:
+                                        // structurally identical to
+                                        // the same call in the
+                                        // Degraded arm above and the
+                                        // end-of-coord drain below.
+                                        // Failure here re-surfaces
+                                        // with a useful path-bearing
+                                        // error from std::fs::write
+                                        // below.
+                                        let _ =
+                                            std::fs::create_dir_all(parent);
+                                    }
+                                    let write_succeeded = match serde_json::to_string(early) {
+                                        Ok(json) => match std::fs::write(&tagged, &json) {
+                                            Ok(()) => {
+                                                tracing::info!(
+                                                    path = %tagged.display(),
+                                                    "freeze-coord: early snapshot preserved (late suppressed, clean exit)"
+                                                );
+                                                true
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    path = %tagged.display(),
+                                                    error = %e,
+                                                    "freeze-coord: early-only (late suppressed) write failed (early retained for end-of-coord drain retry)"
+                                                );
+                                                false
+                                            }
+                                        },
+                                        Err(e) => {
+                                            tracing::error!(
+                                                error = %e,
+                                                "freeze-coord: early-only (late suppressed) JSON serialization failed (early retained for end-of-coord drain retry)"
+                                            );
+                                            false
+                                        }
+                                    };
+                                    if write_succeeded {
+                                        let _ = early_snapshot.take();
+                                    } else {
+                                        // N8-2 (#72): see Degraded arm
+                                        // above for the retain-tag
+                                        // rationale.
+                                        early_retain_tag = Some(
+                                            crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+                                        );
+                                    }
+                                }
                                 freeze_coord_watchpoint
                                     .hit
                                     .store(false, Ordering::Release);
-                                freeze_state = FreezeState::Done;
-                            }
-                            None => {
-                                // bss-triggered with rendezvous
-                                // timeout (or a bss flip that
-                                // happened DURING the rendezvous —
-                                // the post-rendezvous re-read above
-                                // catches that case and routes here
-                                // instead of the watchpoint-only
-                                // arm). The bss latch is sticky on
-                                // the kernel side; retrying would
-                                // just hit the same timeout. Mark
-                                // Done and let the run end normally.
                                 freeze_state = FreezeState::Done;
                             }
                         }
@@ -5990,6 +7097,161 @@ impl KtstrVm {
                          address WAS written to, just past the host-side \
                          capture window."
                     );
+                }
+                // Drain any held early_snapshot at coord exit. The
+                // late-trigger arms (the three `LateCaptureOutcome`
+                // match arms inside the `if err_triggered &&
+                // (freeze_state == Idle || freeze_state ==
+                // TookEarly)` block above) each take() the early when
+                // they fire — but if the late trigger NEVER fires (no
+                // err_exit_detected for the full run), the early
+                // stays in this closure's local and drops silently
+                // when the coord exits. A Captured early IS a real
+                // failure-dump observation worth surfacing.
+                //
+                // Symmetric with the `LateCaptureOutcome::Suppressed`
+                // late-trigger arm above in WRITE PATTERN ONLY (same
+                // snapshot_tagged_path + std::fs::write boilerplate,
+                // same operator-discoverable tagged sibling
+                // discipline). SIGNAL DIFFERS:
+                //   - late-Suppressed: late trigger DID fire, the
+                //     gate examined `*scx_root->exit_kind` and
+                //     decided clean (kind < SCX_EXIT_ERROR). Tag:
+                //     `SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED`.
+                //   - drain (this site): late trigger NEVER fired
+                //     for the run. freeze_state stayed at Idle or
+                //     TookEarly. Tag:
+                //     `SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED`.
+                // Different tags so an operator browsing the dump
+                // dir distinguishes "scheduler recovered AND
+                // reached clean late exit" from "scheduler recovered
+                // AND was terminated/killed before reaching the
+                // late stage."
+                // V6-F1 (advphd_qemu): base_path check FIRST — same
+                // silent-drop rationale as the Degraded + Suppressed
+                // arms above.
+                if freeze_coord_dual_snapshot
+                    && let Some(ref base_path) = freeze_coord_dump_path
+                    && let Some(early) = early_snapshot.take()
+                {
+                    // N7-1 (#70) note: this drain is the TERMINAL
+                    // attempt — coord exit follows immediately, no
+                    // retry path remains. The Degraded + Suppressed
+                    // arms above retain early on write-failure so
+                    // this drain can retry; if THIS write fails the
+                    // early snapshot is lost. On failure we emit a
+                    // structured summary line + the JSON head to
+                    // stderr in addition to the tracing::warn! so
+                    // test harnesses capture the payload via the
+                    // stderr stream — stderr is a separate channel
+                    // from the filesystem and typically survives
+                    // the kinds of failures (ENOSPC, EROFS, EACCES)
+                    // that fail file writes.
+                    //
+                    // N8-2 (#72): if a prior arm (Degraded /
+                    // Suppressed) failed its write and retained
+                    // early via `early_retain_tag`, use that arm's
+                    // intended tag rather than NEVER_FIRED. Without
+                    // this, the recovered file would land at
+                    // `early-only-late-never-fired` but the late
+                    // DID fire (and emitted via the main path) —
+                    // the wrong tag would mislead an operator into
+                    // believing late never ran.
+                    //
+                    // N8-1 (#71): the stderr fallback prefixes a
+                    // structured summary line (schema, vcpu count
+                    // and which were None, map count) BEFORE the
+                    // JSON head so that vcpu_regs — the most
+                    // operator-critical field for stall diagnosis,
+                    // which serde places AFTER `maps` in the
+                    // serialized layout and can be truncated by
+                    // the head-cap — are surfaced regardless of
+                    // payload size.
+                    let drain_tag = early_retain_tag.unwrap_or(
+                        crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+                    );
+                    let tagged = snapshot_tagged_path(base_path, drain_tag);
+                    if let Some(parent) = tagged.parent() {
+                        // Best-effort mkdir: if the directory
+                        // already exists (normal case) this is a
+                        // no-op. If it fails, the std::fs::write
+                        // below will surface a more useful error.
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match serde_json::to_string(&early) {
+                        Ok(json) => {
+                            if let Err(e) = std::fs::write(&tagged, &json) {
+                                tracing::warn!(
+                                    path = %tagged.display(),
+                                    error = %e,
+                                    "freeze-coord: early-only (coord exit drain) write failed; emitting structured summary + payload head to stderr as last-ditch preservation"
+                                );
+                                // N8-1 (#71): structured summary
+                                // line — schema discriminant, vcpu
+                                // count + which are None, map
+                                // count. Always emitted regardless
+                                // of payload size so the most
+                                // operator-critical signals (which
+                                // vCPUs stalled, did the schema
+                                // round-trip) reach stderr even
+                                // when the JSON head truncation
+                                // drops vcpu_regs.
+                                let vcpu_none_indices = vcpu_none_indices(&early.vcpu_regs);
+                                eprintln!(
+                                    "freeze-coord: STDERR-PRESERVED summary: schema={} vcpu_regs_count={} vcpu_none_indices={:?} maps_count={} tasks_enriched={} json_bytes={}",
+                                    early.schema,
+                                    early.vcpu_regs.len(),
+                                    vcpu_none_indices,
+                                    early.maps.len(),
+                                    early.task_enrichments.len(),
+                                    json.len(),
+                                );
+                                // Truncate at 16 KiB to avoid
+                                // flooding the operator's terminal
+                                // with a multi-MB structured dump.
+                                // The summary above preserves the
+                                // critical signals even if the
+                                // head doesn't reach vcpu_regs.
+                                // ADV V8-1 (cloud_hypervisor) + N9-1
+                                // (#75): UTF-8-safe slicing delegated
+                                // to `utf8_safe_truncate_len` (see
+                                // module helper above) — the same
+                                // function used by the emit_json /
+                                // emit_degraded_json stderr fallbacks
+                                // earlier in run_vm. Single source of
+                                // truth for the algorithm + cap value.
+                                const DRAIN_STDERR_DUMP_CAP: usize = 16 * 1024;
+                                let head_end = utf8_safe_truncate_len(
+                                    &json,
+                                    DRAIN_STDERR_DUMP_CAP,
+                                );
+                                let truncated_marker = if head_end < json.len() {
+                                    format!(
+                                        " (truncated to {} bytes at UTF-8 boundary; full {} bytes lost — summary above)",
+                                        head_end,
+                                        json.len()
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                eprintln!(
+                                    "freeze-coord: STDERR-PRESERVED payload head{}: {}",
+                                    truncated_marker,
+                                    &json[..head_end]
+                                );
+                            } else {
+                                tracing::info!(
+                                    path = %tagged.display(),
+                                    retain_tag_used = early_retain_tag.is_some(),
+                                    "freeze-coord: early snapshot preserved at coord exit"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "freeze-coord: early-only (coord exit drain) JSON serialization failed"
+                        ),
+                    }
                 }
                 // Flush any partial-frame bytes the bulk_assembler
                 // is still buffering back into the device's
@@ -6406,10 +7668,11 @@ impl KtstrVm {
                 // Hand the BSP's `bsp_alive` flag to the panic hook so a
                 // panic-unwind path flips it to `false` BEFORE the
                 // stack drop unmaps `bsp`'s `kvm_run` page. The
-                // normal-exit path's post-join store at line 5344
-                // covers `panic = "abort"` and the no-panic path; the
-                // panic hook covers `panic = "unwind"` (test profile)
-                // where the post-join store is unreachable. Mirrors
+                // normal-exit path's post-join `bsp_alive.store(false)`
+                // (see the `collect_results` finalization block) covers
+                // `panic = "abort"` and the no-panic path; the panic
+                // hook covers `panic = "unwind"` (test profile) where
+                // the post-join store is unreachable. Mirrors
                 // the AP-side `alive: Some(alive.clone())` plumbing in
                 // spawn_ap_threads — every cross-thread holder of a
                 // BSP `ImmediateExitHandle` (the freeze coordinator,
@@ -8703,3 +9966,256 @@ mod rendezvous_tests;
 mod snapshot_tlv_tests;
 #[cfg(test)]
 mod tx_dispatch_tests;
+
+#[cfg(test)]
+mod utf8_safe_truncate_len_tests {
+    //! Unit coverage for [`utf8_safe_truncate_len`] — the stderr
+    //! last-ditch preservation helper used by the failure-dump
+    //! emit_json / emit_degraded_json closures and the end-of-coord
+    //! drain. The function exists to prevent a panic when naive
+    //! byte-slicing `&json[..cap]` would land inside a multi-byte
+    //! UTF-8 sequence (U+FFFD from task `comm` lossy decode, kernel
+    //! symbol Unicode, operator-supplied tags). This helper is what
+    //! KEEPS the stderr-fallback path from converting a silent drop
+    //! into a panic that skips coord cleanup. Coverage here pins the
+    //! correctness of every UTF-8 boundary scenario the production
+    //! callers can encounter.
+    use super::utf8_safe_truncate_len;
+
+    /// Empty input always returns 0 — `&""[..0]` is a valid empty
+    /// slice. No walk needed.
+    #[test]
+    fn empty_input_returns_zero() {
+        assert_eq!(utf8_safe_truncate_len("", 0), 0);
+        assert_eq!(utf8_safe_truncate_len("", 16), 0);
+        assert_eq!(utf8_safe_truncate_len("", usize::MAX), 0);
+    }
+
+    /// Cap zero always returns 0 — degenerate "no payload" case.
+    /// The drain's stderr-truncation path with cap=0 would emit an
+    /// empty head, which is acceptable (the structured summary
+    /// line preserves the operator-critical signals).
+    #[test]
+    fn cap_zero_returns_zero() {
+        assert_eq!(utf8_safe_truncate_len("hello", 0), 0);
+        assert_eq!(utf8_safe_truncate_len("\u{FFFD}", 0), 0);
+    }
+
+    /// Cap >= str length returns str length (entire string is a
+    /// valid prefix). No truncation needed; caller emits everything.
+    #[test]
+    fn cap_at_or_above_len_returns_full_len() {
+        assert_eq!(utf8_safe_truncate_len("hi", 2), 2);
+        assert_eq!(utf8_safe_truncate_len("hi", 5), 2);
+        assert_eq!(utf8_safe_truncate_len("hi", usize::MAX), 2);
+    }
+
+    /// Pure-ASCII input: cap inside the string returns cap exactly
+    /// (every byte index is a char boundary in ASCII).
+    #[test]
+    fn ascii_cap_within_len_returns_cap_exactly() {
+        let s = "abcdefghij"; // 10 bytes
+        assert_eq!(utf8_safe_truncate_len(s, 0), 0);
+        assert_eq!(utf8_safe_truncate_len(s, 1), 1);
+        assert_eq!(utf8_safe_truncate_len(s, 5), 5);
+        assert_eq!(utf8_safe_truncate_len(s, 9), 9);
+        assert_eq!(utf8_safe_truncate_len(s, 10), 10);
+    }
+
+    /// REPLACEMENT CHARACTER U+FFFD is 3 bytes in UTF-8
+    /// (`EF BF BD`). This is the exact byte sequence
+    /// `String::from_utf8_lossy` (used by task `comm` decode at
+    /// `task_enrichment.rs::read_comm`) substitutes for invalid
+    /// input — the most realistic vector for the original panic.
+    /// Cap inside the 3-byte sequence must walk back to the
+    /// boundary BEFORE the sequence.
+    #[test]
+    fn walks_back_past_replacement_char() {
+        // "a" (1 byte) + U+FFFD (3 bytes) + "b" (1 byte) = 5 bytes
+        let s = "a\u{FFFD}b";
+        assert_eq!(s.len(), 5);
+        assert_eq!(utf8_safe_truncate_len(s, 0), 0);
+        // Cap 1 lands at "a" boundary — valid.
+        assert_eq!(utf8_safe_truncate_len(s, 1), 1);
+        // Cap 2 lands INSIDE U+FFFD (byte 1 of 3) — walks back to 1.
+        assert_eq!(utf8_safe_truncate_len(s, 2), 1);
+        // Cap 3 lands INSIDE U+FFFD (byte 2 of 3) — walks back to 1.
+        assert_eq!(utf8_safe_truncate_len(s, 3), 1);
+        // Cap 4 lands at the boundary AFTER U+FFFD — valid.
+        assert_eq!(utf8_safe_truncate_len(s, 4), 4);
+        // Cap 5 lands at end — valid.
+        assert_eq!(utf8_safe_truncate_len(s, 5), 5);
+    }
+
+    /// 4-byte UTF-8 sequence (the maximum per RFC 3629). The walk
+    /// must retreat at most 3 bytes to find a valid boundary —
+    /// pins the worst-case retreat distance the doc claims.
+    #[test]
+    fn walks_back_past_4byte_sequence() {
+        // U+1F600 GRINNING FACE = "\u{1F600}" = 0xF0 0x9F 0x98 0x80
+        // = 4 bytes. Surround with ASCII to test boundary walks.
+        let s = "x\u{1F600}y";
+        assert_eq!(s.len(), 6);
+        // Cap 1 at "x" boundary.
+        assert_eq!(utf8_safe_truncate_len(s, 1), 1);
+        // Caps 2/3/4 inside the 4-byte sequence — all walk back to 1.
+        assert_eq!(utf8_safe_truncate_len(s, 2), 1);
+        assert_eq!(utf8_safe_truncate_len(s, 3), 1);
+        assert_eq!(utf8_safe_truncate_len(s, 4), 1);
+        // Cap 5 at the boundary after the 4-byte sequence — valid.
+        assert_eq!(utf8_safe_truncate_len(s, 5), 5);
+        // Cap 6 at end — valid.
+        assert_eq!(utf8_safe_truncate_len(s, 6), 6);
+    }
+
+    /// Slicing the returned head must not panic for any input /
+    /// cap combination. Property-style coverage of the central
+    /// safety guarantee: caller does `&s[..returned]` after the
+    /// helper; this must never trigger Rust's char-boundary panic.
+    /// Iterates a small set of inputs and caps, asserts no panic.
+    #[test]
+    fn slice_with_returned_len_never_panics() {
+        let inputs = [
+            "",
+            "a",
+            "\u{FFFD}",
+            "a\u{FFFD}b",
+            "\u{FFFD}\u{FFFD}\u{FFFD}",
+            "x\u{1F600}y",
+            "Hello, 世界! \u{1F600}",
+        ];
+        for s in inputs {
+            for cap in [0, 1, 2, 3, 4, 5, 10, 100, usize::MAX] {
+                let head_end = utf8_safe_truncate_len(s, cap);
+                // The actual safety guarantee: this slice must not
+                // panic. We assign to `_` to make the side effect
+                // explicit; the slice operation itself is the
+                // assertion.
+                let _ = &s[..head_end];
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod vcpu_none_indices_tests {
+    //! Unit coverage for [`vcpu_none_indices`] — surfaces WHICH vCPUs
+    //! failed to park during freeze rendezvous (or whose KVM_GET_REGS
+    //! errored mid-shutdown) in every structured-summary stderr
+    //! preservation line. An operator needs the index list, not just
+    //! the count, to triage a hung VM — knowing "vCPUs [1, 3] are
+    //! stalled" tells the operator which vCPU threads to inspect in
+    //! the kernel log or `perf top -p`; "2 vCPUs missing" does not.
+    use super::vcpu_none_indices;
+    use crate::monitor::dump::VcpuRegSnapshot;
+
+    // Build a synthetic snapshot for the Some arm. The field values
+    // don't matter for this test — only the Some/None distinction
+    // drives the helper's filter_map. Constructed in-crate so
+    // `#[non_exhaustive]` doesn't block; tcr_el1/user_page_table_root
+    // default to None (arch-conditional fields).
+    fn snap() -> VcpuRegSnapshot {
+        VcpuRegSnapshot {
+            instruction_pointer: 0,
+            stack_pointer: 0,
+            page_table_root: 0,
+            user_page_table_root: None,
+            tcr_el1: None,
+        }
+    }
+
+    /// Empty input — degenerate case (would happen if the monitor
+    /// crashed before the per-vCPU snapshot vec was allocated).
+    /// Returns empty Vec; caller renders `vcpu_none_indices=[]` —
+    /// correct, there are no vCPUs to call "none".
+    #[test]
+    fn empty_vec_returns_empty() {
+        let regs: Vec<Option<VcpuRegSnapshot>> = vec![];
+        assert_eq!(vcpu_none_indices(&regs), Vec::<usize>::new());
+    }
+
+    /// All vCPUs parked + register-captured successfully — happy
+    /// path. Returns empty Vec; operator sees `vcpu_none_indices=[]`
+    /// signaling zero stalled vCPUs.
+    #[test]
+    fn all_some_returns_empty() {
+        let regs = vec![Some(snap()), Some(snap()), Some(snap())];
+        assert_eq!(vcpu_none_indices(&regs), Vec::<usize>::new());
+    }
+
+    /// All vCPUs failed (e.g. all `KVM_GET_REGS` errored or rendezvous
+    /// timed out before any vCPU parked) — returns every index. The
+    /// worst-case stall scenario; operator triages by re-running with
+    /// an extended freeze timeout or reading kernel logs for the
+    /// affected vCPU threads.
+    #[test]
+    fn all_none_returns_all_indices() {
+        let regs: Vec<Option<VcpuRegSnapshot>> = vec![None, None, None];
+        assert_eq!(vcpu_none_indices(&regs), vec![0, 1, 2]);
+    }
+
+    /// Mixed Some/None — the realistic partial-stall case. Pins the
+    /// asymmetry: indices 1 and 3 stalled, 0 and 2 succeeded. A bug
+    /// that swapped the filter polarity (`r.is_some()` instead of
+    /// `r.is_none()`) would return [0, 2] here and would vacuously
+    /// pass the `all_some` / `all_none` cases — this is the case
+    /// that catches a polarity flip.
+    #[test]
+    fn mixed_returns_only_none_indices() {
+        let regs = vec![Some(snap()), None, Some(snap()), None];
+        assert_eq!(vcpu_none_indices(&regs), vec![1, 3]);
+    }
+}
+
+#[cfg(test)]
+mod format_path_part_tests {
+    //! Unit coverage for [`format_path_part`] — the trace-summary
+    //! disambiguator at the tail of the emit_json + emit_degraded_json
+    //! closures. Three operator-visible states must render distinctly
+    //! so a reader of the tracing::info!/warn! line alone (without
+    //! scrolling to the preceding atomic-write-failed tracing::warn!)
+    //! can correctly attribute the outcome. Misattribution of an FS
+    //! error to "operator forgot to configure a sink" is the
+    //! operator-misread class this helper prevents.
+    use super::format_path_part;
+
+    /// Successful write to a configured sink — renders ` -> {p}` so
+    /// the operator sees the on-disk dump path inline with the
+    /// summary.
+    #[test]
+    fn success_renders_path_arrow() {
+        assert_eq!(format_path_part(Some("/tmp/dump.json"), false), " -> /tmp/dump.json");
+    }
+
+    /// Sink configured but atomic write failed (ENOSPC / EROFS /
+    /// EACCES) — renders the "see preceding warn" hint so the
+    /// operator knows to scroll up for the underlying io::Error.
+    #[test]
+    fn write_failed_no_path_directs_to_warn() {
+        assert_eq!(
+            format_path_part(None, true),
+            " (atomic write failed; see preceding warn)"
+        );
+    }
+
+    /// Operator never wired `failure_dump_path` (verifier / shell /
+    /// template default = None) — renders the quiet expected-behavior
+    /// case. No capture was requested, no error to report.
+    #[test]
+    fn no_sink_renders_no_file_sink() {
+        assert_eq!(format_path_part(None, false), " (no file sink)");
+    }
+
+    /// Defensive case — sink configured + write_failed flag set.
+    /// UNREACHABLE by construction: the and_then Err arm in both
+    /// emit closures sets `write_failed = true` AND returns None,
+    /// while the Ok arm returns Some and never sets write_failed.
+    /// If a future refactor breaks that invariant, the `_` wildcard
+    /// renders the success arrow rather than misclassifying — the
+    /// path string is more useful than a write-failure marker when
+    /// both are present.
+    #[test]
+    fn defensive_path_with_write_failed_renders_arrow() {
+        assert_eq!(format_path_part(Some("/x"), true), " -> /x");
+    }
+}

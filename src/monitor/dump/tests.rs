@@ -815,12 +815,13 @@ fn dual_report_display_absent_names_both_causes() {
 
 /// `FailureDumpReportAny::from_json` picks the `Single` variant
 /// for JSON whose `schema` field is `"single"`, the `Dual`
-/// variant for `"dual"`, and the `Single` variant for an absent
-/// `schema` field (back-compat with pre-discriminant dumps).
-/// Unknown schemas return `None` rather than silently falling
-/// back to single — mismatching a future richer wrapper as a
-/// lossy single shape would be the wrong behaviour. Malformed
-/// JSON also returns `None`.
+/// variant for `"dual"`, and the `Degraded` variant for
+/// `"degraded"`. An absent `schema` field returns `None` (the
+/// discriminant is required — silently routing absent-schema to
+/// Single would mis-render a degraded or future-variant dump as
+/// a lossy single shape and hide the WHY-degraded surface from
+/// the operator). Unknown schemas return `None`. Malformed JSON
+/// also returns `None`.
 #[test]
 fn report_any_dispatch_branches() {
     // Single branch: schema="single".
@@ -852,15 +853,31 @@ fn report_any_dispatch_branches() {
         ),
     }
 
-    // Absent-schema branch: pre-discriminant dump.
-    let absent = r#"{"maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
-    match FailureDumpReportAny::from_json(absent) {
-        Some(FailureDumpReportAny::Single(_)) => {}
+    // Degraded branch: schema="degraded".
+    let degraded = super::DegradedFailureDumpReport {
+        schema: super::SCHEMA_DEGRADED.to_string(),
+        reason: super::REASON_DEGRADED_RENDEZVOUS_TIMEOUT.to_string(),
+        vcpu_regs: Vec::new(),
+        watchpoint_hit: false,
+        bss_latch_state: "not_resolved".to_string(),
+        exit_kind: None,
+        elapsed_ms: 0,
+    };
+    let degraded_json = serde_json::to_string(&degraded).expect("serialize degraded");
+    match FailureDumpReportAny::from_json(&degraded_json) {
+        Some(FailureDumpReportAny::Degraded(_)) => {}
         other => panic!(
-            "absent schema must default to Single, got {other:?}",
+            "schema=degraded must map to Degraded, got {other:?}",
             other = other.is_some()
         ),
     }
+
+    // Absent-schema branch: required discriminant, must return None.
+    let absent = r#"{"maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
+    assert!(
+        FailureDumpReportAny::from_json(absent).is_none(),
+        "absent schema must return None (discriminant is required)"
+    );
 
     // Unknown schema → None, not a silent single fallback.
     let unknown = r#"{"schema":"triple","maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
@@ -874,6 +891,63 @@ fn report_any_dispatch_branches() {
         FailureDumpReportAny::from_json("not json").is_none(),
         "garbage input must return None"
     );
+}
+
+/// Round-trip pin for [`DegradedFailureDumpReport`]: serialize a
+/// synthetic instance with every field populated, parse it back via
+/// the schema-dispatcher, and assert field-by-field equality. Pins
+/// the wire-format stability of the degraded variant — adding a new
+/// field requires an explicit test update so an accidental field
+/// rename or serde-attribute mistake can't silently drift the
+/// schema.
+#[test]
+fn degraded_report_roundtrip_field_equality() {
+    use crate::vmm::exit_dispatch::VcpuRegSnapshot;
+    let original = super::DegradedFailureDumpReport {
+        schema: super::SCHEMA_DEGRADED.to_string(),
+        reason: format!(
+            "{}: 30000ms; 1/4 vCPUs parked",
+            super::REASON_DEGRADED_RENDEZVOUS_TIMEOUT
+        ),
+        vcpu_regs: vec![
+            Some(VcpuRegSnapshot {
+                instruction_pointer: 0xffff_ffff_8100_1000,
+                stack_pointer: 0xffff_8880_0010_0000,
+                page_table_root: 0x0000_0000_4000_0000,
+                user_page_table_root: None,
+                tcr_el1: None,
+            }),
+            None,
+            None,
+            None,
+        ],
+        watchpoint_hit: true,
+        bss_latch_state: "triggered".to_string(),
+        exit_kind: Some(1024),
+        elapsed_ms: 30_120,
+    };
+    let json = serde_json::to_string(&original).expect("serialize degraded");
+    let parsed = match FailureDumpReportAny::from_json(&json) {
+        Some(FailureDumpReportAny::Degraded(d)) => d,
+        other => panic!(
+            "degraded roundtrip must map to Degraded, got {other:?}",
+            other = other.is_some()
+        ),
+    };
+    assert_eq!(parsed.schema, super::SCHEMA_DEGRADED);
+    assert_eq!(parsed.reason, original.reason);
+    assert_eq!(parsed.vcpu_regs.len(), 4);
+    assert_eq!(
+        parsed.vcpu_regs[0].as_ref().map(|r| r.instruction_pointer),
+        Some(0xffff_ffff_8100_1000)
+    );
+    assert!(parsed.vcpu_regs[1].is_none());
+    assert!(parsed.vcpu_regs[2].is_none());
+    assert!(parsed.vcpu_regs[3].is_none());
+    assert!(parsed.watchpoint_hit);
+    assert_eq!(parsed.bss_latch_state, "triggered");
+    assert_eq!(parsed.exit_kind, Some(1024));
+    assert_eq!(parsed.elapsed_ms, 30_120);
 }
 
 /// `prog_runtime_stats` populates and round-trips through
@@ -921,11 +995,12 @@ fn report_any_preserves_prog_runtime_stats() {
     }
 }
 
-/// Display roundtrip: a Single-wrapped report renders the same
-/// as the underlying `FailureDumpReport`'s own Display, and a
-/// Dual-wrapped report renders the same as
-/// `DualFailureDumpReport`'s Display. The wrapper's Display is
-/// transparent.
+/// Display roundtrip: each `FailureDumpReportAny` variant
+/// renders the same as its underlying type's own `Display`. The
+/// wrapper's `Display` is transparent across all three schemas
+/// (`Single`, `Dual`, `Degraded`) — confirms the dispatch arm
+/// added for `Degraded` matches the same delegate-to-inner-type
+/// shape as the prior two variants.
 #[test]
 fn report_any_display_matches_underlying() {
     let single = FailureDumpReport::default();
@@ -944,6 +1019,81 @@ fn report_any_display_matches_underlying() {
     let dual_direct = format!("{dual}");
     let dual_via_any = format!("{}", FailureDumpReportAny::Dual(Box::new(dual)));
     assert_eq!(dual_direct, dual_via_any);
+
+    let degraded = DegradedFailureDumpReport {
+        schema: SCHEMA_DEGRADED.to_string(),
+        reason: format!("{REASON_DEGRADED_RENDEZVOUS_TIMEOUT} elapsed=30000ms parked=1/4"),
+        vcpu_regs: vec![None, None],
+        watchpoint_hit: false,
+        bss_latch_state: "not_triggered".to_string(),
+        exit_kind: None,
+        elapsed_ms: 30_000,
+    };
+    let degraded_direct = format!("{degraded}");
+    let degraded_via_any = format!("{}", FailureDumpReportAny::Degraded(Box::new(degraded)));
+    assert_eq!(degraded_direct, degraded_via_any);
+}
+
+/// Wire-format pin: the snapshot-tag string constants used by the
+/// freeze coordinator's dual-snapshot fallback emit paths must
+/// remain stable across releases.
+/// An operator browsing a dump directory after a regression run
+/// finds files named `{stem}.snapshot.{tag}.json` and infers what
+/// happened from the tag alone — silently renaming a tag breaks
+/// that operator-facing convention. This test pins the literal
+/// strings so a rename without intent is caught immediately rather
+/// than silently changing the on-disk file naming convention.
+#[test]
+fn snapshot_tag_constants_pinned() {
+    assert_eq!(SNAPSHOT_TAG_EARLY_DEGRADED, "early-degraded");
+    assert_eq!(
+        SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+        "early-pre-late-degraded"
+    );
+    assert_eq!(
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+        "early-only-late-suppressed"
+    );
+    assert_eq!(
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+        "early-only-late-never-fired"
+    );
+}
+
+
+/// Wire-format pin: FailureDumpReport defaults to `SCHEMA_SINGLE`
+/// so the freeze coordinator's early-only emit path (which
+/// serialises a Captured early as the standalone single-dump when
+/// the late trigger Suppresses or never fires) produces JSON the
+/// consumer-side dispatcher at `FailureDumpReportAny::from_json`
+/// routes to `Self::Single` rather than returning None for missing
+/// schema.
+///
+/// Without this test a future refactor that changed the default
+/// (e.g. defaulting to SCHEMA_DUAL or empty string) would silently
+/// break the early-only emit path: the JSON would still serialize
+/// but the consumer's discriminant-required dispatcher (added in
+/// the same batch as SCHEMA_DEGRADED) would return None, and the
+/// failure-dump file would appear unparseable to downstream tooling
+/// even though the bytes are valid serde JSON of a valid
+/// `FailureDumpReport`. The early-only emit path is fragile to
+/// this drift because it doesn't override the schema field
+/// explicitly — it reuses whatever the early capture wrote.
+#[test]
+fn early_snapshot_serializes_as_schema_single() {
+    let early = FailureDumpReport::default();
+    let json = serde_json::to_string(&early).expect("serialize");
+    let parsed = FailureDumpReportAny::from_json(&json)
+        .expect("parse: schema discriminant present and routes to Single");
+    match parsed {
+        FailureDumpReportAny::Single(_) => {}
+        FailureDumpReportAny::Dual(_) => {
+            panic!("FailureDumpReport default serialized as SCHEMA_DUAL")
+        }
+        FailureDumpReportAny::Degraded(_) => {
+            panic!("FailureDumpReport default serialized as SCHEMA_DEGRADED")
+        }
+    }
 }
 
 // -- ProgRuntimeStats coverage in FailureDumpReport --
@@ -3172,7 +3322,9 @@ fn find_sdt_data_field_offset_zero_type_id_short_circuits() {
 /// struct that DOES carry a `struct sdt_data __arena *` member at a
 /// known byte offset must return `Some(offset)`. The pointee is
 /// declared as `BTF_KIND_FWD struct sdt_data` (the lavd-and-similar
-/// shape per render_map.rs:1127-1132). Without this test, every
+/// shape — see the FWD-pointee branch in
+/// `crate::monitor::render_map::find_sdt_data_field_offset` for the
+/// production walk this test guards). Without this test, every
 /// existing test only pins None-paths — an implementation that
 /// always returns None silently passes them all.
 #[test]

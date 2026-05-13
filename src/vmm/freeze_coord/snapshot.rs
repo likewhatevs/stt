@@ -581,6 +581,50 @@ mod snapshot_tagged_path_tests {
         let out = snapshot_tagged_path(base, "tag1");
         assert_eq!(out, PathBuf::from("/tmp/run/coord.snapshot.tag1.json"));
     }
+
+    /// Composition pin: each public SNAPSHOT_TAG_* constant from
+    /// `crate::monitor::dump` composes into a path containing the
+    /// expected tag substring. Catches a regression where a tag
+    /// constant gets silently moved between call-sites (e.g. the
+    /// late-Suppressed arm accidentally using the EARLY_DEGRADED
+    /// constant) — the test verifies the constant flowing through
+    /// `snapshot_tagged_path` produces the expected operator-
+    /// readable filename, not just that the constant value is
+    /// pinned in isolation.
+    #[test]
+    fn snapshot_tagged_path_composition_per_dump_tag_constant() {
+        use crate::monitor::dump::{
+            SNAPSHOT_TAG_EARLY_DEGRADED, SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+            SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED, SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+        };
+        let base = Path::new("/tmp/run/coord.failure-dump.json");
+        let cases = [
+            (
+                SNAPSHOT_TAG_EARLY_DEGRADED,
+                "/tmp/run/coord.snapshot.early-degraded.json",
+            ),
+            (
+                SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
+                "/tmp/run/coord.snapshot.early-pre-late-degraded.json",
+            ),
+            (
+                SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED,
+                "/tmp/run/coord.snapshot.early-only-late-suppressed.json",
+            ),
+            (
+                SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+                "/tmp/run/coord.snapshot.early-only-late-never-fired.json",
+            ),
+        ];
+        for (tag_const, expected_path) in cases {
+            let out = snapshot_tagged_path(base, tag_const);
+            assert_eq!(
+                out,
+                PathBuf::from(expected_path),
+                "snapshot_tagged_path(base, {tag_const:?}) did not match expected"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

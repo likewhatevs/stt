@@ -627,10 +627,14 @@ pub mod prelude {
     // here so an out-of-crate caller can build synthetic
     // FailureDumpReports for unit-testing their assertions
     // against the snapshot accessor without booting a VM.
+    pub use crate::Payload;
     pub use crate::monitor::btf_render::{RenderedMember, RenderedValue};
     pub use crate::monitor::dump::{
-        FailureDumpEntry, FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry,
-        FailureDumpReport, SCHEMA_DUAL, SCHEMA_SINGLE,
+        DegradedFailureDumpReport, DualFailureDumpReport, FailureDumpEntry, FailureDumpMap,
+        FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpReport,
+        FailureDumpReportAny, REASON_DEGRADED_RENDEZVOUS_TIMEOUT, SCHEMA_DEGRADED, SCHEMA_DUAL,
+        SCHEMA_SINGLE, SNAPSHOT_TAG_EARLY_DEGRADED, SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED,
+        SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED, SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED,
     };
     pub use crate::scenario::sample::{
         BpfMapProjector, Sample, SampleSeries, StatsPathProjector, StatsValue,
@@ -647,7 +651,6 @@ pub mod prelude {
         Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, TopologyConstraints,
         extract_metrics,
     };
-    pub use crate::Payload;
     // The following items are intentionally NOT in the prelude. They
     // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins) or
     // macro-generated glue the `#[ktstr_test]` expansion consumes —

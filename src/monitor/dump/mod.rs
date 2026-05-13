@@ -571,8 +571,11 @@ pub use crate::vmm::exit_dispatch::VcpuRegSnapshot;
 /// Schema discriminant value emitted in `FailureDumpReport.schema`.
 ///
 /// Consumers that read a `.failure-dump.json` file use the `schema`
-/// field's value to choose between [`FailureDumpReport`] and
-/// [`DualFailureDumpReport`] before attempting deserialization.
+/// field's value to choose between [`FailureDumpReport`],
+/// [`DualFailureDumpReport`], and [`DegradedFailureDumpReport`]
+/// before attempting deserialization. The
+/// [`FailureDumpReportAny::from_json`] dispatcher handles this
+/// routing for in-process consumers.
 /// Values are stable wire constants — extending the dump pipeline
 /// with a new shape adds a new constant rather than changing this
 /// one.
@@ -581,6 +584,80 @@ pub const SCHEMA_SINGLE: &str = "single";
 /// Schema discriminant value emitted in `DualFailureDumpReport.schema`.
 /// See [`SCHEMA_SINGLE`] for the discriminant contract.
 pub const SCHEMA_DUAL: &str = "dual";
+
+/// Schema discriminant value emitted in `DegradedFailureDumpReport.schema`.
+///
+/// Carried by failure-dumps the freeze coordinator was unable to
+/// capture as a full [`SCHEMA_SINGLE`] / [`SCHEMA_DUAL`] report — the
+/// trigger fired but rendezvous, gate cross-reference, or KVA
+/// translation aborted the dump path. Per the wire-format contract on
+/// [`SCHEMA_SINGLE`], degraded dumps are a stable variant added by
+/// new constant, not a mutation of the existing two.
+pub const SCHEMA_DEGRADED: &str = "degraded";
+
+/// Reason string written into [`DegradedFailureDumpReport::reason`]
+/// when the freeze coordinator's vCPU rendezvous timed out before
+/// every parked acknowledgement arrived. Wire-format-stable: matches
+/// the operator-grep contract used by every other `REASON_*` constant
+/// in this module. The dynamic detail appended at emit time
+/// (`<timeout_ms>` / `<parked>` / `<expected>`) lets an operator see
+/// which vCPUs stalled without a separate field.
+pub const REASON_DEGRADED_RENDEZVOUS_TIMEOUT: &str =
+    "vCPU rendezvous timed out before parked acknowledgement";
+
+/// Snapshot tag used when the early-snapshot trigger fires but
+/// `freeze_and_capture(false)` returns `Degraded` (early-half
+/// rendezvous timeout). The freeze coordinator writes the degraded
+/// JSON to a sibling path named via
+/// [`super::super::vmm::freeze_coord::snapshot_tagged_path`] using
+/// this tag — main `{stem}.failure-dump.json` is preserved for the
+/// subsequent late-trigger emission. Operator-readable wire-format
+/// constant: kebab-case, stable across releases.
+pub const SNAPSHOT_TAG_EARLY_DEGRADED: &str = "early-degraded";
+
+/// Snapshot tag used when dual-snapshot mode held a Captured early
+/// snapshot AND the late-trigger path returned `Degraded`. The early
+/// snapshot is written to a sibling path with this tag while the
+/// late degraded JSON occupies the main dump path. Distinguishes
+/// "early itself degraded" ([`SNAPSHOT_TAG_EARLY_DEGRADED`]) from
+/// "early captured, late degraded" (this tag) so an operator browsing
+/// the dump directory knows which case produced which file. Every
+/// captured snapshot reaches disk.
+pub const SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED: &str = "early-pre-late-degraded";
+
+/// Snapshot tag used when dual-snapshot mode held a Captured early
+/// snapshot AND the late-trigger path ran AND returned `Suppressed`
+/// (the gate examined `*scx_root->exit_kind`, found it below
+/// SCX_EXIT_ERROR, and decided no failure dump warranted). Distinct
+/// from [`SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED`]: this tag
+/// means the late trigger DID fire and the gate explicitly decided
+/// clean exit. Operator triage: scheduler recovered from the early
+/// stall and reached a clean shutdown via the SCX_EXIT_NONE /
+/// SCX_EXIT_DONE path. The early observation (runnable-age spike)
+/// is independently meaningful and reaches disk at the tagged
+/// sibling. Symmetric with
+/// [`SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED`] — tagged sibling rather
+/// than main path so the main `{stem}.failure-dump.json` keeps the
+/// "scheduler had a failure-class exit" semantic. Per
+/// `feedback_no_silent_drops`.
+pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED: &str =
+    "early-only-late-suppressed";
+
+/// Snapshot tag used when dual-snapshot mode held a Captured early
+/// snapshot AND the late-trigger path NEVER FIRED for the run (no
+/// `err_exit_detected` BPF latch flip; the scheduler never reached
+/// an error-class late event). Distinct from
+/// [`SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED`]: this tag means the
+/// late trigger never ran at all, NOT that it ran and decided
+/// clean. Operator triage: scheduler crossed the half-watchdog
+/// runnable-age threshold (early-trigger fired) but then either
+/// recovered or terminated before reaching the late-trigger path —
+/// `freeze_state` stayed at `Idle` or `TookEarly` through coord
+/// exit. The end-of-coord drain emits the early observation to the
+/// tagged sibling rather than letting it drop with the closure.
+/// Per `feedback_no_silent_drops`.
+pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED: &str =
+    "early-only-late-never-fired";
 
 /// Reason string written into [`FailureDumpReport::prog_runtime_stats_unavailable`]
 /// when [`DumpContext::prog_capture`] was supplied but the per-program
@@ -762,25 +839,19 @@ pub struct ProbeBssCounters {
     pub trigger_count: u64,
 }
 
-fn default_schema_single() -> String {
-    SCHEMA_SINGLE.to_string()
-}
-
-fn default_schema_dual() -> String {
-    SCHEMA_DUAL.to_string()
-}
-
 /// Top-level failure-dump report. One per freeze trigger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct FailureDumpReport {
     /// Wire-format discriminant. Always `"single"` for this variant,
     /// pinning [`SCHEMA_SINGLE`]. Consumers branch on this to
-    /// choose between [`FailureDumpReport`] and
-    /// [`DualFailureDumpReport`] before deserializing — the two
-    /// variants share top-level field names that would collide
-    /// without an explicit tag.
-    #[serde(default = "default_schema_single")]
+    /// choose between [`FailureDumpReport`], [`DualFailureDumpReport`],
+    /// and [`DegradedFailureDumpReport`] before deserializing. Single
+    /// and Dual share top-level field names that would collide without
+    /// an explicit tag; Degraded carries a distinct field set
+    /// (`reason`, `watchpoint_hit`, `bss_latch_state`, `exit_kind`,
+    /// `elapsed_ms`) but still gets the tag so
+    /// [`FailureDumpReportAny::from_json`] can dispatch uniformly.
     pub schema: String,
     /// One entry per BPF map enumerated. Order matches the IDR walk
     /// (i.e. allocation order); the report is otherwise unsorted so
@@ -1160,7 +1231,6 @@ pub struct DualFailureDumpReport {
     /// Wire-format discriminant. Always `"dual"` for this variant,
     /// pinning [`SCHEMA_DUAL`]. Mirror of [`FailureDumpReport::schema`]
     /// — consumers branch on it before deserializing.
-    #[serde(default = "default_schema_dual")]
     pub schema: String,
     /// Snapshot at the watchdog half-way point. `None` when the
     /// stall fired before the half-way scanner crossed its threshold.
@@ -1230,23 +1300,100 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
-/// Either-or wrapper that owns a parsed [`FailureDumpReport`] or
-/// [`DualFailureDumpReport`]. Lets a consumer hold and render a
-/// failure-dump file without prematurely committing to one schema —
-/// the discriminant lives in the JSON's `schema` field, not in the
-/// type the consumer holds.
+/// Top-level degraded failure-dump report. Emitted by the freeze
+/// coordinator when a real error-class trigger fires but the dump
+/// path aborts before a full [`FailureDumpReport`] can be captured —
+/// today only the vCPU rendezvous-timeout path produces this shape.
+///
+/// Carries the partial state the coordinator did collect (per-vCPU
+/// registers from any vCPU that parked before timeout) plus the
+/// observable trigger state at the moment of degradation
+/// (watchpoint hit, BPF `.bss` latch status, live `exit_kind` if the
+/// gate read it). An operator inspecting the JSON learns WHY the
+/// dump degraded from the `reason` field and WHICH vCPUs stalled
+/// from the `vcpu_regs` Vec's per-slot `None` / `Some` pattern.
+///
+/// Schema discriminant: [`SCHEMA_DEGRADED`]. Parsed via the same
+/// [`FailureDumpReportAny::from_json`] dispatcher as the other two
+/// variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct DegradedFailureDumpReport {
+    /// Wire-format discriminant. Always `"degraded"` for this
+    /// variant, pinning [`SCHEMA_DEGRADED`]. Mirror of
+    /// [`FailureDumpReport::schema`] / [`DualFailureDumpReport::schema`]
+    /// — consumers branch on it before deserializing.
+    pub schema: String,
+    /// Operator-readable reason the dump degraded. Carries one of
+    /// the `REASON_DEGRADED_*` constants as the canonical prefix,
+    /// followed by dynamic detail filled in at emit time (e.g.
+    /// timeout milliseconds, parked-vCPU counts). Stable wire format
+    /// per the [`SCHEMA_DEGRADED`] discriminant contract: new degraded
+    /// causes add new `REASON_DEGRADED_*` constants rather than
+    /// mutating the existing ones.
+    pub reason: String,
+    /// Per-vCPU register snapshots collected before degradation.
+    /// Index matches vCPU id (BSP at 0, APs at 1..N). `None` entries
+    /// identify the vCPUs that never parked (the operator's
+    /// signal for which vCPUs stalled) — distinct from
+    /// [`FailureDumpReport::vcpu_regs`]'s `None`, which usually
+    /// means `KVM_GET_REGS` failed mid-shutdown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vcpu_regs: Vec<Option<VcpuRegSnapshot>>,
+    /// Hardware-watchpoint hit state at degradation. `true` when
+    /// the freeze-coordinator's `*scx_root->exit_kind` watchpoint
+    /// fired on a vCPU thread; `false` when only the BPF `.bss`
+    /// latch fired (or the trigger source was a deferred-capture
+    /// request).
+    pub watchpoint_hit: bool,
+    /// BPF probe `.bss` latch state at degradation. One of
+    /// `"triggered"` (probe latched err exit), `"not_triggered"`
+    /// (latch readable, value still 0), `"out_of_bounds"` (cached
+    /// `.bss` PA no longer 4-byte-readable — probe map freed
+    /// mid-run), or `"not_resolved"` (cached `.bss` PA was never
+    /// populated). Mirror of [`super::super::vmm::freeze_coord`]'s
+    /// internal `BssReadState` enum, serialised as the snake-case
+    /// of each variant. String-typed for wire-format stability with
+    /// the rest of the `REASON_*` / state-name surface — see
+    /// [`SCHEMA_DEGRADED`] for the contract.
+    pub bss_latch_state: String,
+    /// Live `*scx_root->exit_kind` value at degradation, when the
+    /// gate read it. `None` when the dump path aborted before
+    /// reaching the gate (rendezvous timed out earlier) or when the
+    /// KVA translation failed. `Some(kind)` carries the raw `u32`
+    /// from `enum scx_exit_kind` — operators read it against
+    /// `kernel/sched/ext_internal.h::scx_exit_kind` to identify
+    /// whether the scheduler's intended exit class matched the
+    /// trigger that fired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_kind: Option<u32>,
+    /// Wall-clock milliseconds from the freeze trigger (capture
+    /// start) to the degraded-emit decision. Lets an operator see
+    /// how long the coordinator spent trying to capture before
+    /// giving up. Mirrors the `elapsed_ms` field
+    /// [`FailureDumpReport`] surfaces via the post-dump log line —
+    /// here it's structured so consumers can read it without
+    /// parsing the log.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub elapsed_ms: u64,
+}
+
+/// Either-or wrapper that owns a parsed [`FailureDumpReport`],
+/// [`DualFailureDumpReport`], or [`DegradedFailureDumpReport`]. Lets
+/// a consumer hold and render a failure-dump file without prematurely
+/// committing to one schema — the discriminant lives in the JSON's
+/// `schema` field, not in the type the consumer holds.
 ///
 /// Centralises the schema-tag dispatch logic that previously lived
 /// inline at every read site (the auto-repro tail renderer, the
 /// failure-dump-e2e test, any future consumer that wants to inspect
-/// either shape). Use [`Self::from_json`] to parse an arbitrary
+/// any shape). Use [`Self::from_json`] to parse an arbitrary
 /// failure-dump JSON blob; the Display impl forwards to the
 /// underlying report's existing Display so the rendered output is
 /// indistinguishable from holding the unwrapped report directly.
 ///
-/// `non_exhaustive` so a future third schema (e.g. a `triple`
-/// wrapper that captures snapshots at three points instead of two)
-/// can be added without breaking external pattern matches.
+/// `non_exhaustive` so a future fourth schema can be added without
+/// breaking external pattern matches.
 #[non_exhaustive]
 pub enum FailureDumpReportAny {
     /// Single-snapshot report, schema=`"single"`. Emitted by the
@@ -1262,6 +1409,15 @@ pub enum FailureDumpReportAny {
     /// — `DualFailureDumpReport` carries the early+late snapshots
     /// inline and is roughly 2x the size of [`FailureDumpReport`].
     Dual(Box<DualFailureDumpReport>),
+    /// Degraded report, schema=`"degraded"`. Emitted when an
+    /// error-class trigger fires but the dump path aborts before a
+    /// full single/dual report can be captured — today only the
+    /// vCPU rendezvous-timeout path produces this shape. Carries
+    /// partial vCPU register data + trigger-state diagnostics
+    /// instead of the full map / scx-walker output.
+    ///
+    /// Boxed for size parity with the other variants.
+    Degraded(Box<DegradedFailureDumpReport>),
 }
 
 impl FailureDumpReportAny {
@@ -1269,26 +1425,25 @@ impl FailureDumpReportAny {
     /// `schema` field. Returns `None` on any of:
     ///
     /// - the blob does not parse as JSON
-    /// - the `schema` field carries an unknown value (no silent
-    ///   fallback to single — that would mis-render a richer wrapper
-    ///   as a lossy single shape)
+    /// - the `schema` field is absent (degraded variant requires an
+    ///   explicit discriminant; the previous "absent ⇒ single"
+    ///   fallback would silently mis-route a richer wrapper as a
+    ///   lossy single shape)
+    /// - the `schema` field carries an unknown value
     /// - the typed deserialisation under the chosen schema fails
-    ///
-    /// An absent `schema` field deserialises as
-    /// [`Self::Single`] via the
-    /// `default_schema_single` serde default — this preserves
-    /// backwards compatibility with dumps written before the
-    /// schema-tag landed.
     pub fn from_json(json: &str) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_str(json).ok()?;
-        let schema = value.get("schema").and_then(|v| v.as_str()).unwrap_or("");
+        let schema = value.get("schema").and_then(|v| v.as_str())?;
         match schema {
             SCHEMA_DUAL => serde_json::from_str(json)
                 .ok()
                 .map(|d| Self::Dual(Box::new(d))),
-            SCHEMA_SINGLE | "" => serde_json::from_str(json)
+            SCHEMA_SINGLE => serde_json::from_str(json)
                 .ok()
                 .map(|r| Self::Single(Box::new(r))),
+            SCHEMA_DEGRADED => serde_json::from_str(json)
+                .ok()
+                .map(|d| Self::Degraded(Box::new(d))),
             _ => None,
         }
     }

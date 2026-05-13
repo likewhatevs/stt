@@ -97,8 +97,35 @@ pub(super) struct SnapshotRequest {
 /// * [`TookEarly`](Self::TookEarly) — early snapshot captured
 ///   (dual-snapshot mode only); waiting for the err_exit latch to
 ///   fire.
-/// * [`Done`](Self::Done) — late snapshot captured and emission
-///   complete; coord just idles until kill / bsp_done.
+/// * [`Done`](Self::Done) — no further late-trigger captures
+///   attempted. Reach paths: (1) late Captured → full single or dual
+///   SCHEMA JSON on the main dump path; (2) late Degraded → degraded
+///   SCHEMA JSON on the main dump path (and, if dual-mode held a
+///   Captured early, the early reaches disk at the
+///   `early-pre-late-degraded` tagged sibling per
+///   [`crate::monitor::dump::SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED`]);
+///   (3) late Suppressed → no main-path emit (clean exit, no late
+///   failure to dump), but if dual-mode held a Captured early, that
+///   early reaches disk at the `early-only-late-suppressed` tagged
+///   sibling per
+///   [`crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED`].
+///   Every captured snapshot reaches disk regardless of how the late
+///   path resolves. Coord idles until kill / bsp_done. The shared
+///   terminal semantic is "stop probing the trigger" — what differs
+///   across reach paths is which file(s) the operator finds in the
+///   dump directory.
+///
+///   Reach path (4) does NOT pass through `Done` via a late-trigger
+///   arm at all: the late trigger never fires (no `err_exit_detected`
+///   BPF latch flip for the run), `freeze_state` stays at `Idle` or
+///   `TookEarly`, and the coordinator's normal-exit cleanup at the
+///   `'coord:` loop tail drains a still-held `early_snapshot` to
+///   `early-only-late-never-fired` (per
+///   [`crate::monitor::dump::SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED`]).
+///   This case is distinct from path (3) — both share the "no main
+///   dump, early at tagged sibling" shape, but signal differs: (3)
+///   means the late trigger fired and the gate decided clean; (4)
+///   means the late trigger never reached terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FreezeState {
     Idle,

@@ -16,9 +16,9 @@ use super::super::btf_render::{
     RenderedMember, RenderedValue, is_inline_scalar, is_zero, write_value_at_depth,
 };
 use super::{
-    DualFailureDumpReport, EventCounterSample, FailureDumpEntry, FailureDumpMap,
-    FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpReport, FailureDumpReportAny,
-    render_sparkline_i64,
+    DegradedFailureDumpReport, DualFailureDumpReport, EventCounterSample, FailureDumpEntry,
+    FailureDumpMap, FailureDumpPercpuEntry, FailureDumpPercpuHashEntry, FailureDumpReport,
+    FailureDumpReportAny, render_sparkline_i64,
 };
 
 /// Minimum entry count for [`FailureDumpMap`] table rendering. Two
@@ -302,7 +302,43 @@ impl std::fmt::Display for FailureDumpReportAny {
         match self {
             Self::Single(r) => std::fmt::Display::fmt(r, f),
             Self::Dual(r) => std::fmt::Display::fmt(r.as_ref(), f),
+            Self::Degraded(r) => std::fmt::Display::fmt(r.as_ref(), f),
         }
+    }
+}
+
+impl std::fmt::Display for DegradedFailureDumpReport {
+    /// Renders the degraded report as a short operator-oriented
+    /// banner: schema label, the human reason, the per-vCPU
+    /// `parked` / `not_parked` pattern that identifies which vCPUs
+    /// stalled, the watchpoint + bss latch state, the optional
+    /// live `exit_kind`, and the elapsed-ms budget the coordinator
+    /// spent before giving up. Designed to fit a single terminal
+    /// scroll without paging — the full diagnostic surface lives
+    /// in the structured fields.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("degraded failure dump:\n")?;
+        writeln!(f, "  reason: {}", self.reason)?;
+        if !self.vcpu_regs.is_empty() {
+            let parked = self.vcpu_regs.iter().filter(|s| s.is_some()).count();
+            let total = self.vcpu_regs.len();
+            writeln!(f, "  vcpus_parked: {parked}/{total}")?;
+            for (i, slot) in self.vcpu_regs.iter().enumerate() {
+                match slot {
+                    Some(s) => writeln!(f, "    vcpu {i}: parked, {s}")?,
+                    None => writeln!(f, "    vcpu {i}: not_parked")?,
+                }
+            }
+        }
+        writeln!(f, "  watchpoint_hit: {}", self.watchpoint_hit)?;
+        writeln!(f, "  bss_latch_state: {}", self.bss_latch_state)?;
+        if let Some(kind) = self.exit_kind {
+            writeln!(f, "  exit_kind: {kind}")?;
+        }
+        if self.elapsed_ms != 0 {
+            writeln!(f, "  elapsed_ms: {}", self.elapsed_ms)?;
+        }
+        Ok(())
     }
 }
 
