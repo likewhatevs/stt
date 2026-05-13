@@ -297,21 +297,33 @@ pub(super) fn format_truncation_marker(head_end: usize, total_len: usize) -> Str
 }
 
 /// Shared prefix for every stderr last-ditch preservation `summary`
-/// line emitted on a failed atomic-publish path. 9 emit sites carry
-/// the same `"freeze-coord: STDERR-PRESERVED summary"` literal at
-/// the head of their `eprintln!` / `stderr_summary` closure return
-/// (run_vm emit_json + emit_degraded_json, TLV CAPTURE +
-/// Degraded, on-demand periodic Captured + Degraded, user-
-/// watchpoint Captured + Degraded, early-snapshot Degraded). The
-/// suffix after this prefix varies per site:
-/// `" ({variant}, write failed): {body}"`.
+/// line emitted on a failed atomic-publish OR serialize-failure
+/// path. 13 emit sites carry the same
+/// `"freeze-coord: STDERR-PRESERVED summary"` literal at the head of
+/// their `eprintln!` / `stderr_summary` closure return:
+/// - run_vm emit_json Captured (write_failed)
+/// - run_vm Captured serialize-failure (serde_json::to_string error)
+/// - run_vm emit_degraded_json (write_failed)
+/// - TLV CAPTURE Captured + Degraded
+/// - on-demand periodic Captured + Degraded
+/// - on-demand user-watchpoint Captured + Degraded
+/// - on-demand early-snapshot Degraded
+/// - dual-snapshot early-pre-late-degraded
+/// - dual-snapshot early-only-late-suppressed
+/// - end-of-coord drain
+///
+/// Suffix after this prefix varies per site:
+/// `" ({variant}, write failed): {body}"` for most;
+/// `" ({variant}, serialize failed): {body}"` for the serde-error path;
+/// `": {body}"` for the end-of-coord drain (no per-variant context
+/// because `early_retain_tag` carries it separately).
 ///
 /// Operator-grep contract: every stderr-fallback site emits a line
 /// matchable by this prefix so a log scraper can pin the entire
 /// stderr-preservation surface with one regex. The const exists so
 /// adding a new emit site (e.g. a future watchpoint class) reuses
 /// the prefix automatically + so a future prefix change updates one
-/// site instead of nine.
+/// site instead of 13.
 pub(super) const SNAPSHOT_SUMMARY_PREFIX: &str = "freeze-coord: STDERR-PRESERVED summary";
 
 /// Atomically write a JSON dump payload to a sibling of `dump_path`
@@ -6990,7 +7002,7 @@ impl KtstrVm {
                                                 .as_millis()
                                                 as u64;
                                             eprintln!(
-                                                "freeze-coord: STDERR-PRESERVED summary (Captured, serialize failed): map_count={} vcpu_regs_count={} vcpu_none_indices={:?} tasks_enriched={} elapsed_ms={} serde_error={:?}",
+                                                "{SNAPSHOT_SUMMARY_PREFIX} (Captured, serialize failed): map_count={} vcpu_regs_count={} vcpu_none_indices={:?} tasks_enriched={} elapsed_ms={} serde_error={:?}",
                                                 map_count,
                                                 vcpu_regs_count,
                                                 vcpu_none_indices,
