@@ -4146,6 +4146,18 @@ impl KtstrVm {
                             let mut worker_dropped: bool = false;
                             let mut parked_count: u64 = 0;
                             let mut all_parked = false;
+                            // Snapshots WHICH loop-break condition fired
+                            // so the post-loop Degraded reason can label
+                            // accurately. A bare post-loop
+                            // `freeze_coord_kill.load(Acquire)` reads the
+                            // CURRENT state, not the cause of the break,
+                            // and races a kill setter that lands in the
+                            // ns window between the deadline-break and
+                            // the post-loop read — mislabelling a true
+                            // 30s timeout as a kill. Setting the flag
+                            // inside the kill-break arm (and only there)
+                            // captures the actual break cause.
+                            let mut killed_during_rendezvous = false;
                             loop {
                                 if freeze_coord_bsp_done.load(Ordering::Acquire) {
                                     break;
@@ -4192,6 +4204,7 @@ impl KtstrVm {
                                 // coalesced-wake misattribution that
                                 // motivates this ordering.
                                 if freeze_coord_kill.load(Ordering::Acquire) {
+                                    killed_during_rendezvous = true;
                                     break;
                                 }
                                 // Worker sub-timeout. Only fires
@@ -4471,17 +4484,27 @@ impl KtstrVm {
                                     let total = expected_parks;
                                     let stuck = total.saturating_sub(parked_count);
                                     // Distinguish the kill-during-rendezvous
-                                    // case from a true 30s timeout. The
-                                    // Acquire load synchronises-with the
-                                    // kill-setter's Release; if kill flipped
-                                    // during the rendezvous wait (SCHED_EXIT
-                                    // propagation, watchdog hard timeout,
-                                    // panic-hook), the loop's break at
-                                    // freeze_coord_kill check fires here
-                                    // with elapsed_ms typically in single-
-                                    // digit ms, where "timed out" would be
-                                    // contradictory.
-                                    let killed = freeze_coord_kill.load(Ordering::Acquire);
+                                    // case from a true 30s timeout via the
+                                    // in-loop `killed_during_rendezvous`
+                                    // snapshot declared before the loop.
+                                    // A bare post-loop `freeze_coord_kill.
+                                    // load(Acquire)` reads CURRENT state,
+                                    // not the cause of the break — a kill
+                                    // setter (SCHED_EXIT propagation,
+                                    // watchdog hard-deadline expiry,
+                                    // panic-hook) racing into the ns
+                                    // window between the deadline-break
+                                    // and the read mislabels a true 30s
+                                    // timeout as a kill. The in-loop flag
+                                    // captures the actual break cause:
+                                    // set inside the kill-check arm
+                                    // before the break, false otherwise.
+                                    // The kill-aware path lands here when
+                                    // kill flipped during the wait, with
+                                    // elapsed_ms typically in single-
+                                    // digit ms, where "timed out" would
+                                    // be contradictory.
+                                    let killed = killed_during_rendezvous;
                                     let reason_prefix = if killed {
                                         crate::monitor::dump::REASON_DEGRADED_KILL_DURING_RENDEZVOUS
                                     } else {
@@ -4490,15 +4513,32 @@ impl KtstrVm {
                                     let reason = format!(
                                         "{reason_prefix}: {elapsed_ms}ms; {parked_count}/{total} vCPUs parked",
                                     );
+                                    // Branch the warn body too so the
+                                    // tracing-stream consumer reads the
+                                    // same kill-vs-timeout disambiguation
+                                    // as the on-disk Degraded JSON.
+                                    // Without this, an operator scrolling
+                                    // traces sees "rendezvous timed out"
+                                    // with elapsed_ms=5ms on every kill
+                                    // while the JSON correctly carries
+                                    // the kill-aware reason — two
+                                    // channels disagreeing on the same
+                                    // event.
+                                    let warn_summary = if killed {
+                                        "freeze-coord: dump degraded — vCPU rendezvous aborted by external kill"
+                                    } else {
+                                        "freeze-coord: dump degraded — vCPU rendezvous timed out"
+                                    };
                                     tracing::warn!(
                                         elapsed_ms,
                                         parked_count,
                                         expected_parks = total,
                                         stuck,
+                                        killed,
                                         watchpoint_hit,
                                         bss_latch_state = bss_state_label(bss_state),
                                         exit_kind,
-                                        "freeze-coord: dump degraded — vCPU rendezvous timed out"
+                                        "{warn_summary}"
                                     );
                                     let degraded = crate::monitor::dump::DegradedFailureDumpReport {
                                         schema: crate::monitor::dump::SCHEMA_DEGRADED.to_string(),

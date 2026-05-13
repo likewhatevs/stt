@@ -1067,17 +1067,20 @@ fn snapshot_tag_constants_pinned() {
 /// stable; a silent rename would break operator playbooks AND any
 /// external `jq '.reason | startswith("vCPU rendezvous")'` consumer.
 ///
-/// Today only `REASON_DEGRADED_RENDEZVOUS_TIMEOUT` exists. When
-/// new `REASON_DEGRADED_*` constants land (per the doc claim at
-/// the `DegradedFailureDumpReport.reason` field that "new
-/// degraded causes add new `REASON_DEGRADED_*` constants rather
-/// than mutating the existing ones"), extend this test to pin
-/// each new value — same one-line `assert_eq!` shape.
+/// When new `REASON_DEGRADED_*` constants land (per the doc claim at
+/// the `DegradedFailureDumpReport.reason` field that "new degraded
+/// causes add new `REASON_DEGRADED_*` constants rather than mutating
+/// the existing ones"), extend this test to pin each new value —
+/// same one-line `assert_eq!` shape.
 #[test]
 fn reason_degraded_constants_pinned() {
     assert_eq!(
         REASON_DEGRADED_RENDEZVOUS_TIMEOUT,
         "vCPU rendezvous timed out before parked acknowledgement"
+    );
+    assert_eq!(
+        REASON_DEGRADED_KILL_DURING_RENDEZVOUS,
+        "vCPU rendezvous aborted by external kill before parked acknowledgement"
     );
 }
 

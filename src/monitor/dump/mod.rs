@@ -614,10 +614,10 @@ pub const REASON_DEGRADED_RENDEZVOUS_TIMEOUT: &str =
 /// the rendezvous loop within milliseconds, so the elapsed_ms in the
 /// dynamic detail (appended at emit time) reads as a small number
 /// and the "timed out" label is internally contradictory. The kill
-/// sources documented in the freeze coordinator's kill-promotion
-/// section are SCHED_EXIT propagation, watchdog hard-deadline expiry,
-/// and panic-hook flips. Wire-format-stable; matches the operator-
-/// grep contract used by every other `REASON_*` constant.
+/// sources are SCHED_EXIT propagation from a vCPU thread, watchdog
+/// hard-deadline expiry, and panic-hook flips. Wire-format-stable;
+/// matches the operator-grep contract used by every other `REASON_*`
+/// constant.
 pub const REASON_DEGRADED_KILL_DURING_RENDEZVOUS: &str =
     "vCPU rendezvous aborted by external kill before parked acknowledgement";
 
