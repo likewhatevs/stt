@@ -1,0 +1,5 @@
+error: declare_scheduler!: `config_file_def` arg_template `--config` is missing the `{file}` placeholder — the framework substitutes the guest path at that position when invoking the scheduler. Add `{file}` (e.g. `"--config {file}"`).
+  --> tests/compile_fail/declare_scheduler_config_file_def_missing_placeholder.rs:10:24
+   |
+10 |     config_file_def = ("--config", "/include-files/cfg.json"),
+   |                        ^^^^^^^^^^

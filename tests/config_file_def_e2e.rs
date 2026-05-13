@@ -47,19 +47,23 @@ use ktstr::assert::AssertResult;
 use ktstr::ktstr_test;
 use ktstr::scenario::Ctx;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
+use ktstr::declare_scheduler;
+#[allow(unused_imports)]
 use ktstr::test_support::{Scheduler, SchedulerSpec};
 
-/// `scx-ktstr` is the workspace's fixture scheduler. It boots a real
-/// sched_ext BPF program, attaches, and runs a dispatch loop — i.e.
-/// "scheduler boots" is observable end-to-end. Its CLI is
-/// permissive: unknown flags are ignored (only `--stall-after`,
-/// `--degrade-after`, `--degrade`, `--fail-verify`, `--scattershot`,
-/// `--slow`, `--verify-loop` are recognised), so the
-/// framework-injected `--config /include-files/config_file_def_e2e.json`
-/// passes through harmlessly.
-const CFG_E2E_SCHED: Scheduler = Scheduler::new("config_file_def_e2e_sched")
-    .binary(SchedulerSpec::Discover("scx-ktstr"))
-    .config_file_def("--config {file}", "/include-files/config_file_def_e2e.json");
+// `scx-ktstr` is the workspace's fixture scheduler. It boots a real
+// sched_ext BPF program, attaches, and runs a dispatch loop — i.e.
+// "scheduler boots" is observable end-to-end. Its CLI is
+// permissive: unknown flags are ignored (only `--stall-after`,
+// `--degrade-after`, `--degrade`, `--fail-verify`, `--scattershot`,
+// `--slow`, `--verify-loop` are recognised), so the
+// framework-injected `--config /include-files/config_file_def_e2e.json`
+// passes through harmlessly.
+declare_scheduler!(CFG_E2E_SCHED, {
+    name = "config_file_def_e2e_sched",
+    binary = "scx-ktstr",
+    config_file_def = ("--config {file}", "/include-files/config_file_def_e2e.json"),
+});
 
 /// Inline scheduler config built via the `ktstr::json!` proc-macro.
 /// The macro lowers Rust tokens to a `&'static str` at compile time,

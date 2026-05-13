@@ -17,6 +17,7 @@
 
 #![deny(missing_docs)]
 
+use ktstr::assert::Assert;
 use ktstr::declare_scheduler;
 use ktstr::test_support::{
     KTSTR_SCHEDULERS, Scheduler, SchedulerJson, SchedulerSpec, Sysctl, TopologyConstraints,
@@ -157,6 +158,149 @@ fn kernel_variant_strings_accepted_by_macro() {
         "git+https://example.com/linux.git#main"
     );
     assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[5], "my-cache-key-x86-64");
+}
+
+// -- assert + config_file_def fields --
+//
+// Pins the new fields' threading from the macro through the
+// emitted Scheduler. The assert validator accepts method chains
+// rooted at a const path (canonical Assert pattern); the
+// config_file_def validator accepts a 2-tuple of non-empty
+// string literals where arg_template contains `{file}` and
+// guest_path is absolute.
+
+declare_scheduler!(DECLARE_SCHEDULER_WITH_ASSERT, {
+    name = "declare_scheduler_with_assert",
+    binary = "scx-assert",
+    assert = Assert::NO_OVERRIDES
+        .check_not_starved()
+        .max_gap_ms(5000)
+        .max_imbalance_ratio(2.5)
+        .fail_on_stall(true)
+        .sustained_samples(15),
+});
+
+#[test]
+fn assert_field_threads_to_scheduler() {
+    assert_eq!(DECLARE_SCHEDULER_WITH_ASSERT.assert.not_starved, Some(true));
+    assert_eq!(DECLARE_SCHEDULER_WITH_ASSERT.assert.max_gap_ms, Some(5000));
+    assert_eq!(
+        DECLARE_SCHEDULER_WITH_ASSERT.assert.max_imbalance_ratio,
+        Some(2.5)
+    );
+    assert_eq!(DECLARE_SCHEDULER_WITH_ASSERT.assert.fail_on_stall, Some(true));
+    assert_eq!(
+        DECLARE_SCHEDULER_WITH_ASSERT.assert.sustained_samples,
+        Some(15)
+    );
+    // Unset fields stay None.
+    assert_eq!(DECLARE_SCHEDULER_WITH_ASSERT.assert.max_spread_pct, None);
+}
+
+declare_scheduler!(DECLARE_SCHEDULER_DEFAULT_CHECKS, {
+    name = "declare_scheduler_default_checks",
+    binary = "scx-defaults",
+    assert = Assert::default_checks(),
+});
+
+#[test]
+fn assert_accepts_const_fn_call() {
+    // `Assert::default_checks()` is a snake_case const fn that the
+    // constraints validator would reject; the assert validator
+    // accepts it (and any other const-eligible expression).
+    let _ = &DECLARE_SCHEDULER_DEFAULT_CHECKS.assert;
+}
+
+#[test]
+fn omitted_assert_defaults_to_no_overrides() {
+    // When the macro omits `assert = ...`, Scheduler::new's
+    // default (`Assert::NO_OVERRIDES`, all-None) flows through.
+    // Verified via DECLARE_SCHEDULER_MINIMAL which omits assert.
+    assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.not_starved, None);
+    assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.max_gap_ms, None);
+    assert_eq!(DECLARE_SCHEDULER_MINIMAL.assert.fail_on_stall, None);
+}
+
+declare_scheduler!(DECLARE_SCHEDULER_CFG_DEF, {
+    name = "declare_scheduler_cfg_def",
+    binary = "scx-cfg-def",
+    config_file_def = ("--config {file}", "/include-files/cfg.json"),
+});
+
+#[test]
+fn config_file_def_threads_tuple_to_scheduler() {
+    assert_eq!(
+        DECLARE_SCHEDULER_CFG_DEF.config_file_def,
+        Some(("--config {file}", "/include-files/cfg.json")),
+    );
+}
+
+declare_scheduler!(DECLARE_SCHEDULER_CFG_DEF_ALT, {
+    name = "declare_scheduler_cfg_def_alt",
+    binary = "scx-cfg-def-alt",
+    config_file_def = ("f:{file}", "/include-files/layered.json"),
+});
+
+#[test]
+fn config_file_def_supports_compact_arg() {
+    assert_eq!(
+        DECLARE_SCHEDULER_CFG_DEF_ALT.config_file_def,
+        Some(("f:{file}", "/include-files/layered.json")),
+    );
+}
+
+declare_scheduler!(DECLARE_SCHEDULER_FULL_NEW, {
+    name = "declare_scheduler_full_new",
+    binary = "scx-full-new",
+    assert = Assert::NO_OVERRIDES.max_gap_ms(3000),
+    config_file_def = ("--cfg {file}", "/inc/x.json"),
+    kernels = ["6.14"],
+    sched_args = ["--exit-dump-len", "1024"],
+});
+
+#[test]
+fn assert_and_config_file_def_coexist_with_other_fields() {
+    assert_eq!(DECLARE_SCHEDULER_FULL_NEW.assert.max_gap_ms, Some(3000));
+    assert!(DECLARE_SCHEDULER_FULL_NEW.config_file_def.is_some());
+    assert_eq!(DECLARE_SCHEDULER_FULL_NEW.kernels, &["6.14"]);
+    assert_eq!(
+        DECLARE_SCHEDULER_FULL_NEW.sched_args,
+        &["--exit-dump-len", "1024"]
+    );
+}
+
+declare_scheduler!(BOTH_CONFIGS, {
+    name = "both_configs",
+    binary = "scx-both",
+    config_file = "host-path.toml",
+    config_file_def = ("--cfg {file}", "/inc/c.json"),
+});
+
+#[test]
+fn both_config_fields_coexist() {
+    assert_eq!(BOTH_CONFIGS.config_file, Some("host-path.toml"));
+    assert_eq!(
+        BOTH_CONFIGS.config_file_def,
+        Some(("--cfg {file}", "/inc/c.json"))
+    );
+}
+
+declare_scheduler!(ONLY_CONFIG_FILE, {
+    name = "only_cf",
+    binary = "scx-cf",
+    config_file = "host.toml",
+});
+
+declare_scheduler!(ONLY_CONFIG_FILE_DEF, {
+    name = "only_cfd",
+    binary = "scx-cfd",
+    config_file_def = ("--c {file}", "/g.json"),
+});
+
+#[test]
+fn config_fields_independent_defaults() {
+    assert_eq!(ONLY_CONFIG_FILE.config_file_def, None);
+    assert_eq!(ONLY_CONFIG_FILE_DEF.config_file, None);
 }
 
 // -- KTSTR_SCHEDULERS registration --

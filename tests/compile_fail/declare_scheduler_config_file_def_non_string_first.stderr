@@ -1,0 +1,5 @@
+error: declare_scheduler!: element of `config_file_def` must be a string literal
+ --> tests/compile_fail/declare_scheduler_config_file_def_non_string_first.rs:8:24
+  |
+8 |     config_file_def = (42, "/include-files/cfg.json"),
+  |                        ^^

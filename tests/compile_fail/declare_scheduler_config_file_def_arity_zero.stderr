@@ -1,0 +1,5 @@
+error: declare_scheduler!: `config_file_def` must be a 2-tuple of string literals (`(arg_template, guest_path)`), got 0-tuple.
+ --> tests/compile_fail/declare_scheduler_config_file_def_arity_zero.rs:9:23
+  |
+9 |     config_file_def = (),
+  |                       ^^

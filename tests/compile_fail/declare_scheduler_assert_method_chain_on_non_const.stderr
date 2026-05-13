@@ -1,0 +1,5 @@
+error: declare_scheduler!: `assert` must be a const-evaluable expression (emitted into a `pub static`). Use a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`. Non-const helper calls and method chains are not const-eligible and would fail with a deep const-eval diagnostic at the spread site.
+  --> tests/compile_fail/declare_scheduler_assert_method_chain_on_non_const.rs:15:14
+   |
+15 |     assert = build_base().max_gap_ms(5000),
+   |              ^^^^^^^^^^^^

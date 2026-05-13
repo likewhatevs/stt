@@ -1,0 +1,5 @@
+error: declare_scheduler!: `config_file_def` guest_path `relative-cfg.json` must be absolute (start with `/`). The framework writes the config file at this path inside the guest, and a relative path breaks the `mkdir -p` invariant.
+  --> tests/compile_fail/declare_scheduler_config_file_def_relative_guest_path.rs:10:43
+   |
+10 |     config_file_def = ("--config {file}", "relative-cfg.json"),
+   |                                           ^^^^^^^^^^^^^^^^^^^

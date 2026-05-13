@@ -1499,24 +1499,9 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | `kargs = [..]` | no | Extra guest kernel cmdline args. |
 /// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#REF`), paths, and cache keys. Each entry is validated at macro-expand time via the same `KernelId::parse` + `validate` the verifier uses at runtime; empty entries, inverted ranges, and `..`-containing strings whose endpoints aren't version-shaped (e.g. `"abc..def"`) are rejected. |
 /// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto [`Scheduler::constraints`]. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::new`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
+/// | `assert = Assert::NO_OVERRIDES.method().chain()` | no | Scheduler-wide assertion overrides — maps directly onto [`Scheduler::assert`]. Merged with `Assert::default_checks()` and the per-test `assert` at runtime (`default ← scheduler ← per-test`). Accepts any const-evaluable expression: a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`. The macro accepts MethodCall chains and Path-rooted (type/module-prefixed) Calls — only bare single-segment lowercase Calls like `helper()` are rejected as non-const free-fn patterns; non-const methods on a Path receiver slip through and surface as a deep const-eval failure at the spread site. |
 /// | `config_file = "..."` | no | Host-side config file path. |
-///
-/// # Fields not yet supported
-///
-/// `assert` and `config_file_def` are real [`Scheduler`] fields but
-/// the macro does not currently accept them. To set either, hand-write
-/// the const using the builder chain:
-///
-/// ```rust,ignore
-/// pub static MY_SCHED: Scheduler = Scheduler::new("my_sched")
-///     .binary(SchedulerSpec::Discover("scx_my_sched"))
-///     .assert(Assert::default_checks().max_gap_ms(50))
-///     .config_file_def("--config", "/include-files/my.json");
-/// ```
-///
-/// Macro support is tracked as a follow-up. The macro rejects these
-/// keys with `unknown field` so the diagnostic points at the gap
-/// rather than silently dropping the value.
+/// | `config_file_def = ("--config {file}", "/include-files/cfg.json")` | no | Inline-config plumbing — maps directly onto [`Scheduler::config_file_def`]. 2-tuple of string literals: arg_template (CLI arg with `{file}` placeholder substituted at run time) and guest_path (absolute path where the framework writes the JSON inside the guest). Distinct from `config_file` (which references a pre-existing host file). The macro validates: tuple-arity = 2, both elements non-empty string literals, `{file}` placeholder present in arg_template, guest_path absolute. |
 ///
 /// # Const naming rules
 ///
@@ -1617,6 +1602,8 @@ fn declare_scheduler_inner(
     let mut sched_kernels_set = false;
     let mut sched_constraints: Option<syn::Expr> = None;
     let mut sched_config_file: Option<String> = None;
+    let mut sched_assert: Option<syn::Expr> = None;
+    let mut sched_config_file_def: Option<(String, String)> = None;
 
     let mut seen_fields = std::collections::HashSet::<String>::new();
     for (key, value) in fields {
@@ -1803,12 +1790,116 @@ fn declare_scheduler_inner(
                 //
                 // Calls and method chains are rejected with a hint
                 // describing the const-eligible alternatives.
-                validate_constraints_expr(&value)?;
+                validate_const_eligible(
+                    &value,
+                    "constraints",
+                    CONSTRAINTS_ACCEPTED_SHAPES,
+                    ConstEligibility::StructLiteralOnly,
+                )?;
                 sched_constraints = Some(value);
             }
             "config_file" => {
                 let lit = expect_str_lit(&value, &key, "config_file")?;
                 sched_config_file = Some(lit);
+            }
+            "assert" => {
+                // `assert` lands in a `pub static`, so the expression
+                // must be const-evaluable. Unlike `constraints`, the
+                // canonical Assert pattern is METHOD-CHAINING on const
+                // fns (`Assert::NO_OVERRIDES.check_not_starved()...`),
+                // so the assert validator accepts MethodCall chains
+                // and Path-rooted Calls (`Assert::default_checks()`,
+                // `Some(x)`). Only bare single-segment lowercase
+                // Calls (`helper()`) are rejected as the free-fn
+                // pattern; non-const methods on a Path receiver
+                // slip through and surface as a deep const-eval
+                // failure at the spread site.
+                // See `validate_const_eligible` with
+                // `ConstEligibility::AllowConstMethodChains`.
+                validate_const_eligible(
+                    &value,
+                    "assert",
+                    ASSERT_ACCEPTED_SHAPES,
+                    ConstEligibility::AllowConstMethodChains,
+                )?;
+                sched_assert = Some(value);
+            }
+            "config_file_def" => {
+                // `config_file_def` is `Option<(arg_template,
+                // guest_path)>`. The macro accepts a 2-tuple of string
+                // literals and auto-wraps in `Some` via the existing
+                // `.config_file_def(arg, path)` builder. Validate at
+                // expand time: tuple-arity = 2, each element is a
+                // non-empty string literal, arg_template contains the
+                // `{file}` placeholder (the runtime substitutes the
+                // guest path at that position; a template without it
+                // silently fails at dispatch), and guest_path is
+                // absolute (the runtime writes the config there, and
+                // a relative path breaks the `mkdir -p` invariant).
+                let tup = if let syn::Expr::Tuple(t) = &value {
+                    t
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        &value,
+                        "declare_scheduler!: `config_file_def` must be a \
+                         2-tuple of string literals: `(arg_template, guest_path)`. \
+                         Example: `(\"--config {file}\", \"/include-files/cfg.json\")`.",
+                    ));
+                };
+                if tup.elems.len() != 2 {
+                    return Err(syn::Error::new_spanned(
+                        tup,
+                        format!(
+                            "declare_scheduler!: `config_file_def` must be a \
+                             2-tuple of string literals (`(arg_template, guest_path)`), \
+                             got {}-tuple.",
+                            tup.elems.len()
+                        ),
+                    ));
+                }
+                let arg_template = expect_str_lit_element(&tup.elems[0], "config_file_def")?;
+                let guest_path = expect_str_lit_element(&tup.elems[1], "config_file_def")?;
+                if arg_template.is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &tup.elems[0],
+                        "declare_scheduler!: `config_file_def` arg_template \
+                         (element 0) must be a non-empty string. Example: \
+                         `\"--config {file}\"`.",
+                    ));
+                }
+                if guest_path.is_empty() {
+                    return Err(syn::Error::new_spanned(
+                        &tup.elems[1],
+                        "declare_scheduler!: `config_file_def` guest_path \
+                         (element 1) must be a non-empty string. Example: \
+                         `\"/include-files/cfg.json\"`.",
+                    ));
+                }
+                if !arg_template.contains("{file}") {
+                    return Err(syn::Error::new_spanned(
+                        &tup.elems[0],
+                        format!(
+                            "declare_scheduler!: `config_file_def` arg_template \
+                             `{arg_template}` is missing the `{{file}}` placeholder \
+                             — the framework substitutes the guest path at \
+                             that position when invoking the scheduler. \
+                             Add `{{file}}` (e.g. `\"--config {{file}}\"`)."
+                        ),
+                    ));
+                }
+                if !guest_path.starts_with('/') {
+                    return Err(syn::Error::new_spanned(
+                        &tup.elems[1],
+                        format!(
+                            "declare_scheduler!: `config_file_def` guest_path \
+                             `{guest_path}` must be absolute (start with `/`). \
+                             The framework writes the config file at this path \
+                             inside the guest, and a relative path breaks the \
+                             `mkdir -p` invariant."
+                        ),
+                    ));
+                }
+                sched_config_file_def = Some((arg_template, guest_path));
             }
             other => {
                 return Err(syn::Error::new(
@@ -1933,6 +2024,12 @@ fn declare_scheduler_inner(
     if let Some(cf) = &sched_config_file {
         builder_chain = quote! { #builder_chain.config_file(#cf) };
     }
+    if let Some(a) = &sched_assert {
+        builder_chain = quote! { #builder_chain.assert(#a) };
+    }
+    if let Some((arg, path)) = &sched_config_file_def {
+        builder_chain = quote! { #builder_chain.config_file_def(#arg, #path) };
+    }
 
     let registry_ident = format_ident!("__KTSTR_SCHED_REG_{}", const_name);
 
@@ -2008,108 +2105,102 @@ fn expect_array<'a>(
     }
 }
 
-/// Reject `declare_scheduler!`'s `constraints = EXPR` argument when
-/// `EXPR` shape cannot be const-evaluated. `constraints` flows into a
-/// `pub static`, so the expression must be const-eligible — non-const
-/// helper calls (`Expr::Call`, `Expr::MethodCall`) yield deep
-/// const-eval failures at the spread site that are hard to map back
-/// to the original mistake. Catch them at expand time with a
-/// targeted diagnostic.
+/// Policy axis for `validate_const_eligible`. Different
+/// `declare_scheduler!` fields have different canonical
+/// const-construction patterns and need different MethodCall + Call
+/// tolerances.
+#[derive(Clone, Copy)]
+enum ConstEligibility {
+    /// Used for `constraints`. Rejects `MethodCall(...)` and rejects
+    /// `Call(...)` whose function path tail is not PascalCase. The
+    /// canonical pattern is a struct literal (`TopologyConstraints
+    /// { .. }`) or a const path (`TopologyConstraints::DEFAULT`) —
+    /// method chains in that position are always wrong because
+    /// `TopologyConstraints` has no const-fn builder.
+    StructLiteralOnly,
+    /// Used for `assert`. Accepts `MethodCall(...)` and recurses
+    /// into receiver + args; accepts `Call(...)` with multi-segment
+    /// or PascalCase function path and recurses into args; rejects
+    /// `Call(...)` with single-segment lowercase path (bare local
+    /// helper). Required because `Assert`'s canonical const
+    /// constructors are snake_case: `Assert::NO_OVERRIDES`,
+    /// `Assert::default_checks()`, and the
+    /// `Assert::NO_OVERRIDES.check_not_starved()` chain pattern.
+    AllowConstMethodChains,
+}
+
+/// Reject a `declare_scheduler!` field whose value cannot be
+/// const-evaluated. The field lands in a `pub static`, so non-const
+/// helper calls yield deep const-eval failures at the spread site
+/// that are hard to map back to the original mistake. This validator
+/// catches them at expand time with a per-field tailored diagnostic.
 ///
-/// Recurses into struct-literal field values and the `..rest` spread:
-/// `TopologyConstraints { min_llcs: build_value(), .. }` is just as
-/// broken as `build_constraints()` itself, and would otherwise slip
-/// through because the outer shape is `Expr::Struct`.
-fn validate_constraints_expr(expr: &syn::Expr) -> syn::Result<()> {
+/// Recurses into struct-literal field values and the `..rest`
+/// spread; both PascalCase Call args and MethodCall args (when
+/// allowed by `mode`) are recursed too.
+fn validate_const_eligible(
+    expr: &syn::Expr,
+    field_name: &str,
+    accepted_shapes: &str,
+    mode: ConstEligibility,
+) -> syn::Result<()> {
+    let recurse = |e: &syn::Expr| validate_const_eligible(e, field_name, accepted_shapes, mode);
     match expr {
-        // Canonical struct-literal form (`TopologyConstraints { .. }`).
-        // Recurse into each field value AND the `..rest` spread so
-        // that non-const expressions inside fields (which the outer
-        // `Struct` shape would otherwise mask) are caught at expand
-        // time. Without this, `TopologyConstraints { min_llcs:
-        // build_value(), ..DEFAULT }` slips past the outer-shape
-        // gate and surfaces as a deep const-eval failure inside the
-        // emitted static.
         syn::Expr::Struct(es) => {
             for fv in &es.fields {
-                validate_constraints_expr(&fv.expr)?;
+                recurse(&fv.expr)?;
             }
             if let Some(rest) = &es.rest {
-                validate_constraints_expr(rest)?;
+                recurse(rest)?;
             }
             Ok(())
         }
-        // Path expression (`TopologyConstraints::DEFAULT`, an
-        // associated const, a re-export).
         syn::Expr::Path(_) => Ok(()),
-        // Parenthesized expression — pass-through.
-        syn::Expr::Paren(p) => validate_constraints_expr(&p.expr),
-        // Reference (`&TopologyConstraints::DEFAULT`) — accept any
-        // const-eligible inner form. The Scheduler builder takes
-        // `TopologyConstraints` by value, not by reference, so a
-        // reference here will surface a downstream type-mismatch
-        // error rather than a confusing const-eval failure — that
-        // diagnostic is already adequate.
-        syn::Expr::Reference(r) => validate_constraints_expr(&r.expr),
-        // Unary (`!x`, `-x`) — accept; rustc rejects non-const
-        // operators downstream.
-        syn::Expr::Unary(u) => validate_constraints_expr(&u.expr),
-        // Binary arithmetic — recurse into BOTH operands. Without
-        // recursion, `min_llcs: build_value() + 1` would slip
-        // through the outer Binary acceptance and surface as a deep
-        // const-eval failure inside the emitted static.
+        syn::Expr::Paren(p) => recurse(&p.expr),
+        syn::Expr::Reference(r) => recurse(&r.expr),
+        syn::Expr::Unary(u) => recurse(&u.expr),
         syn::Expr::Binary(b) => {
-            validate_constraints_expr(&b.left)?;
-            validate_constraints_expr(&b.right)?;
+            recurse(&b.left)?;
+            recurse(&b.right)?;
             Ok(())
         }
-        // Literal — accept (e.g. a `const FOO: TopologyConstraints`
-        // referenced through some non-Path shape; rustc will catch
-        // a type mismatch downstream).
         syn::Expr::Lit(_) => Ok(()),
-        // Method calls are always non-const-eligible at expand time:
-        // `TopologyConstraints::DEFAULT.with_min_llcs(4)` etc.
-        syn::Expr::MethodCall(_) => Err(constraints_not_const_error(expr, true)),
-        // Function calls split by func-path convention:
-        //   * `Some(8)`, `Variant(x)`, `MyTuple(...)` — PascalCase
-        //     last segment indicates a tuple-struct or enum-variant
-        //     constructor, which IS const-eligible (`Option::Some`
-        //     in particular is what `max_*: Some(N)` fields use).
-        //     Even so, the args may themselves be non-const — recurse
-        //     into each so `Some(my_helper())` is rejected.
-        //   * `build_value()`, `helper()` — lowercase last segment
-        //     is the snake_case free-fn pattern and is NOT
-        //     const-eligible.
-        // The PascalCase heuristic is imperfect but matches Rust
-        // naming convention; the alternative — a deep const-eval
-        // diagnostic at the spread site — is strictly worse.
-        syn::Expr::Call(call) => {
-            if call_func_is_pascal_constructor(&call.func) {
-                for arg in &call.args {
-                    validate_constraints_expr(arg)?;
+        syn::Expr::MethodCall(mc) => match mode {
+            ConstEligibility::StructLiteralOnly => {
+                Err(field_not_const_error(field_name, accepted_shapes, expr, true))
+            }
+            ConstEligibility::AllowConstMethodChains => {
+                recurse(&mc.receiver)?;
+                for arg in &mc.args {
+                    recurse(arg)?;
                 }
                 Ok(())
-            } else {
-                Err(constraints_not_const_error(expr, true))
             }
-        }
-        // Block expressions — reject with tailored guidance.
-        // Blocks would require walking statements + let-bindings to
-        // validate, and the common case (`{ literal }`) is just
-        // ceremony — the operator can drop the braces.
-        syn::Expr::Block(_) => Err(syn::Error::new_spanned(
-            expr,
-            "declare_scheduler!: `constraints` must be a const-evaluable \
-             expression (emitted into a `pub static`). Block expressions \
-             like `{ ... }` are not const-eligible here — for a single \
-             literal value, drop the braces (write `min_llcs: 100` not \
-             `min_llcs: { 100 }`). For shared values, use a const binding \
-             (`const MY_MIN: u32 = 100;` then `min_llcs: MY_MIN`).",
-        )),
-        // Anything else (closure, async, await, while, match, etc.)
-        // — not const-eligible. Catchall produces the base message
-        // without the call-specific hint.
-        _ => Err(constraints_not_const_error(expr, false)),
+        },
+        syn::Expr::Call(call) => match mode {
+            ConstEligibility::StructLiteralOnly => {
+                if call_func_is_pascal_constructor(&call.func) {
+                    for arg in &call.args {
+                        recurse(arg)?;
+                    }
+                    Ok(())
+                } else {
+                    Err(field_not_const_error(field_name, accepted_shapes, expr, true))
+                }
+            }
+            ConstEligibility::AllowConstMethodChains => {
+                if call_func_is_single_segment_lowercase(&call.func) {
+                    Err(field_not_const_error(field_name, accepted_shapes, expr, true))
+                } else {
+                    for arg in &call.args {
+                        recurse(arg)?;
+                    }
+                    Ok(())
+                }
+            }
+        },
+        syn::Expr::Block(_) => Err(field_block_not_const_error(field_name, expr)),
+        _ => Err(field_not_const_error(field_name, accepted_shapes, expr, false)),
     }
 }
 
@@ -2121,7 +2212,7 @@ fn validate_constraints_expr(expr: &syn::Expr) -> syn::Result<()> {
 /// const-eligible constructor, while a lowercase last segment
 /// (`build_value()`) is the snake_case free-fn pattern.
 fn call_func_is_pascal_constructor(func: &syn::Expr) -> bool {
-    let syn::Expr::Path(ep) = func else {
+    let syn::Expr::Path(ep) = unwrap_parens(func) else {
         return false;
     };
     path_last_segment_ident(&ep.path).is_some_and(|ident| {
@@ -2141,26 +2232,97 @@ fn path_last_segment_ident(path: &syn::Path) -> Option<&syn::Ident> {
     path.segments.last().map(|s| &s.ident)
 }
 
-/// Emit the shared `declare_scheduler!`: `constraints` not-const-eligible
-/// diagnostic. `append_call_hint` adds the trailing sentence about
-/// helper calls and method chains failing at the spread site — used
-/// for the `Call`/`MethodCall` arm where that hint is load-bearing.
-fn constraints_not_const_error(expr: &syn::Expr, append_call_hint: bool) -> syn::Error {
-    let base = "declare_scheduler!: `constraints` must be a const-evaluable expression \
-                (emitted into a `pub static`). Use a struct literal \
-                `TopologyConstraints { ..TopologyConstraints::DEFAULT }` \
-                or a const path like `TopologyConstraints::DEFAULT`.";
+/// Heuristic: is this call expression a single-segment lowercase
+/// function path (`build_helper()`, `default()`, snake_case-style)?
+/// Used by `validate_const_eligible` under
+/// `ConstEligibility::AllowConstMethodChains` to reject bare local
+/// helpers while accepting type/module-prefixed const-fn calls
+/// (`Assert::default_checks()`, `Some(x)`, `path::to::helper()`).
+fn call_func_is_single_segment_lowercase(func: &syn::Expr) -> bool {
+    let syn::Expr::Path(ep) = unwrap_parens(func) else {
+        return false;
+    };
+    if ep.path.segments.len() != 1 {
+        return false;
+    }
+    path_last_segment_ident(&ep.path).is_some_and(|ident| {
+        ident
+            .to_string()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+    })
+}
+
+/// Strip wrapping `Expr::Paren` layers from an expression so
+/// heuristics that match on shape (`Expr::Path` for constructor or
+/// snake-case detection) see through `(build_helper)()` style
+/// parenthesization. Without this, a deliberately parenthesized
+/// bare ident would bypass the lowercase-bare-call rejection.
+fn unwrap_parens(expr: &syn::Expr) -> &syn::Expr {
+    let mut cur = expr;
+    while let syn::Expr::Paren(p) = cur {
+        cur = &p.expr;
+    }
+    cur
+}
+
+/// Emit the shared `declare_scheduler!`: `<field>` not-const-eligible
+/// diagnostic. `accepted_shapes` is the field-specific sentence
+/// listing the accepted shapes (e.g. struct literal vs const path).
+/// `append_call_hint` adds the trailing sentence about helper calls
+/// and method chains failing at the spread site — used for the
+/// `Call`/`MethodCall` arm where that hint is load-bearing.
+fn field_not_const_error(
+    field_name: &str,
+    accepted_shapes: &str,
+    expr: &syn::Expr,
+    append_call_hint: bool,
+) -> syn::Error {
+    let header = format!(
+        "declare_scheduler!: `{field_name}` must be a const-evaluable \
+         expression (emitted into a `pub static`). {accepted_shapes}"
+    );
     let msg = if append_call_hint {
         format!(
-            "{base} Non-const helper calls and method chains are not \
+            "{header} Non-const helper calls and method chains are not \
              const-eligible and would fail with a deep const-eval \
              diagnostic at the spread site."
         )
     } else {
-        base.to_string()
+        header
     };
     syn::Error::new_spanned(expr, msg)
 }
+
+/// Emit the shared `declare_scheduler!`: `<field>` block-expression
+/// rejection diagnostic. Block expressions need tailored guidance
+/// (drop the braces / use a const binding) that the generic
+/// non-const-eligible message doesn't carry.
+fn field_block_not_const_error(field_name: &str, expr: &syn::Expr) -> syn::Error {
+    syn::Error::new_spanned(
+        expr,
+        format!(
+            "declare_scheduler!: `{field_name}` must be a const-evaluable \
+             expression (emitted into a `pub static`). Block expressions \
+             like `{{ ... }}` are not const-eligible here — for a single \
+             literal value, drop the braces. For shared values, use a \
+             const binding (`const MY_VAL: T = ...;` then reference \
+             `MY_VAL`)."
+        ),
+    )
+}
+
+/// Field-specific accepted-shapes sentence for `constraints`.
+const CONSTRAINTS_ACCEPTED_SHAPES: &str =
+    "Use a struct literal `TopologyConstraints { ..TopologyConstraints::DEFAULT }` \
+     or a const path like `TopologyConstraints::DEFAULT`.";
+
+/// Field-specific accepted-shapes sentence for `assert`.
+const ASSERT_ACCEPTED_SHAPES: &str =
+    "Use a const path like `Assert::NO_OVERRIDES`, a const-fn call like \
+     `Assert::default_checks()`, or a chain of const-fn setters like \
+     `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`.";
 
 /// Walk a `TopologyConstraints { .. }` struct literal and reject
 /// fields whose literal values make the declared scheduler topology

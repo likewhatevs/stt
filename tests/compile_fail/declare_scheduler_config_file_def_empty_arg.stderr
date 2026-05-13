@@ -1,0 +1,5 @@
+error: declare_scheduler!: `config_file_def` arg_template (element 0) must be a non-empty string. Example: `"--config {file}"`.
+ --> tests/compile_fail/declare_scheduler_config_file_def_empty_arg.rs:9:24
+  |
+9 |     config_file_def = ("", "/include-files/cfg.json"),
+  |                        ^^

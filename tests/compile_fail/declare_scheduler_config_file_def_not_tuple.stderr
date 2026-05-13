@@ -1,0 +1,5 @@
+error: declare_scheduler!: `config_file_def` must be a 2-tuple of string literals: `(arg_template, guest_path)`. Example: `("--config {file}", "/include-files/cfg.json")`.
+ --> tests/compile_fail/declare_scheduler_config_file_def_not_tuple.rs:9:23
+  |
+9 |     config_file_def = "single-string-not-a-tuple",
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^

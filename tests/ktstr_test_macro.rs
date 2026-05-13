@@ -622,13 +622,15 @@ fn macro_defaults_leave_payload_none_workloads_empty(ctx: &Ctx) -> Result<Assert
 // `config = EXPR` macro attribute paired with scheduler.config_file_def
 // ---------------------------------------------------------------------------
 
-/// Scheduler that declares `config_file_def`, so a paired `#[ktstr_test]`
-/// must supply `config = ...`. The macro emits a const assertion that
-/// checks the pairing at compile time; this fixture proves the happy
-/// path (def + content → registers cleanly with both fields set).
-const CFG_PAIRING_SCHED: ktstr::test_support::Scheduler =
-    ktstr::test_support::Scheduler::new("cfg_pairing_test")
-        .config_file_def("--config {file}", "/include-files/cfg.json");
+// Scheduler that declares `config_file_def`, so a paired `#[ktstr_test]`
+// must supply `config = ...`. The macro emits a const assertion that
+// checks the pairing at compile time; this fixture proves the happy
+// path (def + content → registers cleanly with both fields set).
+ktstr::declare_scheduler!(CFG_PAIRING_SCHED, {
+    name = "cfg_pairing_test",
+    binary = "scx-ktstr",
+    config_file_def = ("--config {file}", "/include-files/cfg.json"),
+});
 
 /// Inline-literal form: `config = "..."` lands as `Some("...")` in the
 /// emitted entry's `config_content` field, paired with a scheduler that

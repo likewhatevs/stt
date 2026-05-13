@@ -1,0 +1,5 @@
+error: declare_scheduler!: `assert` must be a const-evaluable expression (emitted into a `pub static`). Use a const path like `Assert::NO_OVERRIDES`, a const-fn call like `Assert::default_checks()`, or a chain of const-fn setters like `Assert::NO_OVERRIDES.check_not_starved().max_gap_ms(50)`.
+  --> tests/compile_fail/declare_scheduler_assert_closure.rs:12:14
+   |
+12 |     assert = || Assert::NO_OVERRIDES,
+   |              ^^^^^^^^^^^^^^^^^^^^^^^

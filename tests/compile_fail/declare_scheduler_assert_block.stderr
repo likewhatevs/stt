@@ -1,0 +1,5 @@
+error: declare_scheduler!: `assert` must be a const-evaluable expression (emitted into a `pub static`). Block expressions like `{ ... }` are not const-eligible here — for a single literal value, drop the braces. For shared values, use a const binding (`const MY_VAL: T = ...;` then reference `MY_VAL`).
+  --> tests/compile_fail/declare_scheduler_assert_block.rs:11:14
+   |
+11 |     assert = { Assert::NO_OVERRIDES },
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^

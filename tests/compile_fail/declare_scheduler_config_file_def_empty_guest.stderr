@@ -1,0 +1,5 @@
+error: declare_scheduler!: `config_file_def` guest_path (element 1) must be a non-empty string. Example: `"/include-files/cfg.json"`.
+ --> tests/compile_fail/declare_scheduler_config_file_def_empty_guest.rs:9:43
+  |
+9 |     config_file_def = ("--config {file}", ""),
+  |                                           ^^
