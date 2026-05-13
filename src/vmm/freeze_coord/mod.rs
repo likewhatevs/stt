@@ -4519,13 +4519,38 @@ impl KtstrVm {
                                 if let Some(parent) = p.parent() {
                                     let _ = std::fs::create_dir_all(parent);
                                 }
-                                match std::fs::write(p, json) {
+                                // Atomic-publish pattern: write to a sibling
+                                // .tmp file, fsync the file, then rename into
+                                // place. Guarantees a reader of `p` either
+                                // sees the previous file (if any) or the
+                                // complete new dump — never a truncated /
+                                // mid-write JSON file. The fsync on the tmp
+                                // file holds the bytes against a host
+                                // crash between rename() and writeback.
+                                let tmp_path = p.with_extension("json.tmp");
+                                let write_atomic = || -> std::io::Result<()> {
+                                    use std::io::Write as _;
+                                    let mut f =
+                                        std::fs::File::create(&tmp_path)?;
+                                    f.write_all(json.as_bytes())?;
+                                    f.sync_all()?;
+                                    drop(f);
+                                    std::fs::rename(&tmp_path, p)?;
+                                    Ok(())
+                                };
+                                match write_atomic() {
                                     Ok(()) => Some(p.display().to_string()),
                                     Err(e) => {
+                                        // Best-effort cleanup of the leftover
+                                        // tmp file so a future operator
+                                        // doesn't see a stale `.json.tmp`
+                                        // alongside the previous dump.
+                                        let _ = std::fs::remove_file(&tmp_path);
                                         tracing::warn!(
                                             path = %p.display(),
+                                            tmp_path = %tmp_path.display(),
                                             error = %e,
-                                            "freeze-coord: failure-dump file write failed"
+                                            "freeze-coord: failure-dump atomic write failed"
                                         );
                                         None
                                     }
