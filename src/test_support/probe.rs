@@ -409,9 +409,8 @@ fn extract_not_attached_reason(
 ///
 /// `too_many_arguments` allow: each parameter is independent test
 /// fixture state (test entry, kernel/scheduler/ktstr binaries, the
-/// two console captures, optional topology override, active probe
-/// flags). Bundling into a struct would build a struct used at
-/// exactly one call site.
+/// two console captures, optional topology override). Bundling into
+/// a struct would build a struct used at exactly one call site.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attempt_auto_repro(
     entry: &KtstrTestEntry,
@@ -421,7 +420,6 @@ pub(crate) fn attempt_auto_repro(
     first_vm_output: &str,
     console_output: &str,
     topo: Option<&TopoOverride>,
-    active_flags: &[String],
     primary_exit_kind: Option<u64>,
 ) -> Option<String> {
     use crate::probe::stack::extract_stack_functions_all;
@@ -613,11 +611,6 @@ pub(crate) fn attempt_auto_repro(
         }
 
         super::runtime::append_base_sched_args(entry, &mut args);
-        for flag_name in active_flags {
-            if let Some(flag_args) = entry.scheduler.flag_args(flag_name) {
-                args.extend(flag_args.iter().map(|s| s.to_string()));
-            }
-        }
         if !args.is_empty() {
             builder = builder.sched_args(&args);
         }

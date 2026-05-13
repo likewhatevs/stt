@@ -1,5 +1,0 @@
-error: expected array for required_flags
- --> tests/compile_fail/ktstr_test_required_flags_not_array.rs:3:31
-  |
-3 | #[ktstr_test(required_flags = "not-an-array")]
-  |                               ^^^^^^^^^^^^^^

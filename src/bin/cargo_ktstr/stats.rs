@@ -68,7 +68,6 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             scheduler,
             topology,
             work_type,
-            flags,
             a_kernel,
             a_project_commit,
             a_kernel_commit,
@@ -76,7 +75,6 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             a_scheduler,
             a_topology,
             a_work_type,
-            a_flags,
             b_kernel,
             b_project_commit,
             b_kernel_commit,
@@ -84,7 +82,6 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
             b_scheduler,
             b_topology,
             b_work_type,
-            b_flags,
             no_average,
         }) => {
             // Resolve `--threshold N` / `--policy PATH` / neither
@@ -191,7 +188,6 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 shared_scheduler: scheduler.clone(),
                 shared_topology: topology.clone(),
                 shared_work_type: work_type.clone(),
-                shared_flags: flags.clone(),
                 a_kernel: a_kernel.clone(),
                 a_project_commit,
                 a_kernel_commit,
@@ -199,7 +195,6 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 a_scheduler: a_scheduler.clone(),
                 a_topology: a_topology.clone(),
                 a_work_type: a_work_type.clone(),
-                a_flags: a_flags.clone(),
                 b_kernel: b_kernel.clone(),
                 b_project_commit,
                 b_kernel_commit,
@@ -207,7 +202,6 @@ pub(crate) fn run_stats(command: &Option<StatsCommand>) -> Result<(), String> {
                 b_scheduler: b_scheduler.clone(),
                 b_topology: b_topology.clone(),
                 b_work_type: b_work_type.clone(),
-                b_flags: b_flags.clone(),
             };
             let (filter_a, filter_b) = build.build();
             let exit = cli::compare_partitions(
@@ -491,7 +485,6 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) shared_scheduler: Vec<String>,
     pub(crate) shared_topology: Vec<String>,
     pub(crate) shared_work_type: Vec<String>,
-    pub(crate) shared_flags: Vec<String>,
     pub(crate) a_kernel: Vec<String>,
     pub(crate) a_project_commit: Vec<String>,
     pub(crate) a_kernel_commit: Vec<String>,
@@ -499,7 +492,6 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) a_scheduler: Vec<String>,
     pub(crate) a_topology: Vec<String>,
     pub(crate) a_work_type: Vec<String>,
-    pub(crate) a_flags: Vec<String>,
     pub(crate) b_kernel: Vec<String>,
     pub(crate) b_project_commit: Vec<String>,
     pub(crate) b_kernel_commit: Vec<String>,
@@ -507,7 +499,6 @@ pub(crate) struct BuildCompareFilters {
     pub(crate) b_scheduler: Vec<String>,
     pub(crate) b_topology: Vec<String>,
     pub(crate) b_work_type: Vec<String>,
-    pub(crate) b_flags: Vec<String>,
 }
 
 impl BuildCompareFilters {
@@ -535,7 +526,6 @@ impl BuildCompareFilters {
             schedulers: pick_vec(&self.a_scheduler, &self.shared_scheduler),
             topologies: pick_vec(&self.a_topology, &self.shared_topology),
             work_types: pick_vec(&self.a_work_type, &self.shared_work_type),
-            flags: pick_vec(&self.a_flags, &self.shared_flags),
         };
         let filter_b = ktstr::cli::RowFilter {
             kernels: pick_vec(&self.b_kernel, &self.shared_kernel),
@@ -545,7 +535,6 @@ impl BuildCompareFilters {
             schedulers: pick_vec(&self.b_scheduler, &self.shared_scheduler),
             topologies: pick_vec(&self.b_topology, &self.shared_topology),
             work_types: pick_vec(&self.b_work_type, &self.shared_work_type),
-            flags: pick_vec(&self.b_flags, &self.shared_flags),
         };
         (filter_a, filter_b)
     }
@@ -572,7 +561,6 @@ mod tests {
         assert!(fa.schedulers.is_empty());
         assert!(fa.topologies.is_empty());
         assert!(fa.work_types.is_empty());
-        assert!(fa.flags.is_empty());
         assert_eq!(fa.kernels, fb.kernels);
         assert_eq!(fa.project_commits, fb.project_commits);
         assert_eq!(fa.kernel_commits, fb.kernel_commits);
@@ -727,23 +715,6 @@ mod tests {
         // scheduler.
         let slicing = ktstr::cli::derive_slicing_dims(&fa, &fb);
         assert_eq!(slicing, vec![ktstr::cli::Dimension::Scheduler]);
-    }
-
-    /// `--a-flag` / `--b-flag` (AND-combined Vec) compose the
-    /// same way as `--a-kernel` / `--b-kernel` (OR-combined
-    /// Vec) — per-side empty defers to shared, per-side non-
-    /// empty replaces. Pin the shape for the AND-combined dim
-    /// to ensure no accidental special-case for OR-vs-AND.
-    #[test]
-    fn build_compare_filters_per_side_flag_overrides_shared() {
-        let b = BuildCompareFilters {
-            shared_flags: vec!["llc".to_string()],
-            a_flags: vec!["steal".to_string(), "borrow".to_string()],
-            ..BuildCompareFilters::default()
-        };
-        let (fa, fb) = b.build();
-        assert_eq!(fa.flags, vec!["steal", "borrow"]);
-        assert_eq!(fb.flags, vec!["llc"]);
     }
 
     /// Sibling of `build_compare_filters_empty_yields_default_default`

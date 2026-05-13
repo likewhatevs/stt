@@ -1,5 +1,0 @@
-error: expected string literal or path expression in required_flags
- --> tests/compile_fail/ktstr_test_required_flags_bad_elem.rs:3:32
-  |
-3 | #[ktstr_test(required_flags = [42])]
-  |                                ^^

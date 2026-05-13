@@ -88,7 +88,7 @@ pub(crate) fn profraw_inject_for(
 /// Multi-kernel fan-out lives entirely in the test binary's
 /// gauntlet expansion (`src/test_support/dispatch.rs`): when the
 /// resolved set has more than one entry, the test binary's
-/// `--list` handler prints `gauntlet/{name}/{preset}/{profile}/
+/// `--list` handler prints `gauntlet/{name}/{preset}/
 /// {kernel_label}` for every kernel and the `--exact` handler
 /// strips the kernel suffix and re-exports `KTSTR_KERNEL` to that
 /// kernel's directory before booting the VM. `cargo nextest`

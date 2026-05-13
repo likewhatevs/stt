@@ -33,8 +33,7 @@ fn write_skip_sidecar_records_passed_true_skipped_true() {
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     };
-    let active_flags: Vec<String> = vec!["llc".to_string()];
-    write_skip_sidecar(&entry, &active_flags).expect("skip sidecar must write");
+    write_skip_sidecar(&entry).expect("skip sidecar must write");
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__skip_sidecar_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -52,7 +51,6 @@ fn write_skip_sidecar_records_passed_true_skipped_true() {
         loaded.work_type, "skipped",
         "skip path uses the 'skipped' work_type bucket so grouping keeps the skip distinguishable",
     );
-    assert_eq!(loaded.active_flags, active_flags);
     // write_skip_sidecar shares the host-context capture with
     // write_sidecar (same `collect_host_context()` builder line)
     // so skip paths still give `stats compare --runs` a host
@@ -109,7 +107,7 @@ fn write_skip_sidecar_returns_err_when_dir_cannot_be_created() {
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     };
-    let result = write_skip_sidecar(&entry, &[]);
+    let result = write_skip_sidecar(&entry);
     assert!(
         result.is_err(),
         "skip sidecar write must return Err when the target is a regular file",
@@ -168,7 +166,6 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
         monitor,
         stimulus_events,
         work_type: _,
-        active_flags,
         verifier_stats,
         kvm_stats,
         sysctls,
@@ -190,7 +187,6 @@ fn sidecar_payload_and_metrics_always_emit_when_empty() {
     assert!(project_commit.is_none());
     assert!(monitor.is_none());
     assert!(stimulus_events.is_empty());
-    assert!(active_flags.is_empty());
     assert!(verifier_stats.is_empty());
     assert!(kvm_stats.is_none());
     assert!(sysctls.is_empty());
@@ -299,7 +295,7 @@ fn write_sidecar_records_entry_payload_name() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__payload_name_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -356,7 +352,7 @@ fn write_sidecar_forwards_payload_metrics_slice() {
             exit_code: 2,
         },
     ];
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &metrics).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &metrics).unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__metrics_slice_test__-");
     let data = std::fs::read_to_string(&path).unwrap();
@@ -407,7 +403,7 @@ fn write_skip_sidecar_records_entry_payload_name() {
         payload: Some(&STRESS),
         ..KtstrTestEntry::DEFAULT
     };
-    write_skip_sidecar(&entry, &[]).unwrap();
+    write_skip_sidecar(&entry).unwrap();
 
     let path = find_single_sidecar_by_prefix(tmp.path(), "__skip_payload_name_test__-");
     let data = std::fs::read_to_string(&path).unwrap();

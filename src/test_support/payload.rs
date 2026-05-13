@@ -51,9 +51,9 @@ use crate::test_support::Scheduler;
 /// `#[non_exhaustive]` reserves the right to add fields without
 /// breaking downstream code. Out-of-crate callers cannot construct
 /// `Payload` via struct literal — use the const-fn constructors
-/// ([`Payload::new`], [`Payload::from_scheduler`], [`Payload::binary`])
-/// or the derive macros (`#[derive(Scheduler)]`, `#[derive(Payload)]`),
-/// which route through [`Payload::new`] under the hood.
+/// ([`Payload::new`], [`Payload::binary`]) or the
+/// `#[derive(Payload)]` macro, which routes through [`Payload::new`]
+/// under the hood.
 #[derive(Clone, Copy)]
 #[non_exhaustive]
 pub struct Payload {
@@ -395,18 +395,17 @@ impl Payload {
 
     /// Primary const constructor for a [`Payload`].
     ///
-    /// Takes every field by position so the two derive macros
-    /// (`#[derive(Scheduler)]` / `#[derive(Payload)]`) can emit a
-    /// single call instead of a struct-literal. `#[non_exhaustive]`
-    /// on the struct prevents out-of-crate struct-literal
-    /// construction; this constructor — defined in the same crate
-    /// as `Payload` — is not subject to that restriction, so the
-    /// macro-expanded tokens that reach downstream crates compile
-    /// cleanly.
+    /// Takes every field by position so the `#[derive(Payload)]`
+    /// macro can emit a single call instead of a struct-literal.
+    /// `#[non_exhaustive]` on the struct prevents out-of-crate
+    /// struct-literal construction; this constructor — defined in
+    /// the same crate as `Payload` — is not subject to that
+    /// restriction, so the macro-expanded tokens that reach
+    /// downstream crates compile cleanly.
     ///
-    /// For one-field constructions prefer [`Payload::from_scheduler`]
-    /// or [`Payload::binary`] — both call into this helper and pin
-    /// the non-identity fields to the exit-code-only defaults.
+    /// For one-field constructions prefer [`Payload::binary`] — it
+    /// calls into this helper and pins the non-identity fields to
+    /// the exit-code-only defaults.
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         name: &'static str,
@@ -434,27 +433,6 @@ impl Payload {
         }
     }
 
-    /// Minimal const wrapper: build a `Payload` that references an
-    /// existing `&'static Scheduler`. Used by unit tests and by the
-    /// `#[derive(Scheduler)]` wrapper emission to produce the
-    /// `{CONST}_PAYLOAD` const alongside the Scheduler const. Copies
-    /// the scheduler's `name` into the payload's `name` so the two
-    /// surfaces render with matching identity.
-    pub const fn from_scheduler(sched: &'static Scheduler) -> Payload {
-        Payload::new(
-            sched.name,
-            PayloadKind::Scheduler(sched),
-            OutputFormat::ExitCode,
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-            None,
-            None,
-        )
-    }
-
     /// Minimal const constructor for a binary-kind [`Payload`]. Fills
     /// the non-identity fields with the exit-code-only defaults — no
     /// CLI args, no author-declared checks, no metric hints, and
@@ -467,9 +445,6 @@ impl Payload {
     /// the guest via `-i` / `--include-files` for CLI invocations or
     /// pre-install it in the initramfs for `#[ktstr_test]` entries —
     /// see [`PayloadKind::Binary`] for the full packaging contract.
-    ///
-    /// Pair with [`Payload::from_scheduler`] for the scheduler side
-    /// of the same constructor surface.
     pub const fn binary(name: &'static str, binary: &'static str) -> Payload {
         Payload::new(
             name,

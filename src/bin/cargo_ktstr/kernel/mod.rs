@@ -289,7 +289,7 @@ pub(crate) fn resolve_one(id: ktstr::kernel_path::KernelId) -> Result<(String, P
 /// The flat list is what `cargo ktstr test` (and `coverage` /
 /// `llvm-cov`) hand to the test binary as the kernel dimension of
 /// the gauntlet expansion: every (test × scenario × topology ×
-/// flags × kernel) tuple becomes a distinct nextest test case so
+/// kernel) tuple becomes a distinct nextest test case so
 /// nextest's parallelism, retries, and `-E` filtering apply
 /// natively. A single `cargo nextest run` (or `cargo llvm-cov
 /// nextest`) invocation services every variant; profraw lands per-

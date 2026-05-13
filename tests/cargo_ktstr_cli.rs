@@ -410,9 +410,7 @@ fn help_verifier() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--scheduler"))
-        .stdout(predicate::str::contains("--scheduler-bin"))
-        .stdout(predicate::str::contains("--all-profiles"))
-        .stdout(predicate::str::contains("--profiles"));
+        .stdout(predicate::str::contains("--scheduler-bin"));
 }
 
 #[test]

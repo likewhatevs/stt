@@ -59,8 +59,8 @@ const DEFAULT_MEMORY_MB: u32 = 2048;
 ///     duration / `N` settings that would land boundaries closer
 ///     than 100 ms apart.
 ///   - `scheduler = PATH` — path to a `const Scheduler` (typically
-///     produced by `declare_scheduler!(...)` or `#[derive(Scheduler)]`).
-///     Maps onto `KtstrTestEntry::scheduler`, which is typed
+///     produced by `declare_scheduler!(...)`). Maps onto
+///     `KtstrTestEntry::scheduler`, which is typed
 ///     `&'static Scheduler`. Default: `&Scheduler::EEVDF`, the
 ///     no-scx placeholder that runs under the kernel's default
 ///     scheduler.
@@ -150,8 +150,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut max_cross_node_migration_ratio: Option<f64> = None;
     let mut max_slow_tier_ratio: Option<f64> = None;
     let mut extra_sched_args: Vec<String> = Vec::new();
-    let mut required_flags: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut excluded_flags: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut extra_include_files: Vec<String> = Vec::new();
     let mut min_numa_nodes: u32 = 1;
     let mut min_numa_nodes_set = false;
@@ -667,52 +665,10 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         }
                     }
-                    "required_flags" | "excluded_flags" => {
-                        let arr = match value {
-                            syn::Expr::Array(ea) => ea,
-                            _ => {
-                                return syn::Error::new_spanned(
-                                    value,
-                                    format!("expected array for {ident}"),
-                                )
-                                .to_compile_error()
-                                .into();
-                            }
-                        };
-                        let target = match ident.as_str() {
-                            "required_flags" => &mut required_flags,
-                            "excluded_flags" => &mut excluded_flags,
-                            _ => unreachable!(),
-                        };
-                        for elem in &arr.elems {
-                            match elem {
-                                syn::Expr::Lit(syn::ExprLit {
-                                    lit: syn::Lit::Str(ls),
-                                    ..
-                                }) => {
-                                    let val = ls.value();
-                                    target.push(quote! { #val });
-                                }
-                                syn::Expr::Path(_) => {
-                                    target.push(quote! { #elem });
-                                }
-                                _ => {
-                                    return syn::Error::new_spanned(
-                                        elem,
-                                        format!(
-                                            "expected string literal or path expression in {ident}"
-                                        ),
-                                    )
-                                    .to_compile_error()
-                                    .into();
-                                }
-                            }
-                        }
-                    }
                     _ => {
                         return syn::Error::new_spanned(
                             path,
-                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, required_flags, excluded_flags, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only, cleanup_budget_ms, post_vm, config, num_snapshots"),
+                            format!("unknown attribute `{ident}`, expected: llcs, cores, threads, numa_nodes, memory_mb, scheduler, payload, workloads, auto_repro, not_starved, isolation, max_gap_ms, max_spread_pct, max_throughput_cv, min_work_rate, max_p99_wake_latency_ns, max_wake_latency_cv, min_iteration_rate, max_migration_ratio, max_imbalance_ratio, max_local_dsq_depth, fail_on_stall, sustained_samples, max_fallback_rate, max_keep_last_rate, min_page_locality, max_cross_node_migration_ratio, max_slow_tier_ratio, extra_sched_args, min_numa_nodes, min_llcs, requires_smt, min_cpus, max_llcs, max_numa_nodes, max_cpus, watchdog_timeout_s, performance_mode, no_perf_mode, duration_s, workers_per_cgroup, bpf_map_write, expect_err, host_only, cleanup_budget_ms, post_vm, config, num_snapshots"),
                         )
                         .to_compile_error()
                         .into();
@@ -934,9 +890,8 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Build the scheduler reference token. The `scheduler` slot on
     // `KtstrTestEntry` is `&'static Scheduler`; callers pass either a
-    // `NAME` const emitted by `declare_scheduler!`/`#[derive(Scheduler)]`
-    // or `Scheduler::EEVDF` directly. The default is the kernel-default
-    // EEVDF placeholder.
+    // `NAME` const emitted by `declare_scheduler!` or `Scheduler::EEVDF`
+    // directly. The default is the kernel-default EEVDF placeholder.
     let scheduler_tokens = match &scheduler {
         Some(p) => {
             quote! { &#p }
@@ -1139,16 +1094,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     } else {
         quote! { extra_sched_args: &[#(#extra_sched_args),*], }
-    };
-    let required_flags_field = if required_flags.is_empty() {
-        quote! {}
-    } else {
-        quote! { required_flags: &[#(#required_flags),*], }
-    };
-    let excluded_flags_field = if excluded_flags.is_empty() {
-        quote! {}
-    } else {
-        quote! { excluded_flags: &[#(#excluded_flags),*], }
     };
     let watchdog_timeout_field = if watchdog_timeout_s_set {
         quote! { watchdog_timeout: ::std::time::Duration::from_secs(#watchdog_timeout_s), }
@@ -1447,8 +1392,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #auto_repro_field
             #assert_field
             #extra_sched_args_field
-            #required_flags_field
-            #excluded_flags_field
             #watchdog_timeout_field
             #bpf_map_write_field
             #performance_mode_field
@@ -1476,33 +1419,6 @@ pub fn ktstr_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// Convert a CamelCase identifier to kebab-case.
-///
-/// Handles acronyms (consecutive uppercase): a separator is inserted
-/// before the last letter of a run when followed by lowercase.
-///
-/// `Llc` -> `"llc"`, `RejectPin` -> `"reject-pin"`, `NoCtrl` -> `"no-ctrl"`,
-/// `LLC` -> `"llc"`, `HTTPServer` -> `"http-server"`.
-fn camel_to_kebab(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::new();
-    for (i, &ch) in chars.iter().enumerate() {
-        if ch.is_uppercase() && i > 0 {
-            let prev_upper = chars[i - 1].is_uppercase();
-            let next_lower = chars.get(i + 1).is_some_and(|c| c.is_lowercase());
-            // Insert separator when:
-            // - previous char is lowercase (standard CamelCase boundary), OR
-            // - previous char is uppercase AND next char is lowercase
-            //   (end of acronym run: "HTTPServer" -> "http-server")
-            if !prev_upper || next_lower {
-                out.push('-');
-            }
-        }
-        out.push(ch.to_ascii_lowercase());
-    }
-    out
-}
-
 /// Convert a CamelCase identifier to SCREAMING_SNAKE_CASE.
 ///
 /// Handles acronyms (consecutive uppercase): a separator is inserted
@@ -1526,606 +1442,7 @@ fn camel_to_screaming_snake(s: &str) -> String {
     out
 }
 
-/// Derive macro that generates a `Scheduler` const, `FlagDecl` statics,
-/// and associated name constants from an annotated enum.
-///
-/// # Scheduler attributes (`#[scheduler(...)]`)
-///
-/// | Attribute | Required | Description |
-/// |---|---|---|
-/// | `name = "..."` | yes | Scheduler name passed to `Scheduler::new()` |
-/// | `binary = "..."` | no | Binary name for `SchedulerSpec::Discover(...)`. Omit for EEVDF. |
-/// | `topology(N, L, C, T)` | no | Default VM topology `(numa_nodes, llcs, cores, threads)`. Defaults to `(1, 1, 2, 1)`. |
-/// | `cgroup_parent = "..."` | no | Cgroup parent path. Must begin with `/` (e.g. `"/ktstr"`). |
-/// | `sched_args = [...]` | no | Default scheduler CLI args. |
-/// | `sysctls = [Sysctl::new("key", "value"), ...]` | no | Guest sysctls applied before the scheduler starts. Each element is a fully-qualified Rust expression that evaluates to a [`Sysctl`](crate::test_support::Sysctl); the macro inserts the token stream verbatim, so `Sysctl::new(...)`, a path to a `const Sysctl`, or any user-written constructor call all work. Unlike the bare-form `default_check(min(...))` grammar, `sysctls` has no implicit path prefix — write the type name explicitly (or bring it into scope with `use`). |
-/// | `kargs = ["arg1", "arg2"]` | no | Extra kernel command-line args appended when booting the VM. |
-/// | `min_numa_nodes = N` | no | Minimum NUMA nodes for gauntlet filtering. |
-/// | `max_numa_nodes = N` | no | Maximum NUMA nodes for gauntlet filtering. |
-/// | `min_llcs = N` | no | Minimum LLCs for gauntlet filtering. |
-/// | `max_llcs = N` | no | Maximum LLCs for gauntlet filtering. |
-/// | `min_cpus = N` | no | Minimum total CPUs for gauntlet filtering. |
-/// | `max_cpus = N` | no | Maximum total CPUs for gauntlet filtering. |
-/// | `requires_smt = bool` | no | Require SMT (threads_per_core > 1). |
-/// | `config_file = "..."` | no | Host-side path to an opaque config file passed to the scheduler via `--config`. |
-///
-/// # Flag attributes (`#[flag(...)]`)
-///
-/// | Attribute | Description |
-/// |---|---|
-/// | `args = ["--flag-a", "--flag-b"]` | CLI args passed when this flag is active |
-/// | `requires = [OtherVariant]` | Variants that must also be active |
-///
-/// # Generated items
-///
-/// Given `enum MitosisFlag { Llc, Steal }`:
-///
-/// - Per-variant `static FlagDecl` entries
-/// - A `static &[&FlagDecl]` flags array
-/// - `const MITOSIS: Scheduler` (see naming below)
-/// - `impl MitosisFlag { pub const LLC: &str = "llc"; pub const STEAL: &str = "steal"; }`
-///
-/// The associated constants enable typed flag references:
-/// `required_flags = [MitosisFlag::LLC]` in `#[ktstr_test]`.
-///
-/// # Const name derivation
-///
-/// The generated `Scheduler` const name is derived from the enum name:
-/// 1. Strip trailing `"Flag"` or `"Flags"` suffix (if present)
-/// 2. Convert to `SCREAMING_SNAKE_CASE`
-///
-/// Examples: `MitosisFlag` -> `MITOSIS`, `EevdfFlags` -> `EEVDF`,
-/// `MySchedFlag` -> `MY_SCHED`, `Mitosis` -> `MITOSIS`.
-///
-/// # Variant naming
-///
-/// Variant identifiers are converted to kebab-case for the flag name.
-/// Consecutive uppercase letters are treated as acronyms:
-/// `Llc` -> `"llc"`, `RejectPin` -> `"reject-pin"`, `LLC` -> `"llc"`.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use ktstr::prelude::*;
-///
-/// #[derive(Scheduler)]
-/// #[scheduler(name = "mitosis", binary = "scx_mitosis", topology(1, 2, 4, 1),
-///             cgroup_parent = "/ktstr", sched_args = ["--exit-dump-len", "1048576"])]
-/// #[allow(dead_code)]
-/// enum MitosisFlag {
-///     #[flag(args = ["--enable-llc-awareness"])]
-///     Llc,
-///     #[flag(args = ["--enable-work-stealing"], requires = [Llc])]
-///     Steal,
-/// }
-/// ```
-#[proc_macro_derive(Scheduler, attributes(scheduler, flag))]
-pub fn derive_scheduler(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    match derive_scheduler_inner(input) {
-        Ok(ts) => ts.into(),
-        Err(e) => e.to_compile_error().into(),
-    }
-}
-
-fn derive_scheduler_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
-    let enum_name = &input.ident;
-
-    // Parse #[scheduler(...)] attributes
-    let mut sched_name: Option<String> = None;
-    let mut sched_binary: Option<String> = None;
-    let mut sched_topology: Option<(u32, u32, u32, u32)> = None;
-    let mut sched_cgroup_parent: Option<String> = None;
-    let mut sched_args: Vec<String> = Vec::new();
-    let mut sched_sysctls: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut sched_sysctls_set = false;
-    let mut sched_kargs: Vec<String> = Vec::new();
-    let mut sched_kargs_set = false;
-    let mut sched_min_numa_nodes: Option<u32> = None;
-    let mut sched_max_numa_nodes: Option<u32> = None;
-    let mut sched_min_llcs: Option<u32> = None;
-    let mut sched_max_llcs: Option<u32> = None;
-    let mut sched_min_cpus: Option<u32> = None;
-    let mut sched_max_cpus: Option<u32> = None;
-    let mut sched_requires_smt: Option<bool> = None;
-    let mut sched_config_file: Option<String> = None;
-
-    for attr in &input.attrs {
-        if !attr.path().is_ident("scheduler") {
-            continue;
-        }
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
-                let value = meta.value()?;
-                let lit: syn::LitStr = value.parse()?;
-                sched_name = Some(lit.value());
-                Ok(())
-            } else if meta.path.is_ident("binary") {
-                let value = meta.value()?;
-                let lit: syn::LitStr = value.parse()?;
-                sched_binary = Some(lit.value());
-                Ok(())
-            } else if meta.path.is_ident("topology") {
-                let content;
-                syn::parenthesized!(content in meta.input);
-                let numa_nodes_lit: syn::LitInt = content.parse()?;
-                let _: syn::Token![,] = content.parse()?;
-                let llcs_lit: syn::LitInt = content.parse()?;
-                let _: syn::Token![,] = content.parse()?;
-                let cores: syn::LitInt = content.parse()?;
-                let _: syn::Token![,] = content.parse()?;
-                let threads: syn::LitInt = content.parse()?;
-                sched_topology = Some((
-                    numa_nodes_lit.base10_parse()?,
-                    llcs_lit.base10_parse()?,
-                    cores.base10_parse()?,
-                    threads.base10_parse()?,
-                ));
-                Ok(())
-            } else if meta.path.is_ident("cgroup_parent") {
-                let value = meta.value()?;
-                let lit: syn::LitStr = value.parse()?;
-                sched_cgroup_parent = Some(lit.value());
-                Ok(())
-            } else if meta.path.is_ident("sched_args") {
-                let value = meta.value()?;
-                let arr: syn::ExprArray = value.parse()?;
-                for elem in &arr.elems {
-                    match elem {
-                        syn::Expr::Lit(syn::ExprLit {
-                            lit: syn::Lit::Str(ls),
-                            ..
-                        }) => sched_args.push(ls.value()),
-                        _ => {
-                            return Err(syn::Error::new_spanned(
-                                elem,
-                                "expected string literal in sched_args",
-                            ));
-                        }
-                    }
-                }
-                Ok(())
-            } else if meta.path.is_ident("sysctls") {
-                let value = meta.value()?;
-                let arr: syn::ExprArray = value.parse()?;
-                sched_sysctls_set = true;
-                for elem in &arr.elems {
-                    sched_sysctls.push(elem.to_token_stream());
-                }
-                Ok(())
-            } else if meta.path.is_ident("kargs") {
-                let value = meta.value()?;
-                let arr: syn::ExprArray = value.parse()?;
-                sched_kargs_set = true;
-                for elem in &arr.elems {
-                    match elem {
-                        syn::Expr::Lit(syn::ExprLit {
-                            lit: syn::Lit::Str(ls),
-                            ..
-                        }) => sched_kargs.push(ls.value()),
-                        _ => {
-                            return Err(syn::Error::new_spanned(
-                                elem,
-                                "expected string literal in kargs",
-                            ));
-                        }
-                    }
-                }
-                Ok(())
-            } else if meta.path.is_ident("min_numa_nodes") {
-                let value = meta.value()?;
-                let lit: syn::LitInt = value.parse()?;
-                sched_min_numa_nodes = Some(lit.base10_parse()?);
-                Ok(())
-            } else if meta.path.is_ident("max_numa_nodes") {
-                let value = meta.value()?;
-                let lit: syn::LitInt = value.parse()?;
-                sched_max_numa_nodes = Some(lit.base10_parse()?);
-                Ok(())
-            } else if meta.path.is_ident("min_llcs") {
-                let value = meta.value()?;
-                let lit: syn::LitInt = value.parse()?;
-                sched_min_llcs = Some(lit.base10_parse()?);
-                Ok(())
-            } else if meta.path.is_ident("max_llcs") {
-                let value = meta.value()?;
-                let lit: syn::LitInt = value.parse()?;
-                sched_max_llcs = Some(lit.base10_parse()?);
-                Ok(())
-            } else if meta.path.is_ident("min_cpus") {
-                let value = meta.value()?;
-                let lit: syn::LitInt = value.parse()?;
-                sched_min_cpus = Some(lit.base10_parse()?);
-                Ok(())
-            } else if meta.path.is_ident("max_cpus") {
-                let value = meta.value()?;
-                let lit: syn::LitInt = value.parse()?;
-                sched_max_cpus = Some(lit.base10_parse()?);
-                Ok(())
-            } else if meta.path.is_ident("requires_smt") {
-                let value = meta.value()?;
-                let lit: syn::LitBool = value.parse()?;
-                sched_requires_smt = Some(lit.value());
-                Ok(())
-            } else if meta.path.is_ident("config_file") {
-                let value = meta.value()?;
-                let lit: syn::LitStr = value.parse()?;
-                sched_config_file = Some(lit.value());
-                Ok(())
-            } else {
-                Err(meta.error(format!(
-                    "unknown scheduler attribute `{}`",
-                    meta.path
-                        .get_ident()
-                        .map(|i| i.to_string())
-                        .unwrap_or_default()
-                )))
-            }
-        })?;
-    }
-
-    let sched_name = sched_name
-        .ok_or_else(|| syn::Error::new_spanned(enum_name, "missing `name` in #[scheduler(...)]"))?;
-
-    // Validate topology values at compile time.
-    if let Some((n, l, c, t)) = sched_topology {
-        if n == 0 || l == 0 || c == 0 || t == 0 {
-            return Err(syn::Error::new_spanned(
-                enum_name,
-                "topology values must all be > 0",
-            ));
-        }
-        if l % n != 0 {
-            return Err(syn::Error::new_spanned(
-                enum_name,
-                format!("topology: llcs ({l}) must be divisible by numa_nodes ({n})"),
-            ));
-        }
-    }
-
-    // Extract enum variants
-    let variants = match &input.data {
-        Data::Enum(data) => &data.variants,
-        _ => {
-            return Err(syn::Error::new_spanned(
-                enum_name,
-                "Scheduler can only be derived for enums",
-            ));
-        }
-    };
-
-    // Validate all variants are unit variants
-    for v in variants {
-        if !matches!(v.fields, Fields::Unit) {
-            return Err(syn::Error::new_spanned(
-                v,
-                "Scheduler derive requires unit variants",
-            ));
-        }
-    }
-
-    // Collect variant info
-    struct FlagInfo {
-        ident: syn::Ident,
-        kebab_name: String,
-        screaming_snake: String,
-        args: Vec<String>,
-        requires: Vec<syn::Ident>,
-    }
-
-    let mut flag_infos: Vec<FlagInfo> = Vec::new();
-
-    for v in variants {
-        let ident = v.ident.clone();
-        let kebab_name = camel_to_kebab(&ident.to_string());
-        let screaming_snake = camel_to_screaming_snake(&ident.to_string());
-        let mut args: Vec<String> = Vec::new();
-        let mut requires: Vec<syn::Ident> = Vec::new();
-
-        for attr in &v.attrs {
-            if !attr.path().is_ident("flag") {
-                continue;
-            }
-            attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("args") {
-                    let value = meta.value()?;
-                    let arr: syn::ExprArray = value.parse()?;
-                    for elem in &arr.elems {
-                        match elem {
-                            syn::Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Str(ls),
-                                ..
-                            }) => args.push(ls.value()),
-                            _ => {
-                                return Err(syn::Error::new_spanned(
-                                    elem,
-                                    "expected string literal in flag args",
-                                ));
-                            }
-                        }
-                    }
-                    Ok(())
-                } else if meta.path.is_ident("requires") {
-                    let value = meta.value()?;
-                    let arr: syn::ExprArray = value.parse()?;
-                    for elem in &arr.elems {
-                        match elem {
-                            syn::Expr::Path(ep) => {
-                                let req_ident = ep
-                                    .path
-                                    .get_ident()
-                                    .ok_or_else(|| {
-                                        syn::Error::new_spanned(
-                                            ep,
-                                            "expected variant identifier in requires",
-                                        )
-                                    })?
-                                    .clone();
-                                requires.push(req_ident);
-                            }
-                            _ => {
-                                return Err(syn::Error::new_spanned(
-                                    elem,
-                                    "expected variant identifier in requires",
-                                ));
-                            }
-                        }
-                    }
-                    Ok(())
-                } else {
-                    Err(meta.error(format!(
-                        "unknown flag attribute `{}`",
-                        meta.path
-                            .get_ident()
-                            .map(|i| i.to_string())
-                            .unwrap_or_default()
-                    )))
-                }
-            })?;
-        }
-
-        flag_infos.push(FlagInfo {
-            ident,
-            kebab_name,
-            screaming_snake,
-            args,
-            requires,
-        });
-    }
-
-    // Validate requires references exist
-    let variant_names: Vec<String> = flag_infos.iter().map(|f| f.ident.to_string()).collect();
-    for fi in &flag_infos {
-        for req in &fi.requires {
-            if !variant_names.contains(&req.to_string()) {
-                return Err(syn::Error::new_spanned(
-                    req,
-                    format!(
-                        "unknown variant `{}` in requires (expected one of: {})",
-                        req,
-                        variant_names.join(", ")
-                    ),
-                ));
-            }
-        }
-    }
-
-    // Generate static FlagDecl names
-    let enum_upper = camel_to_screaming_snake(&enum_name.to_string());
-    let decl_idents: Vec<syn::Ident> = flag_infos
-        .iter()
-        .map(|fi| format_ident!("__{}_DECL_{}", enum_upper, fi.screaming_snake))
-        .collect();
-
-    // Generate static FlagDecl entries
-    let mut decl_statics = Vec::new();
-    for (i, fi) in flag_infos.iter().enumerate() {
-        let decl_ident = &decl_idents[i];
-        let name_str = &fi.kebab_name;
-        let args = &fi.args;
-
-        let requires_tokens: Vec<proc_macro2::TokenStream> = fi
-            .requires
-            .iter()
-            .map(|req_ident| {
-                let req_idx = flag_infos
-                    .iter()
-                    .position(|f| f.ident == *req_ident)
-                    .unwrap();
-                let req_decl_ident = &decl_idents[req_idx];
-                quote! { &#req_decl_ident }
-            })
-            .collect();
-
-        decl_statics.push(quote! {
-            static #decl_ident: ::ktstr::scenario::flags::FlagDecl = ::ktstr::scenario::flags::FlagDecl {
-                name: #name_str,
-                args: &[#(#args),*],
-                requires: &[#(#requires_tokens),*],
-            };
-        });
-    }
-
-    // Generate the flags array
-    let flags_array_ident = format_ident!("__{}_FLAGS", enum_upper);
-    let decl_refs: Vec<proc_macro2::TokenStream> =
-        decl_idents.iter().map(|di| quote! { &#di }).collect();
-
-    // Generate associated name constants
-    let name_consts: Vec<proc_macro2::TokenStream> = flag_infos
-        .iter()
-        .map(|fi| {
-            let const_ident = format_ident!("{}", fi.screaming_snake);
-            let name_str = &fi.kebab_name;
-            quote! {
-                pub const #const_ident: &'static str = #name_str;
-            }
-        })
-        .collect();
-
-    // Derive the const name from enum name: strip "Flag"/"Flags" suffix, uppercase
-    let enum_str = enum_name.to_string();
-    let base_name = enum_str
-        .strip_suffix("Flags")
-        .or_else(|| enum_str.strip_suffix("Flag"))
-        .unwrap_or(&enum_str);
-    if base_name.is_empty() {
-        return Err(syn::Error::new(
-            enum_name.span(),
-            "enum name cannot be just \"Flag\" or \"Flags\"",
-        ));
-    }
-    let const_name = format_ident!("{}", camel_to_screaming_snake(base_name));
-
-    // Build the Scheduler const with builder chain
-    let sched_name_str = &sched_name;
-    let mut builder_chain = quote! {
-        ::ktstr::test_support::Scheduler::new(#sched_name_str)
-    };
-
-    if let Some(ref binary) = sched_binary {
-        builder_chain = quote! {
-            #builder_chain.binary(::ktstr::test_support::SchedulerSpec::Discover(#binary))
-        };
-    }
-
-    builder_chain = quote! {
-        #builder_chain.flags(#flags_array_ident)
-    };
-
-    if let Some((n, s, c, t)) = sched_topology {
-        builder_chain = quote! {
-            #builder_chain.topology(#n, #s, #c, #t)
-        };
-    }
-
-    if let Some(ref parent) = sched_cgroup_parent {
-        builder_chain = quote! {
-            #builder_chain.cgroup_parent(#parent)
-        };
-    }
-
-    if !sched_args.is_empty() {
-        builder_chain = quote! {
-            #builder_chain.sched_args(&[#(#sched_args),*])
-        };
-    }
-
-    if sched_sysctls_set {
-        let entries = &sched_sysctls;
-        builder_chain = quote! {
-            #builder_chain.sysctls(&[#(#entries),*])
-        };
-    }
-
-    if sched_kargs_set {
-        builder_chain = quote! {
-            #builder_chain.kargs(&[#(#sched_kargs),*])
-        };
-    }
-
-    // Chain individual constraint builder calls for each explicitly set
-    // attribute. Unset fields inherit from TopologyConstraints::DEFAULT.
-    if let Some(v) = sched_min_numa_nodes {
-        builder_chain = quote! { #builder_chain.min_numa_nodes(#v) };
-    }
-    if let Some(v) = sched_max_numa_nodes {
-        builder_chain = quote! { #builder_chain.max_numa_nodes(#v) };
-    }
-    if let Some(v) = sched_min_llcs {
-        builder_chain = quote! { #builder_chain.min_llcs(#v) };
-    }
-    if let Some(v) = sched_max_llcs {
-        builder_chain = quote! { #builder_chain.max_llcs(#v) };
-    }
-    if let Some(v) = sched_requires_smt {
-        builder_chain = quote! { #builder_chain.requires_smt(#v) };
-    }
-    if let Some(v) = sched_min_cpus {
-        builder_chain = quote! { #builder_chain.min_cpus(#v) };
-    }
-    if let Some(v) = sched_max_cpus {
-        builder_chain = quote! { #builder_chain.max_cpus(#v) };
-    }
-    if let Some(ref v) = sched_config_file {
-        builder_chain = quote! { #builder_chain.config_file(#v) };
-    }
-
-    // Generate the ctor function name for --ktstr-list-flags interception.
-    let list_flags_ctor = format_ident!("__ktstr_list_flags_{}", enum_upper.to_lowercase());
-
-    // Additionally emit a `Payload` const wrapping the `Scheduler`
-    // so the scheduler is usable in the entry's scheduler slot and
-    // in compositions that need a `Payload` reference without
-    // calling `.run()`. Scheduler-kind Payloads in `workloads = [..]`
-    // would fail at `ctx.payload(p).run()` — those slots are
-    // binary-only — so the example is deliberately not about
-    // `workloads`.
-    //
-    // Naming: `#[derive(Payload)]` strips the `Payload` suffix from
-    // the struct name; the scheduler side appends `_PAYLOAD` so the
-    // two surfaces stay symmetric and there's no collision with the
-    // Scheduler const.
-    let payload_const_name = format_ident!("{}_PAYLOAD", const_name);
-    let sched_name_for_payload = sched_name_str;
-
-    let expanded = quote! {
-        #(#decl_statics)*
-
-        static #flags_array_ident: &[&::ktstr::scenario::flags::FlagDecl] = &[#(#decl_refs),*];
-
-        const #const_name: ::ktstr::test_support::Scheduler = #builder_chain;
-
-        /// Payload wrapper around the generated `Scheduler` const so
-        /// the scheduler is usable wherever a `&'static Payload` is
-        /// expected without calling `.run()` — chiefly the entry's
-        /// scheduler slot, plus any composition site that takes a
-        /// `&'static Payload` reference. Scheduler-kind Payloads are
-        /// rejected at `ctx.payload(p).run()`, so this wrapper is
-        /// intentionally not meant for `workloads = [..]` (which is
-        /// binary-only).
-        const #payload_const_name: ::ktstr::test_support::Payload =
-            ::ktstr::test_support::Payload::new(
-                #sched_name_for_payload,
-                ::ktstr::test_support::PayloadKind::Scheduler(&#const_name),
-                ::ktstr::test_support::OutputFormat::ExitCode,
-                &[],
-                &[],
-                &[],
-                &[],
-                false,
-                None,
-                None,
-            );
-
-        impl #enum_name {
-            #(#name_consts)*
-        }
-
-        /// Intercept `--ktstr-list-flags` before `main()` runs.
-        /// Serializes this scheduler's flag declarations as JSON to
-        /// stdout and exits, avoiding BPF program loading.
-        #[::ktstr::__private::ctor::ctor(crate_path = ::ktstr::__private::ctor)]
-        fn #list_flags_ctor() {
-            if !::std::env::args().any(|a| a == "--ktstr-list-flags") {
-                return;
-            }
-            let decls: ::std::vec::Vec<::ktstr::scenario::flags::FlagDeclJson> =
-                #flags_array_ident
-                    .iter()
-                    .map(|d| ::ktstr::scenario::flags::FlagDeclJson::from_decl(d))
-                    .collect();
-            let json = ::ktstr::__private::serde_json::to_string(&decls).expect("serialize flags");
-            println!("{json}");
-            ::std::process::exit(0);
-        }
-    };
-
-    Ok(expanded)
-}
-
-/// Function-style macro that registers a `Scheduler` const without
-/// requiring an enum vehicle.
+/// Function-style macro that registers a `Scheduler` const.
 ///
 /// # Syntax
 ///
@@ -2367,7 +1684,7 @@ fn declare_scheduler_inner(
         ));
     }
 
-    // Validate topology (matches derive's validation).
+    // Validate topology.
     if let Some((n, l, c, t)) = sched_topology {
         if n == 0 || l == 0 || c == 0 || t == 0 {
             return Err(syn::Error::new(
@@ -2575,9 +1892,8 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
     // previous behavior for in-crate tests that rely on it.
     let struct_vis = &input.vis;
 
-    // Reject non-struct inputs; the flag-variant grammar is specific
-    // to `Scheduler` (enums) and a struct-only payload keeps the
-    // attribute space unambiguous.
+    // Reject non-struct inputs; the payload attribute grammar is
+    // struct-only, keeping the attribute space unambiguous.
     if !matches!(&input.data, Data::Struct(_)) {
         return Err(syn::Error::new_spanned(
             struct_name,
@@ -2727,9 +2043,6 @@ fn derive_payload_inner(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
     }
 
     // Derive the const name: strip "Payload" suffix and uppercase.
-    // The suffix strip matches the derive(Scheduler) convention
-    // (strip "Flag"/"Flags") so the two macros feel consistent to
-    // test authors declaring both.
     let struct_str = struct_name.to_string();
     let base = struct_str.strip_suffix("Payload").unwrap_or(&struct_str);
     if base.is_empty() {
@@ -3384,59 +2697,6 @@ fn split_on_commas(tokens: proc_macro2::TokenStream) -> Vec<proc_macro2::TokenSt
 mod tests {
     use super::*;
     use quote::quote;
-
-    #[test]
-    fn camel_to_kebab_single_uppercase_word() {
-        assert_eq!(camel_to_kebab("Llc"), "llc");
-    }
-
-    #[test]
-    fn camel_to_kebab_acronym_then_word() {
-        assert_eq!(camel_to_kebab("HTTPServer"), "http-server");
-    }
-
-    #[test]
-    fn camel_to_kebab_single_char() {
-        assert_eq!(camel_to_kebab("X"), "x");
-    }
-
-    #[test]
-    fn camel_to_kebab_all_caps() {
-        assert_eq!(camel_to_kebab("CPU"), "cpu");
-    }
-
-    #[test]
-    fn camel_to_kebab_standard_camel() {
-        assert_eq!(camel_to_kebab("RejectPin"), "reject-pin");
-    }
-
-    #[test]
-    fn camel_to_kebab_lowercase_passthrough() {
-        assert_eq!(camel_to_kebab("foo"), "foo");
-    }
-
-    #[test]
-    fn camel_to_kebab_empty() {
-        assert_eq!(camel_to_kebab(""), "");
-    }
-
-    #[test]
-    fn camel_to_screaming_snake_strip_flag_suffix() {
-        let s = "MitosisFlag".strip_suffix("Flag").unwrap();
-        assert_eq!(camel_to_screaming_snake(s), "MITOSIS");
-    }
-
-    #[test]
-    fn camel_to_screaming_snake_strip_flags_suffix() {
-        let s = "EevdfFlags".strip_suffix("Flags").unwrap();
-        assert_eq!(camel_to_screaming_snake(s), "EEVDF");
-    }
-
-    #[test]
-    fn camel_to_screaming_snake_multi_word() {
-        let s = "MySchedFlag".strip_suffix("Flag").unwrap();
-        assert_eq!(camel_to_screaming_snake(s), "MY_SCHED");
-    }
 
     #[test]
     fn camel_to_screaming_snake_acronym_run() {

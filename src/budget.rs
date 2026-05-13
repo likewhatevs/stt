@@ -2,7 +2,7 @@
 //!
 //! When `KTSTR_BUDGET_SECS` is set during `--list`, selects the subset of
 //! tests that maximizes feature coverage within the time budget. Each
-//! test is encoded as a bitset feature vector capturing scheduler, flags,
+//! test is encoded as a bitset feature vector capturing scheduler,
 //! topology, and workload properties. The greedy algorithm picks tests
 //! with the highest marginal-coverage-per-second ratio.
 
@@ -11,7 +11,7 @@ use crate::vmm::topology::Topology;
 
 /// A test candidate for budget selection.
 pub(crate) struct TestCandidate {
-    /// Full test name for `--list` output (e.g. `"gauntlet/basic/tiny-1llc/default: test"`).
+    /// Full test name for `--list` output (e.g. `"gauntlet/basic/tiny-1llc: test"`).
     pub name: String,
     /// Bitset encoding test properties for coverage measurement.
     pub features: u64,
@@ -27,56 +27,30 @@ pub(crate) struct TestCandidate {
 // partially covers a different bucket value.
 //
 //   Bits  0..3:  scheduler name hash (4 one-hot bits)
-//   Bits  4..9:  required flags (6 bits, already one-hot per flag)
-//   Bits 10..15: excluded flags (6 bits)
-//   Bits 16..21: active profile flags (6 bits)
-//   Bits 22..26: CPU count bucket (5 one-hot bits)
-//   Bits 27..31: LLC count bucket (5 one-hot bits)
-//   Bit  32:     SMT (threads_per_core > 1)
-//   Bit  33:     performance_mode
-//   Bit  34:     host_only
-//   Bit  35:     expect_err
-//   Bits 36..38: duration bucket (3 one-hot bits)
-//   Bit  39:     workers_per_cgroup bucket (1 bit)
-//   Bit  40:     is gauntlet variant
-//   Bits 41..44: test name hash (4 one-hot bits)
-//   Bits 45..48: NUMA node count bucket (4 one-hot bits)
+//   Bits  4..8:  CPU count bucket (5 one-hot bits)
+//   Bits  9..13: LLC count bucket (5 one-hot bits)
+//   Bit  14:     SMT (threads_per_core > 1)
+//   Bit  15:     performance_mode
+//   Bit  16:     host_only
+//   Bit  17:     expect_err
+//   Bits 18..20: duration bucket (3 one-hot bits)
+//   Bit  21:     workers_per_cgroup bucket (1 bit)
+//   Bit  22:     is gauntlet variant
+//   Bits 23..26: test name hash (4 one-hot bits)
+//   Bits 27..30: NUMA node count bucket (4 one-hot bits)
 
 const SCHED_SHIFT: u32 = 0;
-const REQ_FLAGS_SHIFT: u32 = 4;
-const EXCL_FLAGS_SHIFT: u32 = 10;
-const PROFILE_FLAGS_SHIFT: u32 = 16;
-const CPU_BUCKET_SHIFT: u32 = 22;
-const LLC_BUCKET_SHIFT: u32 = 27;
-const SMT_SHIFT: u32 = 32;
-const PERF_MODE_SHIFT: u32 = 33;
-const HOST_ONLY_SHIFT: u32 = 34;
-const EXPECT_ERR_SHIFT: u32 = 35;
-const DURATION_SHIFT: u32 = 36;
-const WORKERS_SHIFT: u32 = 39;
-const GAUNTLET_SHIFT: u32 = 40;
-const NAME_HASH_SHIFT: u32 = 41;
-const NUMA_BUCKET_SHIFT: u32 = 45;
-
-/// Map a flag name to its bit index within the 6-bit flag fields.
-/// Uses `scenario::flags::ALL` as the canonical order.
-fn flag_bit(name: &str) -> Option<u32> {
-    crate::scenario::flags::ALL
-        .iter()
-        .position(|&n| n == name)
-        .map(|i| i as u32)
-}
-
-/// Encode a set of flag names into a 6-bit mask.
-fn encode_flags(flags: &[&str]) -> u64 {
-    let mut mask = 0u64;
-    for &f in flags {
-        if let Some(bit) = flag_bit(f) {
-            mask |= 1 << bit;
-        }
-    }
-    mask
-}
+const CPU_BUCKET_SHIFT: u32 = 4;
+const LLC_BUCKET_SHIFT: u32 = 9;
+const SMT_SHIFT: u32 = 14;
+const PERF_MODE_SHIFT: u32 = 15;
+const HOST_ONLY_SHIFT: u32 = 16;
+const EXPECT_ERR_SHIFT: u32 = 17;
+const DURATION_SHIFT: u32 = 18;
+const WORKERS_SHIFT: u32 = 21;
+const GAUNTLET_SHIFT: u32 = 22;
+const NAME_HASH_SHIFT: u32 = 23;
+const NUMA_BUCKET_SHIFT: u32 = 27;
 
 /// DJB2 string hash.
 fn djb2_hash(name: &str) -> u32 {
@@ -135,12 +109,10 @@ fn numa_bucket(numa_nodes: u32) -> u64 {
 
 /// Extract feature bitset from a KtstrTestEntry and topology.
 ///
-/// `active_flags` is the flag profile for gauntlet variants (empty for
-/// base tests). `is_gauntlet` distinguishes base from gauntlet variants.
+/// `is_gauntlet` distinguishes base from gauntlet variants.
 pub(crate) fn extract_features(
     entry: &KtstrTestEntry,
     topo: &Topology,
-    active_flags: &[&str],
     is_gauntlet: bool,
     test_name: &str,
 ) -> u64 {
@@ -148,15 +120,6 @@ pub(crate) fn extract_features(
 
     // Scheduler name hash (4 one-hot bits)
     bits |= (1u64 << (djb2_hash(entry.scheduler.name) % 4)) << SCHED_SHIFT;
-
-    // Required flags
-    bits |= encode_flags(entry.required_flags) << REQ_FLAGS_SHIFT;
-
-    // Excluded flags
-    bits |= encode_flags(entry.excluded_flags) << EXCL_FLAGS_SHIFT;
-
-    // Active profile flags
-    bits |= encode_flags(active_flags) << PROFILE_FLAGS_SHIFT;
 
     // Topology
     bits |= cpu_bucket(topo.total_cpus()) << CPU_BUCKET_SHIFT;
@@ -316,37 +279,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flag_bit_known() {
-        assert_eq!(flag_bit("llc"), Some(0));
-        assert_eq!(flag_bit("borrow"), Some(1));
-        assert_eq!(flag_bit("steal"), Some(2));
-        assert_eq!(flag_bit("rebal"), Some(3));
-        assert_eq!(flag_bit("reject-pin"), Some(4));
-        assert_eq!(flag_bit("no-ctrl"), Some(5));
-    }
-
-    #[test]
-    fn flag_bit_unknown() {
-        assert_eq!(flag_bit("nonexistent"), None);
-    }
-
-    #[test]
-    fn encode_flags_empty() {
-        assert_eq!(encode_flags(&[]), 0);
-    }
-
-    #[test]
-    fn encode_flags_single() {
-        assert_eq!(encode_flags(&["borrow"]), 0b10);
-    }
-
-    #[test]
-    fn encode_flags_multiple() {
-        let mask = encode_flags(&["llc", "steal"]);
-        assert_eq!(mask, 0b101); // bit 0 + bit 2
-    }
-
-    #[test]
     fn cpu_bucket_one_hot() {
         assert_eq!(cpu_bucket(1), 1 << 0);
         assert_eq!(cpu_bucket(8), 1 << 0);
@@ -481,8 +413,8 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let f1 = extract_features(&entry, &topo1, &[], false, "numa_test");
-        let f2 = extract_features(&entry, &topo2, &[], false, "numa_test");
+        let f1 = extract_features(&entry, &topo1, false, "numa_test");
+        let f2 = extract_features(&entry, &topo2, false, "numa_test");
         // Same CPU/LLC counts, different NUMA => different features.
         assert_ne!(f1, f2);
         // NUMA bits differ.
@@ -503,7 +435,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let features = extract_features(&entry, &topo, &[], false, "basic_test");
+        let features = extract_features(&entry, &topo, false, "basic_test");
         // Should have bits set for scheduler hash, cpu bucket 0, llc bucket 0,
         // duration bucket 0, workers bucket 0, no gauntlet flag.
         assert_eq!(features & (1 << GAUNTLET_SHIFT), 0);
@@ -524,7 +456,7 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let features = extract_features(&entry, &topo, &[], false, "smt_test");
+        let features = extract_features(&entry, &topo, false, "smt_test");
         assert_ne!(features & (1 << SMT_SHIFT), 0);
     }
 
@@ -539,32 +471,8 @@ mod tests {
             nodes: None,
             distances: None,
         };
-        let features = extract_features(&entry, &topo, &["llc", "borrow"], true, "gauntlet_test");
+        let features = extract_features(&entry, &topo, true, "gauntlet_test");
         assert_ne!(features & (1 << GAUNTLET_SHIFT), 0);
-        // Active flags should be encoded
-        let profile_mask = (features >> PROFILE_FLAGS_SHIFT) & 0x3F;
-        assert_ne!(profile_mask & 0b01, 0); // llc
-        assert_ne!(profile_mask & 0b10, 0); // borrow
-    }
-
-    #[test]
-    fn extract_features_required_flags() {
-        let entry = KtstrTestEntry {
-            required_flags: &["borrow", "rebal"],
-            ..KtstrTestEntry::DEFAULT
-        };
-        let topo = Topology {
-            llcs: 1,
-            cores_per_llc: 2,
-            threads_per_core: 1,
-            numa_nodes: 1,
-            nodes: None,
-            distances: None,
-        };
-        let features = extract_features(&entry, &topo, &[], false, "flag_test");
-        let req_mask = (features >> REQ_FLAGS_SHIFT) & 0x3F;
-        assert_ne!(req_mask & (1 << 1), 0); // borrow = bit 1
-        assert_ne!(req_mask & (1 << 3), 0); // rebal = bit 3
     }
 
     #[test]

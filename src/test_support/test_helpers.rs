@@ -20,7 +20,6 @@ use tempfile::TempDir;
 
 use crate::assert::{AssertDetail, AssertResult, ScenarioStats};
 use crate::scenario::Ctx;
-use crate::scenario::flags::FlagDecl;
 
 use super::entry::{KtstrTestEntry, Scheduler, SchedulerSpec, TopologyConstraints};
 use crate::vmm::topology::Topology;
@@ -189,7 +188,6 @@ pub(crate) fn eevdf_entry(name: &'static str) -> KtstrTestEntry {
 pub(crate) static SCHED_TEST: Scheduler = Scheduler {
     name: "test_sched",
     binary: SchedulerSpec::Discover("test_sched_bin"),
-    flags: &[],
     sysctls: &[],
     kargs: &[],
     assert: crate::assert::Assert::NO_OVERRIDES,
@@ -476,64 +474,6 @@ mod panic_payload_tests {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Shared FlagDecl fixtures
-// ---------------------------------------------------------------------------
-//
-// These `&'static FlagDecl` values are referenced by Scheduler flag
-// lists in multiple test blocks (scheduler_generate_profiles_*,
-// validate_entry_flags_*). Declaring them once here keeps the raw
-// flag definitions out of individual tests so a name/arg tweak only
-// requires touching one place.
-
-pub(crate) static FLAG_A: FlagDecl = FlagDecl {
-    name: "flag_a",
-    args: &["--flag-a"],
-    requires: &[],
-};
-pub(crate) static BORROW: FlagDecl = FlagDecl {
-    name: "borrow",
-    args: &["--borrow"],
-    requires: &[],
-};
-pub(crate) static REBAL: FlagDecl = FlagDecl {
-    name: "rebal",
-    args: &["--rebal"],
-    requires: &[],
-};
-pub(crate) static TEST_LLC: FlagDecl = FlagDecl {
-    name: "llc",
-    args: &["--llc"],
-    requires: &[],
-};
-pub(crate) static TEST_STEAL: FlagDecl = FlagDecl {
-    name: "steal",
-    args: &["--steal"],
-    requires: &[&TEST_LLC],
-};
-pub(crate) static BORROW_LONG: FlagDecl = FlagDecl {
-    name: "borrow",
-    args: &["--enable-borrow"],
-    requires: &[],
-};
-pub(crate) static TEST_A: FlagDecl = FlagDecl {
-    name: "a",
-    args: &["-a"],
-    requires: &[],
-};
-pub(crate) static TEST_B: FlagDecl = FlagDecl {
-    name: "b",
-    args: &["-b"],
-    requires: &[],
-};
-
-pub(crate) static FLAGS_A: &[&FlagDecl] = &[&FLAG_A];
-pub(crate) static FLAGS_BORROW_REBAL: &[&FlagDecl] = &[&BORROW, &REBAL];
-pub(crate) static FLAGS_STEAL_LLC: &[&FlagDecl] = &[&TEST_STEAL, &TEST_LLC];
-pub(crate) static FLAGS_BORROW_LONG: &[&FlagDecl] = &[&BORROW_LONG];
-pub(crate) static FLAGS_AB: &[&FlagDecl] = &[&TEST_A, &TEST_B];
-pub(crate) static FLAGS_LLC_STEAL: &[&FlagDecl] = &[&TEST_LLC, &TEST_STEAL];
 
 // ---------------------------------------------------------------------------
 // EnvVarGuard drop-time restoration tests

@@ -845,18 +845,6 @@ pub struct GauntletRow {
     /// rows with `None` never match a populated filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_commit: Option<String>,
-    /// Active scheduler flags carried from
-    /// `SidecarResult::active_flags`. Previously this field did not
-    /// exist on the row; every A/B comparison therefore ignored
-    /// flag-profile identity and treated two rows whose only
-    /// difference was the flag set as the same row (causing
-    /// same-key collisions in `compare_rows` and pointer-latching
-    /// on whichever sidecar happened to be scanned first).
-    /// Carrying the full flag list here keeps the (scenario,
-    /// topology, work_type, flags) identity tuple unambiguous and
-    /// lets the substring filter match on flag names too.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub flags: Vec<String>,
     /// Run-environment provenance tag carried from
     /// `SidecarResult::run_source` (`"local"` for developer runs,
     /// `"ci"` when [`KTSTR_CI_ENV`](crate::test_support::sidecar::KTSTR_CI_ENV)
@@ -1060,10 +1048,6 @@ pub struct GauntletRow {
 ///   sidecar-write time, or rewritten to `"archive"` at load
 ///   time when the consumer pulled the pool from a non-default
 ///   `--dir`. Surfaced as the `--run-source` CLI flag.
-/// - `flags` — AND-combined: every entry in the filter must appear
-///   somewhere in the row's `flags` vec. The row may carry
-///   additional flags beyond the filter set; the filter pins
-///   "at-least-these-flags-are-active", not "exactly-these".
 /// - A `kernels`-populated filter against a row whose
 ///   `kernel_version` is `None` ALWAYS fails (no wildcard semantic)
 ///   — the operator wrote specific versions and a `None`-row would
@@ -1142,9 +1126,6 @@ pub struct RowFilter {
     /// are the PascalCase variants of `WorkType::ALL_NAMES`. Empty
     /// vec disables the filter.
     pub work_types: Vec<String>,
-    /// Repeatable flag filter, AND-combined: every entry must appear
-    /// in `GauntletRow::flags`. Empty vec disables the filter.
-    pub flags: Vec<String>,
 }
 
 impl RowFilter {
@@ -1258,11 +1239,6 @@ impl RowFilter {
                 return false;
             }
         }
-        for required in &self.flags {
-            if !row.flags.iter().any(|f| f == required) {
-                return false;
-            }
-        }
         true
     }
 }
@@ -1357,10 +1333,10 @@ fn is_major_minor_prefix(s: &str) -> bool {
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// One of the eight dimensions that compose a [`GauntletRow`]'s
+/// One of the seven dimensions that compose a [`GauntletRow`]'s
 /// identity in the comparison pipeline: `kernel`, `scheduler`,
 /// `topology`, `work-type`, `project-commit`, `kernel-commit`,
-/// `run-source`, `flags`. Each maps to the corresponding
+/// `run-source`. Each maps to the corresponding
 /// `RowFilter` field and `GauntletRow` field; the dimension
 /// model lets [`compare_partitions`] derive its slicing dims and
 /// dynamic pairing key without hardcoding the dimension list at
@@ -1377,7 +1353,7 @@ fn is_major_minor_prefix(s: &str) -> bool {
 /// Iteration order via [`Dimension::ALL`] is deterministic and
 /// matches the order operators read in the CLI flags
 /// (`--kernel` / `--scheduler` / `--topology` / `--work-type` /
-/// `--project-commit` / `--kernel-commit` / `--run-source` / `--flag`), so
+/// `--project-commit` / `--kernel-commit` / `--run-source`), so
 /// generated labels and error messages list dims in a stable,
 /// predictable order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1389,7 +1365,6 @@ pub enum Dimension {
     ProjectCommit,
     KernelCommit,
     RunSource,
-    Flags,
 }
 
 impl Dimension {
@@ -1405,7 +1380,6 @@ impl Dimension {
         Dimension::ProjectCommit,
         Dimension::KernelCommit,
         Dimension::RunSource,
-        Dimension::Flags,
     ];
 
     /// Compute pairing dims from a slicing-dim set: every
@@ -1436,23 +1410,22 @@ impl Dimension {
             Dimension::ProjectCommit => "project-commit",
             Dimension::KernelCommit => "kernel-commit",
             Dimension::RunSource => "run-source",
-            Dimension::Flags => "flags",
         }
     }
 }
 
 /// Legacy pairing-dim set used by tests that pre-date the
 /// dimensional-slicing refactor. Equivalent to the historical
-/// hardcoded 4-tuple `(scenario, topology, work_type, flags)` —
-/// scenario is always implicit in [`PairingKey::from_row`] and
-/// the remaining three dimensions are listed here. Production
+/// hardcoded tuple `(scenario, topology, work_type)` — scenario
+/// is always implicit in [`PairingKey::from_row`] and the
+/// remaining two dimensions are listed here. Production
 /// callers (`compare_partitions`) compute pairing dims via
 /// [`Dimension::pairing_dims`] from the slicing-dim derivation;
 /// only test fixtures use this constant directly, so it is gated
 /// behind `#[cfg(test)]`.
 #[cfg(test)]
 pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] =
-    &[Dimension::Topology, Dimension::WorkType, Dimension::Flags];
+    &[Dimension::Topology, Dimension::WorkType];
 
 /// Derive the set of dimensions on which `filter_a` and
 /// `filter_b` differ. These are the SLICING dimensions —
@@ -1464,8 +1437,8 @@ pub(crate) const LEGACY_PAIRING_DIMS: &[Dimension] =
 /// Comparison shape per dimension: every dim uses the same
 /// SORTED-DEDUPED `Vec<&str>` comparison — order and multiplicity
 /// don't matter (`--a-kernel 6.14 --a-kernel 6.15` and
-/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All eight
-/// dimensions are now repeatable Vec filters; the previously
+/// `--b-kernel 6.15 --b-kernel 6.14` are NOT a slice). All seven
+/// dimensions are repeatable Vec filters; the previously
 /// `Option<String>`-typed `scheduler` / `topology` / `work_type`
 /// dims were promoted to `Vec<String>` so the operator-visible
 /// shape is uniform across every dimension.
@@ -1496,7 +1469,6 @@ pub fn derive_slicing_dims(filter_a: &RowFilter, filter_b: &RowFilter) -> Vec<Di
             Dimension::RunSource => {
                 sorted_dedup(&filter_a.run_sources) != sorted_dedup(&filter_b.run_sources)
             }
-            Dimension::Flags => sorted_dedup(&filter_a.flags) != sorted_dedup(&filter_b.flags),
         };
         if differs {
             out.push(dim);
@@ -1518,7 +1490,7 @@ fn sorted_dedup(v: &[String]) -> Vec<&str> {
 /// concatenates each dim's per-side filter value(s) with `:`
 /// between dim values (e.g. `"6.14.2:scx_rusty"` when both
 /// `kernel` and `scheduler` slice). For multi-value Vec filters
-/// (kernels, commits, flags) the values join with `|` when there
+/// (kernels, commits) the values join with `|` when there
 /// are ≤3; longer lists collapse to `"A"` or `"B"` (the bare
 /// side label) to keep the column header readable.
 ///
@@ -1545,7 +1517,6 @@ pub(crate) fn render_side_label(
             Dimension::ProjectCommit => render_vec_dim(&filter.project_commits, bare_label),
             Dimension::KernelCommit => render_vec_dim(&filter.kernel_commits, bare_label),
             Dimension::RunSource => render_vec_dim(&filter.run_sources, bare_label),
-            Dimension::Flags => render_vec_dim(&filter.flags, bare_label),
         };
         parts.push(part);
     }
@@ -1616,11 +1587,6 @@ impl PairingKey {
                 Dimension::ProjectCommit => commit_pairing_key_part(&row.commit),
                 Dimension::KernelCommit => commit_pairing_key_part(&row.kernel_commit),
                 Dimension::RunSource => row.run_source.clone().unwrap_or_default(),
-                Dimension::Flags => {
-                    let mut sorted: Vec<&str> = row.flags.iter().map(String::as_str).collect();
-                    sorted.sort_unstable();
-                    sorted.join("|")
-                }
             });
         }
         PairingKey(parts)
@@ -1651,14 +1617,14 @@ fn commit_pairing_key_part(value: &Option<String>) -> String {
 ///
 /// `row` carries arithmetic-mean metric values across every
 /// non-failing, non-skipped contributor in the group; the
-/// (`scenario`, `topology`, `work_type`, `flags`, `scheduler`,
+/// (`scenario`, `topology`, `work_type`, `scheduler`,
 /// `kernel_version`) identity is taken verbatim from the first
 /// contributor in iteration order — every contributor in the group
-/// shares the identity tuple by construction (it IS the group key
-/// for the first four fields, and `scheduler` / `kernel_version`
-/// are typed-filter-narrowed at the call site, so they can only
-/// vary if the operator passed no `--scheduler` / `--kernel`
-/// filter).
+/// shares the identity tuple by construction (`scenario`,
+/// `topology`, and `work_type` ARE the group key, and `scheduler`
+/// / `kernel_version` are typed-filter-narrowed at the call site
+/// so they can only vary if the operator passed no `--scheduler` /
+/// `--kernel` filter).
 ///
 /// `passed` on `row` is the AND across every contributor: a single
 /// failing contributor in the group flips the aggregated row to
@@ -1766,8 +1732,7 @@ fn render_mixed_dirty(
 ///
 /// Group key matches [`compare_rows_by`]' pairing key so the post-
 /// aggregation row vec joins cleanly across A/B sides under the
-/// same identity contract — different flag profiles do not
-/// collide as long as `Dimension::Flags` is in `pairing_dims`.
+/// same identity contract.
 ///
 /// Aggregation rules:
 /// - `passed` aggregates as a logical AND across every contributor.
@@ -1797,14 +1762,14 @@ fn render_mixed_dirty(
 ///   from others uses the present-only count as its denominator —
 ///   absent-and-zero are not equivalent (the `BTreeMap<String,
 ///   f64>` shape cannot represent "absent" with a stored zero).
-/// - Identity fields (`scenario`, `topology`, `work_type`, `flags`,
+/// - Identity fields (`scenario`, `topology`, `work_type`,
 ///   `scheduler`, `kernel_version`) come from the first contributor
 ///   in iteration order. Every contributor in the group shares the
-///   first four by construction (group key); `scheduler` and
+///   first three by construction (group key); `scheduler` and
 ///   `kernel_version` may vary across the group if the operator did
 ///   not narrow via typed filters first, but the aggregated row
 ///   carries the first contributor's value in any case — the join
-///   downstream uses the four-tuple, so scheduler/version on the
+///   downstream uses the three-tuple, so scheduler/version on the
 ///   aggregate is metadata, not a join key.
 /// - Commit dimensions (`commit`, `kernel_commit`) follow a
 ///   first-seen rule with one exception: when contributors disagree
@@ -2043,7 +2008,6 @@ pub fn group_and_average_by(
             commit: project_commit_rendered,
             kernel_commit: kernel_commit_rendered,
             run_source: acc.first.run_source.clone(),
-            flags: acc.first.flags.clone(),
             // ALL must pass: any failed or skipped contributor
             // flips the aggregate. A group with zero
             // passes_observed (every contributor failed or was
@@ -2148,7 +2112,6 @@ pub fn sidecar_to_row(sc: &crate::test_support::SidecarResult) -> GauntletRow {
         kernel_version: sc.kernel_version.clone(),
         commit: sc.project_commit.clone(),
         kernel_commit: sc.kernel_commit.clone(),
-        flags: sc.active_flags.clone(),
         run_source: sc.run_source.clone(),
         passed: sc.passed,
         skipped: sc.skipped,
@@ -2369,7 +2332,7 @@ fn col_mean_std(df: &DataFrame, name: &str) -> (f64, f64) {
     }
 }
 
-/// Find outlier (scenario, flags) pairs where a metric exceeds 2 sigma.
+/// Find outlier scenarios where a metric exceeds 2 sigma.
 ///
 /// Builds one combined `group_by(scenario).agg(...)` plan that
 /// computes the per-scenario mean of every relevant metric in a
@@ -2830,13 +2793,11 @@ fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<RunEntryRow
 /// Pool every sidecar under the runs root (or `dir` when set) and
 /// emit the distinct values present on each filterable dimension.
 ///
-/// Eight dimensions are reported, matching the eight fields on
-/// [`RowFilter`]: `kernel` (from `SidecarResult::kernel_version`),
-/// `scheduler`, `topology`, `work_type`, `commit`
-/// (from `SidecarResult::project_commit`), `kernel_commit` (from
-/// `SidecarResult::kernel_commit`), `source` (from
-/// `SidecarResult::run_source`), and `flags` (individual flag
-/// names, exploded from each row's `active_flags`). The dimension
+/// Seven dimensions are reported: `kernel` (from
+/// `SidecarResult::kernel_version`), `scheduler`, `topology`,
+/// `work_type`, `commit` (from `SidecarResult::project_commit`),
+/// `kernel_commit` (from `SidecarResult::kernel_commit`), and
+/// `source` (from `SidecarResult::run_source`). The dimension
 /// catalogue here matches what `cargo ktstr stats compare`
 /// accepts as `--X` and `--a-X` / `--b-X` filter flags — the
 /// command exists so an operator can answer "what kernel versions
@@ -2853,13 +2814,6 @@ fn sorted_run_entries(root: &std::path::Path) -> std::io::Result<Vec<RunEntryRow
 /// `None` collates before any populated value in `Option<String>`
 /// ordering, so `null` / `unknown` always lands at the top of the
 /// per-dimension listing.
-///
-/// `flags` is exploded: each entry in any row's `active_flags`
-/// vector becomes a single value in the flag set. The
-/// `--flag NAME` filter on `compare` matches individual flag
-/// names so the discovery output mirrors the filter's input shape.
-/// A scheduler that activates `["llc", "rusty_balance"]` therefore
-/// contributes two distinct entries to this dimension's set.
 ///
 /// `json=true` emits a JSON object keyed by dimension name with
 /// arrays of values (with `null` interleaved for absent
@@ -2894,7 +2848,6 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     let mut schedulers: BTreeSet<String> = BTreeSet::new();
     let mut topologies: BTreeSet<String> = BTreeSet::new();
     let mut work_types: BTreeSet<String> = BTreeSet::new();
-    let mut flags: BTreeSet<String> = BTreeSet::new();
 
     for sc in &pool {
         kernels.insert(sc.kernel_version.clone());
@@ -2904,9 +2857,6 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
         schedulers.insert(sc.scheduler.clone());
         topologies.insert(sc.topology.clone());
         work_types.insert(sc.work_type.clone());
-        for f in &sc.active_flags {
-            flags.insert(f.clone());
-        }
     }
 
     if json {
@@ -2956,7 +2906,6 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
             "scheduler": schedulers.iter().collect::<Vec<_>>(),
             "topology": topologies.iter().collect::<Vec<_>>(),
             "work_type": work_types.iter().collect::<Vec<_>>(),
-            "flags": flags.iter().collect::<Vec<_>>(),
         });
         return serde_json::to_string_pretty(&payload)
             .map(|mut s| {
@@ -3007,7 +2956,6 @@ pub fn list_values(json: bool, dir: Option<&std::path::Path>) -> anyhow::Result<
     render_str_set(&mut out, "scheduler:", &schedulers);
     render_str_set(&mut out, "topology:", &topologies);
     render_str_set(&mut out, "work_type:", &work_types);
-    render_str_set(&mut out, "flags:", &flags);
     Ok(out)
 }
 
@@ -3232,7 +3180,7 @@ impl ComparisonPolicy {
 /// dims still pair as long as they agree on every non-slicing
 /// dim. When `filter` is `Some(s)`, a row is included only if
 /// `s` appears as a substring of the joined `"scenario topology
-/// scheduler work_type flags"` string. The scheduler is
+/// scheduler work_type"` string. The scheduler is
 /// searchable via the substring filter but is not part of the
 /// pairing key by default (only when `Dimension::Scheduler` is
 /// in `pairing_dims`), so the same scenario+topology+work_type
@@ -3291,24 +3239,15 @@ pub(crate) fn compare_rows_by(
     for row_b in rows_b {
         // Dynamic pairing key: scenario + every NON-slicing
         // dimension's value. Two rows pair iff their dynamic keys
-        // match. The flag-set component is sorted-deduped inside
-        // `PairingKey::from_row` so order-of-accumulation noise
-        // doesn't shatter pairs (matching the canonicalize-on-write
-        // contract documented on `canonicalize_active_flags`).
+        // match.
         let key_b = PairingKey::from_row(row_b, pairing_dims);
         if let Some(f) = filter {
             // Substring filter joins all identity-bearing fields —
             // including the SLICING dim values — so an operator
-            // can narrow by any visible field via `-E`. The
-            // canonical `flags` rendering matches what the table
-            // shows.
+            // can narrow by any visible field via `-E`.
             let joined = format!(
-                "{} {} {} {} {}",
-                row_b.scenario,
-                row_b.topology,
-                row_b.scheduler,
-                row_b.work_type,
-                row_b.flags.join(","),
+                "{} {} {} {}",
+                row_b.scenario, row_b.topology, row_b.scheduler, row_b.work_type,
             );
             if !joined.contains(f) {
                 continue;
@@ -3392,12 +3331,8 @@ pub(crate) fn compare_rows_by(
         let key_a = PairingKey::from_row(row_a, pairing_dims);
         if let Some(f) = filter {
             let joined = format!(
-                "{} {} {} {} {}",
-                row_a.scenario,
-                row_a.topology,
-                row_a.scheduler,
-                row_a.work_type,
-                row_a.flags.join(","),
+                "{} {} {} {}",
+                row_a.scenario, row_a.topology, row_a.scheduler, row_a.work_type,
             );
             if !joined.contains(f) {
                 continue;
@@ -3876,12 +3811,11 @@ pub fn compare_partitions(
         // are the pairing-dim values in canonical order. Joining
         // with `/` produces a label whose shape mirrors the
         // pairing-dim count — so a comparison that pairs on
-        // (topology, work_type, flags) renders the historical
-        // `scenario/topology/work_type/flags` label, while a
-        // comparison that slices on most dims renders a shorter
-        // identifier. The operator can always cross-reference
-        // the "pairing on:" header line above to see what each
-        // segment means.
+        // (topology, work_type) renders a `scenario/topology/work_type`
+        // label, while a comparison that slices on most dims
+        // renders a shorter identifier. The operator can always
+        // cross-reference the "pairing on:" header line above to
+        // see what each segment means.
         let label = f.pairing_key.0.join("/");
         table.add_row(vec![
             Cell::new(label),
@@ -4023,9 +3957,9 @@ pub(crate) fn format_average_header(
 /// that prints below the summary line when `--average` is active.
 ///
 /// Pure function of (`avg_a`, `avg_b`, `a`, `b`) so the rendered
-/// surface — one line per (scenario, topology, work_type, flags)
-/// group present on either side, with `N/M` per side and `-` for
-/// any side that lacks the group — can be unit-tested without
+/// surface — one line per (scenario, topology, work_type) group
+/// present on either side, with `N/M` per side and `-` for any
+/// side that lacks the group — can be unit-tested without
 /// capturing stdout. Returns the trailing-newline-terminated
 /// block, or empty string when neither side has groups.
 ///
@@ -4050,7 +3984,7 @@ pub(crate) fn format_per_group_pass_counts(
     a: &str,
     b: &str,
 ) -> String {
-    type SummaryKey<'a> = (&'a str, &'a str, &'a str, &'a [String]);
+    type SummaryKey<'a> = (&'a str, &'a str, &'a str);
     type SummaryValue<'a> = (Option<&'a AveragedGroup>, Option<&'a AveragedGroup>);
     let mut keys: BTreeMap<SummaryKey<'_>, SummaryValue<'_>> = BTreeMap::new();
     for ar in avg_a {
@@ -4058,7 +3992,6 @@ pub(crate) fn format_per_group_pass_counts(
             ar.row.scenario.as_str(),
             ar.row.topology.as_str(),
             ar.row.work_type.as_str(),
-            ar.row.flags.as_slice(),
         );
         keys.entry(k).or_insert((None, None)).0 = Some(ar);
     }
@@ -4067,7 +4000,6 @@ pub(crate) fn format_per_group_pass_counts(
             br.row.scenario.as_str(),
             br.row.topology.as_str(),
             br.row.work_type.as_str(),
-            br.row.flags.as_slice(),
         );
         keys.entry(k).or_insert((None, None)).1 = Some(br);
     }
@@ -4077,7 +4009,7 @@ pub(crate) fn format_per_group_pass_counts(
     let mut out = String::new();
     out.push('\n');
     out.push_str("per-group pass counts (passes_observed/total_observed):\n");
-    for ((scn, topo, wt, _flags), (ka, kb)) in keys.into_iter() {
+    for ((scn, topo, wt), (ka, kb)) in keys.into_iter() {
         let fmt_side = |r: Option<&AveragedGroup>| -> String {
             r.map(|x| format!("{}/{}", x.passes_observed, x.total_observed))
                 .unwrap_or_else(|| "-".to_string())
@@ -4262,7 +4194,6 @@ mod tests {
             commit: None,
             kernel_commit: None,
             run_source: None,
-            flags: Vec::new(),
             skipped: false,
             passed,
             spread,
@@ -5277,22 +5208,21 @@ mod tests {
             "scheduler:",
             "topology:",
             "work_type:",
-            "flags:",
         ] {
             assert!(
                 out.contains(dim),
                 "text output must include heading for {dim}: {out}",
             );
         }
-        // Each dim should report the empty-pool sentinel exactly eight
+        // Each dim should report the empty-pool sentinel exactly seven
         // times — one per dim — so a regression that dropped the
         // sentinel for one dim falls out as a count mismatch.
         let sentinel_count = out.matches("(no sidecars in pool)").count();
         assert_eq!(
-            sentinel_count, 8,
+            sentinel_count, 7,
             "empty pool must surface the no-sidecars sentinel under every \
-             one of the 8 dims (kernel/commit/kernel_commit/source/\
-             scheduler/topology/work_type/flags); got {sentinel_count} \
+             one of the 7 dims (kernel/commit/kernel_commit/source/\
+             scheduler/topology/work_type); got {sentinel_count} \
              occurrences in:\n{out}",
         );
     }
@@ -5313,7 +5243,6 @@ mod tests {
             "scheduler",
             "topology",
             "work_type",
-            "flags",
         ] {
             let arr = parsed
                 .get(dim)
@@ -5328,10 +5257,8 @@ mod tests {
     }
 
     /// Populated pool: distinct values per dim are deduplicated and
-    /// sorted; flags are exploded (each entry of `active_flags`
-    /// becomes one set member); `kernel_version: None` and
-    /// `project_commit: None` produce a `null` entry (JSON) and
-    /// `unknown` line (text).
+    /// sorted; `kernel_version: None` and `project_commit: None`
+    /// produce a `null` entry (JSON) and `unknown` line (text).
     #[test]
     fn list_values_text_dedupes_and_sorts_per_dim() {
         use crate::test_support::SidecarResult;
@@ -5343,7 +5270,6 @@ mod tests {
                 topology: "1n2l4c1t".to_string(),
                 scheduler: "scx_rusty".to_string(),
                 work_type: "SpinWait".to_string(),
-                active_flags: vec!["llc".to_string(), "rusty_balance".to_string()],
                 kernel_version: Some("6.14.2".to_string()),
                 project_commit: Some("abcdef1".to_string()),
                 ..SidecarResult::test_fixture()
@@ -5353,7 +5279,6 @@ mod tests {
                 topology: "1n4l2c1t".to_string(),
                 scheduler: "eevdf".to_string(),
                 work_type: "PageFaultChurn".to_string(),
-                active_flags: vec!["llc".to_string()],
                 kernel_version: None,
                 project_commit: None,
                 ..SidecarResult::test_fixture()
@@ -5366,7 +5291,6 @@ mod tests {
                 topology: "1n2l4c1t".to_string(),
                 scheduler: "scx_rusty".to_string(),
                 work_type: "SpinWait".to_string(),
-                active_flags: vec!["rusty_balance".to_string()],
                 kernel_version: Some("6.14.2".to_string()),
                 project_commit: Some("abcdef1".to_string()),
                 ..SidecarResult::test_fixture()
@@ -5393,8 +5317,6 @@ mod tests {
             "1n4l2c1t",
             "SpinWait",
             "PageFaultChurn",
-            "llc",
-            "rusty_balance",
         ] {
             let count = out.matches(value).count();
             assert_eq!(
@@ -5443,8 +5365,7 @@ mod tests {
 
     /// JSON shape: `kernel` and `commit` arrays carry `null` for
     /// absent values, `Value::String` for present values; the other
-    /// four dims are bare `String` arrays. `flags` is exploded —
-    /// individual flag names, not the joined-set string.
+    /// dims are bare `String` arrays.
     #[test]
     fn list_values_json_carries_null_for_optional_dims() {
         use crate::test_support::SidecarResult;
@@ -5455,14 +5376,12 @@ mod tests {
                 test_name: "t_known".to_string(),
                 kernel_version: Some("6.14.2".to_string()),
                 project_commit: Some("abcdef1".to_string()),
-                active_flags: vec!["llc".to_string(), "rusty_balance".to_string()],
                 ..SidecarResult::test_fixture()
             },
             SidecarResult {
                 test_name: "t_unknown".to_string(),
                 kernel_version: None,
                 project_commit: None,
-                active_flags: vec![],
                 ..SidecarResult::test_fixture()
             },
         ];
@@ -5498,23 +5417,6 @@ mod tests {
             commit.iter().any(|v| v.as_str() == Some("abcdef1")),
             "commit array must include the populated value abcdef1; got {commit:?}",
         );
-
-        // Flags: exploded — both "llc" and "rusty_balance" appear
-        // as DISTINCT entries, NOT a single "llc|rusty_balance"
-        // string.
-        let flags = parsed.get("flags").expect("flags key").as_array().unwrap();
-        assert_eq!(
-            flags.len(),
-            2,
-            "flags must explode to individual names — expected 2 \
-             entries (llc, rusty_balance), got {flags:?}",
-        );
-        let flag_names: Vec<&str> = flags
-            .iter()
-            .map(|v| v.as_str().expect("flag is string"))
-            .collect();
-        assert!(flag_names.contains(&"llc"));
-        assert!(flag_names.contains(&"rusty_balance"));
     }
 
     /// `dir = None` resolves against `runs_root()`; if `runs_root()`
@@ -6524,56 +6426,6 @@ mod tests {
         assert_eq!(spread.delta, 20.0);
     }
 
-    /// Flag-profile collision regression pin. Two rows that share
-    /// `(scenario, topology, work_type)` but run under different
-    /// flag sets must NOT collide in the A/B join. Before `flags`
-    /// was part of the identity key, `compare_rows` would match
-    /// rows_b's `llc` variant against whichever rows_a variant came
-    /// first — typically `borrow` — and silently produce a diff
-    /// across two unrelated flag profiles.
-    ///
-    /// Construction: rows_a carries `llc` at spread=10 and `borrow`
-    /// at spread=100; rows_b mirrors the 3-tuple but swaps the flag
-    /// order (`borrow` at 10, `llc` at 100). A 3-tuple join would
-    /// pair `(llc, 10)` vs `(borrow, 10)` → zero spread delta, zero
-    /// regressions. The 4-tuple join pairs same-flag-set rows:
-    /// `(llc, 10)` vs `(llc, 100)` and `(borrow, 100)` vs
-    /// `(borrow, 10)` — one regression, one improvement on
-    /// worst_spread.
-    #[test]
-    fn compare_rows_same_key_different_flags_do_not_collide() {
-        let mut a_llc = cmp_row("t", "tiny-1llc", true, 10.0, 0);
-        a_llc.flags = vec!["llc".to_string()];
-        let mut a_borrow = cmp_row("t", "tiny-1llc", true, 100.0, 0);
-        a_borrow.flags = vec!["borrow".to_string()];
-        let mut b_borrow = cmp_row("t", "tiny-1llc", true, 10.0, 0);
-        b_borrow.flags = vec!["borrow".to_string()];
-        let mut b_llc = cmp_row("t", "tiny-1llc", true, 100.0, 0);
-        b_llc.flags = vec!["llc".to_string()];
-
-        let rows_a = vec![a_llc, a_borrow];
-        let rows_b = vec![b_borrow, b_llc];
-        let res = compare_rows_by(
-            &rows_a,
-            &rows_b,
-            LEGACY_PAIRING_DIMS,
-            None,
-            &ComparisonPolicy::default(),
-        );
-
-        // Each flag profile's spread moved by 90 → one regression
-        // (llc 10→100) and one improvement (borrow 100→10).
-        assert_eq!(res.regressions, 1, "llc regression should fire (10 → 100)",);
-        assert_eq!(
-            res.improvements, 1,
-            "borrow improvement should fire (100 → 10)",
-        );
-        // Neither side should be treated as new / removed — both
-        // keys match across A and B when flags are part of the key.
-        assert_eq!(res.new_in_b, 0);
-        assert_eq!(res.removed_from_a, 0);
-    }
-
     /// Filtering is applied before the failed-row gate. A failed row
     /// that the filter excludes never reaches the `passed` check, so
     /// `skipped_failed` stays at zero -- the failure on the filtered
@@ -6884,78 +6736,66 @@ mod tests {
 
     // -- GauntletRow serde round-trip tests --
     //
-    // Both `flags: Vec<String>` and `ext_metrics: BTreeMap<String, f64>`
-    // carry `#[serde(default, skip_serializing_if = "…::is_empty")]`.
-    // These tests pin that symmetric contract: the keys disappear from
-    // JSON when the collection is empty, round-trip through from_str
+    // `ext_metrics: BTreeMap<String, f64>` carries
+    // `#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]`.
+    // These tests pin that contract: the key disappears from JSON
+    // when the map is empty, round-trip through from_str
     // reconstructs an equivalent row, and a non-empty payload emits
     // its contents verbatim.
 
-    /// Empty collections are elided on serialize. Regression guard for
-    /// the `skip_serializing_if` half — dropping it would make the
-    /// writer emit `"flags":[]` / `"ext_metrics":{}` noise on every
-    /// row (the `default` half is guarded by the sibling round-trip
-    /// test).
+    /// Empty `ext_metrics` is elided on serialize. Regression guard
+    /// for the `skip_serializing_if` half — dropping it would make
+    /// the writer emit `"ext_metrics":{}` noise on every row (the
+    /// `default` half is guarded by the sibling round-trip test).
     #[test]
-    fn gauntlet_row_empty_collections_omit_keys() {
+    fn gauntlet_row_empty_ext_metrics_omits_key() {
         let row = make_row("scn", "topo", true, 0.0);
-        assert!(row.flags.is_empty());
         assert!(row.ext_metrics.is_empty());
         let json = serde_json::to_string(&row).unwrap();
-        assert!(
-            !json.contains("\"flags\""),
-            "empty flags must be omitted from JSON: {json}"
-        );
         assert!(
             !json.contains("\"ext_metrics\""),
             "empty ext_metrics must be omitted from JSON: {json}"
         );
     }
 
-    /// Non-empty collections appear with their full payload. Locks in
-    /// that `skip_serializing_if` only fires on empty, not on "has
-    /// content". A false positive here would silently drop flags and
+    /// Non-empty `ext_metrics` appears with its full payload. Locks
+    /// in that `skip_serializing_if` only fires on empty, not on
+    /// "has content". A false positive here would silently drop
     /// extensible metrics from sidecar files.
     #[test]
-    fn gauntlet_row_non_empty_collections_emit_payload() {
+    fn gauntlet_row_non_empty_ext_metrics_emits_payload() {
         let mut row = make_row("scn", "topo", true, 0.0);
-        row.flags = vec!["flag_a".into(), "flag_b".into()];
         row.ext_metrics.insert("custom_metric".into(), 42.5);
         let json = serde_json::to_string(&row).unwrap();
-        assert!(
-            json.contains("\"flags\":[\"flag_a\",\"flag_b\"]"),
-            "flags payload missing: {json}"
-        );
         assert!(
             json.contains("\"custom_metric\":42.5"),
             "ext_metrics payload missing: {json}"
         );
     }
 
-    /// Round-trip with empty collections: the writer omits the keys
-    /// (via `skip_serializing_if`), so the reader must default them
+    /// Round-trip with empty `ext_metrics`: the writer omits the key
+    /// (via `skip_serializing_if`), so the reader must default it
     /// back to empty for the round-trip to close. Regression guard
     /// for the `default` half of the symmetric pair — removing it
     /// would make deserialize fail on JSON this same process just
     /// produced.
     #[test]
-    fn gauntlet_row_round_trip_empty_collections() {
+    fn gauntlet_row_round_trip_empty_ext_metrics() {
         let row = make_row("scn", "topo", true, 1.5);
         let json = serde_json::to_string(&row).unwrap();
         let back: GauntletRow = serde_json::from_str(&json).unwrap();
         assert_eq!(back, row);
-        assert!(back.flags.is_empty());
         assert!(back.ext_metrics.is_empty());
     }
 
-    /// Round-trip with populated collections: every entry survives the
-    /// to_string → from_str cycle. Guards against any future field-level
-    /// serde attribute (e.g. a rename or custom serializer) accidentally
-    /// shearing content on one side of the cycle.
+    /// Round-trip with populated `ext_metrics`: every entry survives
+    /// the to_string → from_str cycle. Guards against any future
+    /// field-level serde attribute (e.g. a rename or custom
+    /// serializer) accidentally shearing content on one side of the
+    /// cycle.
     #[test]
-    fn gauntlet_row_round_trip_non_empty_collections() {
+    fn gauntlet_row_round_trip_non_empty_ext_metrics() {
         let mut row = make_row("scn", "topo", false, std::f64::consts::PI);
-        row.flags = vec!["a".into(), "b".into(), "c".into()];
         row.ext_metrics.insert("m1".into(), 1.0);
         row.ext_metrics.insert("m2".into(), 2.5);
         let json = serde_json::to_string(&row).unwrap();
@@ -7194,8 +7034,8 @@ mod tests {
     // -- RowFilter / apply_row_filters --
 
     /// Helper that builds a `GauntletRow` with controllable
-    /// scheduler / topology / work_type / kernel_version / flags
-    /// for the filter tests. The metric fields default to harmless
+    /// scheduler / topology / work_type / kernel_version for the
+    /// filter tests. The metric fields default to harmless
     /// passing values; tests are interested in identity-field
     /// matching, not metrics.
     fn make_filter_row(
@@ -7204,7 +7044,6 @@ mod tests {
         topology: &str,
         work_type: &str,
         kernel_version: Option<&str>,
-        flags: &[&str],
     ) -> GauntletRow {
         GauntletRow {
             scenario: scenario.into(),
@@ -7215,7 +7054,6 @@ mod tests {
             commit: None,
             kernel_commit: None,
             run_source: None,
-            flags: flags.iter().map(|s| (*s).to_owned()).collect(),
             passed: true,
             skipped: false,
             spread: 0.0,
@@ -7247,7 +7085,7 @@ mod tests {
     /// nothing" semantic lands here.
     #[test]
     fn row_filter_default_matches_every_row() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"), &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"));
         let filter = RowFilter::default();
         assert!(filter.matches(&row), "empty filter must match every row");
     }
@@ -7258,7 +7096,7 @@ mod tests {
     /// substring knob; typed flags exact-match.
     #[test]
     fn row_filter_scheduler_strict_equality_rejects_prefix() {
-        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "SpinWait", None, &[]);
+        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "SpinWait", None);
         let filter = RowFilter {
             schedulers: vec!["scx".to_string()],
             ..RowFilter::default()
@@ -7274,7 +7112,7 @@ mod tests {
     /// happy path.
     #[test]
     fn row_filter_scheduler_strict_equality_matches_exact() {
-        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "SpinWait", None, &[]);
+        let row = make_filter_row("t", "scx_rusty", "1n2l4c1t", "SpinWait", None);
         let filter = RowFilter {
             schedulers: vec!["scx_rusty".to_string()],
             ..RowFilter::default()
@@ -7287,7 +7125,7 @@ mod tests {
     /// kernel and a None-row would silently dilute the filtered set.
     #[test]
     fn row_filter_kernel_none_row_never_matches_populated_filter() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         let filter = RowFilter {
             kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
@@ -7302,7 +7140,7 @@ mod tests {
     /// `Some("6.14.2")` matches.
     #[test]
     fn row_filter_kernel_exact_match() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"), &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"));
         let filter = RowFilter {
             kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
@@ -7314,7 +7152,7 @@ mod tests {
     /// `Some("6.14.3")` rejects.
     #[test]
     fn row_filter_kernel_mismatch_rejects() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.3"), &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.3"));
         let filter = RowFilter {
             kernels: vec!["6.14.2".to_string()],
             ..RowFilter::default()
@@ -7327,9 +7165,9 @@ mod tests {
     /// Pins the multi-value semantic.
     #[test]
     fn row_filter_kernels_or_combined_matches_any_listed() {
-        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"), &[]);
-        let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.15.0"), &[]);
-        let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.16.0"), &[]);
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"));
+        let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.15.0"));
+        let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.16.0"));
         let filter = RowFilter {
             kernels: vec!["6.14.2".to_string(), "6.15.0".to_string()],
             ..RowFilter::default()
@@ -7350,9 +7188,9 @@ mod tests {
     /// OR semantic did not exist.
     #[test]
     fn row_filter_schedulers_or_combined_matches_any_listed() {
-        let row_a = make_filter_row("t", "scx_alpha", "1n2l4c1t", "SpinWait", None, &[]);
-        let row_b = make_filter_row("t", "scx_beta", "1n2l4c1t", "SpinWait", None, &[]);
-        let row_c = make_filter_row("t", "scx_gamma", "1n2l4c1t", "SpinWait", None, &[]);
+        let row_a = make_filter_row("t", "scx_alpha", "1n2l4c1t", "SpinWait", None);
+        let row_b = make_filter_row("t", "scx_beta", "1n2l4c1t", "SpinWait", None);
+        let row_c = make_filter_row("t", "scx_gamma", "1n2l4c1t", "SpinWait", None);
         let filter = RowFilter {
             schedulers: vec!["scx_alpha".to_string(), "scx_beta".to_string()],
             ..RowFilter::default()
@@ -7372,9 +7210,9 @@ mod tests {
     /// for the topologies field.
     #[test]
     fn row_filter_topologies_or_combined_matches_any_listed() {
-        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
-        let row_b = make_filter_row("t", "scx_a", "1n2l4c2t", "SpinWait", None, &[]);
-        let row_c = make_filter_row("t", "scx_a", "1n4l8c1t", "SpinWait", None, &[]);
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+        let row_b = make_filter_row("t", "scx_a", "1n2l4c2t", "SpinWait", None);
+        let row_c = make_filter_row("t", "scx_a", "1n4l8c1t", "SpinWait", None);
         let filter = RowFilter {
             topologies: vec!["1n2l4c1t".to_string(), "1n2l4c2t".to_string()],
             ..RowFilter::default()
@@ -7394,9 +7232,9 @@ mod tests {
     /// for the work_types field.
     #[test]
     fn row_filter_work_types_or_combined_matches_any_listed() {
-        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
-        let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "PageFaultChurn", None, &[]);
-        let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "MutexContention", None, &[]);
+        let row_a = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
+        let row_b = make_filter_row("t", "scx_a", "1n2l4c1t", "PageFaultChurn", None);
+        let row_c = make_filter_row("t", "scx_a", "1n2l4c1t", "MutexContention", None);
         let filter = RowFilter {
             work_types: vec!["SpinWait".to_string(), "PageFaultChurn".to_string()],
             ..RowFilter::default()
@@ -7415,7 +7253,7 @@ mod tests {
     /// for the project-commit field.
     #[test]
     fn row_filter_commit_none_row_never_matches_populated_filter() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         let filter = RowFilter {
             project_commits: vec!["abcdef1".to_string()],
             ..RowFilter::default()
@@ -7435,11 +7273,11 @@ mod tests {
     /// of the same HEAD bucket separately).
     #[test]
     fn row_filter_commit_exact_match_and_or_combined() {
-        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_clean.commit = Some("abcdef1".to_string());
-        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_dirty.commit = Some("abcdef1-dirty".to_string());
-        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_other.commit = Some("fedcba2".to_string());
 
         let filter_single = RowFilter {
@@ -7487,7 +7325,7 @@ mod tests {
     /// for the kernel-commit field.
     #[test]
     fn row_filter_kernel_commit_none_row_never_matches_populated_filter() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         let filter = RowFilter {
             kernel_commits: vec!["kabcde7".to_string()],
             ..RowFilter::default()
@@ -7508,11 +7346,11 @@ mod tests {
     /// same kernel HEAD bucket separately).
     #[test]
     fn row_filter_kernel_commit_exact_match_and_or_combined() {
-        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_clean = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_clean.kernel_commit = Some("kabcde7".to_string());
-        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_dirty = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_dirty.kernel_commit = Some("kabcde7-dirty".to_string());
-        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_other = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_other.kernel_commit = Some("fedcba2".to_string());
 
         let filter_single = RowFilter {
@@ -7562,7 +7400,7 @@ mod tests {
     /// sets.
     #[test]
     fn row_filter_kernel_commit_and_commit_filter_distinct_fields() {
-        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row.commit = Some("project1".to_string());
         row.kernel_commit = Some("kernel1".to_string());
 
@@ -7607,7 +7445,7 @@ mod tests {
     /// for the `run_source` field.
     #[test]
     fn row_filter_run_source_none_row_never_matches_populated_filter() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         let filter = RowFilter {
             run_sources: vec!["local".to_string()],
             ..RowFilter::default()
@@ -7625,11 +7463,11 @@ mod tests {
     /// for the `run_source` dimension.
     #[test]
     fn row_filter_run_sources_or_combined_matches_any_listed() {
-        let mut row_local = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_local = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_local.run_source = Some("local".to_string());
-        let mut row_ci = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_ci = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_ci.run_source = Some("ci".to_string());
-        let mut row_archive = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row_archive = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row_archive.run_source = Some("archive".to_string());
         let filter = RowFilter {
             run_sources: vec!["local".to_string(), "ci".to_string()],
@@ -7660,7 +7498,7 @@ mod tests {
     /// for the `run_source` × `kernel_commit` cross-wire surface.
     #[test]
     fn row_filter_run_sources_and_kernel_commits_are_distinct_fields() {
-        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row.run_source = Some("local".to_string());
         row.kernel_commit = None;
         let filter = RowFilter {
@@ -7678,7 +7516,7 @@ mod tests {
 
         // Symmetric arm: run_source mismatches but kernel_commit
         // matches. Whole filter must still reject.
-        let mut row2 = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let mut row2 = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         row2.run_source = Some("ci".to_string());
         row2.kernel_commit = Some("abc1234".to_string());
         let filter2 = RowFilter {
@@ -7702,7 +7540,7 @@ mod tests {
     /// existing multi-field test for scheduler+topology+kernel.
     #[test]
     fn row_filter_commit_and_kernel_compose_and() {
-        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"), &[]);
+        let mut row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"));
         row.commit = Some("abcdef1".to_string());
         let filter_both_match = RowFilter {
             kernels: vec!["6.14.2".to_string()],
@@ -7732,7 +7570,7 @@ mod tests {
     /// is the operator's expected workflow.
     #[test]
     fn row_filter_topology_strict_equality() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None);
         let filter_match = RowFilter {
             topologies: vec!["1n2l4c1t".to_string()],
             ..RowFilter::default()
@@ -7745,61 +7583,13 @@ mod tests {
         assert!(!filter_miss.matches(&row));
     }
 
-    /// Repeatable `--flag` is AND-combined: every entry in the
-    /// filter must appear in the row's flags vec. The row may
-    /// carry additional flags (the filter is at-least-these, not
-    /// exactly-these) — pinned here by adding `extra` to the row
-    /// and confirming it doesn't break the match.
-    #[test]
-    fn row_filter_flags_and_combined_subset() {
-        let row = make_filter_row(
-            "t",
-            "scx_a",
-            "1n2l4c1t",
-            "SpinWait",
-            None,
-            &["llc", "rusty_balance", "extra"],
-        );
-        let filter = RowFilter {
-            flags: vec!["llc".to_string(), "rusty_balance".to_string()],
-            ..RowFilter::default()
-        };
-        assert!(
-            filter.matches(&row),
-            "AND-combined flags must match when row has all required \
-             entries (extra flags are fine); got rejection",
-        );
-    }
-
-    /// AND-combined: a single missing required flag rejects the
-    /// whole match, even when other required flags are present.
-    #[test]
-    fn row_filter_flags_missing_required_rejects() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", None, &["llc"]);
-        let filter = RowFilter {
-            flags: vec!["llc".to_string(), "rusty_balance".to_string()],
-            ..RowFilter::default()
-        };
-        assert!(
-            !filter.matches(&row),
-            "missing single required flag must reject the whole match",
-        );
-    }
-
     /// Multiple typed filters compose with AND semantics: every
     /// populated field must match. A mismatch on any one field
     /// rejects the whole match. Pinned via a row that matches 3
     /// of 4 filter fields and assertion that it still rejects.
     #[test]
     fn row_filter_multi_field_and_composes() {
-        let row = make_filter_row(
-            "t",
-            "scx_a",
-            "1n2l4c1t",
-            "SpinWait",
-            Some("6.14.2"),
-            &["llc"],
-        );
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.14.2"));
         // 3 of 4 typed fields match (scheduler, topology, kernels);
         // work_type mismatches. Whole filter must reject.
         let filter = RowFilter {
@@ -7823,9 +7613,9 @@ mod tests {
     #[test]
     fn apply_row_filters_preserves_order_drops_mismatch() {
         let rows = vec![
-            make_filter_row("t1", "scx_a", "1n2l4c1t", "SpinWait", None, &[]),
-            make_filter_row("t2", "scx_b", "1n2l4c1t", "SpinWait", None, &[]),
-            make_filter_row("t3", "scx_a", "1n2l4c1t", "SpinWait", None, &[]),
+            make_filter_row("t1", "scx_a", "1n2l4c1t", "SpinWait", None),
+            make_filter_row("t2", "scx_b", "1n2l4c1t", "SpinWait", None),
+            make_filter_row("t3", "scx_a", "1n2l4c1t", "SpinWait", None),
         ];
         let filter = RowFilter {
             schedulers: vec!["scx_b".to_string()],
@@ -7841,15 +7631,8 @@ mod tests {
     #[test]
     fn apply_row_filters_default_is_identity() {
         let rows = vec![
-            make_filter_row("t1", "scx_a", "1n2l4c1t", "SpinWait", None, &[]),
-            make_filter_row(
-                "t2",
-                "scx_b",
-                "1n2l4c2t",
-                "YieldHeavy",
-                Some("6.14.2"),
-                &["llc"],
-            ),
+            make_filter_row("t1", "scx_a", "1n2l4c1t", "SpinWait", None),
+            make_filter_row("t2", "scx_b", "1n2l4c2t", "YieldHeavy", Some("6.14.2")),
         ];
         let kept = apply_row_filters(&rows, &RowFilter::default());
         assert_eq!(kept.len(), rows.len());
@@ -7956,10 +7739,10 @@ mod tests {
         assert_eq!(ar.row.worst_p99_wake_latency_us, 40.0);
     }
 
-    /// Different (scenario, topology, work_type, flags) groups
-    /// produce distinct aggregates — the four-tuple is the join
-    /// key. Pins the group-key contract so a regression that
-    /// dropped flags from the key would land here as a collision.
+    /// Different (scenario, topology, work_type) groups produce
+    /// distinct aggregates — the tuple is the join key. Pins the
+    /// group-key contract so a regression that dropped a key
+    /// component would land here as a collision.
     #[test]
     fn group_and_average_distinct_groups_stay_separate() {
         let mut a = make_row("alpha", "tiny-1llc", true, 0.0);
@@ -7971,38 +7754,6 @@ mod tests {
         // First-seen iteration order preserved (alpha before beta).
         assert_eq!(out[0].row.scenario, "alpha");
         assert_eq!(out[1].row.scenario, "beta");
-    }
-
-    /// Different `flags` profiles for the same (scenario,
-    /// topology, work_type) tuple yield distinct aggregates.
-    /// Mirrors the `compare_rows_same_key_different_flags_do_not_collide`
-    /// pin for the join key — averaging must respect the same
-    /// four-tuple.
-    #[test]
-    fn group_and_average_different_flags_stay_separate() {
-        let mut llc1 = make_row("t", "tiny-1llc", true, 0.0);
-        llc1.flags = vec!["llc".to_string()];
-        paint_metrics(&mut llc1, 10.0, 100, 30, 1000);
-        let mut llc2 = make_row("t", "tiny-1llc", true, 0.0);
-        llc2.flags = vec!["llc".to_string()];
-        paint_metrics(&mut llc2, 14.0, 140, 50, 1200);
-        let mut borrow1 = make_row("t", "tiny-1llc", true, 0.0);
-        borrow1.flags = vec!["borrow".to_string()];
-        paint_metrics(&mut borrow1, 80.0, 800, 200, 5000);
-        let out = group_and_average_by(&[llc1, llc2, borrow1], LEGACY_PAIRING_DIMS);
-        assert_eq!(out.len(), 2);
-        let llc_ar = out
-            .iter()
-            .find(|r| r.row.flags == vec!["llc".to_string()])
-            .expect("llc aggregate must exist");
-        assert_eq!(llc_ar.passes_observed, 2);
-        assert_eq!(llc_ar.row.spread, 12.0);
-        let borrow_ar = out
-            .iter()
-            .find(|r| r.row.flags == vec!["borrow".to_string()])
-            .expect("borrow aggregate must exist");
-        assert_eq!(borrow_ar.passes_observed, 1);
-        assert_eq!(borrow_ar.row.spread, 80.0);
     }
 
     /// Failing contributors are excluded from the metric mean and
@@ -8429,10 +8180,10 @@ mod tests {
         // Scheduler is the slicing dim: side A's three trials
         // run under "scx_alpha", side B's under "scx_beta". The
         // pairing dims are everything else (kernel/topology/
-        // work_type/commit/flags) which match across both runs,
+        // work_type/commit) which match across both runs,
         // so the three trials on each side aggregate into one
-        // mean row keyed by `(scenario, topology, work_type,
-        // flags)` plus the matching kernel/commit values.
+        // mean row keyed by `(scenario, topology, work_type)`
+        // plus the matching kernel/commit values.
         for (run_key, trials, sched) in [
             (run_a, &trials_a, "scx_alpha"),
             (run_b, &trials_b, "scx_beta"),
@@ -8531,13 +8282,11 @@ mod tests {
         scenario: &str,
         topology: &str,
         work_type: &str,
-        flags: &[&str],
         passes_observed: u32,
         total_observed: u32,
     ) -> AveragedGroup {
         let mut row = make_row(scenario, topology, true, 0.0);
         row.work_type = work_type.into();
-        row.flags = flags.iter().map(|s| (*s).to_string()).collect();
         AveragedGroup {
             row,
             passes_observed,
@@ -8557,19 +8306,19 @@ mod tests {
         );
     }
 
-    /// Both-sides-present: every (scenario, topology, work_type,
-    /// flags) group renders one line. Healthy 5/5 groups appear
+    /// Both-sides-present: every (scenario, topology, work_type)
+    /// group renders one line. Healthy 5/5 groups appear
     /// alongside unhealthy 3/5 groups — the spec is "show every
     /// group", not "show only the broken ones".
     #[test]
     fn format_per_group_pass_counts_renders_every_group_with_n_over_m() {
         let avg_a = vec![
-            group("alpha", "tiny-1llc", "SpinWait", &[], 5, 5),
-            group("beta", "tiny-1llc", "SpinWait", &[], 3, 5),
+            group("alpha", "tiny-1llc", "SpinWait", 5, 5),
+            group("beta", "tiny-1llc", "SpinWait", 3, 5),
         ];
         let avg_b = vec![
-            group("alpha", "tiny-1llc", "SpinWait", &[], 4, 5),
-            group("beta", "tiny-1llc", "SpinWait", &[], 5, 5),
+            group("alpha", "tiny-1llc", "SpinWait", 4, 5),
+            group("beta", "tiny-1llc", "SpinWait", 5, 5),
         ];
         let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
         // Header line present.
@@ -8602,8 +8351,8 @@ mod tests {
     /// missing.
     #[test]
     fn format_per_group_pass_counts_one_side_missing_renders_dash() {
-        let avg_a = vec![group("only_a", "tiny-1llc", "SpinWait", &[], 5, 5)];
-        let avg_b = vec![group("only_b", "tiny-1llc", "SpinWait", &[], 3, 5)];
+        let avg_a = vec![group("only_a", "tiny-1llc", "SpinWait", 5, 5)];
+        let avg_b = vec![group("only_b", "tiny-1llc", "SpinWait", 3, 5)];
         let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
         assert!(
             out.contains("only_a/tiny-1llc/SpinWait: a=5/5 b=-"),
@@ -8615,35 +8364,9 @@ mod tests {
         );
     }
 
-    /// Different `flags` profiles for the same (scenario,
-    /// topology, work_type) tuple render as separate lines. The
-    /// flag tuple is part of the join key; treating two flag
-    /// profiles as the same group would silently merge their
-    /// pass counts and hide flag-specific failures.
-    #[test]
-    fn format_per_group_pass_counts_distinct_flags_render_separately() {
-        let avg_a = vec![
-            group("t", "tiny-1llc", "SpinWait", &["llc"], 5, 5),
-            group("t", "tiny-1llc", "SpinWait", &["borrow"], 4, 5),
-        ];
-        let avg_b = vec![
-            group("t", "tiny-1llc", "SpinWait", &["llc"], 3, 5),
-            group("t", "tiny-1llc", "SpinWait", &["borrow"], 5, 5),
-        ];
-        let out = format_per_group_pass_counts(&avg_a, &avg_b, "a", "b");
-        // Both lines must appear separately — not collapsed.
-        // Count occurrences of "t/tiny-1llc/SpinWait" — there
-        // should be exactly 2 (one per flag profile).
-        let occurrences = out.matches("t/tiny-1llc/SpinWait").count();
-        assert_eq!(
-            occurrences, 2,
-            "two flag profiles must render as two separate lines; got: {out:?}",
-        );
-    }
-
     // -- Dimension / derive_slicing_dims / pairing dims --
 
-    /// `Dimension::ALL` lists all eight dims in canonical order.
+    /// `Dimension::ALL` lists all seven dims in canonical order.
     /// Order matters for [`PairingKey::from_row`] and for header
     /// rendering — a regression that reordered the slice would
     /// silently shift every dynamic key, splitting previously-
@@ -8660,7 +8383,6 @@ mod tests {
                 Dimension::ProjectCommit,
                 Dimension::KernelCommit,
                 Dimension::RunSource,
-                Dimension::Flags,
             ],
         );
     }
@@ -8680,7 +8402,6 @@ mod tests {
                 Dimension::WorkType,
                 Dimension::KernelCommit,
                 Dimension::RunSource,
-                Dimension::Flags,
             ],
         );
         // Order of slicing input doesn't change the output —
@@ -8722,9 +8443,9 @@ mod tests {
         assert_eq!(derive_slicing_dims(&f_a, &f_b), vec![Dimension::Scheduler]);
     }
 
-    /// Vec dims (kernels/commits/flags) compare as sorted-deduped
-    /// sets — order and duplicates inside the filter don't shift
-    /// the slicing-dim derivation.
+    /// Vec dims (kernels/commits) compare as sorted-deduped sets —
+    /// order and duplicates inside the filter don't shift the
+    /// slicing-dim derivation.
     #[test]
     fn derive_slicing_dims_vec_compares_as_set() {
         let f_a = RowFilter {
@@ -8955,7 +8676,7 @@ mod tests {
     /// series.
     #[test]
     fn row_filter_kernel_major_minor_prefix_admits_patch_version() {
-        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.12.5"), &[]);
+        let row = make_filter_row("t", "scx_a", "1n2l4c1t", "SpinWait", Some("6.12.5"));
         let filter = RowFilter {
             kernels: vec!["6.12".to_string()],
             ..RowFilter::default()
@@ -8974,9 +8695,9 @@ mod tests {
     /// (when topology IS a pairing dim) does not.
     #[test]
     fn pairing_key_from_row_basic() {
-        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
-        let row_b = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
-        let row_c = make_filter_row("scenA", "scx_a", "2n2l", "SpinWait", Some("6.14"), &[]);
+        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+        let row_b = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+        let row_c = make_filter_row("scenA", "scx_a", "2n2l", "SpinWait", Some("6.14"));
         let dims = &[Dimension::Topology, Dimension::WorkType];
         assert_eq!(
             PairingKey::from_row(&row_a, dims),
@@ -8995,8 +8716,8 @@ mod tests {
     /// them across A/B sides.
     #[test]
     fn pairing_key_excludes_slicing_dim() {
-        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
-        let row_b = make_filter_row("scenA", "scx_a", "2n2l", "SpinWait", Some("6.14"), &[]);
+        let row_a = make_filter_row("scenA", "scx_a", "1n1l", "SpinWait", Some("6.14"));
+        let row_b = make_filter_row("scenA", "scx_a", "2n2l", "SpinWait", Some("6.14"));
         // Pairing dims = ALL minus Topology. So these two rows
         // pair iff they agree on everything BUT topology.
         let pair_dims = Dimension::pairing_dims(&[Dimension::Topology]);
@@ -9008,19 +8729,17 @@ mod tests {
     }
 
     /// `PairingKey::from_row` first slot is always scenario;
-    /// rendering via `parts.join("/")` reproduces the historical
-    /// `scenario/topology/work_type/flags` shape when those dims
-    /// are pairing dims.
+    /// rendering via `parts.join("/")` reproduces the
+    /// `scenario/topology/work_type` shape when those dims are
+    /// pairing dims.
     #[test]
     fn pairing_key_join_renders_legacy_shape() {
-        let mut row = make_filter_row("test_a", "scx_a", "1n2l", "SpinWait", Some("6.14"), &[]);
-        row.flags = vec!["llc".to_string(), "steal".to_string()];
+        let row = make_filter_row("test_a", "scx_a", "1n2l", "SpinWait", Some("6.14"));
         let key = PairingKey::from_row(&row, LEGACY_PAIRING_DIMS);
         assert_eq!(
             key.0.join("/"),
-            "test_a/1n2l/SpinWait/llc|steal",
-            "legacy-shape join must render the four-segment label \
-             with flags sorted+deduped via `|`",
+            "test_a/1n2l/SpinWait",
+            "legacy-shape join must render the three-segment label",
         );
     }
 
@@ -9037,9 +8756,9 @@ mod tests {
     /// shape is shared across every Option-typed dim arm.
     #[test]
     fn pairing_key_from_row_includes_kernel_commit_when_pairing() {
-        let mut row_some = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_some = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_some.kernel_commit = Some("kabcde7".to_string());
-        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_none.kernel_commit = None;
 
         // KernelCommit in pairing dims → key carries the commit
@@ -9089,11 +8808,11 @@ mod tests {
     /// `row.run_source` would surface here.
     #[test]
     fn pairing_key_from_row_includes_run_source_when_pairing() {
-        let mut row_local = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_local = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_local.run_source = Some("local".to_string());
-        let mut row_ci = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_ci = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_ci.run_source = Some("ci".to_string());
-        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_none = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_none.run_source = None;
 
         let pair_dims = &[Dimension::RunSource];
@@ -9138,9 +8857,9 @@ mod tests {
     /// land in ONE group).
     #[test]
     fn pairing_key_from_row_strips_dirty_suffix_on_commit() {
-        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_clean.commit = Some("abc1234".to_string());
-        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_dirty.commit = Some("abc1234-dirty".to_string());
 
         let pair_dims = &[Dimension::ProjectCommit];
@@ -9166,9 +8885,9 @@ mod tests {
     /// strip one but not the other.
     #[test]
     fn pairing_key_from_row_strips_dirty_suffix_on_kernel_commit() {
-        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_clean = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_clean.kernel_commit = Some("def5678".to_string());
-        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_dirty = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_dirty.kernel_commit = Some("def5678-dirty".to_string());
 
         let pair_dims = &[Dimension::KernelCommit];
@@ -9189,9 +8908,9 @@ mod tests {
     /// `bbb2222` remain distinct.
     #[test]
     fn pairing_key_from_row_distinct_hexes_remain_distinct_under_strip() {
-        let mut row_a = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_a = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_a.commit = Some("aaa1111-dirty".to_string());
-        let mut row_b = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row_b = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row_b.commit = Some("bbb2222".to_string());
 
         let pair_dims = &[Dimension::ProjectCommit];
@@ -9213,7 +8932,7 @@ mod tests {
     /// inadvertently changed the unwrap_or_default behavior.
     #[test]
     fn pairing_key_from_row_none_commit_unchanged_under_strip() {
-        let mut row = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"), &[]);
+        let mut row = make_filter_row("scn", "scx_a", "1n1l", "SpinWait", Some("6.14"));
         row.commit = None;
         row.kernel_commit = None;
         let pair_dims = &[Dimension::ProjectCommit, Dimension::KernelCommit];
@@ -9320,7 +9039,7 @@ mod tests {
 
     /// `Dimension::KernelCommit` arm of [`render_side_label`] reads
     /// `filter.kernel_commits` (a Vec) and routes through the same
-    /// `render_vec_dim` path as `Kernel` / `ProjectCommit` / `Flags`. Pins
+    /// `render_vec_dim` path as `Kernel` / `ProjectCommit`. Pins
     /// the arm so a regression that omitted it (or substituted the
     /// wrong field, e.g. `filter.project_commits`) surfaces here
     /// instead of silently rendering the bare label even when the

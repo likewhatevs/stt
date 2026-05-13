@@ -196,10 +196,6 @@ pub struct SidecarResult {
     /// WorkSpec type label used for post-hoc filtering and A/B comparison
     /// (distinct from the `WorkType` enum — this is the text name).
     pub work_type: String,
-    /// Scheduler flag names active for this gauntlet variant. Empty
-    /// for the default (no-flags) profile. Participates in the
-    /// sidecar variant-hash so flag-only variants don't clobber.
-    pub active_flags: Vec<String>,
     /// Per-BPF-program verifier statistics captured from the VM's
     /// scheduler (when one was loaded). Empty when no scheduler
     /// programs were inspected. Writer always emits as
@@ -424,7 +420,7 @@ impl SidecarResult {
     ///
     /// **Hash-stability tests must not rely on these defaults for
     /// hash-participating fields** (`topology`, `scheduler`, `payload`,
-    /// `work_type`, `active_flags`, `sysctls`, `kargs`). Tests that pin
+    /// `work_type`, `sysctls`, `kargs`). Tests that pin
     /// a [`sidecar_variant_hash`] output against a literal constant
     /// must spell every hash-participating field out explicitly so a
     /// future change to these defaults cannot silently shift the
@@ -444,7 +440,6 @@ impl SidecarResult {
             monitor: None,
             stimulus_events: Vec::new(),
             work_type: "SpinWait".to_string(),
-            active_flags: Vec::new(),
             verifier_stats: Vec::new(),
             kvm_stats: None,
             sysctls: Vec::new(),
@@ -1840,7 +1835,7 @@ fn resolve_kernel_source_dir_with_cache(
 /// # Host-state collision caveat
 ///
 /// The hash is over test-identity fields (topology, scheduler,
-/// payload, work_type, flags, sysctls, kargs) — NOT over
+/// payload, work_type, sysctls, kargs) — NOT over
 /// [`HostContext`], NOT over `scheduler_commit`, NOT over
 /// `project_commit`, NOT over `kernel_commit`, and NOT over
 /// `run_source`. The [`HostContext`] exclusion is pinned by
@@ -1891,7 +1886,6 @@ pub(crate) fn sidecar_variant_hash(sidecar: &SidecarResult) -> u64 {
         "scheduler": sidecar.scheduler,
         "payload": sidecar.payload,
         "work_type": sidecar.work_type,
-        "active_flags": sidecar.active_flags,
         "sysctls": sorted_sysctls,
         "kargs": sorted_kargs,
     });
@@ -2521,56 +2515,6 @@ fn acquire_run_dir_flock_with_timeout(
     )
 }
 
-/// Return `active_flags` sorted into canonical
-/// [`crate::scenario::flags::ALL`] order. Both sidecar writers
-/// pipe their caller-supplied flag slice through this helper so
-/// the persisted ordering is a pure function of the flag SET,
-/// not the order the caller happened to accumulate them in.
-///
-/// Why this matters: [`sidecar_variant_hash`] walks
-/// `active_flags` in-order and folds each byte into a SipHasher
-/// state (see sibling site that hashes `for f in
-/// &sidecar.active_flags`). Two runs of the same semantic variant
-/// that differ only in flag accumulation order — e.g. a gauntlet
-/// path that inserts `llc` then `steal` versus one that inserts
-/// `steal` then `llc` — would otherwise produce distinct hashes,
-/// distinct sidecar filenames, and end up as two separate rows in
-/// `compare_partitions` even though they describe the same variant. By
-/// canonicalizing at write time against the canonical
-/// [`crate::scenario::flags::ALL`] positional ordering (shared
-/// with `compute_flag_profiles` at scenario/mod.rs, which sorts
-/// the same way), the on-disk representation is
-/// order-insensitive by construction.
-///
-/// Flags not found in [`crate::scenario::flags::ALL`] are kept
-/// and sorted to the end in lexical order. Sort key is composite:
-/// positional for known flags (so the canonical ALL order leads),
-/// then `&str` comparison as a tiebreaker. The lexical secondary
-/// matters because two unknown flags both collide on the fallback
-/// `usize::MAX` positional key — without the tiebreak, a caller
-/// that supplies `["zzz_unknown", "aaa_unknown"]` versus the
-/// reverse would share identical positional keys yet produce
-/// different on-disk orderings under a stable sort, once again
-/// breaking the "variant hash is a pure function of the flag
-/// SET" invariant. The lexical secondary collapses them to one
-/// canonical order so future or ad-hoc flag names are handled
-/// without data loss AND without order sensitivity.
-fn canonicalize_active_flags(flags: &[String]) -> Vec<String> {
-    let mut v: Vec<String> = flags.to_vec();
-    v.sort_by(|a, b| {
-        let ka = crate::scenario::flags::ALL
-            .iter()
-            .position(|x| *x == a.as_str())
-            .unwrap_or(usize::MAX);
-        let kb = crate::scenario::flags::ALL
-            .iter()
-            .position(|x| *x == b.as_str())
-            .unwrap_or(usize::MAX);
-        ka.cmp(&kb).then_with(|| a.as_str().cmp(b.as_str()))
-    });
-    v
-}
-
 /// Emit a minimal sidecar for a PRE-VM-BOOT skip path.
 ///
 /// Stats tooling enumerates sidecars to compute pass/skip/fail
@@ -2624,10 +2568,7 @@ fn canonicalize_active_flags(flags: &[String]) -> Vec<String> {
 /// JSON cannot be serialized, or the file write fails. Callers that
 /// ignore the Result accept the risk of stats-tooling blind spots on
 /// this run.
-pub(crate) fn write_skip_sidecar(
-    entry: &KtstrTestEntry,
-    active_flags: &[String],
-) -> anyhow::Result<()> {
+pub(crate) fn write_skip_sidecar(entry: &KtstrTestEntry) -> anyhow::Result<()> {
     let SchedulerFingerprint {
         scheduler,
         scheduler_commit,
@@ -2655,7 +2596,6 @@ pub(crate) fn write_skip_sidecar(
         // so stats tooling that groups by work_type puts these in a
         // distinguishable bucket.
         work_type: "skipped".to_string(),
-        active_flags: canonicalize_active_flags(active_flags),
         verifier_stats: Vec::new(),
         kvm_stats: None,
         sysctls,
@@ -2697,7 +2637,6 @@ pub(crate) fn write_sidecar(
     stimulus_events: &[StimulusEvent],
     check_result: &AssertResult,
     work_type: &str,
-    active_flags: &[String],
     payload_metrics: &[PayloadMetrics],
 ) -> anyhow::Result<()> {
     let SchedulerFingerprint {
@@ -2720,7 +2659,6 @@ pub(crate) fn write_sidecar(
         monitor: vm_result.monitor.as_ref().map(|m| m.summary.clone()),
         stimulus_events: stimulus_events.to_vec(),
         work_type: work_type.to_string(),
-        active_flags: canonicalize_active_flags(active_flags),
         verifier_stats: vm_result.verifier_stats.clone(),
         kvm_stats: vm_result.kvm_stats.clone(),
         sysctls,

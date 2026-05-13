@@ -235,7 +235,7 @@ pub const KERNEL_HELP_NO_RAW: &str = "Kernel identifier: a source directory \
      on a fresh tree); versions auto-download from kernel.org on cache \
      miss. The flag is REPEATABLE on `test`, `coverage`, and `llvm-cov` \
      — passing multiple `--kernel` flags fans the gauntlet across every \
-     resolved kernel; each (test × scenario × topology × flags × kernel) \
+     resolved kernel; each (test × scenario × topology × kernel) \
      tuple becomes a distinct nextest test case so nextest's parallelism, \
      retries, and `-E` filtering work natively. Ranges expand to every \
      `stable` and `longterm` release inside `[START, END]` inclusive \

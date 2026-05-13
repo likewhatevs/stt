@@ -21,10 +21,10 @@
 //!   gauntlet wire format.
 //! - [`stats`]  — `stats compare` subcommand that diffs
 //!   `target/stats/` JSON across two kernel/scheduler
-//!   build commits or scheduler-flag profiles.
-//! - [`verifier`] — `verifier` subcommand that runs each scheduler
-//!   profile under the BPF-stats verifier and renders
-//!   per-profile output.
+//!   build commits.
+//! - [`verifier`] — `verifier` subcommand that runs a scheduler
+//!   binary under the BPF-stats verifier and renders
+//!   per-program verified-instruction counts.
 //! - [`misc`]   — smaller subcommand dispatchers, one submodule per
 //!   CLI verb: `shell`, `completions`, `funify`,
 //!   `model {fetch,status,clean}`, `export`.
@@ -161,16 +161,7 @@ fn main() {
             scheduler_bin,
             kernel,
             raw,
-            all_profiles,
-            profiles,
-        } => verifier::run_verifier(
-            scheduler,
-            scheduler_bin,
-            kernel,
-            raw,
-            all_profiles,
-            profiles,
-        ),
+        } => verifier::run_verifier(scheduler, scheduler_bin, kernel, raw),
         KtstrCommand::Funify {
             input,
             seed,

@@ -51,9 +51,9 @@ pub(crate) enum KtstrCommand {
         /// (path, version, cache key, range `START..END`, git source
         /// `git+URL#REF`). Multiple `--kernel` flags fan out the
         /// gauntlet across kernels: each `(test × scenario × topology
-        /// × flags × kernel)` tuple becomes a distinct nextest test
-        /// case so nextest's parallelism, retries, and `-E`
-        /// filtering all apply natively.
+        /// × kernel)` tuple becomes a distinct nextest test case so
+        /// nextest's parallelism, retries, and `-E` filtering all
+        /// apply natively.
         #[arg(long, action = ArgAction::Append, help = KERNEL_HELP_NO_RAW)]
         kernel: Vec<String>,
         /// Disable all performance mode features (flock, pinning, RT
@@ -216,17 +216,6 @@ pub(crate) enum KtstrCommand {
         /// Print raw verifier output without formatting.
         #[arg(long)]
         raw: bool,
-        /// Run verifier for all flag profiles. Discovers flags via
-        /// `--ktstr-list-flags`, constructs profiles (power set
-        /// respecting requires dependencies), and collects verifier
-        /// stats per profile.
-        #[arg(long)]
-        all_profiles: bool,
-        /// Run verifier for specific profiles only (comma-separated
-        /// names, e.g. `default,llc,llc+steal`). Implies --all-profiles
-        /// for flag discovery.
-        #[arg(long, value_delimiter = ',')]
-        profiles: Vec<String>,
     },
     /// Throw a costume party for a JSON dump — replaces every
     /// non-metric value with a deterministic `adjective-animal`
@@ -562,10 +551,9 @@ pub(crate) enum StatsCommand {
     ///
     /// Walks every run directory under `runs_root()` (or `--dir`),
     /// pools the sidecars, and reports the set of distinct values
-    /// found across all eight filterable dimensions: `kernel`,
+    /// found across all seven filterable dimensions: `kernel`,
     /// `commit`, `kernel_commit`, `source`, `scheduler`,
-    /// `topology`, `work_type`, and `flags` (individual flag
-    /// names). The JSON keys `commit` and `source` map to the
+    /// `topology`, and `work_type`. The JSON keys `commit` and `source` map to the
     /// internal `SidecarResult::project_commit` /
     /// `SidecarResult::run_source` fields; the per-side filter
     /// flags spell `--project-commit` / `--run-source` on the
@@ -961,13 +949,6 @@ pub(crate) enum StatsCommand {
         /// tag.
         #[arg(long = "run-source", action = ArgAction::Append)]
         run_source: Vec<String>,
-        /// Repeatable AND-combined flag filter (e.g.
-        /// `--flag llc --flag rusty_balance`). Every flag listed
-        /// must be present in the sidecar's `active_flags`; the row
-        /// may carry additional flags beyond the filter set. Empty
-        /// repeats are rejected by clap (zero-width match).
-        #[arg(long = "flag")]
-        flags: Vec<String>,
         /// A-side overrides: replace the corresponding shared
         /// `--X` value for the A side only. See the per-side
         /// semantics on each `--X` flag's doc.
@@ -993,8 +974,6 @@ pub(crate) enum StatsCommand {
         a_topology: Vec<String>,
         #[arg(long = "a-work-type", action = ArgAction::Append)]
         a_work_type: Vec<String>,
-        #[arg(long = "a-flag")]
-        a_flags: Vec<String>,
 
         /// B-side overrides: replace the corresponding shared
         /// `--X` value for the B side only. See the per-side
@@ -1021,8 +1000,6 @@ pub(crate) enum StatsCommand {
         b_topology: Vec<String>,
         #[arg(long = "b-work-type", action = ArgAction::Append)]
         b_work_type: Vec<String>,
-        #[arg(long = "b-flag")]
-        b_flags: Vec<String>,
 
         /// Disable averaging. By default the comparison folds
         /// every matching sidecar within each side into a single

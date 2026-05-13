@@ -20,12 +20,12 @@ use anyhow::Result;
 /// this helper keeps the lookup contract in one place.
 ///
 /// The `.ktstr.json` suffix filter is an intentional tightening
-/// relative to two of the original inline patterns
-/// (`write_sidecar_variant_hash_distinguishes_active_flags` and
-/// `_work_types`), which filtered only by prefix. The write-side
-/// tests only ever produce `.ktstr.json` files in their temp
-/// dirs, so the tightening is safe and rules out future stray
-/// files (a `.json.tmp` atomic-write residue, for instance) from
+/// relative to the original inline pattern in
+/// `write_sidecar_variant_hash_distinguishes_work_types`, which
+/// filtered only by prefix. The write-side tests only ever
+/// produce `.ktstr.json` files in their temp dirs, so the
+/// tightening is safe and rules out future stray files (a
+/// `.json.tmp` atomic-write residue, for instance) from
 /// inflating the count assertions.
 fn find_sidecars_by_prefix(dir: &std::path::Path, prefix: &str) -> Vec<std::path::PathBuf> {
     std::fs::read_dir(dir)
@@ -202,10 +202,6 @@ fn test_fixture_all_collections_empty_by_default() {
     let sc = SidecarResult::test_fixture();
     assert!(sc.metrics.is_empty(), "metrics must default empty");
     assert!(
-        sc.active_flags.is_empty(),
-        "active_flags must default empty"
-    );
-    assert!(
         sc.stimulus_events.is_empty(),
         "stimulus_events must default empty"
     );
@@ -257,7 +253,7 @@ fn test_fixture_variant_hash_is_stable() {
     let b = sidecar_variant_hash(&SidecarResult::test_fixture());
     assert_eq!(a, b, "two fresh fixtures must hash identically");
     assert_eq!(
-        a, 0x4ea01e28f65add5e,
+        a, 0x16b754f538ba41fd,
         "fixture hash drifted — update only if the fixture default \
          change is intentional; verify every call site that passes \
          the fixture straight into sidecar_variant_hash still expresses \
@@ -328,7 +324,6 @@ fn sidecar_result_roundtrip() {
             total_iterations: None,
         }],
         work_type: "SpinWait".to_string(),
-        active_flags: Vec::new(),
         verifier_stats: vec![],
         kvm_stats: None,
         sysctls: vec![],
@@ -366,7 +361,6 @@ fn sidecar_result_roundtrip() {
         monitor,
         stimulus_events,
         work_type,
-        active_flags,
         verifier_stats,
         kvm_stats,
         sysctls,
@@ -410,10 +404,6 @@ fn sidecar_result_roundtrip() {
     // Empty-Vec collections — regression guard against a serde
     // regression that dropped `[]` on round-trip.
     assert!(metrics.is_empty(), "fixture declared empty metrics");
-    assert!(
-        active_flags.is_empty(),
-        "fixture declared empty active_flags",
-    );
     assert!(
         verifier_stats.is_empty(),
         "fixture declared empty verifier_stats",
@@ -538,7 +528,6 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
             total_iterations: None,
         }],
         work_type: "AuditWork".to_string(),
-        active_flags: vec!["flag_a".to_string(), "flag_b".to_string()],
         verifier_stats: vec![ProgVerifierStats {
             name: "audit_prog".to_string(),
             verified_insns: 999,
@@ -601,7 +590,6 @@ fn sidecar_result_roundtrip_all_fields_round_trip() {
     assert_eq!(loaded.stimulus_events[0].label, "audit_event");
     assert_eq!(loaded.stimulus_events[0].elapsed_ms, 123);
     assert_eq!(loaded.work_type, "AuditWork");
-    assert_eq!(loaded.active_flags, vec!["flag_a", "flag_b"]);
     assert_eq!(loaded.verifier_stats.len(), 1);
     assert_eq!(loaded.verifier_stats[0].name, "audit_prog");
     assert_eq!(loaded.verifier_stats[0].verified_insns, 999);
@@ -720,7 +708,6 @@ fn sidecar_result_missing_required_field_rejected_by_deserialize() {
         "stats",
         "stimulus_events",
         "work_type",
-        "active_flags",
         "verifier_stats",
         "sysctls",
         "kargs",
@@ -1017,7 +1004,7 @@ fn write_sidecar_defaults_to_target_dir_without_env() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let check_result = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &check_result, "SpinWait", &[], &[]).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &check_result, "SpinWait", &[]).unwrap();
 
     // The actual on-disk filename embeds a variant-hash suffix
     // (see `serialize_and_write_sidecar`), so a fixed
@@ -1833,7 +1820,7 @@ fn write_sidecar_same_dir_is_last_writer_wins_after_pre_clear() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry_a, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
+    write_sidecar(&entry_a, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
     // Confirm the first invocation's sidecar is on disk.
     assert_eq!(
         find_sidecars_by_prefix(tmp, "__reuse_first_run__-").len(),
@@ -1863,7 +1850,7 @@ fn write_sidecar_same_dir_is_last_writer_wins_after_pre_clear() {
         auto_repro: false,
         ..KtstrTestEntry::DEFAULT
     };
-    write_sidecar(&entry_b, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
+    write_sidecar(&entry_b, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
 
     // Final state: only the second invocation's sidecar is
     // present. The first invocation is gone, the second is
@@ -1917,7 +1904,7 @@ fn write_sidecar_override_does_not_pre_clear() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
 
     // The pre-existing sidecar must still be there. A regression
     // that fired pre_clear on the override path would have
@@ -2019,7 +2006,7 @@ fn write_sidecar_default_path_two_writes_both_survive() {
     // canonicalize-fails (dir missing) → cache key under raw
     // path → wipe was a no-op (dir didn't exist) → created
     // dir → wrote sidecar 1.
-    write_sidecar(&entry_first, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
+    write_sidecar(&entry_first, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
     // Confirm sidecar 1 lands.
     assert_eq!(
         find_sidecars_by_prefix(&dir, "__b3_first__-").len(),
@@ -2035,7 +2022,7 @@ fn write_sidecar_default_path_two_writes_both_survive() {
     // both calls, both canonicalize against an existing dir,
     // both produce the same canonicalized key, and the second
     // call hits the cache → no wipe → both survive.
-    write_sidecar(&entry_second, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
+    write_sidecar(&entry_second, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
 
     // Both sidecars must be present. A regression to the buggy
     // ordering would surface here as `__b3_first__-` count = 0.
@@ -2074,7 +2061,7 @@ fn write_sidecar_writes_file() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let check_result = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &check_result, "SpinWait", &[], &[]).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &check_result, "SpinWait", &[]).unwrap();
 
     // Sidecar filename now includes a variant hash suffix so
     // gauntlet variants don't clobber each other. Use the
@@ -2130,125 +2117,11 @@ fn write_sidecar_writes_file() {
     );
 }
 
-#[test]
-fn write_sidecar_variant_hash_distinguishes_active_flags() {
-    // Two gauntlet variants differing ONLY in active_flags must
-    // produce distinct sidecar filenames so neither clobbers the
-    // other. A hash of work_type/sysctls/kargs alone would miss
-    // this difference.
-    let _lock = lock_env();
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let tmp = tmp_dir.path();
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
-
-    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
-        Ok(AssertResult::pass())
-    }
-    let entry = KtstrTestEntry {
-        name: "__flagvariant_test__",
-        func: dummy,
-        auto_repro: false,
-        ..KtstrTestEntry::DEFAULT
-    };
-    let vm_result = crate::vmm::VmResult::test_fixture();
-    let ok = AssertResult::pass();
-    let flags_a = vec!["llc".to_string()];
-    let flags_b = vec!["llc".to_string(), "steal".to_string()];
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &flags_a, &[]).unwrap();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &flags_b, &[]).unwrap();
-
-    let paths = find_sidecars_by_prefix(tmp, "__flagvariant_test__-");
-    assert_eq!(
-        paths.len(),
-        2,
-        "two active_flags variants must produce two distinct files, got {paths:?}"
-    );
-}
-
-/// Two `write_sidecar` calls differing ONLY in the ORDER their
-/// caller accumulated `active_flags` — same semantic variant,
-/// same flag SET — must produce identical sidecar filenames.
-/// Filenames are keyed on [`sidecar_variant_hash`], which walks
-/// `active_flags` in-order and folds each byte into the hash
-/// state. Without canonicalization at the write site, a caller
-/// that happened to collect `["steal", "llc"]` would hash to
-/// a different bucket than one that collected `["llc",
-/// "steal"]` for the same run — `stats compare` would then see
-/// two rows for one semantic variant and mark one as "new" or
-/// "removed" on a re-run that only changed flag accumulation
-/// order.
-///
-/// This test pins the canonicalization done by
-/// `canonicalize_active_flags` (applied in both
-/// `write_sidecar` and `write_skip_sidecar`): two writes with
-/// reversed flag order collapse to a single file via normal
-/// overwrite. A regression that dropped the sort (reverting to
-/// `active_flags.to_vec()`) would make the second write land
-/// at a different hash → two files, caught here. Pair with
-/// `write_sidecar_variant_hash_distinguishes_active_flags`
-/// above, which pins the complementary property: different
-/// flag SETS must still hash distinctly.
-#[test]
-fn write_sidecar_variant_hash_is_order_invariant_for_active_flags() {
-    let _lock = lock_env();
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let tmp = tmp_dir.path();
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
-
-    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
-        Ok(AssertResult::pass())
-    }
-    let entry = KtstrTestEntry {
-        name: "__flagorder_test__",
-        func: dummy,
-        auto_repro: false,
-        ..KtstrTestEntry::DEFAULT
-    };
-    let vm_result = crate::vmm::VmResult::test_fixture();
-    let ok = AssertResult::pass();
-    // Same set of flags in reversed accumulation order. `llc` is
-    // `ALL_DECLS[0].name` and `steal` is `ALL_DECLS[2].name`, so
-    // the canonical order is ["llc","steal"] regardless of
-    // which order the caller supplied them.
-    let forward = vec!["llc".to_string(), "steal".to_string()];
-    let reversed = vec!["steal".to_string(), "llc".to_string()];
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &forward, &[]).unwrap();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &reversed, &[]).unwrap();
-
-    let paths = find_sidecars_by_prefix(tmp, "__flagorder_test__-");
-    assert_eq!(
-        paths.len(),
-        1,
-        "reversed-order writes of the same flag SET must \
-         collapse to a single canonical sidecar filename \
-         (overwrite); got {paths:?}. If this fails with \
-         `paths.len() == 2`, the write path has regressed to \
-         hashing caller-order flags — re-sort via \
-         `canonicalize_active_flags` in both write_sidecar \
-         and write_skip_sidecar.",
-    );
-
-    // Defensive: the single surviving file must carry the
-    // canonical order on disk, not whichever order the last
-    // caller passed. Deserialize and check.
-    let path = &paths[0];
-    let data = std::fs::read_to_string(path).expect("read canonical sidecar");
-    let loaded: SidecarResult = serde_json::from_str(&data).expect("deserialize canonical sidecar");
-    assert_eq!(
-        loaded.active_flags,
-        vec!["llc".to_string(), "steal".to_string()],
-        "on-disk active_flags must be sorted in \
-         `scenario::flags::ALL` positional order; got: {:?}",
-        loaded.active_flags,
-    );
-}
-
 /// `sidecar_variant_hash` is order-insensitive for `sysctls`
-/// and `kargs` — same contract as `active_flags`, but
-/// canonicalized at hash time (local sort inside
-/// `sidecar_variant_hash`) rather than at write time. Pinning
-/// the invariant directly against the hash function catches a
-/// regression that drops the sort block (reverts to iterating
+/// and `kargs` — canonicalized at hash time via a local sort
+/// inside `sidecar_variant_hash`. Pinning the invariant
+/// directly against the hash function catches a regression
+/// that drops the sort block (reverts to iterating
 /// `&sidecar.sysctls` / `&sidecar.kargs` in-order) even if all
 /// existing stability pins continue to pass — those pins use
 /// single-element collections where sorting is a no-op, so
@@ -2323,137 +2196,6 @@ fn sidecar_variant_hash_is_order_invariant_for_sysctls_and_kargs() {
     );
 }
 
-/// `write_skip_sidecar` sibling of
-/// `write_sidecar_variant_hash_is_order_invariant_for_active_flags`.
-/// The canonicalization path is applied at BOTH write sites
-/// (`write_sidecar` for run-to-completion results,
-/// `write_skip_sidecar` for pre-VM-boot skips), so both need
-/// order-invariance coverage — a partial revert that dropped
-/// `canonicalize_active_flags` in just the skip path would
-/// leave the run path covered by the sibling test yet leave
-/// skip-variant hashes order-sensitive, producing duplicate
-/// skip-sidecar files for the same semantic variant under
-/// `stats list` / `stats compare`.
-///
-/// Pins the same two invariants as the sibling: (1) reversed
-/// flag-order inputs collapse to a single file via normal
-/// overwrite, (2) the surviving on-disk `active_flags` is in
-/// canonical `scenario::flags::ALL` order. Uses a distinct
-/// entry-name prefix (`__skipflagorder_test__`) so the
-/// `find_sidecars_by_prefix` scan doesn't overlap with the
-/// run-path test's fixtures.
-#[test]
-fn write_skip_sidecar_variant_hash_is_order_invariant_for_active_flags() {
-    let _lock = lock_env();
-    let tmp_dir = tempfile::TempDir::new().unwrap();
-    let tmp = tmp_dir.path();
-    let _env_sidecar = EnvVarGuard::set("KTSTR_SIDECAR_DIR", tmp);
-
-    fn dummy(_ctx: &Ctx) -> Result<AssertResult> {
-        Ok(AssertResult::pass())
-    }
-    let entry = KtstrTestEntry {
-        name: "__skipflagorder_test__",
-        func: dummy,
-        auto_repro: false,
-        ..KtstrTestEntry::DEFAULT
-    };
-
-    // Same flag SET, reversed accumulation order. Mirrors the
-    // `llc` / `steal` choice from the run-path sibling so the
-    // canonical order (index 0, index 2 in `ALL_DECLS`) is
-    // unambiguous.
-    let forward = vec!["llc".to_string(), "steal".to_string()];
-    let reversed = vec!["steal".to_string(), "llc".to_string()];
-    write_skip_sidecar(&entry, &forward).unwrap();
-    write_skip_sidecar(&entry, &reversed).unwrap();
-
-    let paths = find_sidecars_by_prefix(tmp, "__skipflagorder_test__-");
-    assert_eq!(
-        paths.len(),
-        1,
-        "reversed-order skip-sidecar writes of the same flag \
-         SET must collapse to a single canonical filename \
-         (overwrite); got {paths:?}. If this fails with \
-         `paths.len() == 2`, canonicalization was removed from \
-         `write_skip_sidecar` even if the run-path test above \
-         still passes — apply `canonicalize_active_flags` in \
-         both write sites, not just one.",
-    );
-
-    let path = &paths[0];
-    let data = std::fs::read_to_string(path).expect("read canonical skip sidecar");
-    let loaded: SidecarResult =
-        serde_json::from_str(&data).expect("deserialize canonical skip sidecar");
-    assert_eq!(
-        loaded.active_flags,
-        vec!["llc".to_string(), "steal".to_string()],
-        "on-disk active_flags of a skip sidecar must be sorted \
-         in `scenario::flags::ALL` positional order; got: {:?}",
-        loaded.active_flags,
-    );
-}
-
-/// Directly exercises `canonicalize_active_flags` on a mixed
-/// input: known canonical flags AND ad-hoc unknown flags. The
-/// sibling
-/// `write_sidecar_variant_hash_is_order_invariant_for_active_flags`
-/// test pins the known-flag-only case through the full
-/// write-and-read round trip; this unit-level test pins the
-/// composite sort-key contract in isolation so a regression in
-/// the tiebreaker (e.g. dropping the secondary lexical
-/// comparator, reverting to `sort_by_key` with a bare
-/// positional key) fails here with a precise diagnostic,
-/// rather than going undetected until a user trips it with
-/// ad-hoc flags.
-///
-/// Invariants pinned:
-/// 1. Known flags (members of `scenario::flags::ALL`) always
-///    appear before unknown flags, regardless of input order.
-/// 2. Known flags are ordered by their position in ALL
-///    (positional key as primary sort).
-/// 3. Unknown flags are ordered lexically among themselves
-///    (secondary `&str` comparator). Without the secondary,
-///    two unknown flags share `usize::MAX` as their positional
-///    key and stable-sort preserves input order — so reversed
-///    unknown-flag input would produce reversed output and
-///    the variant hash would still depend on caller order.
-#[test]
-fn canonicalize_active_flags_orders_unknown_lexically_after_known() {
-    // `llc` is `ALL[0]`, so it always wins against unknown
-    // flags on the positional key. The two `*_unknown` flags
-    // collide at `usize::MAX` and must then be ordered
-    // lexically (`aaa_` < `zzz_`).
-    let input = vec![
-        "zzz_unknown".to_string(),
-        "llc".to_string(),
-        "aaa_unknown".to_string(),
-    ];
-    let got = canonicalize_active_flags(&input);
-    assert_eq!(
-        got,
-        vec![
-            "llc".to_string(),
-            "aaa_unknown".to_string(),
-            "zzz_unknown".to_string(),
-        ],
-        "known flags must sort first by ALL position, unknown \
-         flags must sort lexically after; got: {got:?}",
-    );
-
-    // Invariance check: reversing the input must produce the
-    // same output. Without the lexical secondary the two
-    // unknowns would swap, breaking the set-determines-hash
-    // property for any variant carrying ad-hoc flags.
-    let reversed: Vec<String> = input.into_iter().rev().collect();
-    let got_rev = canonicalize_active_flags(&reversed);
-    assert_eq!(
-        got_rev, got,
-        "reversed input must canonicalize to the same output; \
-         got: {got_rev:?}, expected: {got:?}",
-    );
-}
-
 #[test]
 fn write_sidecar_variant_hash_distinguishes_work_types() {
     // Two gauntlet variants differing only in work_type must
@@ -2475,8 +2217,8 @@ fn write_sidecar_variant_hash_distinguishes_work_types() {
     };
     let vm_result = crate::vmm::VmResult::test_fixture();
     let ok = AssertResult::pass();
-    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[], &[]).unwrap();
-    write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[], &[]).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &ok, "SpinWait", &[]).unwrap();
+    write_sidecar(&entry, &vm_result, &[], &ok, "YieldHeavy", &[]).unwrap();
 
     let paths = find_sidecars_by_prefix(tmp, "__variant_test__-");
     assert_eq!(
@@ -2497,26 +2239,27 @@ fn write_sidecar_variant_hash_distinguishes_work_types() {
 /// pre-computed constant catches that drift before it ships.
 ///
 /// Every currently hash-participating field (topology, scheduler,
-/// payload, work_type, active_flags, sysctls, kargs) is set
+/// payload, work_type, sysctls, kargs) is set
 /// explicitly; non-participating fields come from
 /// [`SidecarResult::test_fixture`] so unrelated schema growth does
-/// not disturb the constant. If a future change adds a new
-/// hash-participating field to [`sidecar_variant_hash`], add it
-/// here too — otherwise this test silently degrades into a
+/// not disturb the constant. If a future change adds, removes, or
+/// renames a hash-participating field in [`sidecar_variant_hash`],
+/// update the field set here too and recompute the expected
+/// constant — otherwise this test silently degrades into a
 /// same-defaults check.
 #[test]
 fn sidecar_variant_hash_stability_populated() {
     // Every currently hash-participating field is spelled out
     // explicitly so a change to `test_fixture` defaults cannot
-    // silently shift the pinned constant. If you add a new
-    // hash-participating field to `sidecar_variant_hash`, add
-    // it here and recompute the expected constant.
+    // silently shift the pinned constant. If you add, remove,
+    // or rename a hash-participating field in
+    // `sidecar_variant_hash`, update the field set here and
+    // recompute the expected constant.
     let sc = SidecarResult {
         topology: "1n2l4c1t".to_string(),
         scheduler: "scx-ktstr".to_string(),
         payload: None,
         work_type: "SpinWait".to_string(),
-        active_flags: vec!["llc".to_string(), "steal".to_string()],
         sysctls: vec!["sysctl.kernel.sched_cfs_bandwidth_slice_us=1000".to_string()],
         kargs: vec!["nosmt".to_string()],
         ..SidecarResult::test_fixture()
@@ -2527,7 +2270,7 @@ fn sidecar_variant_hash_stability_populated() {
     // `sidecar_variant_hash`.
     assert_eq!(
         sidecar_variant_hash(&sc),
-        0x33d8d0cf741e3a06,
+        0x5a5b5775a01a425f,
         "sidecar_variant_hash output drifted — regenerate expected only if \
          the wire format change is intentional and old sidecars are \
          disposable (which they are per ktstr's pre-1.0 stance)",
@@ -2535,30 +2278,35 @@ fn sidecar_variant_hash_stability_populated() {
 }
 
 /// Pair to [`sidecar_variant_hash_stability_populated`] covering
-/// the empty-collections path. If the inter-collection separator
-/// bytes (0xfe / 0xfd / 0xff) disappear or change, an empty-
-/// flags variant could collide with an empty-sysctls variant
-/// whose kargs start with bytes that happen to match the dropped
-/// separator. Pinning the empty-inputs hash catches separator
-/// regressions.
+/// the empty-collections path. [`sidecar_variant_hash`] feeds a
+/// canonical JSON object (via [`serde_json::to_vec`]) into
+/// SipHasher13; the JSON serialization is what keeps an empty
+/// sysctls vec distinct from an empty kargs vec — the object-key
+/// names (`"sysctls"`, `"kargs"`) and the empty-array tokens
+/// (`[]`) plus the `,` / `:` / `"` separators produced by
+/// `serde_json` are the only bytes that distinguish e.g.
+/// `{"sysctls":[],"kargs":[]}` from
+/// `{"sysctls":[],"kargs":["foo"]}` here. Pinning the
+/// empty-inputs hash catches regressions that would erase those
+/// boundaries (e.g. switching to a key-less concatenation).
 #[test]
 fn sidecar_variant_hash_stability_empty_collections() {
     // Every currently hash-participating field is spelled out
     // explicitly so a change to `test_fixture` defaults cannot
-    // silently shift the pinned constant. If you add a new
-    // hash-participating field to `sidecar_variant_hash`, add
-    // it here and recompute the expected constant.
+    // silently shift the pinned constant. If you add, remove,
+    // or rename a hash-participating field in
+    // `sidecar_variant_hash`, update the field set here and
+    // recompute the expected constant.
     let sc = SidecarResult {
         topology: "1n1l1c1t".to_string(),
         scheduler: "eevdf".to_string(),
         payload: None,
         work_type: String::new(),
-        active_flags: Vec::new(),
         sysctls: Vec::new(),
         kargs: Vec::new(),
         ..SidecarResult::test_fixture()
     };
-    assert_eq!(sidecar_variant_hash(&sc), 0x5aa363a3d9aacd98);
+    assert_eq!(sidecar_variant_hash(&sc), 0x36ceceea5c2beda7);
 }
 
 /// Two sidecars that differ only in `payload` must produce

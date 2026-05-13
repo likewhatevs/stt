@@ -346,22 +346,8 @@ fn generate_preamble(entry: &KtstrTestEntry, has_scheduler: bool) -> String {
     let need_threads = topology.threads_per_core;
     let need_numa = topology.numa_nodes;
 
-    // Compose scheduler args = required_flags expansion
-    // (`scheduler.flag_args(name)`) followed by entry.extra_sched_args.
-    // Production dispatch (dispatch.rs:1182, eval.rs after
-    // active_flags resolution) does the same: required_flags are
-    // turned into CLI args via Scheduler::flag_args and prepended
-    // to extra_sched_args. Without this, a test that declares
-    // required_flags would launch the scheduler bare and fail to
-    // exercise the gated code path.
+    // Compose scheduler args from entry.extra_sched_args.
     let mut sched_arg_tokens: Vec<String> = Vec::new();
-    for flag in entry.required_flags {
-        if let Some(args) = entry.scheduler.flag_args(flag) {
-            for a in args {
-                sched_arg_tokens.push(shell_quote(a));
-            }
-        }
-    }
     for a in entry.extra_sched_args {
         sched_arg_tokens.push(shell_quote(a));
     }
@@ -373,7 +359,7 @@ fn generate_preamble(entry: &KtstrTestEntry, has_scheduler: bool) -> String {
     // unquoted lets a future producer regression land an
     // unescaped value with shell metacharacters in the preamble.
     // Quoting at the producer is cheap and matches the same defense
-    // applied to extra_sched_args / flag_args above.
+    // applied to extra_sched_args above.
     let test_name = shell_quote(entry.name);
     let scheduler_name = shell_quote(entry.scheduler.name);
     let git_hash = shell_quote(&git_provenance());

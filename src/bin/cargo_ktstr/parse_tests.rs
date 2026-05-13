@@ -2143,9 +2143,14 @@ fn parse_verifier_scheduler_conflicts_with_scheduler_bin() {
     }
 }
 
+/// `--all-profiles` is no longer a valid flag on the verifier
+/// subcommand — the flag-profile sweep was removed. Pin the
+/// parse-time rejection so a future agent that re-adds the
+/// argument without rebuilding the sweep surface trips this
+/// test instead of silently shipping a dead flag.
 #[test]
-fn parse_verifier_all_profiles() {
-    let m = Cargo::try_parse_from([
+fn parse_verifier_all_profiles_rejected() {
+    let rejected = Cargo::try_parse_from([
         "cargo",
         "ktstr",
         "verifier",
@@ -2153,14 +2158,21 @@ fn parse_verifier_all_profiles() {
         "scx_rustland",
         "--all-profiles",
     ]);
-    assert!(m.is_ok(), "{}", m.err().unwrap());
+    assert!(
+        rejected.is_err(),
+        "--all-profiles must be rejected — the flag-profile sweep \
+         was removed from the verifier subcommand",
+    );
 }
 
+/// `--profiles` is no longer a valid flag on the verifier
+/// subcommand — the flag-profile sweep was removed. Pin the
+/// parse-time rejection so a future agent that re-adds the
+/// argument without rebuilding the sweep surface trips this
+/// test instead of silently shipping a dead flag.
 #[test]
-fn parse_verifier_profiles_filter() {
-    let Cargo {
-        command: CargoSub::Ktstr(k),
-    } = Cargo::try_parse_from([
+fn parse_verifier_profiles_filter_rejected() {
+    let rejected = Cargo::try_parse_from([
         "cargo",
         "ktstr",
         "verifier",
@@ -2168,12 +2180,12 @@ fn parse_verifier_profiles_filter() {
         "scx_rustland",
         "--profiles",
         "default,llc,llc+steal",
-    ])
-    .unwrap_or_else(|e| panic!("{e}"));
-    let KtstrCommand::Verifier { profiles, .. } = k.command else {
-        panic!("expected Verifier");
-    };
-    assert_eq!(profiles, vec!["default", "llc", "llc+steal"]);
+    ]);
+    assert!(
+        rejected.is_err(),
+        "--profiles must be rejected — the flag-profile sweep \
+         was removed from the verifier subcommand",
+    );
 }
 
 // -- try_get_matches_from: completions --
@@ -3563,30 +3575,25 @@ fn parse_stats_compare_with_per_side_project_commit() {
     assert_eq!(b_project_commit, vec!["def5678".to_string()]);
 }
 
-/// `--flag F --a-flag G --b-flag H` round-trips each into its
-/// respective vec — the shared `flags` vec accumulates the
-/// AND-combined filter that applies to BOTH sides, while the
-/// per-side `a_flags` / `b_flags` vecs apply only to their
-/// respective side.
+/// `--flag F --a-flag G --b-flag H` are rejected by clap — the
+/// flag-profile filter surface was removed alongside the flag
+/// infrastructure. A future re-add without rebuilding the
+/// underlying `RowFilter.flags` plumbing would fail this test.
 #[test]
-fn parse_stats_compare_with_flag_per_side() {
-    let StatsCommand::Compare {
-        flags,
-        a_flags,
-        b_flags,
-        ..
-    } = parse_compare(&[
-        "--flag",
-        "shared_flag",
-        "--a-flag",
-        "a_only_flag",
-        "--b-flag",
-        "b_only_flag",
-    ])
-    else {
-        unreachable!()
-    };
-    assert_eq!(flags, vec!["shared_flag".to_string()]);
-    assert_eq!(a_flags, vec!["a_only_flag".to_string()]);
-    assert_eq!(b_flags, vec!["b_only_flag".to_string()]);
+fn parse_stats_compare_flag_filters_rejected() {
+    let outcome = std::panic::catch_unwind(|| {
+        parse_compare(&[
+            "--flag",
+            "shared_flag",
+            "--a-flag",
+            "a_only_flag",
+            "--b-flag",
+            "b_only_flag",
+        ])
+    });
+    assert!(
+        outcome.is_err(),
+        "--flag / --a-flag / --b-flag must be rejected — the flag-profile \
+         filter was removed when the flag infrastructure went away",
+    );
 }

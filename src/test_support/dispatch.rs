@@ -76,10 +76,10 @@ static CAPTURE_ARGV: unsafe extern "C" fn(libc::c_int, *const *mut libc::c_char)
 
 use super::{
     KTSTR_TESTS, KtstrTestEntry, TopoOverride, collect_sidecars, extract_export_output_arg,
-    extract_export_test_arg, extract_flags_arg, extract_test_fn_arg, extract_topo_arg, find_test,
+    extract_export_test_arg, extract_test_fn_arg, extract_topo_arg, find_test,
     format_callback_profile, format_kvm_stats, format_verifier_stats, maybe_dispatch_vm_test,
     parse_topo_string, propagate_rust_env_from_cmdline, record_skip_sidecar, resolve_test_kernel,
-    run_ktstr_test_inner, sidecar_dir, try_flush_profraw, validate_entry_flags,
+    run_ktstr_test_inner, sidecar_dir, try_flush_profraw,
 };
 
 /// Check if an `anyhow::Error` carries a [`ResourceContention`].
@@ -539,22 +539,20 @@ pub fn ktstr_test_early_dispatch() {
     } else {
         // cargo-test-direct path: the standard rustc test harness
         // runs only the bare `#[test]` wrappers `#[ktstr_test]`
-        // generates. Gauntlet expansion (flag-profile × topology-
-        // preset combinations) lives inside `ktstr_main`'s `--list`
-        // + `--exact` handlers and is reachable ONLY under nextest.
-        // Every real ktstr entry produces topology-preset variants
-        // under nextest (`for_each_gauntlet_variant` iterates
-        // `crate::vm::gauntlet_presets()` regardless of whether the
-        // scheduler declares flags — the flag set only determines
-        // the profile half of the `presets × profiles` product).
-        // Without nextest those variants would silently not run —
-        // coverage loss with no error. Emit a one-shot stderr
-        // `warning:` diagnostic (see the `eprintln!` below) when the
-        // binary carries any real entry so the user sees the gap
-        // instead of trusting a false green. Print once per process
-        // (cargo test invokes one test binary per crate; the ctor
-        // runs exactly once per test binary) so there is no need to
-        // gate with a std::sync::Once.
+        // generates. Gauntlet expansion (topology-preset variants)
+        // lives inside `ktstr_main`'s `--list` + `--exact` handlers
+        // and is reachable ONLY under nextest. Every real ktstr
+        // entry produces topology-preset variants under nextest
+        // (`for_each_gauntlet_variant` iterates
+        // `crate::vm::gauntlet_presets()`). Without nextest those
+        // variants would silently not run — coverage loss with no
+        // error. Emit a one-shot stderr `warning:` diagnostic (see
+        // the `eprintln!` below) when the binary carries any real
+        // entry so the user sees the gap instead of trusting a
+        // false green. Print once per process (cargo test invokes
+        // one test binary per crate; the ctor runs exactly once per
+        // test binary) so there is no need to gate with a
+        // std::sync::Once.
         //
         // `KTSTR_CARGO_TEST_MODE=1` opts out of the warning: the
         // operator deliberately picked the cargo-test-direct path
@@ -572,11 +570,11 @@ pub fn ktstr_test_early_dispatch() {
             if real > 0 {
                 eprintln!(
                     "warning: {real} of {total} ktstr test entries registered in this binary \
-                     will not generate their flag-profile / topology-preset gauntlet variants — \
-                     NEXTEST env var is not set and the standard rustc harness does not expand \
-                     them. Use `cargo nextest run` (or `cargo ktstr test`) to exercise the full \
-                     gauntlet, or set KTSTR_CARGO_TEST_MODE=1 to opt into single-variant \
-                     bare-`cargo test` mode without this warning.",
+                     will not generate their topology-preset gauntlet variants — NEXTEST env \
+                     var is not set and the standard rustc harness does not expand them. Use \
+                     `cargo nextest run` (or `cargo ktstr test`) to exercise the full gauntlet, \
+                     or set KTSTR_CARGO_TEST_MODE=1 to opt into single-variant bare-`cargo test` \
+                     mode without this warning.",
                 );
             }
         }
@@ -716,8 +714,7 @@ fn maybe_dispatch_host_test() -> Option<i32> {
         memory_mb,
     };
 
-    let active_flags = extract_flags_arg(&args).unwrap_or_default();
-    match run_ktstr_test_with_topo_and_flags(entry, &topo, &active_flags) {
+    match run_ktstr_test_with_topo(entry, &topo) {
         Ok(_) => Some(0),
         Err(e) => {
             eprintln!("ktstr_test: {e:#}");
@@ -740,7 +737,7 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     entry.validate()?;
 
     // Check if the ctor deferred a prefixed dispatch name via argv
-    // rewrite. If so, resolve the topology and flags from the full
+    // rewrite. If so, resolve the topology from the full
     // gauntlet/multi-kernel name instead of using the entry defaults.
     if let Some(deferred) = DEFERRED_DISPATCH.lock().unwrap().take() {
         return run_deferred_dispatch(entry, &deferred);
@@ -755,13 +752,12 @@ pub fn run_ktstr_test(entry: &KtstrTestEntry) -> Result<AssertResult> {
     {
         anyhow::bail!("vmlinux not found, bpf_map_write requires vmlinux");
     }
-    let active_flags: Vec<String> = entry.required_flags.iter().map(|s| s.to_string()).collect();
-    run_ktstr_test_inner(entry, None, &active_flags)
+    run_ktstr_test_inner(entry, None)
 }
 
 /// Dispatch a test using the full prefixed name that the ctor stored
-/// in [`DEFERRED_DISPATCH`] before rewriting argv. Resolves gauntlet
-/// topology, multi-kernel suffix, and flag profile from the name,
+/// in [`DEFERRED_DISPATCH`] before rewriting argv. Resolves the
+/// gauntlet topology preset and multi-kernel suffix from the name,
 /// then calls `run_ktstr_test_inner` directly — NOT through the
 /// `run_named_test` → `result_to_exit_code` path, so
 /// `ResourceContention` propagates as `Err` rather than being
@@ -776,9 +772,9 @@ fn run_deferred_dispatch(_entry: &KtstrTestEntry, deferred_name: &str) -> Result
     }
 
     if let Some(rest) = test_name.strip_prefix("gauntlet/") {
-        let parts: Vec<&str> = rest.splitn(3, '/').collect();
-        anyhow::ensure!(parts.len() == 3, "invalid gauntlet name: gauntlet/{rest}");
-        let (bare, preset_name, profile_name) = (parts[0], parts[1], parts[2]);
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        anyhow::ensure!(parts.len() == 2, "invalid gauntlet name: gauntlet/{rest}");
+        let (bare, preset_name) = (parts[0], parts[1]);
         let entry = find_test(bare).ok_or_else(|| anyhow::anyhow!("unknown test: {bare}"))?;
         let presets = crate::vm::gauntlet_presets();
         let preset = presets
@@ -794,35 +790,24 @@ fn run_deferred_dispatch(_entry: &KtstrTestEntry, deferred_name: &str) -> Result
             threads: t.threads_per_core,
             memory_mb,
         };
-        let profiles = entry
-            .scheduler
-            .generate_profiles(entry.required_flags, entry.excluded_flags);
-        let flags: Vec<String> = profiles
-            .iter()
-            .find(|p| p.name() == profile_name)
-            .map(|p| p.flags.iter().map(|s| s.to_string()).collect())
-            .unwrap_or_default();
-        return run_ktstr_test_inner(entry, Some(&topo), &flags);
+        return run_ktstr_test_inner(entry, Some(&topo));
     }
 
     let bare = test_name.strip_prefix("ktstr/").unwrap_or(test_name);
     let entry = find_test(bare).ok_or_else(|| anyhow::anyhow!("unknown test: {bare}"))?;
-    let active_flags: Vec<String> = entry.required_flags.iter().map(|s| s.to_string()).collect();
-    run_ktstr_test_inner(entry, None, &active_flags)
+    run_ktstr_test_inner(entry, None)
 }
 
-/// Like `run_ktstr_test` but with an explicit topology override and
-/// active flags that map to scheduler CLI args via
-/// `Scheduler::flag_args()`. Only consumed inside this module by
-/// `maybe_dispatch_host_test`; kept as a named helper so the
-/// `--ktstr-test-fn` + `--ktstr-topo` dispatch path reads symmetrically
-/// with the zero-override [`run_ktstr_test`] library entry point.
-fn run_ktstr_test_with_topo_and_flags(
+/// Like `run_ktstr_test` but with an explicit topology override.
+/// Only consumed inside this module by `maybe_dispatch_host_test`;
+/// kept as a named helper so the `--ktstr-test-fn` + `--ktstr-topo`
+/// dispatch path reads symmetrically with the zero-override
+/// [`run_ktstr_test`] library entry point.
+fn run_ktstr_test_with_topo(
     entry: &KtstrTestEntry,
     topo: &TopoOverride,
-    active_flags: &[String],
 ) -> Result<AssertResult> {
-    run_ktstr_test_inner(entry, Some(topo), active_flags)
+    run_ktstr_test_inner(entry, Some(topo))
 }
 
 /// Run a test result through expect_err logic and return an exit code.
@@ -1046,8 +1031,8 @@ fn host_capacity() -> (u32, u32, u32) {
     (host_cpus, host_llcs, host_max_cpus_per_llc)
 }
 
-/// Iterate (preset, profile) pairs that both fit the host capacity
-/// and match the entry's `TopologyConstraints`. Shared between the
+/// Iterate topology presets that both fit the host capacity and
+/// match the entry's `TopologyConstraints`. Shared between the
 /// eager ("print every name") and budgeted ("push a candidate")
 /// listers in `list_tests_*`.
 fn for_each_gauntlet_variant<F>(
@@ -1058,11 +1043,8 @@ fn for_each_gauntlet_variant<F>(
     host_max_cpus_per_llc: u32,
     mut visit: F,
 ) where
-    F: FnMut(&crate::vm::TopoPreset, &crate::scenario::FlagProfile),
+    F: FnMut(&crate::vm::TopoPreset),
 {
-    let profiles = entry
-        .scheduler
-        .generate_profiles(entry.required_flags, entry.excluded_flags);
     let no_perf_mode = super::runtime::no_perf_mode_for_entry(entry);
     for preset in presets {
         // No-perf-mode tests run KVM-emulated topology — guest sees the
@@ -1085,9 +1067,7 @@ fn for_each_gauntlet_variant<F>(
         if !accepted {
             continue;
         }
-        for profile in &profiles {
-            visit(preset, profile);
-        }
+        visit(preset);
     }
 }
 
@@ -1097,10 +1077,8 @@ fn for_each_gauntlet_variant<F>(
 /// name carries an extra `/{sanitized_kernel_label}` suffix so each
 /// (test × kernel) pair becomes a distinct nextest test case;
 /// nextest's parallelism, retries, and `-E` filtering all apply
-/// natively. Single-kernel mode (0 or 1 entries) preserves the
-/// historical `gauntlet/{name}/{preset}/{profile}` shape so existing
-/// CI baselines, test-name filters, and per-test config overrides
-/// keep matching.
+/// natively. Single-kernel mode (0 or 1 entries) emits the
+/// `gauntlet/{name}/{preset}` shape with no kernel suffix.
 ///
 /// `KTSTR_CARGO_TEST_MODE=1` skips gauntlet variant emission and
 /// the multi-kernel suffix path: each test gets exactly one
@@ -1121,11 +1099,11 @@ fn list_tests_all(ignored_only: bool) {
     let kernel_list = read_kernel_list();
     let multi_kernel = kernel_list.len() > 1 && !cargo_test_mode;
     // Single-kernel mode (no list, or list has exactly one entry)
-    // emits one variant per (test × preset × profile) tuple with no
-    // kernel suffix. Multi-kernel mode iterates every kernel as an
-    // outer loop and appends `/{sanitized}` per variant. The empty-
-    // suffix sentinel below is what the single-kernel branch passes
-    // to keep the print path uniform.
+    // emits one variant per (test × preset) tuple with no kernel
+    // suffix. Multi-kernel mode iterates every kernel as an outer
+    // loop and appends `/{sanitized}` per variant. The empty-suffix
+    // sentinel below is what the single-kernel branch passes to keep
+    // the print path uniform.
     let kernel_suffixes: Vec<&str> = if multi_kernel {
         kernel_list.iter().map(|k| k.sanitized.as_str()).collect()
     } else {
@@ -1133,8 +1111,6 @@ fn list_tests_all(ignored_only: bool) {
     };
 
     for entry in KTSTR_TESTS.iter() {
-        validate_entry_flags(entry);
-
         // bpf_map_write tests require vmlinux to resolve BPF map
         // addresses. Don't list them when vmlinux is unavailable —
         // they cannot run and would produce false PASS results.
@@ -1179,21 +1155,14 @@ fn list_tests_all(ignored_only: bool) {
             host_cpus,
             host_llcs,
             host_max_cpus_per_llc,
-            |preset, profile| {
+            |preset| {
                 for suffix in &kernel_suffixes {
                     if suffix.is_empty() {
-                        println!(
-                            "gauntlet/{}/{}/{}: test",
-                            entry.name,
-                            preset.name,
-                            profile.name()
-                        );
+                        println!("gauntlet/{}/{}: test", entry.name, preset.name);
                     } else {
                         println!(
-                            "gauntlet/{}/{}/{}/{suffix}: test",
-                            entry.name,
-                            preset.name,
-                            profile.name()
+                            "gauntlet/{}/{}/{suffix}: test",
+                            entry.name, preset.name,
                         );
                     }
                 }
@@ -1236,8 +1205,6 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
     };
 
     for entry in KTSTR_TESTS.iter() {
-        validate_entry_flags(entry);
-
         if !entry.bpf_map_write.is_empty() && !has_vmlinux {
             continue;
         }
@@ -1255,7 +1222,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             if entry.host_only {
                 candidates.push(TestCandidate {
                     name: format!("ktstr/{}: test", entry.name),
-                    features: extract_features(entry, &base_topo, &[], false, entry.name),
+                    features: extract_features(entry, &base_topo, false, entry.name),
                     estimated_secs: estimate_duration(entry, &base_topo),
                 });
             } else {
@@ -1267,7 +1234,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
                     };
                     candidates.push(TestCandidate {
                         name,
-                        features: extract_features(entry, &base_topo, &[], false, entry.name),
+                        features: extract_features(entry, &base_topo, false, entry.name),
                         estimated_secs: estimate_duration(entry, &base_topo),
                     });
                 }
@@ -1293,27 +1260,16 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
             host_cpus,
             host_llcs,
             host_max_cpus_per_llc,
-            |preset, profile| {
+            |preset| {
                 for suffix in &kernel_suffixes {
                     let test_name = if suffix.is_empty() {
-                        format!("gauntlet/{}/{}/{}", entry.name, preset.name, profile.name())
+                        format!("gauntlet/{}/{}", entry.name, preset.name)
                     } else {
-                        format!(
-                            "gauntlet/{}/{}/{}/{suffix}",
-                            entry.name,
-                            preset.name,
-                            profile.name(),
-                        )
+                        format!("gauntlet/{}/{}/{suffix}", entry.name, preset.name)
                     };
                     candidates.push(TestCandidate {
                         name: format!("{test_name}: test"),
-                        features: extract_features(
-                            entry,
-                            &preset.topology,
-                            &profile.flags,
-                            true,
-                            &test_name,
-                        ),
+                        features: extract_features(entry, &preset.topology, true, &test_name),
                         estimated_secs: estimate_duration(entry, &preset.topology),
                     });
                 }
@@ -1363,9 +1319,9 @@ fn strip_kernel_suffix<'a>(
     // final segment. Iterate the labels rather than splitting on
     // `/` — the suffix always has exactly one extra `/` separator
     // before `kernel_…`, but the body of the test name CAN contain
-    // `/` (gauntlet variants already do), so a naive
-    // `rsplit_once('/')` would accidentally peel the gauntlet's
-    // profile segment instead.
+    // `/` (gauntlet variants already do — `gauntlet/{name}/{preset}`),
+    // so a naive `rsplit_once('/')` would accidentally peel the
+    // preset segment instead.
     //
     // Distinct kernels in the same `KTSTR_KERNEL_LIST` produce
     // distinct sanitized labels in practice — the producer emits
@@ -1409,8 +1365,8 @@ fn export_kernel_for_variant(entry: &KernelEntry) {
 /// Parse a nextest-style test name and run it.
 ///
 /// Handles base tests (`ktstr/{name}`), gauntlet variants
-/// (`gauntlet/{name}/{preset}/{profile}`), and bare names
-/// (backward compat). When `KTSTR_KERNEL_LIST` carries 2+ kernels,
+/// (`gauntlet/{name}/{preset}`), and bare names (backward compat).
+/// When `KTSTR_KERNEL_LIST` carries 2+ kernels,
 /// VM-bound test names additionally end with
 /// `/{sanitized_kernel_label}` — that suffix is peeled here and
 /// the matching kernel directory is re-exported via
@@ -1479,22 +1435,13 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         return run_host_only_test(entry);
     }
 
-    // Base tests don't carry a gauntlet profile, but the entry's
-    // `required_flags` must still be activated for tests whose
-    // scheduler-arg contract requires them (per the invariant
-    // enforced by validate_entry_flags: every gauntlet profile
-    // contains required_flags). Using an empty flags list would run
-    // the scheduler without its required CLI args and produce
-    // incorrect sidecar metadata.
-    let active_flags: Vec<String> = entry.required_flags.iter().map(|s| s.to_string()).collect();
-
     if entry.performance_mode && super::runtime::no_perf_mode_active() {
         crate::report::test_skip(format_args!(
             "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             bare_name,
         ));
         // See run_ktstr_test_inner for the sidecar-emission rationale.
-        record_skip_sidecar(entry, &active_flags);
+        record_skip_sidecar(entry);
         return 0;
     }
 
@@ -1506,7 +1453,7 @@ pub(crate) fn run_named_test(test_name: &str) -> i32 {
         return 1;
     }
 
-    let result = run_ktstr_test_inner(entry, None, &active_flags);
+    let result = run_ktstr_test_inner(entry, None);
     result_to_exit_code(result, entry.expect_err)
 }
 
@@ -1537,14 +1484,14 @@ fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
     (entry.func)(&ctx)
 }
 
-/// Run a gauntlet variant test. `rest` is `{name}/{preset}/{profile}`.
+/// Run a gauntlet variant test. `rest` is `{name}/{preset}`.
 pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
-    let parts: Vec<&str> = rest.splitn(3, '/').collect();
-    if parts.len() != 3 {
+    let parts: Vec<&str> = rest.splitn(2, '/').collect();
+    if parts.len() != 2 {
         eprintln!("invalid gauntlet test name: gauntlet/{rest}");
         return 1;
     }
-    let (test_name, preset_name, profile_name) = (parts[0], parts[1], parts[2]);
+    let (test_name, preset_name) = (parts[0], parts[1]);
 
     let entry = match find_test(test_name) {
         Some(e) => e,
@@ -1553,7 +1500,6 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
             return 1;
         }
     };
-    validate_entry_flags(entry);
 
     let presets = crate::vm::gauntlet_presets();
     let preset = match presets.iter().find(|p| p.name == preset_name) {
@@ -1576,23 +1522,12 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
         memory_mb,
     };
 
-    let profiles = entry
-        .scheduler
-        .generate_profiles(entry.required_flags, entry.excluded_flags);
-    let flags: Vec<String> = match profiles.iter().find(|p| p.name() == profile_name) {
-        Some(p) => p.flags.iter().map(|s| s.to_string()).collect(),
-        None => {
-            eprintln!("unknown flag profile: {profile_name}");
-            return 1;
-        }
-    };
-
     if entry.performance_mode && super::runtime::no_perf_mode_active() {
         crate::report::test_skip(format_args!(
             "{}: test requires performance_mode but --no-perf-mode or KTSTR_NO_PERF_MODE is active",
             test_name,
         ));
-        record_skip_sidecar(entry, &flags);
+        record_skip_sidecar(entry);
         return 0;
     }
 
@@ -1604,7 +1539,7 @@ pub(crate) fn run_gauntlet_test(rest: &str) -> i32 {
         return 1;
     }
 
-    let result = run_ktstr_test_inner(entry, Some(&topo), &flags);
+    let result = run_ktstr_test_inner(entry, Some(&topo));
     result_to_exit_code(result, entry.expect_err)
 }
 
@@ -1706,10 +1641,10 @@ fn ktstr_list_only() {
 /// Not intended for direct use.
 ///
 /// - `--list --format terse`: output `ktstr/{name}: test\n` for base
-///   tests and `gauntlet/{name}/{preset}/{profile}: test\n` for
-///   gauntlet variants. (Discovery uses [`ktstr_list_only`] instead
-///   to allow libtest to print its own list afterward; this branch
-///   is preserved for direct callers of `ktstr_main`.)
+///   tests and `gauntlet/{name}/{preset}: test\n` for gauntlet
+///   variants. (Discovery uses [`ktstr_list_only`] instead to allow
+///   libtest to print its own list afterward; this branch is
+///   preserved for direct callers of `ktstr_main`.)
 /// - `--exact NAME --nocapture`: run the named test, exit 0/1.
 pub fn ktstr_main() -> ! {
     let args: Vec<String> = std::env::args().collect();
@@ -1784,8 +1719,7 @@ mod tests {
     // so the assertions here target the failure branches that return
     // exit code 1 before any VM spawn:
     //   - `ktstr/` prefix with unknown bare name
-    //   - `gauntlet/` prefix with malformed parts / unknown preset /
-    //     unknown profile
+    //   - `gauntlet/` prefix with malformed parts / unknown preset
     //   - bare names fall through to `ktstr/` lookup
     //
     // The routing invariant: `gauntlet/` always delegates to
@@ -1794,10 +1728,10 @@ mod tests {
 
     #[test]
     fn run_named_test_gauntlet_prefix_routes_to_run_gauntlet_test() {
-        // Gauntlet names require three slash-separated parts after
-        // the prefix; a name missing them is rejected by
-        // `run_gauntlet_test`, proving the prefix routed there and
-        // not into the base-test path (which would print
+        // Gauntlet names require two slash-separated parts after the
+        // prefix (`{name}/{preset}`); a single-segment name is
+        // rejected by `run_gauntlet_test`, proving the prefix routed
+        // there and not into the base-test path (which would print
         // `unknown test: gauntlet/...` instead of the gauntlet-
         // specific error and still return 1 but via a different
         // branch).
@@ -1823,10 +1757,10 @@ mod tests {
     }
 
     #[test]
-    fn run_gauntlet_test_rejects_name_with_fewer_than_three_parts() {
-        // `rest` must split into exactly 3 parts
-        // (`{name}/{preset}/{profile}`). Two parts is a format error.
-        let exit = run_gauntlet_test("some_test/some_preset");
+    fn run_gauntlet_test_rejects_name_with_fewer_than_two_parts() {
+        // `rest` must split into exactly 2 parts (`{name}/{preset}`).
+        // A single-segment name has no preset and is a format error.
+        let exit = run_gauntlet_test("some_test_no_preset");
         assert_eq!(exit, 1);
     }
 
@@ -1840,10 +1774,10 @@ mod tests {
 
     #[test]
     fn run_gauntlet_test_rejects_unknown_test_name() {
-        // Well-formed three-part name whose test is not registered
+        // Well-formed two-part name whose test is not registered
         // in KTSTR_TESTS. Returns 1 via the find_test None branch,
         // never reaching preset lookup or VM spawn.
-        let exit = run_gauntlet_test("__not_a_test__/tiny-1llc/default");
+        let exit = run_gauntlet_test("__not_a_test__/tiny-1llc");
         assert_eq!(exit, 1);
     }
 
@@ -1853,7 +1787,7 @@ mod tests {
         // combined with a preset name that is not in
         // `gauntlet_presets`, the function returns 1 at the preset-
         // lookup branch.
-        let exit = run_gauntlet_test("__unit_test_dummy__/__no_such_preset__/__default__");
+        let exit = run_gauntlet_test("__unit_test_dummy__/__no_such_preset__");
         assert_eq!(exit, 1);
     }
 
@@ -2050,7 +1984,7 @@ mod tests {
             1,
             1,
             1,
-            |preset, _| visited.push(preset.name.to_string()),
+            |preset| visited.push(preset.name.to_string()),
         );
         assert!(
             visited.is_empty(),
@@ -2060,11 +1994,11 @@ mod tests {
     }
 
     #[test]
-    fn for_each_gauntlet_variant_visits_every_fitting_preset_x_profile() {
+    fn for_each_gauntlet_variant_visits_every_fitting_preset() {
         // With generous host capacity (u32::MAX cpus/llcs), every
-        // preset that the dummy entry's constraints accept yields at
-        // least one `FlagProfile` visit (every scheduler generates a
-        // default profile when no flags are required/excluded).
+        // preset that the dummy entry's constraints accept yields
+        // exactly one visit — there is no longer a profile dimension
+        // multiplying preset count.
         let presets = crate::vm::gauntlet_presets();
         let mut count = 0;
         for_each_gauntlet_variant(
@@ -2073,11 +2007,8 @@ mod tests {
             u32::MAX,
             u32::MAX,
             u32::MAX,
-            |_, _| count += 1,
+            |_| count += 1,
         );
-        // `__unit_test_dummy__` defaults to Payload::KERNEL_DEFAULT
-        // (which wraps Scheduler::EEVDF) and Scheduler::EEVDF has no
-        // flags → exactly one profile per accepted preset.
         // Asserting `count >= 1` proves at least one preset was
         // accepted and visited. Coupling to the exact preset count
         // would fail if the preset list changes.
@@ -2096,11 +2027,11 @@ mod tests {
         // fewer. The upper-bound assertion in
         // `for_each_gauntlet_variant_skips_presets_exceeding_host_capacity`
         // and the lower-bound assertion in
-        // `..._visits_every_fitting_preset_x_profile` both check one
-        // extreme; this test anchors the monotonic relationship
-        // between them. A regression that inverted the host-cap
-        // comparison (e.g. `host_cpus < preset_cpus` → accept) would
-        // pass both endpoint tests but fail here.
+        // `..._visits_every_fitting_preset` both check one extreme;
+        // this test anchors the monotonic relationship between them.
+        // A regression that inverted the host-cap comparison (e.g.
+        // `host_cpus < preset_cpus` → accept) would pass both
+        // endpoint tests but fail here.
         let presets = crate::vm::gauntlet_presets();
         if presets.is_empty() {
             return;
@@ -2108,7 +2039,7 @@ mod tests {
         let entry = find_test("__unit_test_dummy__").unwrap();
         let count_for = |cpus: u32, llcs: u32| {
             let mut n = 0;
-            for_each_gauntlet_variant(entry, &presets, cpus, llcs, u32::MAX, |_, _| n += 1);
+            for_each_gauntlet_variant(entry, &presets, cpus, llcs, u32::MAX, |_| n += 1);
             n
         };
         let tight = count_for(1, 1);
@@ -2352,8 +2283,8 @@ mod tests {
             kernel_dir: PathBuf::from("/a"),
         }];
         let (stripped, entry) =
-            strip_kernel_suffix("gauntlet/eevdf/2llc/default", &kernel_list).unwrap();
-        assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
+            strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list).unwrap();
+        assert_eq!(stripped, "gauntlet/eevdf/2llc");
         assert!(entry.is_none());
 
         let (stripped, entry) = strip_kernel_suffix("ktstr/eevdf", &[]).unwrap();
@@ -2376,13 +2307,13 @@ mod tests {
             },
         ];
         let (stripped, entry) =
-            strip_kernel_suffix("gauntlet/eevdf/2llc/default/kernel_6_14_2", &kernel_list).unwrap();
-        assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
+            strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_14_2", &kernel_list).unwrap();
+        assert_eq!(stripped, "gauntlet/eevdf/2llc");
         assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/a"));
 
         let (stripped, entry) =
-            strip_kernel_suffix("gauntlet/eevdf/2llc/default/kernel_6_15_0", &kernel_list).unwrap();
-        assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
+            strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_15_0", &kernel_list).unwrap();
+        assert_eq!(stripped, "gauntlet/eevdf/2llc");
         assert_eq!(entry.unwrap().kernel_dir, PathBuf::from("/b"));
     }
 
@@ -2403,7 +2334,7 @@ mod tests {
                 kernel_dir: PathBuf::from("/b"),
             },
         ];
-        let err = strip_kernel_suffix("gauntlet/eevdf/2llc/default", &kernel_list)
+        let err = strip_kernel_suffix("gauntlet/eevdf/2llc", &kernel_list)
             .expect_err("missing suffix in multi-kernel mode must error");
         assert!(
             err.contains("no recognised kernel suffix"),
@@ -2412,11 +2343,11 @@ mod tests {
     }
 
     /// Suffix peeling is anchored at the end of the test name —
-    /// gauntlet variants whose body contains `/` (the preset /
-    /// profile separator) are not accidentally peeled. A naive
-    /// `rsplit_once('/')` would peel the profile segment instead.
+    /// gauntlet variants whose body contains `/` (the test / preset
+    /// separator) are not accidentally peeled. A naive
+    /// `rsplit_once('/')` would peel the preset segment instead.
     #[test]
-    fn strip_kernel_suffix_does_not_peel_profile_segment() {
+    fn strip_kernel_suffix_does_not_peel_preset_segment() {
         let kernel_list = vec![
             KernelEntry {
                 sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
@@ -2427,14 +2358,14 @@ mod tests {
                 kernel_dir: PathBuf::from("/b"),
             },
         ];
-        // The profile name is `default`, NOT `kernel_6_14_2` — the
+        // The preset name is `2llc`, NOT `kernel_6_14_2` — the
         // peeler must require an EXACT match against a known
         // sanitized label, not just any `/<word>` ending.
         let (stripped, entry) =
-            strip_kernel_suffix("gauntlet/eevdf/2llc/default/kernel_6_14_2", &kernel_list).unwrap();
-        // Stripped name still contains all three of the original
-        // path segments (eevdf, 2llc, default).
-        assert_eq!(stripped, "gauntlet/eevdf/2llc/default");
+            strip_kernel_suffix("gauntlet/eevdf/2llc/kernel_6_14_2", &kernel_list).unwrap();
+        // Stripped name still contains both of the original path
+        // segments (eevdf, 2llc).
+        assert_eq!(stripped, "gauntlet/eevdf/2llc");
         assert!(entry.is_some());
     }
 
@@ -2679,7 +2610,7 @@ mod tests {
     // `list_tests_all` and `list_tests_budget` skip gauntlet
     // emission when `KTSTR_CARGO_TEST_MODE` is active. Pins the
     // dispatch contract: bare `cargo test` runs each test once
-    // with its declared topology, no preset × profile fan-out.
+    // with its declared topology, no per-preset fan-out.
     // Multi-kernel suffix emission is also suppressed because the
     // cargo-ktstr resolver that produces `KTSTR_KERNEL_LIST` is
     // not on the cargo-test path.

@@ -57,18 +57,6 @@ pub(crate) fn extract_topo_arg(args: &[String]) -> Option<String> {
     None
 }
 
-/// Extract `--ktstr-flags=borrow,rebal` from the argument list.
-pub(crate) fn extract_flags_arg(args: &[String]) -> Option<Vec<String>> {
-    for a in args {
-        if let Some(val) = a.strip_prefix("--ktstr-flags=")
-            && !val.is_empty()
-        {
-            return Some(val.split(',').map(|s| s.to_string()).collect());
-        }
-    }
-    None
-}
-
 /// Extract `--ktstr-work-type=NAME` from the argument list.
 pub(crate) fn extract_work_type_arg(args: &[String]) -> Option<String> {
     for a in args {

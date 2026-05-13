@@ -344,10 +344,10 @@ fn entry_performance_mode_set() {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler derive macro tests
+// declare_scheduler! macro tests
 // ---------------------------------------------------------------------------
 
-ktstr::declare_scheduler!(TEST_DERIVE, {
+ktstr::declare_scheduler!(TEST_DECLARE, {
     name = "test_derive",
     binary = "scx-ktstr",
     topology = (1, 2, 4, 1),
@@ -359,15 +359,15 @@ ktstr::declare_scheduler!(TEST_DERIVE, {
 /// Check the macro generates a const Scheduler with the correct name.
 #[test]
 fn declare_scheduler_const_name() {
-    let _ = &TEST_DERIVE;
-    assert_eq!(TEST_DERIVE.name, "test_derive");
+    let _ = &TEST_DECLARE;
+    assert_eq!(TEST_DECLARE.name, "test_derive");
 }
 
 /// Check scheduler binary spec.
 #[test]
 fn declare_scheduler_binary() {
     assert!(matches!(
-        TEST_DERIVE.binary,
+        TEST_DECLARE.binary,
         ktstr::test_support::SchedulerSpec::Discover("scx-ktstr")
     ));
 }
@@ -375,16 +375,16 @@ fn declare_scheduler_binary() {
 /// Check scheduler topology.
 #[test]
 fn declare_scheduler_topology() {
-    assert_eq!(TEST_DERIVE.topology.llcs, 2);
-    assert_eq!(TEST_DERIVE.topology.cores_per_llc, 4);
-    assert_eq!(TEST_DERIVE.topology.threads_per_core, 1);
+    assert_eq!(TEST_DECLARE.topology.llcs, 2);
+    assert_eq!(TEST_DECLARE.topology.cores_per_llc, 4);
+    assert_eq!(TEST_DECLARE.topology.threads_per_core, 1);
 }
 
 /// Check scheduler cgroup_parent.
 #[test]
 fn declare_scheduler_cgroup_parent() {
     assert_eq!(
-        TEST_DERIVE.cgroup_parent,
+        TEST_DECLARE.cgroup_parent,
         Some(ktstr::test_support::CgroupPath::new("/test"))
     );
 }
@@ -392,17 +392,17 @@ fn declare_scheduler_cgroup_parent() {
 /// Check scheduler sched_args.
 #[test]
 fn declare_scheduler_sched_args() {
-    assert_eq!(TEST_DERIVE.sched_args, &["--arg1", "--arg2"]);
+    assert_eq!(TEST_DECLARE.sched_args, &["--arg1", "--arg2"]);
 }
 
 /// Check scheduler config_file.
 #[test]
 fn declare_scheduler_config_file() {
-    assert_eq!(TEST_DERIVE.config_file, Some("test-config.toml"));
+    assert_eq!(TEST_DECLARE.config_file, Some("test-config.toml"));
 }
 
 /// Check topology inheritance from declared scheduler.
-#[ktstr_test(scheduler = TEST_DERIVE)]
+#[ktstr_test(scheduler = TEST_DECLARE)]
 fn declare_topo_inherit(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
@@ -441,13 +441,6 @@ fn declare_scheduler_empty_binary() {
         ktstr::test_support::SchedulerSpec::Discover("empty-binary")
     ));
 }
-
-// (derive(Scheduler)-specific suffix-strip / no-suffix-fallback /
-// bare-variant / acronym-name / minimal-defaults tests deleted with
-// the derive macro. declare_scheduler! emits exactly the const
-// identifier the caller supplies — no name munging, no per-variant
-// generation — so the equivalent guarantees are pinned by
-// tests/declare_scheduler.rs::minimal_expansion_emits_scheduler.)
 
 /// Topology validation: boot a multi-LLC VM and check the guest sees
 /// more than the 2-CPU default. The base test boots 2l2c1t (4 CPUs, 2

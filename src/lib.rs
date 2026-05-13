@@ -53,13 +53,12 @@
 //! once with a binary, default topology, and any always-on args. Tests
 //! reference the generated const and inherit its configuration:
 //!
-//! ```rust
+//! ```rust,no_run
 //! use ktstr::prelude::*;
 //!
 //! declare_scheduler!(MY_SCHED, {
 //!     name = "my_sched",
 //!     binary = "scx_my_sched",
-//!     topology = (1, 2, 4, 1),
 //! });
 //!
 //! #[ktstr_test(scheduler = MY_SCHED)]
@@ -200,13 +199,13 @@
 //! correlates stimulus events with monitor samples for
 //! phase-aligned reporting.
 
-// `#[derive(Payload)]` and `#[derive(Scheduler)]` expand into
-// `::ktstr::test_support::...` paths so downstream crates can use
-// them without a `use` import. This alias lets the same derives be
-// used inside the ktstr crate itself — for example by doctests and
-// by integration-test modules under `tests/common/` that pull the
-// derive through the same public path downstream authors take. No
-// runtime cost: `extern crate self as ktstr` is a pure name-binding.
+// `#[derive(Payload)]` expands into `::ktstr::test_support::...`
+// paths so downstream crates can use it without a `use` import.
+// This alias lets the same derive be used inside the ktstr crate
+// itself — for example by doctests and by integration-test modules
+// under `tests/common/` that pull the derive through the same
+// public path downstream authors take. No runtime cost:
+// `extern crate self as ktstr` is a pure name-binding.
 extern crate self as ktstr;
 
 #[allow(
@@ -563,7 +562,6 @@ pub fn merge_kconfig_fragments<'a>(
 
 pub use ktstr_macros::Claim;
 pub use ktstr_macros::Payload;
-pub use ktstr_macros::Scheduler;
 pub use ktstr_macros::declare_scheduler;
 pub use ktstr_macros::json;
 pub use ktstr_macros::ktstr_test;
@@ -601,15 +599,9 @@ pub use crate::probe::process::resolve_func_ip;
 pub mod prelude {
     pub use anyhow::Result;
 
-    // `Scheduler` exists in both the type namespace (the
-    // `test_support::Scheduler` *struct* — the scheduler-definition
-    // record test authors build) and the macro namespace (the
-    // `#[derive(Scheduler)]` *derive macro* from `ktstr-macros`).
-    // Rust separates these, so `let s: Scheduler = ...` and
-    // `#[derive(Scheduler)]` both resolve unambiguously. The double
-    // spelling is intentional: `#[derive(Scheduler)]` generates a
-    // `static` of type `Scheduler`, and matching the derive-macro
-    // name to its emitted type reads naturally at the call site.
+    // `Scheduler` is the `test_support::Scheduler` struct — the
+    // scheduler-definition record test authors build via the
+    // `declare_scheduler!` macro.
     pub use crate::assert::{
         Assert, AssertDetail, AssertResult, ClaimBuilder, DetailKind, EachClaim, NoteValue,
         SchedulerBaseline, SeqClaim, SeriesField, SetClaim, Verdict, assert_baseline,
@@ -622,7 +614,6 @@ pub mod prelude {
     pub use crate::host_heap::HostHeapState;
     pub use crate::ktstr_test;
     pub use crate::scenario::backdrop::Backdrop;
-    pub use crate::scenario::flags::FlagDecl;
     pub use crate::scenario::ops::{
         CgroupDef, CpusetSpec, HoldSpec, Op, Setup, Step, execute_defs, execute_scenario,
         execute_scenario_with, execute_steps, execute_steps_with,
@@ -656,12 +647,7 @@ pub mod prelude {
         Polarity, Scheduler, SchedulerSpec, SidecarResult, Sysctl, Topology, TopologyConstraints,
         extract_metrics,
     };
-    pub use crate::{Payload, Scheduler};
-    // `FlagDecl` is already re-exported via `crate::scenario::flags::FlagDecl`
-    // above; omitted here because `test_support::FlagDecl` is the same item
-    // (`pub use crate::scenario::flags::FlagDecl;` in test_support/mod.rs),
-    // and a second prelude line would shadow harmlessly but add noise.
-    //
+    pub use crate::Payload;
     // The following items are intentionally NOT in the prelude. They
     // are binary-entry helpers (the `ktstr` / `cargo-ktstr` bins) or
     // macro-generated glue the `#[ktstr_test]` expansion consumes —
@@ -714,7 +700,7 @@ pub const KTSTR_KERNEL_ENV: &str = "KTSTR_KERNEL";
 /// `cargo nextest`. Read by the test binary's `--list` /
 /// `--exact` handlers in [`crate::test_support::dispatch`] to fan
 /// the gauntlet across kernels: each (test × scenario × topology ×
-/// flags × kernel) tuple becomes a distinct nextest test case so
+/// kernel) tuple becomes a distinct nextest test case so
 /// nextest's parallelism, retries, and `-E` filtering work
 /// natively. Per-variant subprocesses re-export `KTSTR_KERNEL` to
 /// the kernel directory selected by the test name's `kernel_…`

@@ -72,19 +72,18 @@ pub(crate) const ERR_NO_TEST_FUNCTION_OUTPUT: &str =
 /// and `eval_crash_message_from_field`.
 pub(crate) const ERR_GUEST_CRASHED_PREFIX: &str = "guest crashed:";
 
-/// Write a skip sidecar for `entry` + `active_flags`, logging to
-/// stderr on failure without propagating the error. Used at six
-/// sites — the four in [`run_ktstr_test_inner`] (the wrapper's
-/// catch-all that fires for any pre-VM-build ResourceContention,
-/// the performance_mode gate, and the two `ResourceContention`
-/// arms at VM build + VM run) and the two in `super::dispatch`
-/// (performance_mode gates at the plain-run and flag-profile
-/// entry points) — all of which must record the skip for stats
-/// tooling but cannot meaningfully handle a sidecar-write failure
-/// beyond logging it. The skip itself is still valid; only
-/// post-run stats tooling loses visibility.
-pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry, active_flags: &[String]) {
-    if let Err(e) = write_skip_sidecar(entry, active_flags) {
+/// Write a skip sidecar for `entry`, logging to stderr on failure
+/// without propagating the error. Used at six sites — the four in
+/// [`run_ktstr_test_inner`] (the wrapper's catch-all that fires
+/// for any pre-VM-build ResourceContention, the performance_mode
+/// gate, and the two `ResourceContention` arms at VM build + VM
+/// run) and the two in `super::dispatch` (performance_mode gates
+/// at the plain-run entry points) — all of which must record the
+/// skip for stats tooling but cannot meaningfully handle a
+/// sidecar-write failure beyond logging it. The skip itself is
+/// still valid; only post-run stats tooling loses visibility.
+pub(crate) fn record_skip_sidecar(entry: &KtstrTestEntry) {
+    if let Err(e) = write_skip_sidecar(entry) {
         // Dual-emit at warn level: an unwritten skip sidecar costs
         // the run no correctness — the test still skipped — but
         // silently drops post-run stats tooling's visibility into
@@ -732,9 +731,8 @@ pub(crate) fn dedupe_include_files(
 pub(crate) fn run_ktstr_test_inner(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
-    active_flags: &[String],
 ) -> Result<AssertResult> {
-    let result = run_ktstr_test_inner_impl(entry, topo, active_flags);
+    let result = run_ktstr_test_inner_impl(entry, topo);
     if let Err(ref e) = result
         && super::is_resource_contention(e)
     {
@@ -751,7 +749,7 @@ pub(crate) fn run_ktstr_test_inner(
         // second write refreshes run_id and timestamp — but the
         // skip classification round-trips identically, so stats
         // tooling sees the same outcome.
-        record_skip_sidecar(entry, active_flags);
+        record_skip_sidecar(entry);
     }
     result
 }
@@ -759,7 +757,6 @@ pub(crate) fn run_ktstr_test_inner(
 fn run_ktstr_test_inner_impl(
     entry: &KtstrTestEntry,
     topo: Option<&TopoOverride>,
-    active_flags: &[String],
 ) -> Result<AssertResult> {
     entry.validate().context("KtstrTestEntry validation")?;
     if let Some(t) = topo {
@@ -833,7 +830,7 @@ fn run_ktstr_test_inner_impl(
         // not just the ones that made it to the VM-run site. A sidecar
         // write failure is logged but not propagated: the skip itself
         // is still valid — only post-run stats tooling loses visibility.
-        record_skip_sidecar(entry, active_flags);
+        record_skip_sidecar(entry);
         return Ok(AssertResult::skip(REASON));
     }
     ensure_kvm()?;
@@ -974,11 +971,6 @@ fn run_ktstr_test_inner_impl(
         builder = builder.include_files(unioned);
     }
     super::runtime::append_base_sched_args(entry, &mut sched_args);
-    for flag_name in active_flags {
-        if let Some(args) = entry.scheduler.flag_args(flag_name) {
-            sched_args.extend(args.iter().map(|s| s.to_string()));
-        }
-    }
     if !sched_args.is_empty() {
         builder = builder.sched_args(&sched_args);
     }
@@ -1308,7 +1300,7 @@ fn run_ktstr_test_inner_impl(
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some()
             {
-                record_skip_sidecar(entry, active_flags);
+                record_skip_sidecar(entry);
             }
             return Err(e.context("build ktstr_test VM"));
         }
@@ -1319,7 +1311,7 @@ fn run_ktstr_test_inner_impl(
             if e.downcast_ref::<crate::vmm::host_topology::ResourceContention>()
                 .is_some()
             {
-                record_skip_sidecar(entry, active_flags);
+                record_skip_sidecar(entry);
             }
             return Err(e.context("run ktstr_test VM"));
         }
@@ -1596,7 +1588,6 @@ fn run_ktstr_test_inner_impl(
             output,
             &result.stderr,
             topo,
-            active_flags,
             primary_exit_kind,
         );
         // When auto-repro was attempted but produced no data, return a
@@ -1621,7 +1612,6 @@ fn run_ktstr_test_inner_impl(
         &payload_metrics,
         &host_extract_failures,
         &vm_topology,
-        active_flags,
         &repro_fn,
     );
     eprintln!(
@@ -1656,7 +1646,6 @@ fn evaluate_vm_result(
     payload_metrics: &[crate::test_support::PayloadMetrics],
     host_extract_failures: &[crate::assert::AssertDetail],
     topo: &Topology,
-    active_flags: &[String],
     repro_fn: &dyn Fn(&str) -> Option<String>,
 ) -> Result<AssertResult> {
     // Build timeline from stimulus events + monitor samples.
@@ -1809,7 +1798,6 @@ fn evaluate_vm_result(
             stimulus_events,
             &check_result,
             &work_type,
-            active_flags,
             payload_metrics,
         ) {
             eprintln!("ktstr_test: {e:#}");
@@ -3307,7 +3295,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -3343,7 +3330,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -3376,7 +3362,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -3419,7 +3404,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &repro_fn,
         )
         .unwrap_err();
@@ -3462,7 +3446,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &repro_fn,
         )
         .unwrap_err();
@@ -3496,7 +3479,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -3534,7 +3516,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -3563,7 +3544,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -3593,7 +3573,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro,
             )
             .is_ok(),
@@ -3623,7 +3602,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro
             )
             .unwrap_err()
@@ -3661,7 +3639,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro,
             )
             .unwrap_err()
@@ -3704,7 +3681,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro,
             )
             .is_ok(),
@@ -3737,7 +3713,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro,
             )
             .is_ok(),
@@ -3774,7 +3749,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro
             )
             .unwrap_err()
@@ -3805,7 +3779,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro
             )
             .unwrap_err()
@@ -3831,7 +3804,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -3864,7 +3836,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -3898,7 +3869,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro
             )
             .unwrap_err()
@@ -3994,7 +3964,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro
             )
             .unwrap_err()
@@ -4024,7 +3993,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -4064,7 +4032,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -4099,7 +4066,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -4136,7 +4102,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -4163,7 +4128,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -4186,7 +4150,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -4223,7 +4186,6 @@ mod tests {
             &[],
             &[],
             &EVAL_TOPO,
-            &[],
             &no_repro,
         )
         .unwrap_err();
@@ -4271,7 +4233,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro
             )
             .unwrap_err()
@@ -4344,7 +4305,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro
             )
             .unwrap_err()
@@ -4443,7 +4403,6 @@ mod tests {
                 &[],
                 &[],
                 &EVAL_TOPO,
-                &[],
                 &no_repro
             )
             .unwrap_err()

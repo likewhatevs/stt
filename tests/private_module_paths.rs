@@ -1,21 +1,21 @@
 //! External-context check for `ktstr::__private::{ctor, serde_json}`.
 //!
-//! The `#[ktstr_test]` proc macro emits two items that reference
-//! crates through the `__private` re-export module:
+//! The `#[ktstr_test]` proc macro emits a
+//! `#[::ktstr::__private::linkme::distributed_slice(::ktstr::test_support::KTSTR_TESTS)]`
+//! static of type `KtstrTestEntry` that registers the test in the
+//! `KTSTR_TESTS` distributed slice at link time. The `__private::ctor`
+//! and `__private::serde_json` re-exports are used by test-author
+//! code (e.g. `tests/jemalloc_probe_tests.rs` attaches `#[ctor::ctor]`
+//! via the re-export to set env vars before the test harness runs;
+//! downstream consumers reach for `__private::serde_json` to parse
+//! sidecar output without listing `serde_json` as a direct dep).
 //!
-//! - A `#[::ktstr::__private::ctor::ctor(crate_path = ::ktstr::__private::ctor)]`
-//!   static that registers flag metadata in a startup hook
-//!   (ktstr-macros/src/lib.rs:1449).
-//! - A call into `::ktstr::__private::serde_json::to_string` that
-//!   serializes the metadata for the sidecar writer
-//!   (ktstr-macros/src/lib.rs:1459).
-//!
-//! If either re-export changes path or disappears, macro-generated
-//! code in every downstream crate that uses `#[ktstr_test]` fails to
-//! compile. This file exercises both paths directly from external
-//! test code — i.e. treating `ktstr` as a dev-dependency — so a
-//! silent regression in the private re-export surface would fail
-//! this binary's build before the broader integration suite runs.
+//! If any of these re-exports change path or disappear, downstream
+//! crates that depend on the surface fail to compile. This file
+//! exercises both paths directly from external test code — i.e.
+//! treating `ktstr` as a dev-dependency — so a silent regression in
+//! the private re-export surface would fail this binary's build
+//! before the broader integration suite runs.
 //!
 //! The assertions live inside a plain `#[test]` because this file
 //! holds no `#[ktstr_test]` entries. Confirm both paths resolve, can
@@ -26,8 +26,7 @@ use ktstr::__private;
 
 /// `serde_json::to_string` must be reachable through the re-export
 /// and must serialize a simple structure the same way the top-level
-/// `serde_json` crate would. The macro uses this path to serialize a
-/// `Vec<FlagDecl>` before writing it to the sidecar.
+/// `serde_json` crate would.
 #[test]
 fn private_serde_json_to_string_roundtrip() {
     let v: Vec<(&str, u32)> = vec![("llc", 0), ("borrow", 1)];

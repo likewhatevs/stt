@@ -258,10 +258,8 @@ pub(crate) fn vm_timeout_from_entry(entry: &super::entry::KtstrTestEntry) -> Dur
 /// The caller owns the divergent tail. `run_ktstr_test_inner`
 /// additionally wires `performance_mode`,
 /// `sched_enable_cmds`/`sched_disable_cmds` for kernel-built
-/// schedulers, `monitor_thresholds`, and `sched_args` extended with
-/// active-flag mappings from `entry.scheduler.flag_args`.
-/// `attempt_auto_repro` additionally wires `include_files` plus
-/// base `sched_args` (no active-flag extension).
+/// schedulers, and `monitor_thresholds`. `attempt_auto_repro`
+/// additionally wires `include_files` plus base `sched_args`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_vm_builder_base(
     entry: &KtstrTestEntry,

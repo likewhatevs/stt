@@ -72,15 +72,19 @@ pub(super) fn write_corrupt_sidecar(
 ///
 /// Pinned as a constant so the
 /// `explain_sidecar_does_not_flag_empty_vec_fields_as_none`
-/// test and any future Vec-aware test source the same list.
-/// A schema change that adds, removes, or renames a Vec
-/// field MUST update this constant — the
-/// `sidecar_vec_fields_drift_guard` test fires when the
-/// runtime fixture's Vec field set diverges.
+/// test sources the same list. The check is one-directional:
+/// it asserts that none of these names appear in the
+/// explain-sidecar output. A schema change that REMOVES or
+/// RENAMES a Vec field must drop the corresponding entry here
+/// — leaving a stale name keeps the check enforcing absence
+/// of a string that the renderer cannot emit, which still
+/// passes but conveys nothing. A schema change that ADDS a
+/// Vec field is not caught by this guard (it would have to
+/// appear in output to fail, and the renderer only emits the
+/// Option-field catalog).
 pub(super) const SIDECAR_VEC_FIELDS: &[&str] = &[
     "metrics",
     "stimulus_events",
-    "active_flags",
     "verifier_stats",
     "sysctls",
     "kargs",

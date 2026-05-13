@@ -42,8 +42,6 @@ use crate::scenario::Ctx;
 #[cfg(test)]
 use anyhow::Result;
 
-pub use crate::scenario::flags::FlagDecl;
-
 mod args;
 mod dispatch;
 mod entry;
@@ -68,7 +66,7 @@ mod topo;
 // uniformly across all CLI arg extractors.
 #[allow(unused_imports)]
 pub(crate) use args::{
-    extract_export_output_arg, extract_export_test_arg, extract_flags_arg, extract_probe_stack_arg,
+    extract_export_output_arg, extract_export_test_arg, extract_probe_stack_arg,
     extract_test_fn_arg, extract_topo_arg, extract_work_type_arg,
 };
 #[cfg(test)]
@@ -86,7 +84,6 @@ pub use dispatch::{
     analyze_sidecars, is_kernel_unavailable, is_resource_contention, ktstr_main,
     ktstr_test_early_dispatch, run_ktstr_test, sanitize_kernel_label,
 };
-pub(crate) use entry::validate_entry_flags;
 pub use entry::{
     BpfMapWrite, CgroupPath, KTSTR_SCHEDULERS, KTSTR_TESTS, KtstrTestEntry, MemSideCache,
     NumaDistance, NumaNode, Scheduler, SchedulerJson, SchedulerSpec, Sysctl, Topology,
