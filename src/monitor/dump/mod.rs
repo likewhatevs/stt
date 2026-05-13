@@ -638,10 +638,8 @@ pub const SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED: &str = "early-pre-late-degraded"
 /// sibling. Symmetric with
 /// [`SNAPSHOT_TAG_EARLY_PRE_LATE_DEGRADED`] — tagged sibling rather
 /// than main path so the main `{stem}.failure-dump.json` keeps the
-/// "scheduler had a failure-class exit" semantic. Per
-/// `feedback_no_silent_drops`.
-pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED: &str =
-    "early-only-late-suppressed";
+/// "scheduler had a failure-class exit" semantic.
+pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED: &str = "early-only-late-suppressed";
 
 /// Snapshot tag used when dual-snapshot mode held a Captured early
 /// snapshot AND the late-trigger path NEVER FIRED for the run (no
@@ -655,9 +653,7 @@ pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_SUPPRESSED: &str =
 /// `freeze_state` stayed at `Idle` or `TookEarly` through coord
 /// exit. The end-of-coord drain emits the early observation to the
 /// tagged sibling rather than letting it drop with the closure.
-/// Per `feedback_no_silent_drops`.
-pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED: &str =
-    "early-only-late-never-fired";
+pub const SNAPSHOT_TAG_EARLY_ONLY_LATE_NEVER_FIRED: &str = "early-only-late-never-fired";
 
 /// Reason string written into [`FailureDumpReport::prog_runtime_stats_unavailable`]
 /// when [`DumpContext::prog_capture`] was supplied but the per-program
@@ -1351,7 +1347,7 @@ pub struct DegradedFailureDumpReport {
     /// (latch readable, value still 0), `"out_of_bounds"` (cached
     /// `.bss` PA no longer 4-byte-readable — probe map freed
     /// mid-run), or `"not_resolved"` (cached `.bss` PA was never
-    /// populated). Mirror of [`super::super::vmm::freeze_coord`]'s
+    /// populated). Mirror of [`crate::vmm::freeze_coord`]'s
     /// internal `BssReadState` enum, serialised as the snake-case
     /// of each variant. String-typed for wire-format stability with
     /// the rest of the `REASON_*` / state-name surface — see
@@ -1362,7 +1358,7 @@ pub struct DegradedFailureDumpReport {
     /// reaching the gate (rendezvous timed out earlier) or when the
     /// KVA translation failed. `Some(kind)` carries the raw `u32`
     /// from `enum scx_exit_kind` — operators read it against
-    /// `kernel/sched/ext_internal.h::scx_exit_kind` to identify
+    /// the kernel's `scx_exit_kind` enum definition to identify
     /// whether the scheduler's intended exit class matched the
     /// trigger that fired.
     #[serde(default, skip_serializing_if = "Option::is_none")]

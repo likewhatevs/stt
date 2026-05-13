@@ -4426,6 +4426,7 @@ mod tests {
             max_local_dsq_depth: 10000,
             fail_on_stall: true,
             sustained_samples: 2,
+            enforce: true,
             ..Default::default()
         };
 

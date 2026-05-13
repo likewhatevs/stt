@@ -3568,21 +3568,21 @@ mod tests {
     }
 
     #[test]
-    fn render_failure_dump_file_absent_schema_defaults_to_single() {
-        // JSON without the `schema` field: matches what older dump
-        // files (pre-discriminant) wrote. The
-        // `default_schema_single` serde default in
-        // `FailureDumpReport` makes that deserialise as a single
-        // report, and the helper falls into the single branch.
+    fn render_failure_dump_file_absent_schema_returns_none() {
+        // JSON without the `schema` field: the dispatcher at
+        // `FailureDumpReportAny::from_json` requires an explicit
+        // schema discriminant. Per the dispatcher doc, the previous
+        // "absent ⇒ single" fallback was deliberately removed to
+        // avoid silently mis-routing a richer wrapper as a lossy
+        // single shape. So absent-schema JSON returns None — the
+        // helper does not invent a schema choice.
         let json = r#"{"maps":[],"vcpu_regs":[],"sdt_allocations":[]}"#;
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(tmp.path(), json).expect("write tempfile");
 
-        let rendered =
-            render_failure_dump_file(tmp.path()).expect("absent-schema JSON must render as single");
         assert!(
-            rendered.contains("(empty failure dump)"),
-            "absent schema must default to single: {rendered}"
+            render_failure_dump_file(tmp.path()).is_none(),
+            "absent-schema JSON must return None to avoid silent mis-routing"
         );
     }
 

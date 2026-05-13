@@ -3953,7 +3953,8 @@ mod tests {
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES
             .max_imbalance_ratio(4.0)
-            .fail_on_stall(true);
+            .fail_on_stall(true)
+            .with_monitor_defaults();
         let msg = format!(
             "{}",
             evaluate_vm_result(
@@ -4392,7 +4393,8 @@ mod tests {
         };
         let assertions = crate::assert::Assert::NO_OVERRIDES
             .max_imbalance_ratio(4.0)
-            .fail_on_stall(true);
+            .fail_on_stall(true)
+            .with_monitor_defaults();
         let msg = format!(
             "{}",
             evaluate_vm_result(

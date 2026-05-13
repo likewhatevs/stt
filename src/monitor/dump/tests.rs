@@ -1060,6 +1060,26 @@ fn snapshot_tag_constants_pinned() {
     );
 }
 
+/// Wire-format pin: `REASON_DEGRADED_*` constant values are
+/// operator-grep-stable across releases. An operator who tails a
+/// degraded-dump's `reason` field or filters by the
+/// `REASON_DEGRADED_*` prefix expects the string to remain byte-
+/// stable; a silent rename would break operator playbooks AND any
+/// external `jq '.reason | startswith("vCPU rendezvous")'` consumer.
+///
+/// Today only `REASON_DEGRADED_RENDEZVOUS_TIMEOUT` exists. When
+/// new `REASON_DEGRADED_*` constants land (per the doc claim at
+/// the `DegradedFailureDumpReport.reason` field that "new
+/// degraded causes add new `REASON_DEGRADED_*` constants rather
+/// than mutating the existing ones"), extend this test to pin
+/// each new value — same one-line `assert_eq!` shape.
+#[test]
+fn reason_degraded_constants_pinned() {
+    assert_eq!(
+        REASON_DEGRADED_RENDEZVOUS_TIMEOUT,
+        "vCPU rendezvous timed out before parked acknowledgement"
+    );
+}
 
 /// Wire-format pin: FailureDumpReport defaults to `SCHEMA_SINGLE`
 /// so the freeze coordinator's early-only emit path (which
@@ -1394,9 +1414,11 @@ fn reason_strings_round_trip_through_serde() {
 // "remove every field" loop would over-assert here.
 //
 // Asserted contract:
-//   - `maps` is the only required field on the wire.
-//   - `schema` is `serde(default = default_schema_single)` —
-//     omission yields `SCHEMA_SINGLE`.
+//   - `maps` is required on the wire (no `serde(default)`).
+//   - `schema` is required on the wire (no `serde(default)`).
+//     Per the dispatcher doc at [`FailureDumpReportAny::from_json`],
+//     the previous "absent ⇒ single" fallback was removed; tests
+//     provide `schema: "single"` explicitly to round-trip.
 //   - Every other field is `serde(default, skip_serializing_if =
 //     ...)` — omission MUST succeed.
 //
@@ -1435,22 +1457,25 @@ fn failure_dump_report_strict_schema_maps_required() {
     );
 }
 
-/// Omitting all optional fields (`schema`, `vcpu_regs`,
-/// `sdt_allocations`, every diagnostic Option, every capture
-/// Vec) MUST succeed and produce a deserialized report whose
-/// absent fields take their `serde(default)` value. `schema`
-/// gets a positive control: omission MUST yield `SCHEMA_SINGLE`,
-/// not the empty string a naive `Default for String` would
-/// produce.
+/// Omitting all optional fields (`vcpu_regs`, `sdt_allocations`,
+/// every diagnostic Option, every capture Vec) MUST succeed and
+/// produce a deserialized report whose absent fields take their
+/// `serde(default)` value. `schema` is REQUIRED — it has no
+/// `serde(default)`, so absent-schema JSON fails at serde directly
+/// (the proximate reason this test must provide it). At the
+/// wire-format level, [`FailureDumpReportAny::from_json`] also
+/// rejects absent-schema JSON to avoid silently mis-routing a
+/// richer wrapper as a lossy single shape. The test provides
+/// `schema: "single"` explicitly and verifies the round-trip
+/// preserves it.
 #[test]
 fn failure_dump_report_optional_fields_round_trip_when_omitted() {
-    let minimal = serde_json::json!({ "maps": [] });
+    let minimal = serde_json::json!({ "schema": "single", "maps": [] });
     let report: FailureDumpReport = serde_json::from_value(minimal)
-        .expect("deserialize must accept FailureDumpReport with only `maps`");
+        .expect("deserialize must accept FailureDumpReport with `schema` + `maps`");
     assert_eq!(
         report.schema, SCHEMA_SINGLE,
-        "absent `schema` field must default to SCHEMA_SINGLE \
-         (default_schema_single fn); got: {:?}",
+        "explicit `schema: single` field must round-trip; got: {:?}",
         report.schema,
     );
     assert!(report.maps.is_empty());

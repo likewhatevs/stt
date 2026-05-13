@@ -627,6 +627,7 @@ fn thresholds_imbalance_at_sustained_fails() {
     let t = MonitorThresholds {
         sustained_samples: 5,
         max_imbalance_ratio: 4.0,
+        enforce: true,
         ..Default::default()
     };
     // 5 consecutive imbalanced samples (ratio=10, threshold=4).
@@ -666,6 +667,7 @@ fn thresholds_dsq_depth_sustained_fails() {
         sustained_samples: 3,
         max_local_dsq_depth: 10,
         fail_on_stall: false,
+        enforce: true,
         ..Default::default()
     };
     let mut samples = Vec::new();
@@ -744,10 +746,12 @@ fn thresholds_dsq_depth_below_sustained_passes() {
 #[test]
 fn thresholds_stuck_detected_fails() {
     // Stuck checks use the sustained_samples window. With sustained_samples=1,
-    // a single stuck pair triggers failure.
+    // a single stuck pair triggers failure. `enforce: true` opts out of
+    // the report-only default so the violation flips `passed` to false.
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
@@ -905,6 +909,7 @@ fn thresholds_multiple_violations() {
         sustained_samples: 2,
         max_imbalance_ratio: 2.0,
         fail_on_stall: true,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
@@ -1131,6 +1136,7 @@ fn thresholds_single_cpu_single_sample_valid() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![MonitorSample {
@@ -1199,6 +1205,7 @@ fn thresholds_fallback_rate_sustained_fails() {
         sustained_samples: 3,
         max_fallback_rate: 10.0,
         fail_on_stall: false,
+        enforce: true,
         ..Default::default()
     };
     let samples: Vec<_> = (0..4)
@@ -1245,6 +1252,7 @@ fn thresholds_keep_last_rate_sustained_fails() {
         sustained_samples: 3,
         max_keep_last_rate: 10.0,
         fail_on_stall: false,
+        enforce: true,
         ..Default::default()
     };
     let samples: Vec<_> = (0..4)
@@ -1907,6 +1915,7 @@ fn neg_tight_imbalance_threshold_catches_mild_imbalance() {
         max_imbalance_ratio: 1.0,
         sustained_samples: 2,
         fail_on_stall: false,
+        enforce: true,
         ..Default::default()
     };
     let samples: Vec<_> = (0..3u64)
@@ -1973,6 +1982,7 @@ fn neg_tight_dsq_threshold_catches_small_depth() {
         max_local_dsq_depth: 1,
         sustained_samples: 2,
         fail_on_stall: false,
+        enforce: true,
         ..Default::default()
     };
     let samples: Vec<_> = (0..3u64)
@@ -2032,6 +2042,7 @@ fn neg_stuck_detection_catches_frozen_rq_clock() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
@@ -2102,6 +2113,7 @@ fn neg_combined_imbalance_and_stuck_both_reported() {
         max_imbalance_ratio: 2.0,
         sustained_samples: 1,
         fail_on_stall: true,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
@@ -2174,6 +2186,7 @@ fn stuck_idle_cpu_exempt() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
@@ -2237,6 +2250,7 @@ fn stuck_idle_to_busy_not_exempt() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
@@ -2352,9 +2366,13 @@ fn stuck_sustained_window_filters_transient() {
 fn stuck_sustained_window_catches_real_stuck() {
     // With sustained_samples=3, 3+ consecutive stall pairs trigger.
     // Second CPU has a different clock value so data_looks_valid passes.
+    // `enforce: true` opts the verdict out of report-only mode (the
+    // default), so the recorded stall violation flips `passed` to
+    // false.
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 3,
+        enforce: true,
         ..Default::default()
     };
     // 4 samples = 3 consecutive stall pairs for cpu0. cpu1 advances.
@@ -2503,6 +2521,7 @@ fn neg_fallback_rate_threshold_fires() {
         sustained_samples: 2,
         max_fallback_rate: 5.0,
         fail_on_stall: false,
+        enforce: true,
         ..Default::default()
     };
     let samples: Vec<_> = (0..3u64)
@@ -2547,6 +2566,7 @@ fn neg_keep_last_rate_threshold_fires() {
         sustained_samples: 2,
         max_keep_last_rate: 5.0,
         fail_on_stall: false,
+        enforce: true,
         ..Default::default()
     };
     let samples: Vec<_> = (0..3u64)
@@ -2588,6 +2608,7 @@ fn evaluate_suppresses_stuck_when_vcpu_preempted() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
@@ -2657,6 +2678,7 @@ fn evaluate_catches_stuck_when_vcpu_running() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
@@ -2720,6 +2742,7 @@ fn evaluate_stuck_none_vcpu_time_falls_back_to_current_behavior() {
     let t = MonitorThresholds {
         fail_on_stall: true,
         sustained_samples: 1,
+        enforce: true,
         ..Default::default()
     };
     let samples = vec![
