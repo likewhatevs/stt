@@ -95,7 +95,6 @@ fn assert_no_perf_mode_ran_clean(result: &VmResult) -> Result<()> {
     threads = 2,
     duration_s = 3,
     watchdog_timeout_s = 30,
-    workers_per_cgroup = 2,
     auto_repro = false,
     post_vm = assert_no_perf_mode_ran_clean,
 )]

@@ -301,7 +301,6 @@ longer / heavier runs:
 |---|---|---|
 | `duration_s` | `12` | Per-scenario wall-clock seconds. The framework keeps both cgroups running for `duration_s` seconds, then signals workers to stop and collects reports. |
 | `watchdog_timeout_s` | `5` | sched_ext watchdog fire threshold. Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels and the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
-| `workers_per_cgroup` | `2` | Default worker count when a `CgroupDef` does not call `.workers(n)`. Per-cgroup `.workers(n)` overrides this. |
 | `memory_mb` | `2048` | VM memory in MiB. |
 
 `watchdog_timeout_s` is sched_ext's per-task stall threshold — if

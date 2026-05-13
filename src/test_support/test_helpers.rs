@@ -352,20 +352,18 @@ pub(crate) fn lifecycle_drain(
     crate::vmm::host_comms::BulkDrainResult { entries }
 }
 
-/// Build a `KtstrTestEntry` with overridden memory/duration/workers
-/// for `KtstrTestEntry::validate` tests. Everything else inherits
-/// from `DEFAULT`.
+/// Build a `KtstrTestEntry` with overridden memory/duration for
+/// `KtstrTestEntry::validate` tests. Everything else inherits from
+/// `DEFAULT`.
 pub(crate) fn validate_entry(
     name: &'static str,
     memory_mb: u32,
     duration: Duration,
-    workers_per_cgroup: u32,
 ) -> KtstrTestEntry {
     KtstrTestEntry {
         name,
         memory_mb,
         duration,
-        workers_per_cgroup,
         ..KtstrTestEntry::DEFAULT
     }
 }

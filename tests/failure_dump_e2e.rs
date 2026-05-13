@@ -545,7 +545,6 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
         // teardown stays under the test duration.
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         // The scenario itself returns Err to surface a missing-dump
         // regression as a real failure. Successful rendering returns
         // a failed AssertResult (the stall is the expected behaviour);
@@ -806,7 +805,6 @@ static __KTSTR_ENTRY_FAILURE_DUMP_CAPTURES: ktstr::test_support::KtstrTestEntry 
         // teardown stays under the test duration.
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         // The scenario returns a non-failed AssertResult on success
         // (the stall is the expected trigger that produces the dump);
         // any capture defect is reported via anyhow::bail! and bubbles
@@ -979,7 +977,6 @@ static __KTSTR_ENTRY_FAILURE_DUMP_PROBE_COUNTERS: ktstr::test_support::KtstrTest
         // teardown stays under the test duration.
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         // Stall scenarios surface as a failed AssertResult — the
         // test framework's `expect_err: true` flips that into a
         // pass, so the scenario itself only returns Err when the

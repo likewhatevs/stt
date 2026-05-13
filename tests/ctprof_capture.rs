@@ -53,8 +53,8 @@ use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
 fn ctprof_capture_returns_threads_with_nonzero_counters(ctx: &Ctx) -> Result<AssertResult> {
     // Simple SpinWait workload — workers hit the dispatcher,
     // accrue run_time_ns / voluntary_csw / minflt. One cgroup,
-    // default workers_per_cgroup so the test doesn't need to
-    // pick a specific count.
+    // framework default worker count so the test doesn't need to
+    // pick a specific number.
     let steps = vec![Step {
         setup: vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)].into(),
         ops: vec![],

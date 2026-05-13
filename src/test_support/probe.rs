@@ -1539,7 +1539,6 @@ pub(crate) fn maybe_dispatch_vm_test_with_args(args: &[String]) -> Option<i32> {
     let (topo, cgroups, sched_pid, merged_assert) = build_dispatch_ctx_parts(entry, args);
     let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
         .duration(entry.duration)
-        .workers_per_cgroup(entry.workers_per_cgroup as usize)
         .sched_pid(sched_pid)
         .settle(Duration::ZERO)
         .work_type_override(work_type_override)
@@ -1991,7 +1990,6 @@ pub(crate) fn maybe_dispatch_vm_test_with_phase_a(
     // the auto-repro fast path on par with the non-probe path.
     let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
         .duration(entry.duration)
-        .workers_per_cgroup(entry.workers_per_cgroup as usize)
         .sched_pid(sched_pid)
         .settle(Duration::ZERO)
         .work_type_override(work_type_override)

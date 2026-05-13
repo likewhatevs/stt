@@ -79,7 +79,6 @@ fn assert_workers_ran_clean(result: &VmResult) -> Result<()> {
     scheduler = KTSTR_SCHED,
     duration_s = 3,
     watchdog_timeout_s = 15,
-    workers_per_cgroup = 2,
     auto_repro = false,
     post_vm = assert_workers_ran_clean,
 )]

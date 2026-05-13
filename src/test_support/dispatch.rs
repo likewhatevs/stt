@@ -1471,13 +1471,11 @@ fn run_host_only_test(entry: &KtstrTestEntry) -> i32 {
 fn run_host_only_test_inner(entry: &KtstrTestEntry) -> Result<AssertResult> {
     let topo = crate::topology::TestTopology::from_vm_topology(&entry.topology);
     let cgroups = crate::cgroup::CgroupManager::new("/sys/fs/cgroup/ktstr");
-    let workers_per_cgroup = entry.workers_per_cgroup as usize;
     let merged_assert = crate::assert::Assert::default_checks()
         .merge(&entry.scheduler.assert)
         .merge(&entry.assert);
     let ctx = crate::scenario::Ctx::builder(&cgroups, &topo)
         .duration(entry.duration)
-        .workers_per_cgroup(workers_per_cgroup)
         .settle(std::time::Duration::ZERO)
         .assert(merged_assert)
         .build();

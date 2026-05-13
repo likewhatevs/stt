@@ -593,7 +593,6 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_KERNEL_KPTR: ktstr::test_support::KtstrTestEn
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         // The scheduler intentionally dies (SCX_EXIT_ERROR_STALL).
         // The framework would record a failed AssertResult; flip
         // it to PASS with `expect_err`. Real defects (missing
@@ -1005,7 +1004,6 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_BSS_TO_ARENA: ktstr::test_support::KtstrTestE
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         // Matches the kernel-kptr scenario: the scheduler intentionally
         // dies via SCX_EXIT_ERROR_STALL; flip the framework's failed
         // AssertResult to PASS. Real defects bail via `anyhow::bail!`
@@ -1502,7 +1500,6 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_CROSS_SUBPROG: ktstr::test_support::KtstrTest
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -1524,7 +1521,6 @@ static __KTSTR_ENTRY_CAST_ANALYSIS_SDT_ALLOC_BRIDGE: ktstr::test_support::KtstrT
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         // SCX_EXIT_ERROR_STALL is the intentional kill; flip the
         // framework's failed AssertResult to PASS. Real defects
         // bail via `anyhow::bail!` and bypass `expect_err`.

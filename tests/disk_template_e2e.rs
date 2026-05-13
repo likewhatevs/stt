@@ -323,7 +323,6 @@ static __KTSTR_ENTRY_BTRFS_TEMPLATE_BUILD: ktstr::test_support::KtstrTestEntry =
         watchdog_timeout: std::time::Duration::from_secs(3),
         // Short duration — the assertion is a single statfs syscall.
         duration: std::time::Duration::from_millis(500),
-        workers_per_cgroup: 1,
         expect_err: false,
         disk: Some(KTSTR_DISK_BTRFS),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
@@ -339,7 +338,6 @@ static __KTSTR_ENTRY_FICLONE_CLONE_ISOLATED: ktstr::test_support::KtstrTestEntry
         extra_sched_args: &[],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_millis(500),
-        workers_per_cgroup: 1,
         expect_err: false,
         disk: Some(KTSTR_DISK_BTRFS),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT

@@ -34,7 +34,7 @@ pub(crate) struct TestCandidate {
 //   Bit  16:     host_only
 //   Bit  17:     expect_err
 //   Bits 18..20: duration bucket (3 one-hot bits)
-//   Bit  21:     workers_per_cgroup bucket (1 bit)
+//   Bit  21:     reserved (formerly workers_per_cgroup bucket)
 //   Bit  22:     is gauntlet variant
 //   Bits 23..26: test name hash (4 one-hot bits)
 //   Bits 27..30: NUMA node count bucket (4 one-hot bits)
@@ -47,7 +47,6 @@ const PERF_MODE_SHIFT: u32 = 15;
 const HOST_ONLY_SHIFT: u32 = 16;
 const EXPECT_ERR_SHIFT: u32 = 17;
 const DURATION_SHIFT: u32 = 18;
-const WORKERS_SHIFT: u32 = 21;
 const GAUNTLET_SHIFT: u32 = 22;
 const NAME_HASH_SHIFT: u32 = 23;
 const NUMA_BUCKET_SHIFT: u32 = 27;
@@ -90,11 +89,6 @@ fn duration_bucket(duration_secs: u64) -> u64 {
         3..=10 => 1 << 1,
         _ => 1 << 2,
     }
-}
-
-/// Classify workers_per_cgroup (1 bit: low or high).
-fn workers_bucket(workers: u32) -> u64 {
-    if workers <= 2 { 0 } else { 1 }
 }
 
 /// Classify NUMA node count into a one-hot bit (4 classes).
@@ -142,9 +136,6 @@ pub(crate) fn extract_features(
 
     // Duration bucket
     bits |= duration_bucket(entry.duration.as_secs()) << DURATION_SHIFT;
-
-    // Workers bucket
-    bits |= workers_bucket(entry.workers_per_cgroup) << WORKERS_SHIFT;
 
     // Gauntlet flag
     if is_gauntlet {
@@ -360,14 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn workers_bucket_values() {
-        assert_eq!(workers_bucket(1), 0);
-        assert_eq!(workers_bucket(2), 0);
-        assert_eq!(workers_bucket(3), 1);
-        assert_eq!(workers_bucket(32), 1);
-    }
-
-    #[test]
     fn numa_bucket_one_hot() {
         assert_eq!(numa_bucket(0), 1 << 0);
         assert_eq!(numa_bucket(1), 1 << 0);
@@ -504,7 +487,6 @@ mod tests {
         assert_eq!(PERF_MODE_SHIFT, 15, "PERF_MODE_SHIFT pinned");
         assert_eq!(HOST_ONLY_SHIFT, 16, "HOST_ONLY_SHIFT pinned");
         assert_eq!(EXPECT_ERR_SHIFT, 17, "EXPECT_ERR_SHIFT pinned");
-        assert_eq!(WORKERS_SHIFT, 21, "WORKERS_SHIFT pinned");
         assert_eq!(GAUNTLET_SHIFT, 22, "GAUNTLET_SHIFT pinned");
 
         // Plain non-SMT topo so the SMT bit is naturally clear in
@@ -535,7 +517,6 @@ mod tests {
             (PERF_MODE_SHIFT, "PERF_MODE"),
             (HOST_ONLY_SHIFT, "HOST_ONLY"),
             (EXPECT_ERR_SHIFT, "EXPECT_ERR"),
-            (WORKERS_SHIFT, "WORKERS"),
             (GAUNTLET_SHIFT, "GAUNTLET"),
         ];
 
@@ -603,16 +584,6 @@ mod tests {
             extract_features(&expect_err_entry, &plain_topo, false, "expect_err_test");
         assert_only(expect_err_f, "EXPECT_ERR");
 
-        // WORKERS-only: workers_per_cgroup > 2 (per workers_bucket
-        // threshold), plain topo.
-        let workers_entry = KtstrTestEntry {
-            workers_per_cgroup: 4,
-            ..KtstrTestEntry::DEFAULT
-        };
-        let workers_f =
-            extract_features(&workers_entry, &plain_topo, false, "workers_test");
-        assert_only(workers_f, "WORKERS");
-
         // GAUNTLET-only: plain entry, plain topo, is_gauntlet=true.
         let gauntlet_f =
             extract_features(&KtstrTestEntry::DEFAULT, &plain_topo, true, "gauntlet_test");
@@ -656,7 +627,6 @@ mod tests {
             (PERF_MODE_SHIFT, "PERF_MODE"),
             (HOST_ONLY_SHIFT, "HOST_ONLY"),
             (EXPECT_ERR_SHIFT, "EXPECT_ERR"),
-            (WORKERS_SHIFT, "WORKERS"),
             (GAUNTLET_SHIFT, "GAUNTLET"),
         ];
         for &(shift, name) in one_bit_shifts {

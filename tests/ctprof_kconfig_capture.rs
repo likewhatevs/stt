@@ -206,8 +206,8 @@ fn ctprof_capture_records_wchar_under_iosync(ctx: &Ctx) -> Result<AssertResult> 
 /// without requiring the workload to drive the counter past
 /// zero.
 ///
-/// Topology: 1 LLC / 2 cores / 1 thread, with
-/// `workers_per_cgroup` workers running SpinWait — the
+/// Topology: 1 LLC / 2 cores / 1 thread, with the framework
+/// default workers running SpinWait — the
 /// load shape is right for `cpu.some` accumulation when the
 /// kernel observes it, and the snapshot's PSI struct is
 /// populated either way.
@@ -340,8 +340,8 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
 ///   satisfied unconditionally.
 ///
 /// Topology: 1 LLC / 2 cores / 1 thread + 4 SpinWait workers
-/// (`workers_per_cgroup = 4` overrides the default of 2) for
-/// 2× oversubscription. Even though cpu_delay is now
+/// (explicit `.workers(4)` on the CgroupDef) for 2× oversubscription.
+/// Even though cpu_delay is now
 /// reachability-only, the oversubscription topology is kept so
 /// (a) the cpu_delay diagnostic surfaces meaningful numbers
 /// when the kernel does happen to retain a worker's
@@ -361,16 +361,16 @@ fn ctprof_capture_reaches_host_psi_cpu_under_oversubscription(ctx: &Ctx) -> Resu
     llcs = 1,
     cores = 2,
     threads = 1,
-    workers_per_cgroup = 4,
     duration_s = 3
 )]
 fn ctprof_capture_records_taskstats_cpu_delay_and_hiwater_under_oversubscription(
     ctx: &Ctx,
 ) -> Result<AssertResult> {
+    let _ = ctx;
     let steps = vec![Step {
         setup: vec![
             CgroupDef::named("cg_0")
-                .workers(ctx.workers_per_cgroup)
+                .workers(4)
                 .work_type(WorkType::SpinWait),
         ]
         .into(),

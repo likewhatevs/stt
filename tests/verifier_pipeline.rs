@@ -134,7 +134,6 @@ static __KTSTR_ENTRY_FAIL_VERIFY: KtstrTestEntry = KtstrTestEntry {
     scheduler: &FAIL_SCHED,
     extra_sched_args: &["--fail-verify"],
     duration: std::time::Duration::from_secs(5),
-    workers_per_cgroup: 2,
     ..KtstrTestEntry::DEFAULT
 };
 
@@ -146,6 +145,5 @@ static __KTSTR_ENTRY_VERIFY_REJECT: KtstrTestEntry = KtstrTestEntry {
     scheduler: &FAIL_SCHED,
     extra_sched_args: &["--verify-loop"],
     duration: std::time::Duration::from_secs(5),
-    workers_per_cgroup: 2,
     ..KtstrTestEntry::DEFAULT
 };

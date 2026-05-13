@@ -37,7 +37,6 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     scheduler = MY_SCHED_PAYLOAD,
     performance_mode = true,
     duration_s = 3,
-    workers_per_cgroup = 2,
     sustained_samples = 15,
 )]
 fn perf_positive(ctx: &Ctx) -> Result<AssertResult> {
@@ -45,7 +44,7 @@ fn perf_positive(ctx: &Ctx) -> Result<AssertResult> {
         .min_iteration_rate(5000.0)
         .max_gap_ms(500);
     let steps = vec![Step::with_defs(
-        vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)],
+        vec![CgroupDef::named("cg_0").workers(2)],
         HoldSpec::FULL,
     )];
     execute_steps_with(ctx, steps, Some(&checks))
@@ -81,14 +80,13 @@ const MY_SCHED: Scheduler = Scheduler::new("my_sched")
     scheduler = MY_SCHED_PAYLOAD,
     performance_mode = true,
     duration_s = 5,
-    workers_per_cgroup = 4,
     extra_sched_args = ["--fail-verify"],
     expect_err = true,
 )]
 fn perf_negative(ctx: &Ctx) -> Result<AssertResult> {
     let checks = Assert::default_checks().max_gap_ms(50);
     let steps = vec![Step::with_defs(
-        vec![CgroupDef::named("cg_0").workers(ctx.workers_per_cgroup)],
+        vec![CgroupDef::named("cg_0").workers(4)],
         HoldSpec::FULL,
     )];
     execute_steps_with(ctx, steps, Some(&checks))

@@ -819,7 +819,6 @@ static __KTSTR_ENTRY_DSQ_RQ_WALKER: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -834,7 +833,6 @@ static __KTSTR_ENTRY_PERF_COUNTERS: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -851,7 +849,6 @@ static __KTSTR_ENTRY_EVENT_TIMELINE: ktstr::test_support::KtstrTestEntry =
         // Longer duration so the per-tick monitor loop accumulates
         // multiple samples before the stall fires.
         duration: std::time::Duration::from_secs(15),
-        workers_per_cgroup: 2,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -870,7 +867,6 @@ static __KTSTR_ENTRY_DEADLINE: ktstr::test_support::KtstrTestEntry =
         // Short duration — work_units > 0 needs only a few ms under
         // the 5% bandwidth reservation.
         duration: std::time::Duration::from_millis(500),
-        workers_per_cgroup: 1,
         // expect_err: false because this scenario asserts on the
         // success path (worker.completed=true, work_units > 0).
         expect_err: false,
@@ -887,7 +883,6 @@ static __KTSTR_ENTRY_DUMP_TRIGGER: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -1092,7 +1087,6 @@ static __KTSTR_ENTRY_DISK_DEFAULT: ktstr::test_support::KtstrTestEntry =
         // Short duration — the test only opens /dev/vda and reads
         // capacity; no extended workload required.
         duration: std::time::Duration::from_millis(500),
-        workers_per_cgroup: 1,
         expect_err: false,
         disk: Some(KTSTR_DISK_DEFAULT),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
@@ -1108,7 +1102,6 @@ static __KTSTR_ENTRY_DISK_ROUNDTRIP: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &[],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_millis(500),
-        workers_per_cgroup: 1,
         expect_err: false,
         disk: Some(KTSTR_DISK_DEFAULT),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
@@ -1124,7 +1117,6 @@ static __KTSTR_ENTRY_DISK_READ_ONLY: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &[],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_millis(500),
-        workers_per_cgroup: 1,
         expect_err: false,
         disk: Some(KTSTR_DISK_READ_ONLY),
         ..ktstr::test_support::KtstrTestEntry::DEFAULT

@@ -93,7 +93,6 @@ const GUEST_CFG_PATH: &str = "/include-files/config_file_def_e2e.json";
     config = CFG_E2E_CONTENT,
     duration_s = 3,
     watchdog_timeout_s = 15,
-    workers_per_cgroup = 2,
     auto_repro = false,
 )]
 fn config_file_def_e2e_pipeline(ctx: &Ctx) -> Result<AssertResult> {

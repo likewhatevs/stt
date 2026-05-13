@@ -717,8 +717,6 @@ pub struct KtstrTestEntry {
     pub no_perf_mode: bool,
     /// Workload duration.
     pub duration: Duration,
-    /// Workers per cgroup.
-    pub workers_per_cgroup: u32,
     /// When true, the test expects run_ktstr_test to return Err.
     /// Disables auto_repro (no point probing a deliberately failing test).
     pub expect_err: bool,
@@ -932,7 +930,6 @@ impl KtstrTestEntry {
         performance_mode: false,
         no_perf_mode: false,
         duration: Duration::from_secs(12),
-        workers_per_cgroup: 2,
         expect_err: false,
         host_only: false,
         extra_include_files: &[],
@@ -960,8 +957,6 @@ impl KtstrTestEntry {
     /// - `memory_mb` must be `> 0` (a VM with zero memory cannot boot).
     /// - `duration` must be `> 0` (a zero-duration run never exercises
     ///   the scheduler and produces no telemetry).
-    /// - `workers_per_cgroup` must be `> 0` (zero workers emit no
-    ///   `WorkerReport`s so assertions again pass vacuously).
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.name.is_empty() {
             anyhow::bail!(
@@ -991,14 +986,6 @@ impl KtstrTestEntry {
                 "KtstrTestEntry '{}'.duration must be > 0 (a zero-duration \
                  run never exercises the scheduler and produces no data \
                  for assertions)",
-                self.name,
-            );
-        }
-        if self.workers_per_cgroup == 0 {
-            anyhow::bail!(
-                "KtstrTestEntry '{}'.workers_per_cgroup must be > 0 (a \
-                 zero-worker cgroup emits no WorkerReports and assertions \
-                 vacuously pass)",
                 self.name,
             );
         }
@@ -1418,7 +1405,6 @@ mod tests {
         assert!(!d.performance_mode);
         assert!(!d.no_perf_mode);
         assert_eq!(d.duration, Duration::from_secs(12));
-        assert_eq!(d.workers_per_cgroup, 2);
         assert!(!d.expect_err);
         assert!(!d.host_only);
         // Payload slot defaults to None (scheduler-only entry); workloads
@@ -2094,13 +2080,13 @@ mod tests {
 
     #[test]
     fn ktstr_test_entry_validate_accepts_defaults() {
-        let e = validate_entry("ok", 512, Duration::from_secs(2), 2);
+        let e = validate_entry("ok", 512, Duration::from_secs(2));
         e.validate().unwrap();
     }
 
     #[test]
     fn ktstr_test_entry_validate_rejects_empty_name() {
-        let e = validate_entry("", 512, Duration::from_secs(2), 2);
+        let e = validate_entry("", 512, Duration::from_secs(2));
         let err = e.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -2111,7 +2097,7 @@ mod tests {
 
     #[test]
     fn ktstr_test_entry_validate_rejects_zero_memory() {
-        let e = validate_entry("t", 0, Duration::from_secs(2), 2);
+        let e = validate_entry("t", 0, Duration::from_secs(2));
         let err = e.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -2122,22 +2108,11 @@ mod tests {
 
     #[test]
     fn ktstr_test_entry_validate_rejects_zero_duration() {
-        let e = validate_entry("t", 512, Duration::ZERO, 2);
+        let e = validate_entry("t", 512, Duration::ZERO);
         let err = e.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("duration") && msg.contains("> 0"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn ktstr_test_entry_validate_rejects_zero_workers() {
-        let e = validate_entry("t", 512, Duration::from_secs(2), 0);
-        let err = e.validate().unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("workers_per_cgroup") && msg.contains("> 0"),
             "got: {msg}"
         );
     }

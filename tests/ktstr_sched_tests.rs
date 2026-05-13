@@ -148,7 +148,6 @@ static __KTSTR_ENTRY_BPF_HOST_WRITE_STALLS: ktstr::test_support::KtstrTestEntry 
     threads = 1,
     performance_mode = true,
     duration_s = 3,
-    workers_per_cgroup = 2,
     sustained_samples = 15,
     watchdog_timeout_s = 15,
 )]
@@ -187,7 +186,6 @@ static __KTSTR_ENTRY_PERF_NEG: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--degrade"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(5),
-        workers_per_cgroup: 4,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -223,7 +221,6 @@ static __KTSTR_ENTRY_SCATTER: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--scattershot"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(5),
-        workers_per_cgroup: 4,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -252,7 +249,6 @@ static __KTSTR_ENTRY_SLOW: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--slow"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(5),
-        workers_per_cgroup: 4,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -276,7 +272,6 @@ static __KTSTR_ENTRY_AUTO_REPRO: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -431,7 +426,6 @@ static __KTSTR_ENTRY_WATCHDOG_TIMING: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--stall-after=1"],
         watchdog_timeout: std::time::Duration::from_secs(2),
         duration: std::time::Duration::from_secs(15),
-        workers_per_cgroup: 2,
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
@@ -454,7 +448,6 @@ static __KTSTR_ENTRY_EEVDF: ktstr::test_support::KtstrTestEntry =
         auto_repro: false,
         performance_mode: true,
         duration: std::time::Duration::from_secs(3),
-        workers_per_cgroup: 4,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -467,7 +460,6 @@ static __KTSTR_ENTRY_SCX: ktstr::test_support::KtstrTestEntry =
         scheduler: &KTSTR_SCHED,
         performance_mode: true,
         duration: std::time::Duration::from_secs(3),
-        workers_per_cgroup: 4,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT
     };
 
@@ -526,7 +518,6 @@ static __KTSTR_ENTRY_MID_DEGRADE: ktstr::test_support::KtstrTestEntry =
         extra_sched_args: &["--degrade-after=3"],
         performance_mode: true,
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 4,
         watchdog_timeout: std::time::Duration::from_secs(60),
         expect_err: true,
         ..ktstr::test_support::KtstrTestEntry::DEFAULT

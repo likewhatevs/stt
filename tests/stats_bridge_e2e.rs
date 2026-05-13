@@ -105,7 +105,6 @@ fn assert_stats_round_trip(result: &VmResult) -> Result<()> {
     num_snapshots = 1,
     duration_s = 5,
     watchdog_timeout_s = 15,
-    workers_per_cgroup = 2,
     auto_repro = false,
     post_vm = assert_stats_round_trip,
 )]

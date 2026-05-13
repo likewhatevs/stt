@@ -393,7 +393,6 @@ static __KTSTR_ENTRY_SNAPSHOT_OP_IN_VM: ktstr::test_support::KtstrTestEntry =
         // `tests/ktstr_sched_tests.rs`.
         duration: std::time::Duration::from_secs(3),
         watchdog_timeout: std::time::Duration::from_secs(15),
-        workers_per_cgroup: 2,
         // Skip auto-repro: this test drives bridge-side behaviour,
         // not scheduler correctness — a probe-attached repro VM
         // adds runtime without value when the scenario passes.
@@ -566,7 +565,6 @@ static __KTSTR_ENTRY_WATCH_SNAPSHOT_EXIT: ktstr::test_support::KtstrTestEntry =
         // teardown stays inside the test duration.
         watchdog_timeout: std::time::Duration::from_secs(3),
         duration: std::time::Duration::from_secs(10),
-        workers_per_cgroup: 2,
         // The scenario surfaces a failed AssertResult because the
         // scheduler intentionally dies; `expect_err: true` inverts
         // that to PASS. Snapshot/watch assertion failures bubble

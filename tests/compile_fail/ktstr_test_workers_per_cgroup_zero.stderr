@@ -1,7 +1,0 @@
-error: workers_per_cgroup must be > 0 (a zero-worker cgroup emits no WorkerReports and assertions vacuously pass)
- --> tests/compile_fail/ktstr_test_workers_per_cgroup_zero.rs:3:1
-  |
-3 | #[ktstr_test(workers_per_cgroup = 0)]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  |
-  = note: this error originates in the attribute macro `ktstr_test` (in Nightly builds, run with -Z macro-backtrace for more info)

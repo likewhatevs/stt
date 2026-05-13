@@ -44,7 +44,6 @@ macro_rules! gate_test {
             performance_mode: $perf,
             extra_sched_args: if $neg { &["--degrade"] } else { &[] },
             expect_err: $neg,
-            workers_per_cgroup: if $neg { 4 } else { 2 },
             duration: std::time::Duration::from_secs(5),
             ..KtstrTestEntry::DEFAULT
         };

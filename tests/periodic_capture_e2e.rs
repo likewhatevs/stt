@@ -120,7 +120,6 @@ fn assert_periodic_captures(result: &VmResult) -> Result<()> {
     scheduler = KTSTR_SCHED,
     duration_s = 10,
     watchdog_timeout_s = 15,
-    workers_per_cgroup = 2,
     num_snapshots = 3,
     auto_repro = false,
     post_vm = assert_periodic_captures,
