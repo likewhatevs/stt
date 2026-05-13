@@ -1,0 +1,5 @@
+error: declare_scheduler!: missing required field `binary`. Every user scheduler must declare its binary (e.g. `binary = "scx_mitosis"`) — omitting it would register the scheduler as the kernel-default EEVDF baseline. To test under the kernel-default scheduler, reference `ktstr::test_support::Scheduler::EEVDF` directly instead of declaring a new scheduler.
+ --> tests/compile_fail/declare_scheduler_missing_binary.rs:9:20
+  |
+9 | declare_scheduler!(MY_SCHED, {
+  |                    ^^^^^^^^

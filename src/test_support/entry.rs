@@ -1215,8 +1215,68 @@ pub fn find_test(name: &str) -> Option<&'static KtstrTestEntry> {
 /// [`declare_scheduler!`](crate::declare_scheduler), not the
 /// SCREAMING_SNAKE_CASE const identifier the macro emits). Returns
 /// `None` if no registered scheduler matches.
+///
+/// Two `declare_scheduler!` invocations that share a `name = "..."`
+/// value (under distinct const idents) both register in
+/// [`KTSTR_SCHEDULERS`]; a linear scan returns the first match and
+/// the second is unreachable. This function panics on the first call
+/// when any duplicate exists so the misconfiguration surfaces
+/// loudly instead of silently dropping a registration. The scan and
+/// map construction happen once per process via a `LazyLock`.
 pub fn find_scheduler(name: &str) -> Option<&'static Scheduler> {
-    KTSTR_SCHEDULERS.iter().find(|s| s.name == name).copied()
+    scheduler_index().get(name).copied()
+}
+
+/// Process-wide index from [`Scheduler::name`] to the registered
+/// `&'static Scheduler`. Built once on first lookup. Detects
+/// duplicate names and panics with both colliding consts' addresses
+/// so the test author can identify the two declarations.
+fn scheduler_index() -> &'static std::collections::HashMap<&'static str, &'static Scheduler> {
+    static INDEX: std::sync::LazyLock<std::collections::HashMap<&'static str, &'static Scheduler>> =
+        std::sync::LazyLock::new(|| build_scheduler_index_or_panic(KTSTR_SCHEDULERS.iter().copied()));
+    &INDEX
+}
+
+/// Build a name → scheduler map from an iterator of registered
+/// schedulers, panicking on the first duplicate name. Factored out
+/// so [`tests`] can exercise the duplicate-detection branch against a
+/// mock slice — the real [`KTSTR_SCHEDULERS`] is the union of every
+/// `declare_scheduler!` invocation in the linked binary and so
+/// cannot host an intentional duplicate without poisoning every
+/// other test.
+fn build_scheduler_index_or_panic<I>(
+    schedulers: I,
+) -> std::collections::HashMap<&'static str, &'static Scheduler>
+where
+    I: IntoIterator<Item = &'static Scheduler>,
+{
+    let mut map: std::collections::HashMap<&'static str, &'static Scheduler> =
+        std::collections::HashMap::new();
+    for sched in schedulers {
+        if let Some(prev) = map.insert(sched.name, sched)
+            && !std::ptr::eq(prev, sched)
+        {
+            // `{:p}` prints the pointer in the standard `0x…` form
+            // so a user diff'ing two declarations can tell at a
+            // glance whether they're literally the same static
+            // (re-export of the same const, harmless) or two
+            // distinct consts with the same `name = "..."` (the
+            // collision this guard exists for).
+            panic!(
+                "ktstr: duplicate scheduler name `{name}` registered \
+                 in KTSTR_SCHEDULERS:\n  \
+                 first: {prev:p}\n  \
+                 second: {sched:p}\n\
+                 Two `declare_scheduler!` invocations declared the \
+                 same `name = \"{name}\"`. The first registration \
+                 wins under linear scan and the second is unreachable. \
+                 Rename one of the declarations or remove the \
+                 duplicate.",
+                name = sched.name,
+            );
+        }
+    }
+    map
 }
 
 /// JSON shape projected from a registered [`Scheduler`]. Each entry
@@ -2010,6 +2070,26 @@ mod tests {
         assert_eq!(s.assert.max_imbalance_ratio, Some(3.0));
     }
 
+    #[test]
+    fn scheduler_new_default_topology_matches_macro_hardcode() {
+        // The `declare_scheduler!` macro at
+        // `ktstr-macros/src/lib.rs` hardcodes
+        // `(numa=1, llcs=1, cores_per_llc=2, threads_per_core=1)`
+        // as the fallback when the user omits `topology = (...)`.
+        // That hardcode mirrors `Scheduler::new`'s default Topology.
+        // The two sites are mechanically coupled by convention but
+        // not by code: a change to `Scheduler::new` here would
+        // silently let the macro check stale values, producing
+        // misleading "effective topology llcs (N)" errors and/or
+        // false-positives. Pin the defaults here so a drift fails
+        // this test loudly and points at both sites.
+        let s = Scheduler::new("__macro_default_topology_pin__");
+        assert_eq!(s.topology.numa_nodes, 1);
+        assert_eq!(s.topology.llcs, 1);
+        assert_eq!(s.topology.cores_per_llc, 2);
+        assert_eq!(s.topology.threads_per_core, 1);
+    }
+
     // -- KtstrTestEntry::validate coverage --
 
     #[test]
@@ -2499,5 +2579,48 @@ mod tests {
             ..KtstrTestEntry::DEFAULT
         };
         assert!(entry.all_include_files().is_empty());
+    }
+
+    /// Dedup-detection: two distinct `&'static Scheduler` consts with
+    /// the same `name` field must panic when `find_scheduler` builds
+    /// its name → scheduler map. Exercises the
+    /// `build_scheduler_index_or_panic` branch against a mock slice
+    /// since the real `KTSTR_SCHEDULERS` is the union of every
+    /// `declare_scheduler!` registration in the linked test binary
+    /// and so cannot host an intentional duplicate without
+    /// poisoning every other test that calls `find_scheduler`.
+    #[test]
+    #[should_panic(expected = "duplicate scheduler name `dup_name_test`")]
+    fn build_scheduler_index_or_panic_rejects_duplicate_names() {
+        // Two consts with the same name. Address-distinct so
+        // `std::ptr::eq` returns false and the dedup branch fires.
+        static A: Scheduler = Scheduler::new("dup_name_test");
+        static B: Scheduler = Scheduler::new("dup_name_test");
+        let _ = build_scheduler_index_or_panic([&A, &B]);
+    }
+
+    /// Distinct names build a populated index without panicking, and
+    /// the returned map points back at the same `&'static Scheduler`
+    /// references for lookup parity with `find_scheduler`.
+    #[test]
+    fn build_scheduler_index_or_panic_accepts_distinct_names() {
+        static A: Scheduler = Scheduler::new("dup_name_a");
+        static B: Scheduler = Scheduler::new("dup_name_b");
+        let map = build_scheduler_index_or_panic([&A, &B]);
+        assert!(std::ptr::eq(*map.get("dup_name_a").unwrap(), &A));
+        assert!(std::ptr::eq(*map.get("dup_name_b").unwrap(), &B));
+    }
+
+    /// Same `&'static Scheduler` passed twice (a benign re-export of
+    /// the same const, not a true duplicate-name collision across
+    /// distinct consts) does not panic — `std::ptr::eq` short-circuits
+    /// the dedup branch. Linkme's distributed slice is allowed to
+    /// emit the same registration through multiple paths; only a
+    /// pointer-distinct duplicate is a misconfiguration.
+    #[test]
+    fn build_scheduler_index_or_panic_tolerates_pointer_identity_aliases() {
+        static A: Scheduler = Scheduler::new("alias_test");
+        let map = build_scheduler_index_or_panic([&A, &A]);
+        assert!(std::ptr::eq(*map.get("alias_test").unwrap(), &A));
     }
 }

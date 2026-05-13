@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernels` entry `abc..def` contains `..` but the endpoints aren't both version-shaped (`MAJOR.MINOR[.PATCH][-rcN]`). If this was meant as a version range, fix the endpoints (e.g. `6.14..7.0`). If this is a literal cache key, remove the `..` — cache keys do not use range syntax.
+  --> tests/compile_fail/declare_scheduler_invalid_kernel.rs:14:16
+   |
+14 |     kernels = ["abc..def"],
+   |                ^^^^^^^^^^

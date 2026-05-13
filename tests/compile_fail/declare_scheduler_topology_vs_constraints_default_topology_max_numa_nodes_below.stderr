@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.max_numa_nodes (Some(0)) is below effective topology numa_nodes (1); every gauntlet preset would reject this test at runtime and the test would never execute. (`topology` field omitted; macro fell back to Scheduler::new's default `(numa=1, llcs=1, cores=2, threads=1)`. Add an explicit `topology = (numa, llcs, cores, threads)` to override.)
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints_default_topology_max_numa_nodes_below.rs:12:25
+   |
+12 |         max_numa_nodes: Some(0),
+   |                         ^^^^^^^

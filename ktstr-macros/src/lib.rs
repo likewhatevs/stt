@@ -4,6 +4,18 @@ use syn::{
     Data, DeriveInput, Fields, ItemFn, Meta, MetaNameValue, parse::Parser, parse_macro_input,
 };
 
+// `kernel_path` is mirrored from the parent ktstr crate via
+// `build.rs` (see that file for the rationale). It exposes
+// `KernelId::parse` + `KernelId::validate` — the same parser the
+// verifier uses at runtime — so `declare_scheduler!` can reject
+// obviously-malformed `kernels = [..]` entries at macro expand time
+// instead of letting them surface as "cache key not found" errors
+// inside the verifier.
+#[allow(dead_code)]
+mod kernel_path {
+    include!(concat!(env!("OUT_DIR"), "/kernel_path.rs"));
+}
+
 /// Emit `Some(value)` or `None` as token streams.
 fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenStream {
     match opt {
@@ -1479,14 +1491,14 @@ fn camel_to_screaming_snake(s: &str) -> String {
 /// | Field | Required | Description |
 /// |---|---|---|
 /// | `name = "..."` | yes | Scheduler name (sidecar / logs). |
-/// | `binary = "..."` | no | Binary name → `SchedulerSpec::Discover(...)`. Matched against `[[bin]]` names in `target/{debug,release}/`, the test binary's directory, or `KTSTR_SCHEDULER` env var. Often equal to the cargo package name but not required to be. Omit for the EEVDF baseline. |
+/// | `binary = "..."` | yes | Binary name → `SchedulerSpec::Discover(...)`. Matched against `[[bin]]` names in `target/{debug,release}/`, the test binary's directory, or `KTSTR_SCHEDULER` env var. Often equal to the cargo package name but not required to be. To target the EEVDF baseline, reference [`ktstr::test_support::Scheduler::EEVDF`] directly instead of declaring a new scheduler. |
 /// | `topology = (numa, llcs, cores, threads)` | no | Default VM topology. Default: `(1, 1, 2, 1)` (from `Scheduler::new`). Validated at compile time: each value must be non-zero, and `llcs` must be a multiple of `numa`. |
 /// | `cgroup_parent = "..."` | no | Cgroup parent path (must begin with `/`). |
 /// | `sched_args = [..]` | no | Scheduler CLI args prepended before per-test `extra_sched_args`. |
 /// | `sysctls = [Sysctl::new("k", "v"), ..]` | no | Guest sysctls. |
 /// | `kargs = [..]` | no | Extra guest kernel cmdline args. |
-/// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#REF`), paths, and cache keys. |
-/// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto [`Scheduler::constraints`]. Filters which gauntlet topology presets exercise this scheduler. |
+/// | `kernels = ["6.14", "7.0..=7.2", ..]` | no | Kernel specs the verifier sweeps. Same parser as the `--kernel` CLI flag — accepts exact versions, ranges (`..` or `..=`, both inclusive), git refs (`git+URL#REF`), paths, and cache keys. Each entry is validated at macro-expand time via the same `KernelId::parse` + `validate` the verifier uses at runtime; empty entries, inverted ranges, and `..`-containing strings whose endpoints aren't version-shaped (e.g. `"abc..def"`) are rejected. |
+/// | `constraints = TopologyConstraints { .. }` | no | Gauntlet preset constraints — maps directly onto [`Scheduler::constraints`]. Filters which gauntlet topology presets exercise this scheduler. When given as a struct literal, the macro additionally cross-checks each literal field against the effective topology (explicit `topology` field if present, otherwise the `(1, 1, 2, 1)` default from `Scheduler::new`) and rejects infeasible pairings; non-struct-literal forms (e.g. `OTHER::CONST_CONSTRAINTS`) skip that check. |
 /// | `config_file = "..."` | no | Host-side config file path. |
 ///
 /// # Fields not yet supported
@@ -1709,10 +1721,89 @@ fn declare_scheduler_inner(
                 sched_kernels_set = true;
                 let arr = expect_array(&value, &key, "kernels")?;
                 for elem in &arr.elems {
-                    sched_kernels.push(expect_str_lit_element(elem, "kernels")?);
+                    let s = expect_str_lit_element(elem, "kernels")?;
+                    // Empty kernel strings parse as `CacheKey("")` and
+                    // fail confusingly at verifier runtime with "cache
+                    // key not found". Reject up-front so the diagnostic
+                    // lands on the literal in the source.
+                    if s.is_empty() {
+                        return Err(syn::Error::new_spanned(
+                            elem,
+                            "declare_scheduler!: `kernels` entry must \
+                             be a non-empty string. Accepted forms: \
+                             exact version (`6.14`), inclusive range \
+                             (`6.14..7.0` or `6.14..=7.0`), git source \
+                             (`git+URL#REF`), absolute or `~`-prefixed \
+                             path, or cache key.",
+                        ));
+                    }
+                    // Run the same `KernelId::parse` + `validate` the
+                    // verifier uses so any malformed entry — inverted
+                    // range, suspicious `..` substring that fails the
+                    // range grammar — is caught at the call site
+                    // rather than as a confusing runtime "cache key
+                    // not found" error.
+                    let parsed = kernel_path::KernelId::parse(&s);
+                    if let Err(msg) = parsed.validate() {
+                        return Err(syn::Error::new_spanned(
+                            elem,
+                            format!("declare_scheduler!: invalid kernel \
+                                     spec `{s}`: {msg}"),
+                        ));
+                    }
+                    // A literal containing `..` that did not classify
+                    // as a Range almost always indicates a typo'd
+                    // range spec (e.g. `"abc..def"` where neither
+                    // endpoint is version-shaped, or `"6.14..xyz"`).
+                    // Per-variant disambiguation: `CacheKey("a..b")`
+                    // is wrong because cache keys are content-addressed
+                    // identifiers that don't carry `..` separators;
+                    // `Path("foo/..bar")` is fine (file paths legally
+                    // contain `..`) and already matched the Path arm.
+                    if s.contains("..")
+                        && matches!(parsed, kernel_path::KernelId::CacheKey(_))
+                    {
+                        return Err(syn::Error::new_spanned(
+                            elem,
+                            format!(
+                                "declare_scheduler!: `kernels` entry `{s}` \
+                                 contains `..` but the endpoints aren't both \
+                                 version-shaped (`MAJOR.MINOR[.PATCH][-rcN]`). \
+                                 If this was meant as a version range, \
+                                 fix the endpoints (e.g. `6.14..7.0`). \
+                                 If this is a literal cache key, remove \
+                                 the `..` — cache keys do not use \
+                                 range syntax.",
+                            ),
+                        ));
+                    }
+                    sched_kernels.push(s);
                 }
             }
             "constraints" => {
+                // `constraints` lands in a `pub static`, so the
+                // expression must be const-evaluable. Reject the
+                // common typo of passing a non-const helper call
+                // (`build_constraints()`, `default_topology().min_llcs(4)`,
+                // `Foo::derive(...).constraints`) up-front so the
+                // diagnostic explains the constraint instead of
+                // letting rustc surface a deep, confusing
+                // const-eval-failure chain at the spread site.
+                //
+                // Accepted shapes:
+                //   - `TopologyConstraints { ..TopologyConstraints::DEFAULT }`
+                //     (struct literal — the canonical form, used by
+                //     every in-tree call site)
+                //   - `TopologyConstraints::DEFAULT` (path expression
+                //     — bare DEFAULT or any other `const` path)
+                //   - `( … )` (parenthesized const-eligible expression
+                //     — pass-through to the underlying form so a user
+                //     who wraps for clarity is not punished)
+                //   - reference / unary on top of any accepted form
+                //
+                // Calls and method chains are rejected with a hint
+                // describing the const-eligible alternatives.
+                validate_constraints_expr(&value)?;
                 sched_constraints = Some(value);
             }
             "config_file" => {
@@ -1740,21 +1831,72 @@ fn declare_scheduler_inner(
             "declare_scheduler!: `name` must be a non-empty string",
         ));
     }
+    // Require `binary = ...`. Omitting binary previously defaulted the
+    // emitted Scheduler to `SchedulerSpec::Eevdf` (the kernel-default
+    // baseline). Now that `name = "eevdf"` is reserved, the omit-binary
+    // path always silently registered a user scheduler as the EEVDF
+    // baseline — wrong for every user. Reject at expand time so the
+    // diagnostic surfaces at the call site.
+    let sched_binary = sched_binary.ok_or_else(|| {
+        syn::Error::new(
+            const_name.span(),
+            "declare_scheduler!: missing required field `binary`. \
+             Every user scheduler must declare its binary (e.g. \
+             `binary = \"scx_mitosis\"`) — omitting it would register \
+             the scheduler as the kernel-default EEVDF baseline. \
+             To test under the kernel-default scheduler, reference \
+             `ktstr::test_support::Scheduler::EEVDF` directly \
+             instead of declaring a new scheduler.",
+        )
+    })?;
 
     // Validate topology.
     if let Some((n, l, c, t)) = sched_topology {
         if n == 0 || l == 0 || c == 0 || t == 0 {
             return Err(syn::Error::new(
                 const_name.span(),
-                "topology values must all be > 0",
+                "declare_scheduler!: topology values must all be > 0",
             ));
         }
         if l % n != 0 {
             return Err(syn::Error::new(
                 const_name.span(),
-                format!("topology: llcs ({l}) must be divisible by numa_nodes ({n})"),
+                format!(
+                    "declare_scheduler!: topology: llcs ({l}) must \
+                     be divisible by numa_nodes ({n})"
+                ),
             ));
         }
+    }
+
+    // Sanity-check the effective topology vs explicit
+    // struct-literal constraints. Without this, both
+    // `topology = (1, 2, 4, 1)` AND an omitted topology paired
+    // with `constraints = TopologyConstraints { min_llcs: 100, .. }`
+    // are silently accepted: every gauntlet preset rejects the
+    // test at runtime because the effective topology violates
+    // the declared minimum (100 LLCs), and the test never runs.
+    //
+    // When `topology` is omitted the runtime falls back to
+    // `Scheduler::new`'s default (numa_nodes=1, llcs=1,
+    // cores_per_llc=2, threads_per_core=1, total_cpus=2) — see
+    // `Scheduler::new` in `src/test_support/entry.rs`. The macro
+    // checks against the same default so infeasible constraints
+    // are caught regardless of whether the caller pinned a
+    // topology.
+    //
+    // The macro can only walk the constraint fields when the
+    // expression is a struct literal — non-struct-literal forms
+    // (`TopologyConstraints::DEFAULT`, a const path) carry values
+    // the macro cannot inspect at expand time, so the check no-ops
+    // for those shapes.
+    if let Some(constraints_expr) = sched_constraints.as_ref()
+        && let syn::Expr::Struct(es) = constraints_expr
+    {
+        let topology_is_default = sched_topology.is_none();
+        let (n, l, c, t) = sched_topology.unwrap_or((1, 1, 2, 1));
+        let total = (l as u64) * (c as u64) * (t as u64);
+        check_constraint_field_against_topology(es, n, l, total, t, topology_is_default)?;
     }
 
     // Build the Scheduler const expression via the builder chain.
@@ -1763,11 +1905,9 @@ fn declare_scheduler_inner(
         ::ktstr::test_support::Scheduler::new(#sched_name_str)
     };
 
-    if let Some(binary) = &sched_binary {
-        builder_chain = quote! {
-            #builder_chain.binary(::ktstr::test_support::SchedulerSpec::Discover(#binary))
-        };
-    }
+    builder_chain = quote! {
+        #builder_chain.binary(::ktstr::test_support::SchedulerSpec::Discover(#sched_binary))
+    };
     if let Some((n, l, c, t)) = sched_topology {
         builder_chain = quote! { #builder_chain.topology(#n, #l, #c, #t) };
     }
@@ -1866,6 +2006,373 @@ fn expect_array<'a>(
             format!("declare_scheduler!: `{field}` must be an array literal `[..]`"),
         ))
     }
+}
+
+/// Reject `declare_scheduler!`'s `constraints = EXPR` argument when
+/// `EXPR` shape cannot be const-evaluated. `constraints` flows into a
+/// `pub static`, so the expression must be const-eligible — non-const
+/// helper calls (`Expr::Call`, `Expr::MethodCall`) yield deep
+/// const-eval failures at the spread site that are hard to map back
+/// to the original mistake. Catch them at expand time with a
+/// targeted diagnostic.
+///
+/// Recurses into struct-literal field values and the `..rest` spread:
+/// `TopologyConstraints { min_llcs: build_value(), .. }` is just as
+/// broken as `build_constraints()` itself, and would otherwise slip
+/// through because the outer shape is `Expr::Struct`.
+fn validate_constraints_expr(expr: &syn::Expr) -> syn::Result<()> {
+    match expr {
+        // Canonical struct-literal form (`TopologyConstraints { .. }`).
+        // Recurse into each field value AND the `..rest` spread so
+        // that non-const expressions inside fields (which the outer
+        // `Struct` shape would otherwise mask) are caught at expand
+        // time. Without this, `TopologyConstraints { min_llcs:
+        // build_value(), ..DEFAULT }` slips past the outer-shape
+        // gate and surfaces as a deep const-eval failure inside the
+        // emitted static.
+        syn::Expr::Struct(es) => {
+            for fv in &es.fields {
+                validate_constraints_expr(&fv.expr)?;
+            }
+            if let Some(rest) = &es.rest {
+                validate_constraints_expr(rest)?;
+            }
+            Ok(())
+        }
+        // Path expression (`TopologyConstraints::DEFAULT`, an
+        // associated const, a re-export).
+        syn::Expr::Path(_) => Ok(()),
+        // Parenthesized expression — pass-through.
+        syn::Expr::Paren(p) => validate_constraints_expr(&p.expr),
+        // Reference (`&TopologyConstraints::DEFAULT`) — accept any
+        // const-eligible inner form. The Scheduler builder takes
+        // `TopologyConstraints` by value, not by reference, so a
+        // reference here will surface a downstream type-mismatch
+        // error rather than a confusing const-eval failure — that
+        // diagnostic is already adequate.
+        syn::Expr::Reference(r) => validate_constraints_expr(&r.expr),
+        // Unary (`!x`, `-x`) — accept; rustc rejects non-const
+        // operators downstream.
+        syn::Expr::Unary(u) => validate_constraints_expr(&u.expr),
+        // Binary arithmetic — recurse into BOTH operands. Without
+        // recursion, `min_llcs: build_value() + 1` would slip
+        // through the outer Binary acceptance and surface as a deep
+        // const-eval failure inside the emitted static.
+        syn::Expr::Binary(b) => {
+            validate_constraints_expr(&b.left)?;
+            validate_constraints_expr(&b.right)?;
+            Ok(())
+        }
+        // Literal — accept (e.g. a `const FOO: TopologyConstraints`
+        // referenced through some non-Path shape; rustc will catch
+        // a type mismatch downstream).
+        syn::Expr::Lit(_) => Ok(()),
+        // Method calls are always non-const-eligible at expand time:
+        // `TopologyConstraints::DEFAULT.with_min_llcs(4)` etc.
+        syn::Expr::MethodCall(_) => Err(constraints_not_const_error(expr, true)),
+        // Function calls split by func-path convention:
+        //   * `Some(8)`, `Variant(x)`, `MyTuple(...)` — PascalCase
+        //     last segment indicates a tuple-struct or enum-variant
+        //     constructor, which IS const-eligible (`Option::Some`
+        //     in particular is what `max_*: Some(N)` fields use).
+        //     Even so, the args may themselves be non-const — recurse
+        //     into each so `Some(my_helper())` is rejected.
+        //   * `build_value()`, `helper()` — lowercase last segment
+        //     is the snake_case free-fn pattern and is NOT
+        //     const-eligible.
+        // The PascalCase heuristic is imperfect but matches Rust
+        // naming convention; the alternative — a deep const-eval
+        // diagnostic at the spread site — is strictly worse.
+        syn::Expr::Call(call) => {
+            if call_func_is_pascal_constructor(&call.func) {
+                for arg in &call.args {
+                    validate_constraints_expr(arg)?;
+                }
+                Ok(())
+            } else {
+                Err(constraints_not_const_error(expr, true))
+            }
+        }
+        // Block expressions — reject with tailored guidance.
+        // Blocks would require walking statements + let-bindings to
+        // validate, and the common case (`{ literal }`) is just
+        // ceremony — the operator can drop the braces.
+        syn::Expr::Block(_) => Err(syn::Error::new_spanned(
+            expr,
+            "declare_scheduler!: `constraints` must be a const-evaluable \
+             expression (emitted into a `pub static`). Block expressions \
+             like `{ ... }` are not const-eligible here — for a single \
+             literal value, drop the braces (write `min_llcs: 100` not \
+             `min_llcs: { 100 }`). For shared values, use a const binding \
+             (`const MY_MIN: u32 = 100;` then `min_llcs: MY_MIN`).",
+        )),
+        // Anything else (closure, async, await, while, match, etc.)
+        // — not const-eligible. Catchall produces the base message
+        // without the call-specific hint.
+        _ => Err(constraints_not_const_error(expr, false)),
+    }
+}
+
+/// Heuristic: does this call expression look like a tuple-struct
+/// or enum-variant constructor (`Some(x)`, `MyVariant(x)`,
+/// `Foo::Bar(x)`)? Rust naming convention reserves PascalCase for
+/// types and variants; a function-path whose last segment starts
+/// with an uppercase ASCII letter is therefore very likely a
+/// const-eligible constructor, while a lowercase last segment
+/// (`build_value()`) is the snake_case free-fn pattern.
+fn call_func_is_pascal_constructor(func: &syn::Expr) -> bool {
+    let syn::Expr::Path(ep) = func else {
+        return false;
+    };
+    path_last_segment_ident(&ep.path).is_some_and(|ident| {
+        ident
+            .to_string()
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_uppercase())
+    })
+}
+
+/// Return the last segment's identifier of a path, or `None` for an
+/// empty path. Used by helpers that match on a path's tail name
+/// (`Some`, `BTreeSet`, etc.) without forcing the caller to import
+/// the full path.
+fn path_last_segment_ident(path: &syn::Path) -> Option<&syn::Ident> {
+    path.segments.last().map(|s| &s.ident)
+}
+
+/// Emit the shared `declare_scheduler!`: `constraints` not-const-eligible
+/// diagnostic. `append_call_hint` adds the trailing sentence about
+/// helper calls and method chains failing at the spread site — used
+/// for the `Call`/`MethodCall` arm where that hint is load-bearing.
+fn constraints_not_const_error(expr: &syn::Expr, append_call_hint: bool) -> syn::Error {
+    let base = "declare_scheduler!: `constraints` must be a const-evaluable expression \
+                (emitted into a `pub static`). Use a struct literal \
+                `TopologyConstraints { ..TopologyConstraints::DEFAULT }` \
+                or a const path like `TopologyConstraints::DEFAULT`.";
+    let msg = if append_call_hint {
+        format!(
+            "{base} Non-const helper calls and method chains are not \
+             const-eligible and would fail with a deep const-eval \
+             diagnostic at the spread site."
+        )
+    } else {
+        base.to_string()
+    };
+    syn::Error::new_spanned(expr, msg)
+}
+
+/// Walk a `TopologyConstraints { .. }` struct literal and reject
+/// fields whose literal values make the declared scheduler topology
+/// `(numa, llcs, _, threads)` infeasible (total CPUs = `total`,
+/// threads_per_core = `threads`).
+///
+/// Only literal-valued fields are checked — non-literal expressions
+/// (paths, calls) carry values the macro cannot evaluate. Fields
+/// dropped via `..TopologyConstraints::DEFAULT` are also not
+/// validated against the DEFAULT values; doing so would silently
+/// reject test authors who pair an explicit non-default topology
+/// with the default constraint set on the assumption that those
+/// defaults match. Limiting the check to fields the user explicitly
+/// wrote keeps the diagnostic targeted: it fires only when an
+/// explicit constraint contradicts an explicit topology.
+fn check_constraint_field_against_topology(
+    es: &syn::ExprStruct,
+    numa: u32,
+    llcs: u32,
+    total_cpus: u64,
+    threads_per_core: u32,
+    topology_is_default: bool,
+) -> syn::Result<()> {
+    // When `topology` was omitted, the macro inferred Scheduler::new
+    // defaults. Reading "effective topology llcs (1)" without
+    // context makes a user wonder where the 1 came from — they
+    // didn't write a topology field. Append a tail that names the
+    // fallback source + the override syntax.
+    let topology_origin_tail = if topology_is_default {
+        " (`topology` field omitted; macro fell back to \
+         Scheduler::new's default `(numa=1, llcs=1, \
+         cores=2, threads=1)`. Add an explicit \
+         `topology = (numa, llcs, cores, threads)` to \
+         override.)"
+    } else {
+        ""
+    };
+    for fv in &es.fields {
+        let syn::Member::Named(ident) = &fv.member else {
+            continue;
+        };
+        let name = ident.to_string();
+        match name.as_str() {
+            "min_llcs" => {
+                if let Some(v) = u64_from_lit_expr(&fv.expr)
+                    && v > llcs as u64
+                {
+                    return Err(syn::Error::new_spanned(
+                        &fv.expr,
+                        format!(
+                            "declare_scheduler!: constraints.min_llcs \
+                             ({v}) exceeds effective topology llcs \
+                             ({llcs}); every gauntlet preset would \
+                             reject this test at runtime and the test \
+                             would never execute. Lower min_llcs to \
+                             {llcs} or fewer, or raise topology llcs.\
+                             {topology_origin_tail}",
+                        ),
+                    ));
+                }
+            }
+            "max_llcs" => {
+                if let Some(v) = u64_from_option_some_lit(&fv.expr)
+                    && v < llcs as u64
+                {
+                    return Err(syn::Error::new_spanned(
+                        &fv.expr,
+                        format!(
+                            "declare_scheduler!: constraints.max_llcs \
+                             (Some({v})) is below effective topology \
+                             llcs ({llcs}); every gauntlet preset \
+                             would reject this test at runtime and \
+                             the test would never execute. Raise \
+                             max_llcs to {llcs} or higher, or lower \
+                             topology llcs.{topology_origin_tail}",
+                        ),
+                    ));
+                }
+            }
+            "min_numa_nodes" => {
+                if let Some(v) = u64_from_lit_expr(&fv.expr)
+                    && v > numa as u64
+                {
+                    return Err(syn::Error::new_spanned(
+                        &fv.expr,
+                        format!(
+                            "declare_scheduler!: constraints.min_numa_nodes \
+                             ({v}) exceeds effective topology numa_nodes \
+                             ({numa}); every gauntlet preset would reject \
+                             this test at runtime and the test would \
+                             never execute.{topology_origin_tail}",
+                        ),
+                    ));
+                }
+            }
+            "max_numa_nodes" => {
+                if let Some(v) = u64_from_option_some_lit(&fv.expr)
+                    && v < numa as u64
+                {
+                    return Err(syn::Error::new_spanned(
+                        &fv.expr,
+                        format!(
+                            "declare_scheduler!: constraints.max_numa_nodes \
+                             (Some({v})) is below effective topology \
+                             numa_nodes ({numa}); every gauntlet preset \
+                             would reject this test at runtime and the \
+                             test would never execute.{topology_origin_tail}",
+                        ),
+                    ));
+                }
+            }
+            "min_cpus" => {
+                if let Some(v) = u64_from_lit_expr(&fv.expr)
+                    && v > total_cpus
+                {
+                    return Err(syn::Error::new_spanned(
+                        &fv.expr,
+                        format!(
+                            "declare_scheduler!: constraints.min_cpus \
+                             ({v}) exceeds effective topology total_cpus \
+                             ({total_cpus} = llcs * cores * threads); \
+                             every gauntlet preset would reject this \
+                             test at runtime and the test would never \
+                             execute.{topology_origin_tail}",
+                        ),
+                    ));
+                }
+            }
+            "max_cpus" => {
+                if let Some(v) = u64_from_option_some_lit(&fv.expr)
+                    && v < total_cpus
+                {
+                    return Err(syn::Error::new_spanned(
+                        &fv.expr,
+                        format!(
+                            "declare_scheduler!: constraints.max_cpus \
+                             (Some({v})) is below effective topology \
+                             total_cpus ({total_cpus} = llcs * cores * \
+                             threads); every gauntlet preset would \
+                             reject this test at runtime and the test \
+                             would never execute.{topology_origin_tail}",
+                        ),
+                    ));
+                }
+            }
+            "requires_smt" => {
+                if let Some(true) = bool_from_lit_expr(&fv.expr)
+                    && threads_per_core < 2
+                {
+                    return Err(syn::Error::new_spanned(
+                        &fv.expr,
+                        format!(
+                            "declare_scheduler!: constraints.requires_smt \
+                             = true but effective topology \
+                             threads_per_core = {threads_per_core}; SMT \
+                             requires threads_per_core >= 2. Set topology \
+                             threads_per_core to 2 (or higher) or drop \
+                             the requires_smt constraint.{topology_origin_tail}",
+                        ),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Extract a `u64` from a literal integer expression. Returns `None`
+/// for any other shape so non-literal field values pass through the
+/// macro-time check.
+fn u64_from_lit_expr(expr: &syn::Expr) -> Option<u64> {
+    let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Int(li),
+        ..
+    }) = expr
+    else {
+        return None;
+    };
+    li.base10_parse().ok()
+}
+
+/// Extract a `u64` from a `Some(<int literal>)` expression. Returns
+/// `None` for `None`, paths, or anything else — non-literal forms
+/// pass through unchecked.
+fn u64_from_option_some_lit(expr: &syn::Expr) -> Option<u64> {
+    let syn::Expr::Call(call) = expr else {
+        return None;
+    };
+    let syn::Expr::Path(ep) = &*call.func else {
+        return None;
+    };
+    if path_last_segment_ident(&ep.path)? != "Some" {
+        return None;
+    }
+    if call.args.len() != 1 {
+        return None;
+    }
+    u64_from_lit_expr(&call.args[0])
+}
+
+/// Extract a `bool` from a literal boolean expression. Returns `None`
+/// for any other shape.
+fn bool_from_lit_expr(expr: &syn::Expr) -> Option<bool> {
+    let syn::Expr::Lit(syn::ExprLit {
+        lit: syn::Lit::Bool(lb),
+        ..
+    }) = expr
+    else {
+        return None;
+    };
+    Some(lb.value())
 }
 
 /// Derive macro that generates a `Payload` const from an annotated
@@ -2438,9 +2945,9 @@ fn polarity_from_expr(expr: &syn::Expr) -> syn::Result<proc_macro2::TokenStream>
 /// stats structs all use the canonical `BTreeSet` / `Vec` names.
 fn is_path_named(ty: &syn::Type, name: &str) -> bool {
     if let syn::Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last()
+        && let Some(ident) = path_last_segment_ident(&tp.path)
     {
-        return seg.ident == name;
+        return ident == name;
     }
     false
 }

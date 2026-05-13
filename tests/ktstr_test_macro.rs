@@ -162,6 +162,7 @@ fn entry_post_vm_attr() {
 // Scheduler that exercises the sysctls + kargs attributes.
 ktstr::declare_scheduler!(SYS_KARGS_TEST, {
     name = "sys_kargs_test",
+    binary = "scx-ktstr",
     sysctls = [
         ktstr::test_support::Sysctl::new("kernel.sched_cfs_bandwidth_slice_us", "1000"),
         ktstr::test_support::Sysctl::new("kernel.sched_rr_timeslice_ms", "25"),
@@ -243,6 +244,7 @@ fn entry_max_constraints_match_attrs() {
 // Scheduler with constraint attributes for inheritance tests.
 ktstr::declare_scheduler!(CONSTRAINED_SCHED, {
     name = "constrained_sched",
+    binary = "scx-ktstr",
     topology = (1, 2, 4, 1),
     constraints = ktstr::test_support::TopologyConstraints {
         max_llcs: Some(8),

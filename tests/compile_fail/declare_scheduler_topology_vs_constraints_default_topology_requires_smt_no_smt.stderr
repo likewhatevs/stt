@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.requires_smt = true but effective topology threads_per_core = 1; SMT requires threads_per_core >= 2. Set topology threads_per_core to 2 (or higher) or drop the requires_smt constraint. (`topology` field omitted; macro fell back to Scheduler::new's default `(numa=1, llcs=1, cores=2, threads=1)`. Add an explicit `topology = (numa, llcs, cores, threads)` to override.)
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints_default_topology_requires_smt_no_smt.rs:12:23
+   |
+12 |         requires_smt: true,
+   |                       ^^^^

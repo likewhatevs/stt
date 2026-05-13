@@ -1,0 +1,5 @@
+error: declare_scheduler!: `constraints` must be a const-evaluable expression (emitted into a `pub static`). Block expressions like `{ ... }` are not const-eligible here — for a single literal value, drop the braces (write `min_llcs: 100` not `min_llcs: { 100 }`). For shared values, use a const binding (`const MY_MIN: u32 = 100;` then `min_llcs: MY_MIN`).
+  --> tests/compile_fail/declare_scheduler_constraints_block.rs:14:19
+   |
+14 |         min_llcs: { 100 },
+   |                   ^^^^^^^

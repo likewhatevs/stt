@@ -1,0 +1,5 @@
+error: declare_scheduler!: `constraints` must be a const-evaluable expression (emitted into a `pub static`). Use a struct literal `TopologyConstraints { ..TopologyConstraints::DEFAULT }` or a const path like `TopologyConstraints::DEFAULT`.
+  --> tests/compile_fail/declare_scheduler_constraints_closure.rs:13:19
+   |
+13 |     constraints = || TopologyConstraints::DEFAULT,
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

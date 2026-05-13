@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.max_llcs (Some(0)) is below effective topology llcs (1); every gauntlet preset would reject this test at runtime and the test would never execute. Raise max_llcs to 1 or higher, or lower topology llcs. (`topology` field omitted; macro fell back to Scheduler::new's default `(numa=1, llcs=1, cores=2, threads=1)`. Add an explicit `topology = (numa, llcs, cores, threads)` to override.)
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints_default_topology_max_llcs_below.rs:13:19
+   |
+13 |         max_llcs: Some(0),
+   |                   ^^^^^^^

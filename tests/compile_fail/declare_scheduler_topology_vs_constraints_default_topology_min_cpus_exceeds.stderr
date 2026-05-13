@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.min_cpus (3) exceeds effective topology total_cpus (2 = llcs * cores * threads); every gauntlet preset would reject this test at runtime and the test would never execute. (`topology` field omitted; macro fell back to Scheduler::new's default `(numa=1, llcs=1, cores=2, threads=1)`. Add an explicit `topology = (numa, llcs, cores, threads)` to override.)
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints_default_topology_min_cpus_exceeds.rs:12:19
+   |
+12 |         min_cpus: 3,
+   |                   ^

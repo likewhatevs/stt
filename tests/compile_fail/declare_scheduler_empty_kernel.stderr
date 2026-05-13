@@ -1,0 +1,5 @@
+error: declare_scheduler!: `kernels` entry must be a non-empty string. Accepted forms: exact version (`6.14`), inclusive range (`6.14..7.0` or `6.14..=7.0`), git source (`git+URL#REF`), absolute or `~`-prefixed path, or cache key.
+  --> tests/compile_fail/declare_scheduler_empty_kernel.rs:10:16
+   |
+10 |     kernels = [""],
+   |                ^^

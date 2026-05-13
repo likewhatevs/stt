@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.min_cpus (100) exceeds effective topology total_cpus (8 = llcs * cores * threads); every gauntlet preset would reject this test at runtime and the test would never execute.
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints_min_cpus_exceeds.rs:13:19
+   |
+13 |         min_cpus: 100,
+   |                   ^^^

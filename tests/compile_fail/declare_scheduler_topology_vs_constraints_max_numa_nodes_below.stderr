@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.max_numa_nodes (Some(1)) is below effective topology numa_nodes (4); every gauntlet preset would reject this test at runtime and the test would never execute.
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints_max_numa_nodes_below.rs:14:25
+   |
+14 |         max_numa_nodes: Some(1),
+   |                         ^^^^^^^

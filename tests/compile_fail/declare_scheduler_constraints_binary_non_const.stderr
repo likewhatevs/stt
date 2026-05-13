@@ -1,0 +1,5 @@
+error: declare_scheduler!: `constraints` must be a const-evaluable expression (emitted into a `pub static`). Use a struct literal `TopologyConstraints { ..TopologyConstraints::DEFAULT }` or a const path like `TopologyConstraints::DEFAULT`. Non-const helper calls and method chains are not const-eligible and would fail with a deep const-eval diagnostic at the spread site.
+  --> tests/compile_fail/declare_scheduler_constraints_binary_non_const.rs:16:19
+   |
+16 |         min_llcs: build_value() + 1,
+   |                   ^^^^^^^^^^^^^

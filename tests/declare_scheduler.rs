@@ -122,6 +122,43 @@ fn allow_missing_docs_attribute_lets_pub_static_compile() {
     ));
 }
 
+// -- KernelId variant coverage --
+//
+// Exercises every non-Version `KernelId` shape the macro's
+// kernels-validator must accept: range via `..=`, Path,
+// Path containing `..` (the macro's dot-dot heuristic is
+// CacheKey-only and must not reject paths), Git, and CacheKey.
+// A regression that broke the macro's routing for any
+// non-Version/non-`..`-Range variant would fail this declaration
+// at expand time.
+
+declare_scheduler!(DECLARE_SCHEDULER_KERNEL_VARIANTS, {
+    name = "declare_scheduler_kernel_variants",
+    binary = "scx-variants",
+    kernels = [
+        "6.14",
+        "6.14..=6.20",
+        "/tmp/linux-custom",
+        "foo/../bar/linux",
+        "git+https://example.com/linux.git#main",
+        "my-cache-key-x86-64",
+    ],
+});
+
+#[test]
+fn kernel_variant_strings_accepted_by_macro() {
+    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels.len(), 6);
+    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[0], "6.14");
+    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[1], "6.14..=6.20");
+    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[2], "/tmp/linux-custom");
+    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[3], "foo/../bar/linux");
+    assert_eq!(
+        DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[4],
+        "git+https://example.com/linux.git#main"
+    );
+    assert_eq!(DECLARE_SCHEDULER_KERNEL_VARIANTS.kernels[5], "my-cache-key-x86-64");
+}
+
 // -- KTSTR_SCHEDULERS registration --
 
 #[test]
@@ -145,6 +182,16 @@ fn slice_contains_every_declared_scheduler() {
     assert!(names.contains(&"declare_scheduler_full"));
     assert!(names.contains(&"declare_scheduler_explicit_empty"));
     assert!(names.contains(&"declare_scheduler_no_docs"));
+    assert!(names.contains(&"declare_scheduler_kernel_variants"));
+}
+
+#[test]
+fn find_scheduler_returns_none_for_unknown_name() {
+    // Pin the negative path: a name not in `KTSTR_SCHEDULERS`
+    // returns `None`, not `Some(arbitrary)`. A regression that
+    // returned the first slice entry on miss would silently
+    // produce wrong-scheduler attribution in sidecars.
+    assert!(find_scheduler("__definitely_not_a_real_scheduler__").is_none());
 }
 
 // -- SchedulerJson roundtrip --

@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.min_llcs (100) exceeds effective topology llcs (2); every gauntlet preset would reject this test at runtime and the test would never execute. Lower min_llcs to 2 or fewer, or raise topology llcs.
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints.rs:16:19
+   |
+16 |         min_llcs: 100,
+   |                   ^^^

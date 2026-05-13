@@ -1,0 +1,5 @@
+error: declare_scheduler!: constraints.requires_smt = true but effective topology threads_per_core = 1; SMT requires threads_per_core >= 2. Set topology threads_per_core to 2 (or higher) or drop the requires_smt constraint.
+  --> tests/compile_fail/declare_scheduler_topology_vs_constraints_requires_smt_no_smt.rs:14:23
+   |
+14 |         requires_smt: true,
+   |                       ^^^^
