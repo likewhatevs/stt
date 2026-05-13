@@ -57,6 +57,9 @@ mod watchpoint;
 #[cfg(test)]
 mod bss_tests;
 
+#[cfg(test)]
+mod early_snapshot_guard_tests;
+
 use self::dispatch::{BulkDispatchSinks, dispatch_bulk_message};
 #[allow(unused_imports)]
 use self::lazy_init::{
@@ -434,6 +437,16 @@ pub(super) fn write_to_tagged_path(
     warn_msg: &'static str,
 ) -> std::io::Result<Option<std::path::PathBuf>> {
     let Some(base_path) = dump_path else {
+        // Ok(None) semantic: dump_path was unwired by the caller
+        // (verifier / shell / template iteration; ADV V11-1 "no
+        // capture requested" case). Stable contract — the
+        // `EarlySnapshotGuard::drain_to_disk` Ok(None) arm carries
+        // a `debug_assert!(false, ...)` that depends on this
+        // semantic NOT widening to other no-write conditions
+        // (e.g. unwritable parent), since the guard's own
+        // pre-filter guarantees dump_path is Some when reaching
+        // the helper. A widened Ok(None) would fire the
+        // debug_assert in test/debug spuriously.
         return Ok(None);
     };
 
@@ -659,13 +672,36 @@ impl EarlySnapshotGuard {
                             "freeze-coord: early snapshot preserved at coord exit"
                         );
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // Unreachable: write_to_tagged_path returns
+                        // Ok(None) only when its dump_path argument
+                        // is None — but drain_to_disk's own
+                        // pre-filter at the `let Some(dump_path) =
+                        // self.dump_path.as_deref()` arm above
+                        // guarantees `Some(dump_path)` reaches the
+                        // helper. A None here means a regression
+                        // removed the pre-filter; debug builds
+                        // fail-loud, release builds stay silent
+                        // (matches the prior empty-arm semantics).
+                        debug_assert!(
+                            false,
+                            "Ok(None) unreachable: drain_to_disk pre-filters \
+                             dump_path before calling write_to_tagged_path; \
+                             a None reaching here means the pre-filter was \
+                             removed"
+                        );
+                    }
                     Err(_) => {}
                 }
             }
             Err(e) => tracing::error!(
                 error = %e,
-                "freeze-coord: early-only (coord exit drain) JSON serialization failed"
+                "freeze-coord: early-only (coord exit drain) JSON serialization \
+                 failed (FailureDumpReport serialization is infallible for the \
+                 concrete shape — see test \
+                 failure_dump_report_serialization_is_infallible_for_max_synthetic_input \
+                 in src/monitor/dump/tests.rs; if this error ever fires a new \
+                 field with a fallible Serialize impl landed)"
             ),
         }
     }

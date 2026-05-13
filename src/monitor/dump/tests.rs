@@ -207,6 +207,140 @@ fn empty_report_serde() {
     assert!(parsed.maps.is_empty());
 }
 
+/// Type-system proof that [`serde_json::to_string`] is infallible
+/// for [`FailureDumpReport`]'s concrete shape, no matter how full
+/// the vecs and options are populated.
+///
+/// Load-bearing for the
+/// [`crate::vmm::freeze_coord::EarlySnapshotGuard`] Drop body's
+/// "MUST NOT panic" precondition (the Drop documents
+/// `serde_json::to_string` as panic-free for well-typed input). A
+/// regression that introduced a field whose `Serialize` impl can
+/// return an error (e.g. a `HashMap<NotEq, _>` or a custom type
+/// with a fallible serializer) would fire here BEFORE landing in
+/// the Drop site, where the same failure would log via
+/// `tracing::error` rather than reaching disk.
+///
+/// The reachable subset of fields stays at empty / default for
+/// types whose constructors are private to other modules — the
+/// proof matters at the dispatch-site level (every populated
+/// field serializes), not at the cardinality level (every
+/// possible value of every field). Multiple `maps` entries +
+/// multi-vCPU `vcpu_regs` mix + populated diagnostic strings +
+/// `Some(ProbeBssCounters::default())` exercise the per-vec /
+/// per-option serializer dispatch paths that the empty-default
+/// roundtrip test does not.
+#[test]
+fn failure_dump_report_serialization_is_infallible_for_max_synthetic_input() {
+    let report = FailureDumpReport {
+        schema: SCHEMA_SINGLE.to_string(),
+        // Multiple maps: different map types, error vs value-bearing,
+        // exercise the per-map serialization dispatch.
+        maps: vec![
+            FailureDumpMap {
+                name: "synthetic_array.bss".into(),
+                map_type: BPF_MAP_TYPE_ARRAY,
+                value_size: 8,
+                max_entries: 1,
+                value: Some(RenderedValue::Uint {
+                    bits: 32,
+                    value: 0xCAFE,
+                }),
+                entries: Vec::new(),
+                percpu_entries: Vec::new(),
+                percpu_hash_entries: Vec::new(),
+                arena: None,
+                ringbuf: None,
+                stack_trace: None,
+                fd_array: None,
+                error: None,
+            },
+            FailureDumpMap {
+                name: "synthetic_hash.hash".into(),
+                map_type: BPF_MAP_TYPE_HASH,
+                value_size: 16,
+                max_entries: 64,
+                value: None,
+                entries: Vec::new(),
+                percpu_entries: Vec::new(),
+                percpu_hash_entries: Vec::new(),
+                arena: None,
+                ringbuf: None,
+                stack_trace: None,
+                fd_array: None,
+                error: Some("synthetic walker failure (test fixture)".into()),
+            },
+            FailureDumpMap {
+                name: "synthetic_unsupported.queue".into(),
+                map_type: BPF_MAP_TYPE_QUEUE,
+                value_size: 4,
+                max_entries: 0,
+                value: None,
+                entries: Vec::new(),
+                percpu_entries: Vec::new(),
+                percpu_hash_entries: Vec::new(),
+                arena: None,
+                ringbuf: None,
+                stack_trace: None,
+                fd_array: None,
+                error: Some("type not supported".into()),
+            },
+        ],
+        // Multi-vCPU mix of Some / None to stress the
+        // `Vec<Option<VcpuRegSnapshot>>` serializer dispatch.
+        vcpu_regs: vec![None, None, None],
+        sdt_allocations: Vec::new(),
+        sdt_alloc_unavailable: Some(super::REASON_SDT_ALLOC_NO_INSTANCE.into()),
+        prog_runtime_stats: Vec::new(),
+        prog_runtime_stats_unavailable: Some(super::REASON_PROG_ACCESSOR_UNAVAILABLE.into()),
+        per_cpu_time: vec![PerCpuTimeStats::default(); 4],
+        per_node_numa: vec![PerNodeNumaStats::default(); 2],
+        per_node_numa_unavailable: Some(super::REASON_NO_NUMA_WALKER.into()),
+        task_enrichments: Vec::new(),
+        task_enrichments_unavailable: Some(super::REASON_NO_TASK_WALKER.into()),
+        event_counter_timeline: vec![EventCounterSample::default(); 8],
+        rq_scx_states: Vec::new(),
+        dsq_states: Vec::new(),
+        scx_sched_state: None,
+        scx_walker_unavailable: Some(super::REASON_NO_SCX_WALKER.into()),
+        vcpu_perf_at_freeze: vec![None, None, None],
+        dump_truncated_at_us: Some(12_345),
+        probe_counters: Some(ProbeBssCounters::default()),
+        scx_static_ranges: Default::default(),
+        is_placeholder: false,
+    };
+
+    let result = serde_json::to_string(&report);
+    assert!(
+        result.is_ok(),
+        "FailureDumpReport serialization MUST be infallible for max-synthetic input \
+         (see EarlySnapshotGuard Drop body's panic-free precondition); error: {:?}",
+        result.err()
+    );
+    let json = result.unwrap();
+    assert!(
+        json.len() > 200,
+        "max-synthetic JSON should be non-trivial; got {} bytes",
+        json.len()
+    );
+
+    // Roundtrip leg confirms the populated fields survive a
+    // serialize → deserialize cycle without losing the
+    // diagnostic strings or counts.
+    let parsed: FailureDumpReport =
+        serde_json::from_str(&json).expect("max-synthetic JSON must deserialize cleanly");
+    assert_eq!(parsed.maps.len(), 3);
+    assert_eq!(parsed.vcpu_regs.len(), 3);
+    assert_eq!(parsed.per_cpu_time.len(), 4);
+    assert_eq!(parsed.per_node_numa.len(), 2);
+    assert_eq!(parsed.event_counter_timeline.len(), 8);
+    assert_eq!(parsed.vcpu_perf_at_freeze.len(), 3);
+    assert_eq!(parsed.dump_truncated_at_us, Some(12_345));
+    assert!(parsed.probe_counters.is_some());
+    assert!(parsed.sdt_alloc_unavailable.is_some());
+    assert!(parsed.task_enrichments_unavailable.is_some());
+}
+
 // ---- Display impl coverage --------------------------------------
 //
 // The Display impl is the human-readable form used in test
