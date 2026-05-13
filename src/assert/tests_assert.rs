@@ -191,6 +191,146 @@ fn with_monitor_defaults_fills_all_unset_threshold_fields() {
     );
 }
 
+/// Merge semantics pin: true (self) || true (other) → true.
+/// Completes the OR truth-table coverage that the false_false /
+/// true_left / false_true canaries above pin three of four cells
+/// for. The TT cell is the case a future XOR-vs-OR regression would
+/// catch only via this canary — false||false=F, false||true=T, and
+/// true||false=T pass under XOR semantics too. true||true=T does
+/// NOT pass under XOR (XOR would yield F here), so a regression
+/// that swapped OR for XOR escapes the existing 3 canaries unless
+/// this 4th cell pins it.
+#[test]
+fn merge_enforce_monitor_thresholds_or_semantics_true_true() {
+    let left = Assert::NO_OVERRIDES.with_monitor_defaults();
+    let right = Assert::NO_OVERRIDES.with_monitor_defaults();
+    let merged = left.merge(&right);
+    assert!(
+        merged.enforce_monitor_thresholds,
+        "true || true must yield true (OR, not XOR)"
+    );
+}
+
+/// Behavior pin: `with_monitor_defaults()` MUST NOT clobber
+/// user-set values for the 6 unset-Option monitor-threshold fields.
+/// The auto-fill loop in `with_monitor_defaults` uses `if X.is_none()`
+/// guards; a regression that drops the guard and unconditionally
+/// stores `Some(default)` would silently overwrite a user's custom
+/// thresholds (e.g. test author sets max_imbalance_ratio=2.0 to
+/// catch a known schedule-balance issue, with_monitor_defaults
+/// silently restores 4.0). The companion canary
+/// `with_monitor_defaults_fills_all_unset_threshold_fields` above
+/// tests the auto-fill SIDE of the contract; this canary tests
+/// the inverse SIDE: user-set values survive.
+#[test]
+fn with_monitor_defaults_preserves_user_set_values() {
+    use crate::monitor::MonitorThresholds;
+    let d = MonitorThresholds::DEFAULT;
+    // Pick values DIFFERENT from each DEFAULT so the test fails if
+    // the auto-fill loop drops its `is_none()` guard and silently
+    // overwrites. Differs from DEFAULT by ~50% on each axis where
+    // the type allows; bool / counter axes flip / shift respectively.
+    let custom_imbalance = d.max_imbalance_ratio * 0.5;
+    let custom_local_dsq = d.max_local_dsq_depth * 2;
+    let custom_fail_on_stall = !d.fail_on_stall;
+    let custom_sustained = d.sustained_samples * 2;
+    let custom_fallback = d.max_fallback_rate * 0.5;
+    let custom_keep_last = d.max_keep_last_rate * 0.5;
+    let assert = Assert::NO_OVERRIDES
+        .max_imbalance_ratio(custom_imbalance)
+        .max_local_dsq_depth(custom_local_dsq)
+        .fail_on_stall(custom_fail_on_stall)
+        .sustained_samples(custom_sustained)
+        .max_fallback_rate(custom_fallback)
+        .max_keep_last_rate(custom_keep_last)
+        .with_monitor_defaults();
+    assert!(
+        (assert.max_imbalance_ratio.unwrap() - custom_imbalance).abs() < f64::EPSILON,
+        "max_imbalance_ratio user-set value must survive with_monitor_defaults"
+    );
+    assert_eq!(
+        assert.max_local_dsq_depth,
+        Some(custom_local_dsq),
+        "max_local_dsq_depth user-set value must survive"
+    );
+    assert_eq!(
+        assert.fail_on_stall,
+        Some(custom_fail_on_stall),
+        "fail_on_stall user-set value must survive"
+    );
+    assert_eq!(
+        assert.sustained_samples,
+        Some(custom_sustained),
+        "sustained_samples user-set value must survive"
+    );
+    assert!(
+        (assert.max_fallback_rate.unwrap() - custom_fallback).abs() < f64::EPSILON,
+        "max_fallback_rate user-set value must survive"
+    );
+    assert!(
+        (assert.max_keep_last_rate.unwrap() - custom_keep_last).abs() < f64::EPSILON,
+        "max_keep_last_rate user-set value must survive"
+    );
+    assert!(
+        assert.enforce_monitor_thresholds,
+        "enforce_monitor_thresholds still set to true (the only field with_monitor_defaults unconditionally writes)"
+    );
+}
+
+/// OR-chain coverage: `has_monitor_thresholds()` MUST return false
+/// when every monitor-threshold Option is None. NO_OVERRIDES is
+/// the canonical all-None starting point; this canary pins the
+/// false-side of the OR-chain in `has_monitor_thresholds`.
+#[test]
+fn has_monitor_thresholds_false_when_all_none() {
+    let v = Assert::NO_OVERRIDES;
+    assert!(
+        !v.has_monitor_thresholds(),
+        "NO_OVERRIDES must report has_monitor_thresholds() == false"
+    );
+}
+
+/// OR-chain coverage: `has_monitor_thresholds()` MUST return true
+/// when ANY single monitor-threshold Option is Some. Parametric
+/// over the 6 fields — each iteration sets exactly one field to a
+/// non-None value via the builder, asserts has_monitor_thresholds
+/// returns true. Catches a regression that drops a field from the
+/// `has_monitor_thresholds` OR-chain (the same field-drift class
+/// the FailureDumpReport round-trip test catches on the dump
+/// side). A dropped field would silently skip monitor enforcement
+/// for tests that set only the missed field.
+#[test]
+fn has_monitor_thresholds_true_when_any_set() {
+    // Each closure returns an Assert with exactly one threshold
+    // field set. Adding a new MonitorThresholds field requires
+    // adding a closure here — that's the maintenance contract.
+    let setters: &[(&str, fn() -> Assert)] = &[
+        ("max_imbalance_ratio", || {
+            Assert::NO_OVERRIDES.max_imbalance_ratio(3.0)
+        }),
+        ("max_local_dsq_depth", || {
+            Assert::NO_OVERRIDES.max_local_dsq_depth(64)
+        }),
+        ("fail_on_stall", || Assert::NO_OVERRIDES.fail_on_stall(true)),
+        ("sustained_samples", || {
+            Assert::NO_OVERRIDES.sustained_samples(7)
+        }),
+        ("max_fallback_rate", || {
+            Assert::NO_OVERRIDES.max_fallback_rate(150.0)
+        }),
+        ("max_keep_last_rate", || {
+            Assert::NO_OVERRIDES.max_keep_last_rate(75.0)
+        }),
+    ];
+    for (field, build) in setters {
+        let v = build();
+        assert!(
+            v.has_monitor_thresholds(),
+            "has_monitor_thresholds() must return true when only `{field}` is set"
+        );
+    }
+}
+
 #[test]
 fn assert_merge_other_overrides_self() {
     let base = Assert::NO_OVERRIDES;
