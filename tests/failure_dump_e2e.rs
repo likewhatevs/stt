@@ -27,24 +27,16 @@
 //!   3. `ktstr_alloc_count` in `.bss` is non-zero (cross-validates
 //!      that the alloc path executed before the stall).
 
+mod common;
+
 use anyhow::Result;
+use common::dump_paths::failure_dump_path;
 use ktstr::assert::AssertResult;
 use ktstr::scenario::ops::{CgroupDef, HoldSpec, Step, execute_steps};
-use ktstr::test_support::{Scheduler, SchedulerSpec, sidecar_dir};
+use ktstr::test_support::{Scheduler, SchedulerSpec};
 
 const KTSTR_SCHED: Scheduler =
     Scheduler::new("ktstr_sched").binary(SchedulerSpec::Discover("scx-ktstr"));
-
-/// Compute the per-test failure-dump path. Mirrors the path
-/// `test_support::eval::run_ktstr_test_inner` configures on the
-/// VM builder for every test (the primary dispatch attaches this
-/// path before booting):
-/// `{sidecar_dir()}/{test_name}.failure-dump.json`. Both sites
-/// must agree — if `run_ktstr_test_inner` changes the naming
-/// convention, this helper must follow.
-fn failure_dump_path(test_name: &str) -> std::path::PathBuf {
-    sidecar_dir().join(format!("{test_name}.failure-dump.json"))
-}
 
 fn scenario_failure_dump_renders_bss_fields(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
     // The freeze coordinator's file sink is wired by the test

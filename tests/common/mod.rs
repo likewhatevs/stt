@@ -9,4 +9,5 @@
 //! of the `ktstr` crate's public API.
 
 pub mod ctprof;
+pub mod dump_paths;
 pub mod fixtures;
