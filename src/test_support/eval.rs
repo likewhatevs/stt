@@ -1554,39 +1554,34 @@ fn run_ktstr_test_inner_impl(
     // - a scheduler is running (not EEVDF)
     // - the test does not expect failure (expect_err = false)
     let effective_auto_repro = entry.auto_repro && scheduler.is_some() && !entry.expect_err;
+    // Only the BPF-latched `ktstr_exit_kind_snap` (persisted via the
+    // failure-dump JSON's `scx_sched_state.exit_kind`) is authoritative
+    // for the stall vs non-stall distinction. The downstream auto-repro
+    // path uses this exclusively to gate whether to skip probe
+    // attachment in the repro VM — a misclassification suppresses
+    // exactly the diagnostic the user runs ktstr to get.
+    //
+    // The previous text-parsing fallbacks (`parse_kmsg_window` returning
+    // `ScxExitKind::Stall`, and the literal `"runnable task stall"`
+    // substring match in the sched_ext dump) misclassified non-stall
+    // errors whose sched_ext dump happened to contain stalled tasks at
+    // exit time — flipping `is_stall` to true and silencing the
+    // annotated stall the BPF probe would have produced in the repro
+    // VM. Dropped both fallbacks: if the dump JSON is missing,
+    // `primary_exit_kind` stays `None` and the auto-repro path falls
+    // through to running the probe (the conservative choice — probe
+    // attachment on a true stall is a slowdown, not a correctness
+    // hazard).
     let primary_exit_kind = {
-        let from_dump = {
-            let dump_path =
-                super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
-            std::fs::read_to_string(&dump_path)
-                .ok()
-                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-                .and_then(|v| {
-                    v.get("scx_sched_state")
-                        .and_then(|s| s.get("exit_kind"))
-                        .and_then(|k| k.as_u64())
-                })
-        };
-        from_dump
-            .or_else(|| {
-                let scx_exits = crate::monitor::dmesg_scx::parse_kmsg_window(&result.stderr);
-                scx_exits.last().and_then(|ev| {
-                    use crate::monitor::dmesg_scx::ScxExitKind;
-                    match ev.kind {
-                        ScxExitKind::Stall => Some(crate::probe::scx_defs::EXIT_ERROR_STALL),
-                        ScxExitKind::Error => Some(crate::probe::scx_defs::EXIT_ERROR),
-                        _ => None,
-                    }
-                })
-            })
-            .or_else(|| {
-                extract_exit_from_dump_trace(&result.stderr).and_then(|reason| {
-                    if reason.contains("runnable task stall") {
-                        Some(crate::probe::scx_defs::EXIT_ERROR_STALL)
-                    } else {
-                        None
-                    }
-                })
+        let dump_path =
+            super::sidecar::sidecar_dir().join(format!("{}.failure-dump.json", entry.name));
+        std::fs::read_to_string(&dump_path)
+            .ok()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .and_then(|v| {
+                v.get("scx_sched_state")
+                    .and_then(|s| s.get("exit_kind"))
+                    .and_then(|k| k.as_u64())
             })
     };
     let repro_fn = |output: &str| -> Option<String> {
