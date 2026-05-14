@@ -74,23 +74,20 @@ For the full attribute reference, see
 
 ## Step 2: Define your scheduler
 
-To target a sched_ext scheduler, declare it with `#[derive(Scheduler)]`
-on an enum and reference the generated `_PAYLOAD` const from
-`#[ktstr_test(scheduler = …)]`. The example uses `scx-ktstr`, the
-test-fixture scheduler shipped in this workspace; substitute your own
-binary name to target a different scheduler.
+To target a sched_ext scheduler, declare it with
+`declare_scheduler!` and reference the generated `_PAYLOAD` const
+from `#[ktstr_test(scheduler = …)]`. The example uses `scx-ktstr`,
+the test-fixture scheduler shipped in this workspace; substitute
+your own binary name to target a different scheduler.
 
 ```rust,ignore
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-#[derive(Scheduler)]
-#[scheduler(name = "ktstr_sched", binary = "scx-ktstr")]
-enum KtstrSchedFlag {
-    #[flag(args = ["--slow"])]
-    Slow,
-    #[flag(args = ["--scattershot"])]
-    Scattershot,
-}
+declare_scheduler!(KTSTR_SCHED, {
+    name = "ktstr_sched",
+    binary = "scx-ktstr",
+});
 
 #[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
@@ -99,51 +96,46 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-`#[derive(Scheduler)]` takes an enum where each variant is a feature
-flag. The derive emits two consts named after the enum (the
-`Flag`/`Flags` suffix is stripped, the rest is screaming-snake-cased
-— so `KtstrSchedFlag` produces `KTSTR_SCHED`):
+`declare_scheduler!` emits two consts:
 
-- `const KTSTR_SCHED: Scheduler` — the bare scheduler record.
-- `const KTSTR_SCHED_PAYLOAD: Payload` — the `Payload` wrapper. The
-  `scheduler =` slot on `#[ktstr_test]` expects a `Payload`, so pass
-  `KTSTR_SCHED_PAYLOAD`.
+- `pub static KTSTR_SCHED: Scheduler` — the bare scheduler record,
+  registered in the `KTSTR_SCHEDULERS` distributed slice so
+  `cargo ktstr verifier` discovers it automatically.
+- `pub const KTSTR_SCHED_PAYLOAD: Payload` — the `Payload`
+  wrapper. The `scheduler =` slot on `#[ktstr_test]` expects a
+  `Payload`, so pass `KTSTR_SCHED_PAYLOAD`.
 
-The `#[scheduler(...)]` attributes:
+The macro fields:
 
 - `name` — scheduler name for display and sidecar keys.
 - `binary` — binary name for auto-discovery in
   `target/{debug,release}/`, the directory containing the test
   binary, or a `KTSTR_SCHEDULER` override path. When the scheduler
-  is a `[[bin]]` target in the same workspace, `cargo build` already
-  places it where discovery looks. The resolved binary is packed into
-  the VM's initramfs.
-- `topology(numa, llcs, cores, threads)` — optional default VM
+  is a `[[bin]]` target in the same workspace, `cargo build`
+  already places it where discovery looks. The resolved binary is
+  packed into the VM's initramfs.
+- `topology = (numa, llcs, cores, threads)` — optional default VM
   topology. Tests can override individual dimensions via
-  `#[ktstr_test(llcs = ...)]`. Omitted here; the per-test attributes
-  in Step 4 set every dimension explicitly.
+  `#[ktstr_test(llcs = ...)]`. Omitted here; the per-test
+  attributes in Step 4 set every dimension explicitly.
+- `sched_args = ["--flag", "--another"]` — optional CLI args
+  prepended to every test that uses this scheduler. Useful when a
+  scheduler needs the same `--enable-llc`-style switches in every
+  run; for one-off variations, use `#[ktstr_test(extra_sched_args = [...])]`
+  on the test instead.
+- `kernels = ["6.14", "6.15..=7.0"]` — optional set of kernel
+  specs the verifier sweep should exercise this scheduler against.
+  See [BPF Verifier](running-tests/verifier.md) for the cell
+  emission contract.
 
-Each enum variant is a feature flag. `#[flag(args = ["--slow"])]`
-means "when this flag is active, append `--slow` to the scheduler's
-command line." (See `scx-ktstr --help` for the full flag list:
-`--slow`, `--scattershot`, `--degrade`, `--stall-after`,
-`--degrade-after`, `--fail-verify`, `--verify-loop`.) An optional
-`requires = [OtherVariant]` clause gates one flag on another so the
-gauntlet (Step 10) only emits combinations where every dependency is
-present. The gauntlet generates the power set of valid flag
-combinations — each combination becomes a test variant.
-
-An enum with zero variants is valid and produces no flag combinations
-beyond the default (no-flags) profile.
-
-For the full attribute surface (`sched_args`, `sysctls`, `kargs`,
-`config_file`, gauntlet constraints), see
+For the full attribute surface (`sysctls`, `kargs`, `config_file`,
+gauntlet constraints, scheduler-level assertion overrides), see
 [Scheduler Definitions](writing-tests/scheduler-definitions.md).
 
-When the derive doesn't fit — the most common case being inline JSON
-config supplied per-test — define the `Scheduler` const through the
-manual builder instead. Step 12 below walks through that path with
-`scx_layered`.
+When the macro doesn't fit — the most common case being inline
+JSON config supplied per-test or programmatic composition — define
+the `Scheduler` const through the manual builder instead. Step 12
+below walks through that path with `scx_layered`.
 
 ## Step 3: Add workloads
 
@@ -328,7 +320,7 @@ fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
 ```
 
 For the full attribute reference (auto-repro, performance mode,
-flag and topology constraints, etc.), see
+topology constraints, etc.), see
 [The #\[ktstr_test\] Macro](writing-tests/ktstr-test-macro.md).
 
 ## Step 7: Add assertions
@@ -550,18 +542,13 @@ that fires whenever the guest writes a kernel symbol, see
 
 The `#[ktstr_test]` macro doesn't just emit a single test -- it
 also generates a **gauntlet** of variants that run the same body
-across the cartesian product of:
-
-- Topology presets (single-LLC, multi-LLC, multi-NUMA, with/without
-  SMT).
-- Flag profiles (when the test references a
-  `#[derive(Scheduler)]` enum).
+across every accepted topology preset (single-LLC, multi-LLC,
+multi-NUMA, with/without SMT).
 
 Gauntlet variants are nextest-discovered and run with
 `cargo ktstr test -- --run-ignored ignored-only -E 'test(gauntlet/)'`.
 Constrain coverage with `min_llcs` / `max_llcs`, `min_cpus` /
-`max_cpus`, `requires_smt`, and `required_flags` / `excluded_flags`
-on the attribute. See
+`max_cpus`, and `requires_smt` on the attribute. See
 [Gauntlet Tests](writing-tests/gauntlet-tests.md) for the full
 filtering and worked examples.
 
@@ -977,37 +964,49 @@ test-author configuration is required either way.
 
 ### Verifier output
 
-`cargo ktstr verifier --scheduler scx_my_sched` runs the BPF
-verifier against the scheduler's struct_ops programs inside a real
-kernel and prints per-callback verified-instruction counts. When
-the verifier captures a libbpf log, it appears below the stats
-automatically. `--raw` disables cycle collapsing in that section:
+`cargo ktstr verifier` runs the BPF verifier against every
+`declare_scheduler!`-registered scheduler's struct_ops programs
+inside a real kernel and prints per-program verified-instruction
+counts. The dispatcher hands off to
+`cargo nextest run -E 'test(/^verifier/)'`; nextest fans out
+across (scheduler × declared kernel × accepted topology preset)
+cells, each cell booting its own VM. Per-cell output starts with
+a banner identifying the axis values:
 
 ```text
-llc+steal
+=== ktstr_sched | kernel kernel_6_14_2 | topology tiny-1llc ===
+
+verifier
   enqueue                                  verified_insns=42
 
-llc+steal --- verifier stats ---
+verifier --- verifier stats ---
   processed=42  states=8/10
 
-llc+steal --- scheduler log ---
+verifier --- scheduler log ---
 func#0 @0
 0: R1=ctx() R10=fp0
 processed 42 insns (limit 1000000) max_states_per_insn 1 total_states 10 peak_states 8 mark_read 5
 ```
 
 When the scheduler did not capture a log, the output is just the
-per-callback table:
+per-program table:
 
 ```text
-default
+=== ktstr_sched | kernel kernel_6_14_2 | topology tiny-1llc ===
+
+verifier
   enqueue                                  verified_insns=500
   dispatch                                 verified_insns=1200
   init                                     verified_insns=300
 ```
 
-For the verifier-flag matrix, cycle-collapse rules, and the
-sidecar-friendly JSON variant, see [Verifier](running-tests/verifier.md).
+`--raw` disables cycle collapsing in the scheduler-log section.
+`--kernel A --kernel B` runs the sweep against multiple kernels;
+the cell handler walks `KTSTR_KERNEL_LIST` to match each cell's
+sanitized kernel label against the resolved set. For the full
+verifier-sweep model, cycle-collapse rules, and the
+cell-name → kernel matching contract, see
+[Verifier](running-tests/verifier.md).
 
 ## What's next
 

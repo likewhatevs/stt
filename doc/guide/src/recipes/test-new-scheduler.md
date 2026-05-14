@@ -4,28 +4,30 @@ End-to-end workflow: define a scheduler, write tests, run them.
 
 ## 1. Define the scheduler
 
-Use `#[derive(Scheduler)]` on an enum of flags:
+Use `declare_scheduler!` to register a scheduler in the
+`KTSTR_SCHEDULERS` distributed slice. The verifier sweep picks
+it up automatically.
 
 ```rust,ignore
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-#[derive(Scheduler)]
-#[scheduler(
+declare_scheduler!(MY_SCHED, {
     name = "my_sched",
     binary = "scx_my_sched",
-    topology(1, 2, 4, 1),
-)]
-#[allow(dead_code)]
-enum MySchedFlag {
-    #[flag(args = ["--enable-llc"])]
-    Llc,
-    #[flag(args = ["--enable-stealing"], requires = [Llc])]
-    Steal,
-}
+    topology = (1, 2, 4, 1),
+    kernels = ["6.14", "6.15..=7.0"],
+    sched_args = ["--exit-dump-len", "1048576"],
+});
 ```
 
-This generates `const MY_SCHED: Scheduler` and typed flag
-constants (`MySchedFlag::LLC`, `MySchedFlag::STEAL`).
+The macro generates `pub static MY_SCHED: Scheduler` and a
+`pub const MY_SCHED_PAYLOAD: Payload` wrapper. Tests reference
+the `*_PAYLOAD` form; the bare `MY_SCHED` form is for library
+code that composes `Scheduler` builders directly.
+
+See [Scheduler Definitions](../writing-tests/scheduler-definitions.md)
+for every supported field.
 
 ## 2. Write integration tests
 
@@ -41,12 +43,10 @@ fn basic_steady(ctx: &Ctx) -> Result<AssertResult> {
     scenarios::steady(ctx)
 }
 
-#[ktstr_test(
-    scheduler = MY_SCHED_PAYLOAD,
-    required_flags = [MySchedFlag::LLC],
-)]
-fn llc_aware_test(ctx: &Ctx) -> Result<AssertResult> {
-    scenarios::steady_llc(ctx)
+#[ktstr_test(scheduler = MY_SCHED_PAYLOAD, threads = 2)]
+fn smt_steady(ctx: &Ctx) -> Result<AssertResult> {
+    // Inherits llcs=2, cores=4; overrides threads to exercise SMT
+    scenarios::steady(ctx)
 }
 ```
 
@@ -69,20 +69,30 @@ cargo ktstr test --kernel ../linux
 
 ## 5. Check BPF complexity (optional)
 
-Collect per-program verifier statistics:
+Collect per-program verifier statistics across the declared
+kernels and accepted topology presets:
 
 ```sh
-cargo ktstr verifier --scheduler scx_my_sched
+# Use the kernel auto-discovered via KTSTR_KERNEL / cache.
+cargo ktstr verifier
+
+# Pin to a specific kernel build.
+cargo ktstr verifier --kernel ../linux
+
+# Sweep across the declared kernels (labels must align with
+# the scheduler's `kernels = [...]` declaration).
+cargo ktstr verifier --kernel 6.14 --kernel 7.0
 ```
 
-See [BPF Verifier](../running-tests/verifier.md) for output format and
-cycle collapse.
+See [BPF Verifier](../running-tests/verifier.md) for output
+format, cycle collapse, and the cell-name → kernel matching
+contract.
 
 ## 6. Manage the kernel cache
 
 Cached kernel images accumulate under
-`$XDG_CACHE_HOME/ktstr/kernels/`. Keep a handful of recent builds
-and drop the rest when disk pressure grows:
+`$XDG_CACHE_HOME/ktstr/kernels/`. Keep a handful of recent
+builds and drop the rest when disk pressure grows:
 
 ```sh
 cargo ktstr kernel list                # inspect cache contents
@@ -100,10 +110,10 @@ cargo ktstr shell -i ./target/debug/scx_my_sched
 
 Inside the guest, run `/include-files/scx_my_sched` manually to
 inspect behavior. See
-[cargo-ktstr shell](../running-tests/cargo-ktstr.md#shell) for all
-flags.
+[cargo-ktstr shell](../running-tests/cargo-ktstr.md#shell) for
+all flags.
 
-See [The #\[ktstr_test\] Macro](../writing-tests/ktstr-test-macro.md) for
-all available attributes and
-[Scheduler Definitions](../writing-tests/scheduler-definitions.md) for
-the full `Scheduler` type and derive macro.
+See [The #\[ktstr_test\] Macro](../writing-tests/ktstr-test-macro.md)
+for all available attributes and
+[Scheduler Definitions](../writing-tests/scheduler-definitions.md)
+for the full `Scheduler` type and the `declare_scheduler!` macro.

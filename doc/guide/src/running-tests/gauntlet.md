@@ -1,7 +1,7 @@
 # Gauntlet
 
-The gauntlet runs every test across 24 topology presets (14 on aarch64)
-and all valid flag profiles. Gauntlet variants are prefixed with `gauntlet/` and
+The gauntlet runs every test across 24 topology presets (14 on aarch64).
+Gauntlet variants are prefixed with `gauntlet/` and
 ignored by default.
 
 ```sh
@@ -23,19 +23,17 @@ how that flag is set.
 ## Variant naming
 
 Single-kernel runs name each gauntlet variant
-`gauntlet/{test_name}/{preset}/{profile}`:
+`gauntlet/{test_name}/{preset}`:
 
 - `{test_name}` -- the `#[ktstr_test]` function name
 - `{preset}` -- one of the topology preset names below
-- `{profile}` -- `default` when no flags are active, otherwise the
-  active flags joined with `+` (e.g. `llc+borrow`)
 
 When `--kernel` resolves to two or more kernels (multiple
 `--kernel` flags or a `START..END` range that expands to
 several releases), `cargo ktstr test` / `coverage` /
-`llvm-cov` add the kernel as a fifth dimension and append a
+`llvm-cov` add the kernel as a third dimension and append a
 `{kernel_label}` suffix:
-`gauntlet/{test_name}/{preset}/{profile}/{kernel_label}`. See
+`gauntlet/{test_name}/{preset}/{kernel_label}`. See
 [Multi-kernel: kernel as a gauntlet dimension](cargo-ktstr.md#multi-kernel-kernel-as-a-gauntlet-dimension)
 for how the kernel labels are derived (sanitized from the
 resolved version, range expansion, cache key, git source, or
@@ -45,7 +43,7 @@ To run a single variant:
 
 ```sh
 cargo ktstr test --kernel ../linux -- --run-ignored ignored-only \
-  -E 'test(=gauntlet/my_test/smt-2llc/default)'
+  -E 'test(=gauntlet/my_test/smt-2llc)'
 ```
 
 ## Topology presets

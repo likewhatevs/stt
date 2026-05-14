@@ -19,16 +19,14 @@ When a scheduler with a default topology is specified, the topology
 can be omitted:
 
 ```rust,ignore
-const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Discover("scx_my_sched"))
-    //            numa, llcs, cores/llc, threads/core
-    .topology(1, 2, 4, 1);
+use ktstr::declare_scheduler;
 
-// Wrap the bare `Scheduler` const in a `Payload` so it fits the
-// `scheduler =` slot's `&'static Payload` shape. `#[derive(Scheduler)]`
-// emits the wrapper as `{NAME}_PAYLOAD` automatically; the manual
-// builder path uses `Payload::from_scheduler` to do the same thing.
-const MY_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&MY_SCHED);
+declare_scheduler!(MY_SCHED, {
+    name = "my_sched",
+    binary = "scx_my_sched",
+    //          numa, llcs, cores/llc, threads/core
+    topology = (1,    2,    4,         1),
+});
 
 #[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
 fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
@@ -36,6 +34,12 @@ fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
 ```
+
+`declare_scheduler!` emits both the `Scheduler` static and its
+`*_PAYLOAD` `Payload` wrapper. The `scheduler =` slot accepts
+the `*_PAYLOAD` form; the bare `Scheduler` const will not
+type-check. Manual builders (no macro) compose the wrapper
+explicitly with `Payload::from_scheduler(&MY_SCHED)`.
 
 The function must have signature
 `fn(&ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult>`.
@@ -74,7 +78,7 @@ so most tests do not need to set `numa_nodes`. See
 
 | Attribute | Default | Description |
 |---|---|---|
-| `scheduler = CONST` | `&Payload::KERNEL_DEFAULT` | Rust const path to a `&'static Payload` whose kind is `PayloadKind::Scheduler`. The `_PAYLOAD` wrapper emitted by `#[derive(Scheduler)]` (e.g. `MY_SCHED_PAYLOAD`) is the expected form here; the bare `Scheduler` const will not type-check. The default `Payload::KERNEL_DEFAULT` wraps `Scheduler::EEVDF` (the kernel's default scheduler — EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
+| `scheduler = CONST` | `&Payload::KERNEL_DEFAULT` | Rust const path to a `&'static Payload` whose kind is `PayloadKind::Scheduler`. The `_PAYLOAD` wrapper emitted by `declare_scheduler!` (e.g. `MY_SCHED_PAYLOAD`) is the expected form here; the bare `Scheduler` const will not type-check. The default `Payload::KERNEL_DEFAULT` wraps `Scheduler::EEVDF` (the kernel's default scheduler — EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
 | `watchdog_timeout_s` | 5 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 
@@ -121,36 +125,6 @@ Each threshold can be overridden independently. See
 [Customize Checking](../recipes/custom-checking.md) for
 override examples and [Checking](../concepts/checking.md) for
 the merge chain.
-
-### Flag constraints
-
-| Attribute | Default | Description |
-|---|---|---|
-| `required_flags = [...]` | `[]` | Flags that must be present in every flag profile |
-| `excluded_flags = [...]` | `[]` | Flags that must not be present in any flag profile |
-
-Values are arrays of string literals or path expressions from
-`#[derive(Scheduler)]`:
-
-```rust,ignore
-// String literals
-#[ktstr_test(
-    required_flags = ["llc", "borrow"],
-    excluded_flags = ["no-ctrl"],
-)]
-
-// Path expressions (typed constants from derive)
-#[ktstr_test(
-    required_flags = [MySchedFlag::LLC, MySchedFlag::BORROW],
-    excluded_flags = [MySchedFlag::NO_CTRL],
-)]
-```
-
-These constrain `generate_profiles()`: `required_flags` are always
-included, `excluded_flags` are never included. Invalid combinations
-(e.g. `steal` without `llc`) are still rejected by dependency checks.
-See [Gauntlet Tests](gauntlet-tests.md#controlling-flag-coverage)
-for profile generation examples.
 
 ### Topology constraints
 
@@ -246,32 +220,25 @@ the test is needed in that flavor.
 
 ## Example with custom scheduler
 
-Define the scheduler with `#[derive(Scheduler)]` (see
-[Scheduler Definitions](scheduler-definitions.md)), then reference it
-in `#[ktstr_test]`:
+Define the scheduler with `declare_scheduler!` (see
+[Scheduler Definitions](scheduler-definitions.md)), then
+reference it in `#[ktstr_test]`:
 
 ```rust,ignore
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-#[derive(Scheduler)]
-#[scheduler(
+declare_scheduler!(MY_SCHED, {
     name = "my_sched",
     binary = "scx_my_sched",
-    topology(1, 2, 4, 1),
-)]
-#[allow(dead_code)]
-enum MySchedFlag {
-    #[flag(args = ["--enable-llc"])]
-    Llc,
-    #[flag(args = ["--enable-stealing"], requires = [Llc])]
-    Steal,
-}
+    topology = (1, 2, 4, 1),
+    sched_args = ["--enable-llc", "--enable-stealing"],
+});
 
 #[ktstr_test(
     scheduler = MY_SCHED_PAYLOAD,
     not_starved = true,
     max_gap_ms = 5000,
-    required_flags = [MySchedFlag::LLC],
 )]
 fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
     // Inherits 1n2l4c1t from MY_SCHED_PAYLOAD
@@ -279,11 +246,14 @@ fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-`#[derive(Scheduler)]` emits two consts — the bare `MY_SCHED:
-Scheduler` (for builder composition) and `MY_SCHED_PAYLOAD:
-Payload` (for the `scheduler =` slot here). See
+`declare_scheduler!` emits two consts — `MY_SCHED: Scheduler`
+(for builder composition) and `MY_SCHED_PAYLOAD: Payload` (for
+the `scheduler =` slot here) — and registers `MY_SCHED` in the
+`KTSTR_SCHEDULERS` distributed slice so
+`cargo ktstr verifier` discovers it. See
 [Scheduler Definitions](scheduler-definitions.md#defining-a-scheduler)
-for the full derive output.
+for the full macro grammar.
 
-For the manual `FlagDecl` + builder pattern, see
+For the manual builder pattern (no distributed-slice
+registration), see
 [Scheduler Definitions: Manual definition](scheduler-definitions.md#manual-definition).

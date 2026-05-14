@@ -54,14 +54,14 @@ expands to several releases), cargo-ktstr resolves all kernels
 upfront and exports the resolved set to `cargo nextest` via the
 `KTSTR_KERNEL_LIST` env var. The test binary's gauntlet expansion
 adds the kernel as an additional dimension to the gauntlet
-cross-product, so each `(test × scenario × topology × flags × kernel)`
+cross-product, so each `(test × scenario × topology × kernel)`
 tuple becomes a distinct nextest test case. Two name shapes carry
 the kernel suffix:
 
 - **Base tests**: `ktstr/{name}/{kernel_label}` — one variant per
   registered `#[ktstr_test]` per kernel.
-- **Gauntlet variants**: `gauntlet/{name}/{preset}/{profile}/{kernel_label}` —
-  one variant per (test × topology preset × flag profile × kernel).
+- **Gauntlet variants**: `gauntlet/{name}/{preset}/{kernel_label}` —
+  one variant per (test × topology preset × kernel).
 
 Single-kernel runs (zero or one resolved kernel) keep the
 historical name shapes `ktstr/{name}` and
@@ -391,11 +391,11 @@ cargo ktstr llvm-cov --kernel ../linux report                  # pin kernel + pa
 Note: a bare `cargo ktstr llvm-cov` (no trailing subcommand)
 dispatches to `cargo llvm-cov`, which runs `cargo test` — ktstr
 tests rely on the nextest harness for gauntlet expansion
-(flag-profile × topology-preset variants) and VM dispatch. Under
-bare `cargo test`, only the `#[test]` stubs run and gauntlet
-variants are silently skipped. Always pass a subcommand after
-`llvm-cov` (most often `nextest`, for which `cargo ktstr coverage`
-is the shorter route).
+(topology-preset variants), verifier cell emission, and VM
+dispatch. Under bare `cargo test`, only the `#[test]` stubs run
+and gauntlet variants + verifier cells are silently skipped.
+Always pass a subcommand after `llvm-cov` (most often `nextest`,
+for which `cargo ktstr coverage` is the shorter route).
 
 ## kernel
 
@@ -546,39 +546,54 @@ re-downloads the pin from scratch.
 
 ## verifier
 
-Collect BPF verifier statistics for a scheduler. Builds the
-scheduler, boots a VM, loads the BPF programs, and reports per-program
-verified instruction counts from host-side memory introspection.
+Collect BPF verifier statistics for every scheduler declared via
+`declare_scheduler!` in the workspace's test binaries. Spawns
+`cargo nextest run -E 'test(/^verifier/)'` and lets nextest fan
+out per (scheduler × kernel-list entry × accepted topology preset)
+cell — each cell boots its own VM, loads the scheduler's BPF
+programs, and reports per-program verified instruction counts
+from host-side memory introspection.
 
 ```sh
-cargo ktstr verifier --scheduler scx_rustland
-cargo ktstr verifier --scheduler-bin ./target/release/scx_rustland
-cargo ktstr verifier --scheduler scx_rustland --raw
-cargo ktstr verifier --scheduler scx_rustland --all-profiles
-cargo ktstr verifier --scheduler scx_rustland --profiles default,llc,llc+steal
+cargo ktstr verifier                              # auto-discover kernel
+cargo ktstr verifier --kernel ../linux            # pin to one kernel
+cargo ktstr verifier --kernel 6.14 --kernel 7.0   # multi-kernel sweep
+cargo ktstr verifier --raw                        # raw verifier log
 ```
 
-Either `--scheduler` (package name, built via `cargo build`) or
-`--scheduler-bin` (pre-built binary path) is required. They conflict
-with each other.
+There are no `--scheduler` / `--scheduler-bin` flags: the sweep
+discovers schedulers from the `KTSTR_SCHEDULERS` distributed
+slice populated by `declare_scheduler!`. To exclude a scheduler
+from the sweep, omit it from the test binary (or declare it with
+`SchedulerSpec::Eevdf` / `SchedulerSpec::KernelBuiltin` — both
+are skipped at cell-emission time because neither has a
+userspace binary to verify).
 
-`--all-profiles` discovers flags via `--ktstr-list-flags`, generates
-the power set of valid flag combinations (respecting `requires`
-constraints), and collects verifier stats for each profile. When more
-than one profile is run, a summary table compares `verified_insns`
-across profiles.
+`--kernel` is repeatable; cargo-ktstr always exports
+`KTSTR_KERNEL_LIST` to the nextest invocation (synthesizing a
+single entry from auto-discovery when no `--kernel` is passed).
+Each scheduler's `kernels = [...]` declaration acts as a
+per-scheduler filter on the operator-supplied set; an empty (or
+omitted) `kernels` field accepts every entry. See [BPF Verifier:
+Matrix dimension + per-scheduler filter](verifier.md#matrix-dimension--per-scheduler-filter)
+for the full filter contract.
+
+`--raw` exports `KTSTR_VERIFIER_RAW=1`; the cell handler reads
+it via `env::var_os` and switches `format_verifier_output` from
+the cycle-collapsed default to the raw scheduler-log dump. See
+[BPF Verifier: Cycle collapse algorithm](verifier.md#cycle-collapse-algorithm)
+for the rendering details.
 
 | Flag | Description |
 |------|-------------|
-| `--scheduler PKG` | Scheduler package name to build and analyze. |
-| `--scheduler-bin PATH` | Path to pre-built scheduler binary. Conflicts with `--scheduler`. |
-| `--kernel ID` | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Raw image files (`bzImage`/`Image`) are NOT accepted by `verifier` — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
+| `--kernel ID` (repeatable) | Kernel identifier: path, version, cache key, range (`START..END`), or git source (`git+URL#REF`). Raw image files (`bzImage`/`Image`) are NOT accepted — the verifier needs the cached `vmlinux` and kconfig fragment alongside the image. Source directories auto-build; version strings auto-download on cache miss. When absent, resolves via cache then filesystem, falling back to auto-download. Raw images are accepted only on `cargo ktstr shell`. |
 | `--raw` | Print raw verifier output without cycle collapse. |
-| `--all-profiles` | Run verifier for all flag profiles (power set). |
-| `--profiles LIST` | Run verifier for specific profiles only (comma-separated, e.g. `default,llc,llc+steal`). |
 
-See [BPF Verifier](verifier.md) for the verifier pipeline design and
-output format.
+See [BPF Verifier](verifier.md) for the cell-based dispatch
+design and output format, and
+[Scheduler Definitions](../writing-tests/scheduler-definitions.md)
+for the `declare_scheduler!` macro that registers a scheduler
+in `KTSTR_SCHEDULERS`.
 
 ## shell
 

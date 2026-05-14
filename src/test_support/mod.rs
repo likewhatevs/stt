@@ -124,7 +124,7 @@ pub(crate) use topo::{TopoOverride, parse_topo_string};
 /// Host capacity triple `(cpus, llcs, max_cpus_per_llc)` used to
 /// filter gauntlet topology presets against what the host can actually
 /// schedule. Both `dispatch::list_tests_*` (gauntlet variant filter)
-/// and `cargo_ktstr::verifier::run_sweep` (verifier sweep filter)
+/// and `dispatch::list_verifier_cells_all` (verifier sweep filter)
 /// share this single source of truth so the two filters never drift.
 /// Reads `available_parallelism()` for CPU count + `HostTopology::from_sysfs()`
 /// for LLC layout; falls back to single-LLC + single-cpu-per-llc when

@@ -385,8 +385,21 @@ pub struct Scheduler {
     /// versions (`"6.14"`), closed ranges spelled either `..` or `..=`
     /// (`"6.14..7.0"` or `"6.14..=7.0"` — both inclusive on both
     /// endpoints), git refs (`"git+URL#REF"`), paths, and cache keys.
-    /// Empty (`&[]`) means the verifier uses whatever `--kernel`
-    /// flags the operator passed on the command line.
+    ///
+    /// Drives the verifier sweep matrix:
+    /// `list_verifier_cells_all` in `test_support::dispatch` walks this
+    /// slice and emits one
+    /// `verifier/<sched>/<sanitized_kernel_label>/<preset>: test`
+    /// nextest cell per (declared kernel × accepted topology preset)
+    /// pair. Empty (`&[]`) means no verifier cells emit for this
+    /// scheduler — the scheduler is silently skipped by
+    /// `cargo ktstr verifier`.
+    ///
+    /// The operator's `cargo ktstr verifier --kernel <SPEC>` set
+    /// supplies the matching kernel paths via `KTSTR_KERNEL_LIST`;
+    /// the labels in that env must align with the sanitized form of
+    /// the values declared here so the cell handler can resolve
+    /// each cell to a directory.
     pub kernels: &'static [&'static str],
 }
 
