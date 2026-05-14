@@ -1007,26 +1007,9 @@ fn list_tests(ignored_only: bool) {
 
 /// Host capacity inputs for `TopologyConstraints::accepts`.
 ///
-/// `list_tests_all` and `list_tests_budget` both need the same
-/// `(cpus, llcs, max_cpus_per_llc)` triple to filter gauntlet presets
-/// against what the host can actually schedule. Reading sysfs here
-/// once per listing (instead of per-entry) keeps the signal-to-noise
-/// of each lister high and makes the host-query decision explicit.
-fn host_capacity() -> (u32, u32, u32) {
-    let host_cpus = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(1);
-    let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
-    let host_llcs = host_topo
-        .as_ref()
-        .map(|t| t.llc_groups.len() as u32)
-        .unwrap_or(1);
-    let host_max_cpus_per_llc = host_topo
-        .as_ref()
-        .map(|t| t.max_cores_per_llc() as u32)
-        .unwrap_or(host_cpus);
-    (host_cpus, host_llcs, host_max_cpus_per_llc)
-}
+// host_capacity moved to crate::test_support::host_capacity for shared
+// use by both dispatch.rs (gauntlet variant filter) and
+// cargo_ktstr/verifier.rs (verifier sweep filter).
 
 /// Iterate topology presets that both fit the host capacity and
 /// match the entry's `TopologyConstraints`. Shared between the
@@ -1091,7 +1074,7 @@ fn list_tests_all(ignored_only: bool) {
         .ok()
         .and_then(|k| crate::vmm::find_vmlinux(&k))
         .is_some();
-    let (host_cpus, host_llcs, host_max_cpus_per_llc) = host_capacity();
+    let (host_cpus, host_llcs, host_max_cpus_per_llc) = super::host_capacity();
 
     let kernel_list = read_kernel_list();
     let multi_kernel = kernel_list.len() > 1 && !cargo_test_mode;
@@ -1187,7 +1170,7 @@ fn list_tests_budget(ignored_only: bool, budget_secs: f64) {
         .ok()
         .and_then(|k| crate::vmm::find_vmlinux(&k))
         .is_some();
-    let (host_cpus, host_llcs, host_max_cpus_per_llc) = host_capacity();
+    let (host_cpus, host_llcs, host_max_cpus_per_llc) = super::host_capacity();
     let mut candidates: Vec<TestCandidate> = Vec::new();
 
     let kernel_list = read_kernel_list();
@@ -1933,7 +1916,7 @@ mod tests {
         //   - llcs >= 1 (at least one cache domain)
         //   - max_cpus_per_llc >= 1
         //   - max_cpus_per_llc <= cpus (no LLC wider than the whole host)
-        let (cpus, llcs, max_cpus_per_llc) = host_capacity();
+        let (cpus, llcs, max_cpus_per_llc) = super::super::host_capacity();
         assert!(cpus >= 1, "cpus >= 1, got {cpus}");
         assert!(llcs >= 1, "llcs >= 1, got {llcs}");
         assert!(

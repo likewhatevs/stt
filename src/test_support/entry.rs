@@ -1377,6 +1377,23 @@ impl TryFrom<TopologyJson> for Topology {
     }
 }
 
+/// Project a [`Topology`] into its wire-format mirror. Drops the
+/// `nodes` and `distances` fields (uniform-distribution shape only);
+/// callers that need to preserve explicit per-node config or distance
+/// matrices must not use this conversion. Takes [`Topology`] by value
+/// (it derives [`Copy`]) to match the by-value shape of
+/// [`From<TopologyConstraintsJson> for TopologyConstraints`].
+impl From<Topology> for TopologyJson {
+    fn from(t: Topology) -> Self {
+        Self {
+            num_numa_nodes: t.numa_nodes,
+            num_llcs: t.llcs,
+            cores_per_llc: t.cores_per_llc,
+            threads_per_core: t.threads_per_core,
+        }
+    }
+}
+
 /// JSON-friendly mirror of [`TopologyConstraints`] — the host-side
 /// `Option<u32>` fields serialize as `null` (default serde behavior;
 /// no `skip_serializing_if`) rather than the `Some(N)`/`None`-tagged
@@ -1392,6 +1409,24 @@ pub struct TopologyConstraintsJson {
     pub requires_smt: bool,
     pub min_cpus: u32,
     pub max_cpus: Option<u32>,
+}
+
+/// Infallible shape conversion — every field maps 1:1 to
+/// [`TopologyConstraints`], so the verifier sweep dispatch can reuse
+/// the same `accepts` / `accepts_no_perf_mode` filters that gauntlet
+/// dispatch uses.
+impl From<TopologyConstraintsJson> for TopologyConstraints {
+    fn from(j: TopologyConstraintsJson) -> Self {
+        Self {
+            min_numa_nodes: j.min_numa_nodes,
+            max_numa_nodes: j.max_numa_nodes,
+            min_llcs: j.min_llcs,
+            max_llcs: j.max_llcs,
+            requires_smt: j.requires_smt,
+            min_cpus: j.min_cpus,
+            max_cpus: j.max_cpus,
+        }
+    }
 }
 
 impl SchedulerJson {
@@ -2803,5 +2838,60 @@ mod tests {
             err.contains("overflow"),
             "error should mention overflow: {err}"
         );
+    }
+
+    #[test]
+    fn topology_into_topology_json_drops_explicit_nodes_distances() {
+        let topo = Topology {
+            llcs: 4,
+            cores_per_llc: 8,
+            threads_per_core: 2,
+            numa_nodes: 2,
+            nodes: None,
+            distances: None,
+        };
+        let json: TopologyJson = topo.into();
+        assert_eq!(json.num_numa_nodes, 2);
+        assert_eq!(json.num_llcs, 4);
+        assert_eq!(json.cores_per_llc, 8);
+        assert_eq!(json.threads_per_core, 2);
+    }
+
+    #[test]
+    fn topology_constraints_json_into_topology_constraints_preserves_fields() {
+        let json = TopologyConstraintsJson {
+            min_numa_nodes: 1,
+            max_numa_nodes: Some(4),
+            min_llcs: 2,
+            max_llcs: Some(8),
+            requires_smt: true,
+            min_cpus: 4,
+            max_cpus: Some(64),
+        };
+        let c: TopologyConstraints = json.into();
+        assert_eq!(c.min_numa_nodes, 1);
+        assert_eq!(c.max_numa_nodes, Some(4));
+        assert_eq!(c.min_llcs, 2);
+        assert_eq!(c.max_llcs, Some(8));
+        assert!(c.requires_smt);
+        assert_eq!(c.min_cpus, 4);
+        assert_eq!(c.max_cpus, Some(64));
+    }
+
+    #[test]
+    fn topology_constraints_json_into_topology_constraints_handles_none_options() {
+        let json = TopologyConstraintsJson {
+            min_numa_nodes: 1,
+            max_numa_nodes: None,
+            min_llcs: 1,
+            max_llcs: None,
+            requires_smt: false,
+            min_cpus: 1,
+            max_cpus: None,
+        };
+        let c: TopologyConstraints = json.into();
+        assert!(c.max_numa_nodes.is_none());
+        assert!(c.max_llcs.is_none());
+        assert!(c.max_cpus.is_none());
     }
 }

@@ -435,7 +435,7 @@ pub mod remote_cache;
 pub(crate) mod sync;
 pub(crate) mod tar_util;
 pub mod verifier;
-pub(crate) mod vm;
+pub mod vm;
 pub(crate) mod vmm;
 pub mod worker_ready;
 

@@ -121,6 +121,30 @@ pub(crate) use profraw::try_flush_profraw;
 pub(crate) use timefmt::now_iso8601;
 pub(crate) use topo::{TopoOverride, parse_topo_string};
 
+/// Host capacity triple `(cpus, llcs, max_cpus_per_llc)` used to
+/// filter gauntlet topology presets against what the host can actually
+/// schedule. Both `dispatch::list_tests_*` (gauntlet variant filter)
+/// and `cargo_ktstr::verifier::run_sweep` (verifier sweep filter)
+/// share this single source of truth so the two filters never drift.
+/// Reads `available_parallelism()` for CPU count + `HostTopology::from_sysfs()`
+/// for LLC layout; falls back to single-LLC + single-cpu-per-llc when
+/// sysfs is unavailable.
+pub fn host_capacity() -> (u32, u32, u32) {
+    let host_cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
+    let host_topo = crate::vmm::host_topology::HostTopology::from_sysfs().ok();
+    let host_llcs = host_topo
+        .as_ref()
+        .map(|t| t.llc_groups.len() as u32)
+        .unwrap_or(1);
+    let host_max_cpus_per_llc = host_topo
+        .as_ref()
+        .map(|t| t.max_cores_per_llc() as u32)
+        .unwrap_or(host_cpus);
+    (host_cpus, host_llcs, host_max_cpus_per_llc)
+}
+
 // ---------------------------------------------------------------------------
 // Test infrastructure requirements
 // ---------------------------------------------------------------------------
