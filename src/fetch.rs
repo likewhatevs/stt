@@ -31,12 +31,13 @@ static SHARED_CLIENT: OnceLock<Client> = OnceLock::new();
 /// duration once the connection is up.
 ///
 /// No total request `.timeout()` is set: the same client serves both
-/// short HEAD probes ([`probe_patch_exists`]) and large tarball
-/// streams ([`download_stable_tarball`], [`download_rc_tarball`]),
-/// where a 130–180 MB compressed payload over a slow uplink can take
-/// minutes of wall-clock to deliver. Capping that with a per-request
-/// timeout would abort legitimate downloads; bounding only the
-/// connect phase preserves the dead-route guarantee while letting
+/// short requests (directory listings, releases.json) and large
+/// tarball streams ([`download_stable_tarball`],
+/// [`download_rc_tarball`]), where a 130–180 MB compressed payload
+/// over a slow uplink can take minutes of wall-clock to deliver.
+/// Capping that with a per-request timeout would abort legitimate
+/// downloads; bounding only the connect phase preserves the
+/// dead-route guarantee while letting
 /// the body stream as long as the upstream is making forward
 /// progress.
 const SHARED_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1202,14 +1203,14 @@ pub fn is_major_minor_prefix(s: &str) -> bool {
 /// E.g., "6.12" → "6.12.81", "6" → "6.19.12" (highest 6.x.y).
 ///
 /// Scans all monikers in releases.json except linux-next. If no
-/// match is found (EOL series), probes cdn.kernel.org with HEAD
-/// requests to find the highest patch version with a tarball.
+/// match is found (EOL series), fetches the cdn.kernel.org directory
+/// listing to find the highest patch version with a tarball.
 ///
 /// When `client` is the process-wide [`shared_client`] singleton,
 /// routes through [`RELEASES_CACHE`]; other clients bypass the
 /// cache via pointer-equality and exercise [`fetch_releases`]
 /// directly — see [`cached_releases_with`] for details. Cache
-/// scope is releases.json only; the EOL-series HEAD-probe
+/// scope is releases.json only; the EOL-series directory-listing
 /// fallback in [`probe_latest_patch`] always hits the network.
 ///
 /// `cli_label` prefixes diagnostic status output (e.g. `"ktstr"` or
@@ -1246,124 +1247,58 @@ pub fn fetch_version_for_prefix(client: &Client, prefix: &str, cli_label: &str) 
     probe_latest_patch(client, prefix, cli_label)
 }
 
-/// Upper bound for the search range in [`probe_latest_patch`].
-/// No kernel minor has ever produced this many patch releases; the bound
-/// exists only to terminate the exponential-expansion phase when a CDN
-/// misbehaves and returns success for every probe.
-const PROBE_PATCH_MAX: u32 = 500;
-
-/// HEAD one cdn.kernel.org tarball URL for `{prefix}.{patch}`.
+/// Find the latest patch version for an EOL series by fetching the
+/// CDN directory listing.
 ///
-/// Returns `Ok(true)` iff the server returned a 2xx status AND the
-/// response body is not HTML (some CDN error pages return 200 with
-/// text/html). Network / transport failures propagate as `Err`.
-fn probe_patch_exists(client: &Client, major: u32, prefix: &str, patch: u32) -> Result<bool> {
-    let url =
-        format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/linux-{prefix}.{patch}.tar.xz");
-    let response = client
-        .head(&url)
-        .send()
-        .with_context(|| format!("HEAD {url}"))?;
-    if !response.status().is_success() {
-        return Ok(false);
-    }
-    if let Some(ct) = response.headers().get(reqwest::header::CONTENT_TYPE)
-        && let Ok(ct_str) = ct.to_str()
-        && ct_str.contains("text/html")
-    {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-/// Probe cdn.kernel.org to find the highest patch version for an EOL series.
-///
-/// Probes patches in parallel batches that double in size each round
-/// (16, 32, 64, ...). Each batch HEADs its entire window concurrently
-/// via rayon; scanning the ordered results short-circuits at the first
-/// non-existent patch. This replaces the former "serial HEAD 1..=500"
-/// scan, which issued up to 500 sequential HTTP requests — each ~1 RTT
-/// — even for minors with only a handful of published patches, and
-/// stalled interactive runs by ~500x the single-request RTT on the
-/// slowest path.
-///
-/// Complexity: the largest patch N is pinpointed in `O(log N)` batches
-/// rather than `O(N)` serial requests, and every batch completes in
-/// roughly one RTT.
+/// GETs the `v{major}.x/` directory index from cdn.kernel.org and
+/// extracts `linux-{prefix}.{patch}.tar.xz` filenames to find the
+/// highest patch. One GET replaces the former parallel-HEAD probe
+/// which failed in CI environments that block or mishandle HEAD
+/// requests to the CDN.
 fn probe_latest_patch(client: &Client, prefix: &str, cli_label: &str) -> Result<String> {
-    use rayon::prelude::*;
-
     let major = major_version(prefix)?;
+    let url = format!("https://cdn.kernel.org/pub/linux/kernel/v{major}.x/");
+    eprintln!("{cli_label}: fetching directory listing from {url}");
+    let body = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("GET {url}"))?
+        .text()
+        .with_context(|| format!("reading body from {url}"))?;
 
-    /// Initial batch size. Each subsequent round doubles the window so
-    /// minors with many patches still finish in log-time rounds.
-    const PROBE_PATCH_INITIAL_BATCH: u32 = 16;
-
-    // Cap the window at the rayon pool size: HEAD requests beyond that
-    // cannot run in parallel anyway, they just queue behind the pool's
-    // threads and add latency without widening the probe. Floor at
-    // PROBE_PATCH_INITIAL_BATCH so small-core hosts (2-4 core CI
-    // runners) still get the log-time search — work-stealing handles
-    // the initial queuing cheaply, and the cap only kicks in on large
-    // hosts whose growth phase would otherwise run absurdly wide.
-    let pool_cap = rayon::current_num_threads().max(PROBE_PATCH_INITIAL_BATCH as usize) as u32;
-
-    let mut last_good: u32 = 0;
-    let mut lo: u32 = 1;
-    let mut window: u32 = PROBE_PATCH_INITIAL_BATCH.min(pool_cap);
-    'expand: loop {
-        let hi = (lo + window - 1).min(PROBE_PATCH_MAX);
-        // HEAD the entire window concurrently. A transient per-probe
-        // transport error (DNS hiccup, connection reset, single 5xx
-        // from the CDN) is treated as "patch absent" rather than
-        // aborting the whole search: a single blip in a 16/32/64-wide
-        // window would otherwise terminate EOL discovery and report
-        // "no tarball found" for a series that actually has one. The
-        // worst-case mis-classification — calling a real patch absent
-        // — produces a strictly conservative `last_good`, never a
-        // higher version than the CDN actually serves. Persistent
-        // outage degrades gracefully into the existing
-        // `last_good == 0` bail below (no tarball found at all).
-        // Per-probe errors are logged via `tracing::warn!` so total
-        // outage is not silent.
-        let results: Vec<(u32, bool)> = (lo..=hi)
-            .into_par_iter()
-            .map(
-                |patch| match probe_patch_exists(client, major, prefix, patch) {
-                    Ok(ok) => (patch, ok),
-                    Err(e) => {
-                        tracing::warn!(
-                            major, prefix, patch, error = %e,
-                            "probe_latest_patch: HEAD failed; treating patch as \
-                             absent and continuing search",
-                        );
-                        (patch, false)
-                    }
-                },
-            )
-            .collect();
-        // rayon preserves input order, so iterating advances `last_good`
-        // through increasing patch numbers and stops at the first 404
-        // (or treated-as-404 transport error).
-        for (patch, ok) in results {
-            if !ok {
-                break 'expand;
-            }
-            last_good = patch;
+    let needle = format!("linux-{prefix}.");
+    let mut best_patch: Option<u32> = None;
+    for line in body.lines() {
+        let Some(pos) = line.find(&needle) else {
+            continue;
+        };
+        let after = &line[pos + needle.len()..];
+        let Some(dot) = after.find(".tar.xz") else {
+            continue;
+        };
+        let patch_str = &after[..dot];
+        if let Ok(patch) = patch_str.parse::<u32>()
+            && best_patch.is_none_or(|b| patch > b)
+        {
+            best_patch = Some(patch);
         }
-        if hi >= PROBE_PATCH_MAX {
-            break;
-        }
-        lo = hi + 1;
-        window = window.saturating_mul(2).min(pool_cap);
     }
 
-    if last_good == 0 {
-        anyhow::bail!("no tarball found for {prefix}.x on cdn.kernel.org");
+    match best_patch {
+        Some(patch) => {
+            let version = format!("{prefix}.{patch}");
+            eprintln!("{cli_label}: latest {prefix}.x kernel (from cdn listing): {version}");
+            Ok(version)
+        }
+        None => {
+            anyhow::bail!(
+                "no tarball matching {prefix}.x found in cdn.kernel.org \
+                 directory listing at {url}"
+            );
+        }
     }
-    let version = format!("{prefix}.{last_good}");
-    eprintln!("{cli_label}: latest {prefix}.x kernel (from cdn probe): {version}");
-    Ok(version)
 }
 
 /// Clone a git repository with shallow depth.
