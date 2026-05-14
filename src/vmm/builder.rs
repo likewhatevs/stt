@@ -56,6 +56,7 @@ pub struct KtstrVmBuilder {
     pub(crate) timeout: Duration,
     pub(crate) monitor_thresholds: Option<crate::monitor::MonitorThresholds>,
     pub(crate) watchdog_timeout: Option<Duration>,
+    pub(crate) rendezvous_timeout: Option<Duration>,
     bpf_map_writes: Vec<BpfMapWriteParams>,
     pub(crate) performance_mode: bool,
     no_perf_mode: bool,
@@ -154,6 +155,7 @@ impl Default for KtstrVmBuilder {
             timeout: Duration::from_secs(12),
             monitor_thresholds: None,
             watchdog_timeout: Some(Duration::from_secs(5)),
+            rendezvous_timeout: None,
             bpf_map_writes: Vec::new(),
             performance_mode: false,
             no_perf_mode: false,
@@ -412,6 +414,22 @@ impl KtstrVmBuilder {
     #[allow(dead_code)]
     pub fn watchdog_timeout(mut self, timeout: Duration) -> Self {
         self.watchdog_timeout = Some(timeout);
+        self
+    }
+
+    /// Override the freeze coordinator's per-rendezvous wait timeout
+    /// (default: 30 s via `FREEZE_RENDEZVOUS_TIMEOUT` in
+    /// `freeze_coord::state`). Lowering this drives the rendezvous's
+    /// Degraded emit path — a `DegradedFailureDumpReport` carrying
+    /// `REASON_DEGRADED_RENDEZVOUS_TIMEOUT` or
+    /// `REASON_DEGRADED_KILL_DURING_RENDEZVOUS` — without waiting the
+    /// full 30 s. Primarily a test-fixture knob; production callers
+    /// should not override, as the 30 s default sits well above
+    /// worst-case healthy rendezvous and any real timeout indicates
+    /// a wedged vCPU.
+    #[allow(dead_code)]
+    pub fn rendezvous_timeout(mut self, timeout: Duration) -> Self {
+        self.rendezvous_timeout = Some(timeout);
         self
     }
 
@@ -873,6 +891,7 @@ impl KtstrVmBuilder {
             timeout: self.timeout,
             monitor_thresholds: self.monitor_thresholds,
             watchdog_timeout: self.watchdog_timeout,
+            rendezvous_timeout: self.rendezvous_timeout,
             bpf_map_writes: self.bpf_map_writes,
             performance_mode: self.performance_mode,
             no_perf_mode,
@@ -1178,6 +1197,18 @@ mod tests {
     fn builder_watchdog_timeout_override() {
         let b = KtstrVmBuilder::default().watchdog_timeout(Duration::from_secs(5));
         assert_eq!(b.watchdog_timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn builder_rendezvous_timeout_default() {
+        let b = KtstrVmBuilder::default();
+        assert_eq!(b.rendezvous_timeout, None);
+    }
+
+    #[test]
+    fn builder_rendezvous_timeout_override() {
+        let b = KtstrVmBuilder::default().rendezvous_timeout(Duration::from_millis(100));
+        assert_eq!(b.rendezvous_timeout, Some(Duration::from_millis(100)));
     }
 
     #[test]

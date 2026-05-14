@@ -439,6 +439,32 @@ pub(crate) mod vm;
 pub(crate) mod vmm;
 pub mod worker_ready;
 
+/// Test-only seams for the freeze coordinator's exit_kind gate.
+/// Integration tests under `tests/` flip these to force the rare
+/// silent-drop-fix branches (KVA translate failure, BPF latch
+/// rescue) that real workloads only hit during teardown races. Both
+/// statics default to `false`; production code paths read them on
+/// every gate decision via two relaxed atomic loads — one per
+/// static — that sit immediately before the KVA-translate and
+/// `.bss` reads they gate, work that dwarfs the load cost. Relaxed
+/// is sufficient because the bool is the entire signal: no other
+/// memory's visibility depends on the flag value, and cross-thread
+/// happens-before between the test setter and the freeze
+/// coordinator is established by the surrounding rendezvous
+/// mechanism (KVM signals, eventfds, mutexes), which is far stronger
+/// than any single-bool ordering. The gate itself fires at most
+/// once per error-class exit (not per task-switch), so even the
+/// relaxed load is negligible against the surrounding rendezvous
+/// work. `#[doc(hidden)]` keeps the symbols out of the published
+/// rustdoc surface — `pub` is the only path that survives the
+/// `tests/` integration-test boundary (Rust `#[cfg(test)]`-gated
+/// items are invisible to integration tests, which compile as
+/// separate crates linking against the library's public surface).
+#[doc(hidden)]
+pub use vmm::freeze_coord::{
+    FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED, FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE,
+};
+
 /// Pre-populate the on-disk cast analysis cache for a scheduler binary.
 ///
 /// Called by cargo-ktstr before spawning nextest so test processes

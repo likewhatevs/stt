@@ -229,6 +229,12 @@ pub struct KtstrVm {
     /// Converted to jiffies via CONFIG_HZ at monitor start time and
     /// written at each monitor iteration after the scheduler attaches.
     pub(crate) watchdog_timeout: Option<Duration>,
+    /// Override for the freeze coordinator's per-rendezvous wait
+    /// timeout. `None` means use `FREEZE_RENDEZVOUS_TIMEOUT` (30 s) from
+    /// `src/vmm/freeze_coord/state.rs`. Lowering this drives the
+    /// rendezvous-timeout Degraded emit path for E2E coverage of the
+    /// silent-drop fixes; production callers should not override.
+    pub(crate) rendezvous_timeout: Option<Duration>,
     /// Host-side BPF map writes. Empty slice disables the thread.
     /// When non-empty, a thread polls for BPF map discoverability,
     /// waits for scenario start via SHM ring, then writes each

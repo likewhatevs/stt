@@ -77,6 +77,38 @@ use self::state::{
 };
 use self::watchpoint::{WatchpointPublishResult, republish_watchpoint_on_rebind};
 
+/// Test-only seam: when set, the exit_kind gate's `translate_any_kva`
+/// call returns `None` unconditionally — driving the same code path
+/// that fires when a previously-published `*scx_root->exit_kind` KVA
+/// can no longer translate (slab page freed during teardown). E2E
+/// tests for the silent-drop fixes flip this to deterministically
+/// exercise the suppression + BPF-latch-rescue branches without
+/// staging a real translate failure (which depends on
+/// timing-sensitive teardown race windows).
+///
+/// `pub` because integration tests under `tests/` link against the
+/// library's public surface and `#[cfg(test)]`-gated statics are
+/// invisible across that boundary. `#[doc(hidden)]` keeps the symbol
+/// out of the published rustdoc surface. Production callers must
+/// never flip this — setting it forces dump suppression on every
+/// dump-eligible exit, masking real failures (unless
+/// [`FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED`] is also set, which would
+/// instead synthesize a phantom dump on every dump-eligible exit via
+/// the BPF-latch rescue path).
+#[doc(hidden)]
+pub static FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE: AtomicBool = AtomicBool::new(false);
+
+/// Test-only seam: when set, [`bss_read_state`] returns
+/// `BssReadState::Triggered` unconditionally — simulating a BPF probe
+/// latch fire. Combined with [`FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE`]
+/// this drives the "gate would suppress but latch rescues — proceed
+/// with dump" path that the silent-drop fix introduced to recover
+/// dumps when `*scx_root->exit_kind` is unreadable but the BPF probe
+/// has historically observed an error-class exit. See the partner
+/// static's doc for visibility / production-safety guidance.
+#[doc(hidden)]
+pub static FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
 /// Three-way result of polling the BPF probe's `.bss` latch via the
 /// cached guest-physical-address path used by [`bss_read_state`].
 ///
@@ -1762,6 +1794,16 @@ impl KtstrVm {
         }
 
         let kern_phys_base_for_result = kern_phys_base.clone();
+        // Effective rendezvous-wait deadline shared by the worker-park
+        // and post-thaw barriers downstream. Downstream comments
+        // reference `FREEZE_RENDEZVOUS_TIMEOUT` (the 30 s const) as
+        // the canonical bound; the captured local resolves
+        // to that const unless `KtstrVmBuilder::rendezvous_timeout` was
+        // set — the override path is test-fixture only. Captured here
+        // (outside the spawn) so the closure copies the `Duration`
+        // (`Copy`) by value rather than borrowing `self`, which the
+        // `'static` thread::spawn bound forbids.
+        let rendezvous_timeout = self.rendezvous_timeout.unwrap_or(FREEZE_RENDEZVOUS_TIMEOUT);
         let freeze_coord_handle = std::thread::Builder::new()
             .name("vmm-freeze-coord".into())
             .spawn(move || {
@@ -4072,12 +4114,14 @@ impl KtstrVm {
                             if still_parked > 0 {
                                 tracing::warn!(
                                     still_parked,
+                                    ?rendezvous_timeout,
                                     "freeze-coord: detected stale parked=true \
                                      parker(s) at cycle entry — prior post-thaw \
                                      barrier likely timed out. Pre-seeding \
                                      parked_evt to credit them as acks for this \
-                                     cycle so the rendezvous does not wait 30s \
-                                     for events that already fired."
+                                     cycle so the rendezvous does not wait the \
+                                     full rendezvous timeout for events that \
+                                     already fired."
                                 );
                                 if let Err(e) =
                                     freeze_coord_parked_evt.write(still_parked as u64)
@@ -4085,10 +4129,10 @@ impl KtstrVm {
                                     tracing::warn!(
                                         err = %e,
                                         still_parked,
+                                        ?rendezvous_timeout,
                                         "freeze-coord: parked_evt pre-seed write \
-                                         failed; rendezvous may wait full \
-                                         FREEZE_RENDEZVOUS_TIMEOUT for stale \
-                                         parker(s)"
+                                         failed; rendezvous may wait the full \
+                                         rendezvous timeout for stale parker(s)"
                                     );
                                 }
                             }
@@ -4302,7 +4346,7 @@ impl KtstrVm {
                                 freeze_coord_ap_parked.len() as u64
                                     + if bsp_alive_at_start { 1 } else { 0 }
                                     + if worker_was_running { 1 } else { 0 };
-                            let deadline = Instant::now() + FREEZE_RENDEZVOUS_TIMEOUT;
+                            let deadline = Instant::now() + rendezvous_timeout;
                             // Sub-deadline for the virtio-blk worker
                             // ack. `device.rs::stop_worker_and_reclaim_state`
                             // (and any sibling shutdown path) writes
@@ -4462,6 +4506,7 @@ impl KtstrVm {
                                             WORKER_PARK_SUB_TIMEOUT.as_millis() as u64,
                                         parked_count,
                                         expected_parks,
+                                        ?rendezvous_timeout,
                                         "freeze-coord: virtio-blk worker did \
                                          not ack park within sub-timeout AND \
                                          `paused` is still false — most \
@@ -4472,9 +4517,8 @@ impl KtstrVm {
                                          for this cycle. Dropping the +1 \
                                          from expected_parks so the \
                                          rendezvous proceeds without waiting \
-                                         the full FREEZE_RENDEZVOUS_TIMEOUT \
-                                         for an ack that physically cannot \
-                                         arrive."
+                                         the full rendezvous timeout for an \
+                                         ack that physically cannot arrive."
                                     );
                                     expected_parks =
                                         expected_parks.saturating_sub(1);
@@ -4815,14 +4859,21 @@ impl KtstrVm {
                                     (kva, Some(owned), Some(mem)) => {
                                         let kernel = owned.guest_kernel();
                                         let walk = kernel.walk_context();
-                                        match crate::monitor::idr::translate_any_kva(
-                                            mem,
-                                            walk.cr3_pa,
-                                            walk.page_offset,
-                                            kva,
-                                            walk.l5,
-                                            walk.tcr_el1,
-                                        ) {
+                                        let translate_result = if FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE
+                                            .load(Ordering::Relaxed)
+                                        {
+                                            None
+                                        } else {
+                                            crate::monitor::idr::translate_any_kva(
+                                                mem,
+                                                walk.cr3_pa,
+                                                walk.page_offset,
+                                                kva,
+                                                walk.l5,
+                                                walk.tcr_el1,
+                                            )
+                                        };
+                                        match translate_result {
                                             Some(pa) => {
                                                 let kind = mem.read_u32(pa, 0);
                                                 // SCX_EXIT_ERROR = 1024 — the
@@ -4903,10 +4954,16 @@ impl KtstrVm {
                                     // silently drop a real failure
                                     // dump; the BPF latch is the
                                     // historical authority and wins.
-                                    let bss_state = bss_read_state(
-                                        freeze_coord_mem.as_deref(),
-                                        cached_bss_pa,
-                                    );
+                                    let bss_state = if FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED
+                                        .load(Ordering::Relaxed)
+                                    {
+                                        BssReadState::Triggered
+                                    } else {
+                                        bss_read_state(
+                                            freeze_coord_mem.as_deref(),
+                                            cached_bss_pa,
+                                        )
+                                    };
                                     // The cross-reference Triggered
                                     // override is only safe when the
                                     // cached `.bss` PA has not been
@@ -5344,8 +5401,7 @@ impl KtstrVm {
                             return;
                         }
 
-                        let post_thaw_deadline =
-                            Instant::now() + FREEZE_RENDEZVOUS_TIMEOUT;
+                        let post_thaw_deadline = Instant::now() + rendezvous_timeout;
                         loop {
                             if freeze_coord_kill.load(Ordering::Acquire)
                                 || freeze_coord_bsp_done.load(Ordering::Acquire)
@@ -5382,11 +5438,11 @@ impl KtstrVm {
                                     ?ap_states,
                                     bsp_parked = !bsp_unparked,
                                     blk_paused = !blk_unpaused,
+                                    ?rendezvous_timeout,
                                     "freeze-coord: post-thaw barrier timed out — \
-                                     a parker did not clear within \
-                                     FREEZE_RENDEZVOUS_TIMEOUT; subsequent freeze \
-                                     cycles may see stale parked=true and timeout \
-                                     the rendezvous"
+                                     a parker did not clear within the rendezvous \
+                                     timeout; subsequent freeze cycles may see \
+                                     stale parked=true and timeout the rendezvous"
                                 );
                                 break;
                             }
