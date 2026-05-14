@@ -504,6 +504,7 @@ pub fn ktstr_test_early_dispatch() {
             let args: Vec<String> = std::env::args().collect();
             if args.iter().any(|a| a == "--list") {
                 ktstr_list_only();
+                list_verifier_cells_all();
                 list_plain_tests();
                 std::process::exit(0);
             } else if let Some(pos) = args.iter().position(|a| a == "--exact")
@@ -1145,6 +1146,41 @@ fn list_tests_all(ignored_only: bool) {
                 }
             },
         );
+    }
+}
+
+/// Emit `verifier/<sched>/<kernel>/<preset>: test` lines — one per
+/// (declared scheduler × declared kernel × accepted gauntlet preset)
+/// cell. Mirrors the gauntlet emission pattern in
+/// [`list_tests_all`] but walks [`super::KTSTR_SCHEDULERS`] instead
+/// of [`KTSTR_TESTS`].
+///
+/// Verifier cells always use the no-perf-mode acceptance filter (KVM
+/// emulates the topology; host LLC layout doesn't constrain).
+///
+/// Cells are nextest-discoverable but the `--exact verifier/...`
+/// handler is added in a follow-up; running a cell currently falls
+/// through to libtest and fails with "no test matches".
+fn list_verifier_cells_all() {
+    let presets = crate::vm::gauntlet_presets();
+    let (host_cpus, _host_llcs, _host_max_cpus_per_llc) = super::host_capacity();
+
+    for sched in super::KTSTR_SCHEDULERS.iter() {
+        for kernel_spec in sched.kernels.iter() {
+            let kernel_label = sanitize_kernel_label(kernel_spec);
+            for preset in presets.iter() {
+                if !sched
+                    .constraints
+                    .accepts_no_perf_mode(&preset.topology, host_cpus)
+                {
+                    continue;
+                }
+                println!(
+                    "verifier/{}/{kernel_label}/{}: test",
+                    sched.name, preset.name,
+                );
+            }
+        }
     }
 }
 
