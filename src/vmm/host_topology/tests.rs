@@ -1284,9 +1284,7 @@ fn resource_lock_all_or_nothing() {
     cleanup_lock(&llc_600);
     cleanup_lock(&llc_601);
 
-    let holder = try_flock(&llc_601, FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
+    let holder = try_flock(&llc_601, FlockMode::Exclusive).unwrap().unwrap();
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
     assert!(
@@ -1320,9 +1318,7 @@ fn resource_lock_shared_cpu_contention() {
     cleanup_lock(&llc_path);
     cleanup_lock(&cpu_path);
 
-    let holder = try_flock(&cpu_path, FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
+    let holder = try_flock(&cpu_path, FlockMode::Exclusive).unwrap().unwrap();
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
     assert!(
@@ -1382,9 +1378,7 @@ fn resource_lock_service_cpu_contention() {
     cleanup_lock(&cpu_901);
 
     // Hold the service CPU lock.
-    let holder = try_flock(&cpu_901, FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
+    let holder = try_flock(&cpu_901, FlockMode::Exclusive).unwrap().unwrap();
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
     match &outcome {
@@ -1433,9 +1427,7 @@ fn cpu_lock_window_contention_all_or_nothing() {
     cleanup_lock(&cpu_400);
     cleanup_lock(&cpu_401);
 
-    let holder = try_flock(&cpu_400, FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
+    let holder = try_flock(&cpu_400, FlockMode::Exclusive).unwrap().unwrap();
 
     let result = try_acquire_cpu_window(91400, 2);
     assert!(result.is_err(), "should fail when first CPU is held");
@@ -1443,9 +1435,7 @@ fn cpu_lock_window_contention_all_or_nothing() {
     // Hold 91401 instead — 91400 acquires then drops on failure.
     drop(holder);
 
-    let holder2 = try_flock(&cpu_401, FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
+    let holder2 = try_flock(&cpu_401, FlockMode::Exclusive).unwrap().unwrap();
     let result2 = try_acquire_cpu_window(91400, 2);
     assert!(result2.is_err(), "should fail when second CPU is held");
 
@@ -1643,9 +1633,7 @@ fn pid_window_offset_max_start_one() {
 fn cpu_lock_acquire_slides_past_held() {
     let cpu0 = cpu_lock_path(0);
     cleanup_lock(&cpu0);
-    let holder = try_flock(&cpu0, FlockMode::Exclusive)
-        .unwrap()
-        .unwrap();
+    let holder = try_flock(&cpu0, FlockMode::Exclusive).unwrap().unwrap();
 
     let result = match acquire_cpu_locks(2, 100, None) {
         Ok(r) => r,
