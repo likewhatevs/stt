@@ -409,8 +409,8 @@ fn help_verifier() {
         .args(["verifier", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--scheduler"))
-        .stdout(predicate::str::contains("--scheduler-bin"));
+        .stdout(predicate::str::contains("--kernel"))
+        .stdout(predicate::str::contains("--raw"));
 }
 
 #[test]
@@ -424,15 +424,6 @@ fn help_completions() {
 }
 
 // -- error cases --
-
-#[test]
-fn verifier_no_scheduler_fails() {
-    cargo_ktstr()
-        .arg("verifier")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("--scheduler"));
-}
 
 #[test]
 fn no_subcommand_fails() {

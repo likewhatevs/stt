@@ -305,7 +305,19 @@ impl SanitizedKernelLabel {
 
 /// One resolved kernel entry from `KTSTR_KERNEL_LIST` (the multi-
 /// kernel fan-out wire format that `cargo ktstr test --kernel A
-/// --kernel B` exports before exec'ing into `cargo nextest`).
+/// --kernel B` or `cargo ktstr verifier --kernel A --kernel B`
+/// exports before exec'ing into `cargo nextest`).
+///
+/// `label` is the producer-side label string before
+/// sanitization — e.g. `"6.14.2"` for Version, `"git_tj_sched_ext_for-next"`
+/// for Git, `"6.14.2-tarball-x86_64-kc..."` for CacheKey,
+/// `"path_linux_a3f2b1"` for Path. Preserved so the
+/// [`crate::test_support::dispatch`] verifier sweep filter can
+/// compare against `declare_scheduler!`'s `kernels = [...]`
+/// declarations — specifically, range membership
+/// (`"6.14..6.16"` vs `"6.14.2"`) needs the raw version string
+/// to feed into [`crate::kernel_path::decompose_version_for_compare`],
+/// which the sanitized form has lost (slashes / dots → underscores).
 ///
 /// `sanitized` is the nextest-safe identifier appended to test names
 /// so `cargo nextest run -E 'test(kernel_6_14_2)'` filters work
@@ -331,6 +343,7 @@ impl SanitizedKernelLabel {
 /// `KTSTR_KERNEL`.
 #[derive(Clone, Debug)]
 pub(crate) struct KernelEntry {
+    pub(crate) label: String,
     pub(crate) sanitized: SanitizedKernelLabel,
     pub(crate) kernel_dir: PathBuf,
 }
@@ -361,6 +374,7 @@ pub(crate) fn parse_kernel_list(raw: &str) -> Vec<KernelEntry> {
                 return None;
             }
             Some(KernelEntry {
+                label: label.to_string(),
                 sanitized: SanitizedKernelLabel::new(label),
                 kernel_dir: PathBuf::from(path),
             })
@@ -1199,12 +1213,117 @@ fn list_tests_all(ignored_only: bool) {
     }
 }
 
+/// True iff the given operator-resolved kernel `entry` matches one
+/// of the `declared` kernel specs from a scheduler's
+/// `declare_scheduler!` `kernels = [...]` declaration. Empty
+/// `declared` accepts every entry (no per-scheduler filter).
+///
+/// Match semantics per spec variant (via [`crate::kernel_path::KernelId::parse`]):
+/// - [`KernelId::Version`]: raw-label string equality OR sanitized-label match
+///   ([`sanitize_kernel_label`] of the spec string equals the entry's
+///   sanitized label). Direct match catches the common case where
+///   the dispatcher resolved `--kernel 6.14.2` and the scheduler
+///   declared `kernels = ["6.14.2"]`.
+/// - [`KernelId::Range`]: range-membership check on the entry's raw
+///   label via [`crate::kernel_path::decompose_version_for_compare`].
+///   Lets schedulers declaring `kernels = ["6.14..6.16"]` match
+///   any operator-supplied kernel whose version falls in
+///   `[6.14, 6.16]` inclusive.
+/// - [`KernelId::Path`] / [`KernelId::CacheKey`] / [`KernelId::Git`]:
+///   sanitized-label equality — the producer-side encoder
+///   (`cargo_ktstr/kernel/wire_format.rs`) emits a deterministic
+///   label per variant (`path_…`, `git_owner_repo_ref`, version
+///   prefix from cache key), so identical specs on both sides
+///   produce identical sanitized labels.
+///
+/// [`KernelId`]: crate::kernel_path::KernelId
+fn sched_kernel_filter_accepts(declared: &[&'static str], entry: &KernelEntry) -> bool {
+    if declared.is_empty() {
+        return true;
+    }
+    declared.iter().any(|spec| entry_matches_spec(entry, spec))
+}
+
+/// Single-spec match helper for [`sched_kernel_filter_accepts`].
+/// Parses `spec` via [`crate::kernel_path::KernelId::parse`] and
+/// dispatches on the variant. Pure logic — no network, no FS.
+fn entry_matches_spec(entry: &KernelEntry, spec: &str) -> bool {
+    use crate::kernel_path::{KernelId, decompose_version_for_compare};
+    match KernelId::parse(spec) {
+        KernelId::Version(spec_ver) => {
+            entry.label == spec_ver
+                || entry.sanitized.as_str() == sanitize_kernel_label(&spec_ver)
+        }
+        KernelId::Range { start, end } => {
+            let Some(entry_t) = decompose_version_for_compare(&entry.label) else {
+                return false;
+            };
+            let Some(start_t) = decompose_version_for_compare(&start) else {
+                return false;
+            };
+            let Some(end_t) = decompose_version_for_compare(&end) else {
+                return false;
+            };
+            entry_t >= start_t && entry_t <= end_t
+        }
+        KernelId::CacheKey(_) | KernelId::Path(_) | KernelId::Git { .. } => {
+            entry.sanitized.as_str() == sanitize_kernel_label(spec)
+        }
+    }
+}
+
+/// Format the `KTSTR_KERNEL_LIST is empty` diagnostic emitted by
+/// [`run_verifier_cell`] when a verifier cell name reaches the cell
+/// handler with no kernel-list to look the label up in. Extracted
+/// from the inline eprintln! so the exact wording can be pinned in
+/// unit tests without spawning a process.
+fn format_empty_kernel_list_error(full_name: &str) -> String {
+    format!(
+        "ktstr verifier: cell {full_name}: KTSTR_KERNEL_LIST is empty. \
+         Direct `--exact verifier/...` invocation outside `cargo ktstr verifier` \
+         is not supported — the dispatcher owns kernel-set resolution. Run \
+         `cargo ktstr verifier [--kernel SPEC]` instead.",
+    )
+}
+
+/// Format the "kernel label not in KTSTR_KERNEL_LIST" diagnostic.
+/// `present` is the slice of sanitized labels actually present in
+/// the list, in their KTSTR_KERNEL_LIST ordering. Extracted for the
+/// same reason as [`format_empty_kernel_list_error`].
+fn format_unknown_kernel_label_error(
+    full_name: &str,
+    kernel_label: &str,
+    sched_name: &str,
+    present: &[&str],
+) -> String {
+    format!(
+        "ktstr verifier: cell {full_name}: kernel label {kernel_label:?} \
+         not in KTSTR_KERNEL_LIST. Present labels: [{}]. \
+         Either add --kernel <SPEC> to the dispatcher invocation so it \
+         resolves into this label, or remove the matching entry from \
+         declare_scheduler!(... kernels = [...]) for {sched_name}.",
+        present.join(", "),
+    )
+}
+
 /// Emit `verifier/<sched>/<kernel>/<preset>: test` lines — one per
-/// (declared scheduler × declared kernel × accepted gauntlet preset)
-/// cell. Mirrors the gauntlet emission pattern in [`list_tests_all`]
-/// but walks [`super::KTSTR_SCHEDULERS`] instead of [`KTSTR_TESTS`].
-/// Cells are paired with the [`run_verifier_cell`] handler registered
-/// in [`ktstr_test_early_dispatch`]'s `--exact verifier/...` branch.
+/// (declared scheduler × kernel-list entry × accepted gauntlet
+/// preset) cell. Mirrors the gauntlet emission pattern in
+/// [`list_tests_all`] but walks [`super::KTSTR_SCHEDULERS`] instead
+/// of [`KTSTR_TESTS`]. Cells are paired with the
+/// [`run_verifier_cell`] handler registered in
+/// [`ktstr_test_early_dispatch`]'s `--exact verifier/...` branch.
+///
+/// The matrix dimension is `KTSTR_KERNEL_LIST` (always populated by
+/// the `cargo ktstr verifier` dispatcher — even with a single
+/// auto-discovered kernel, the dispatcher synthesizes a one-entry
+/// list with a derived label). Each scheduler's
+/// `declare_scheduler!` `kernels = [...]` declaration acts as a
+/// per-scheduler filter on the matrix — `Version` / `Range`
+/// declarations match entries by raw-label equality / range
+/// membership; `Path` / `CacheKey` / `Git` declarations match by
+/// sanitized-label equality. An empty `kernels = []` declaration
+/// accepts every entry in the list (no filter).
 ///
 /// Acceptance filter mirrors the gauntlet branching in
 /// [`for_each_gauntlet_variant`]: perf-mode pinning constrains
@@ -1225,8 +1344,18 @@ fn list_tests_all(ignored_only: bool) {
 /// corrupt the splitn-based parse in [`run_verifier_cell`]. The
 /// emission elides such cells with a stderr warning so the operator
 /// sees the gap rather than silently dropping cells.
+///
+/// When `KTSTR_KERNEL_LIST` is absent (direct binary invocation
+/// outside the `cargo ktstr verifier` dispatcher), no cells emit.
+/// Operators who invoke a test binary directly with `--exact
+/// verifier/...` will see the cell handler's "kernel label not in
+/// KTSTR_KERNEL_LIST" error.
 fn list_verifier_cells_all() {
     use super::SchedulerSpec;
+    let kernel_list = read_kernel_list();
+    if kernel_list.is_empty() {
+        return;
+    }
     let presets = crate::vm::gauntlet_presets();
     let (host_cpus, host_llcs, host_max_cpus_per_llc) = super::host_capacity();
     let no_perf_mode = super::runtime::no_perf_mode_active();
@@ -1236,8 +1365,6 @@ fn list_verifier_cells_all() {
             sched.binary,
             SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. }
         ) {
-            // Skip at list time — these variants have no userspace
-            // binary to verify.
             continue;
         }
         if sched.name.contains('/') {
@@ -1247,8 +1374,10 @@ fn list_verifier_cells_all() {
             );
             continue;
         }
-        for kernel_spec in sched.kernels.iter() {
-            let kernel_label = sanitize_kernel_label(kernel_spec);
+        for kernel_entry in &kernel_list {
+            if !sched_kernel_filter_accepts(sched.kernels, kernel_entry) {
+                continue;
+            }
             for preset in presets.iter() {
                 if preset.name.contains('/') {
                     eprintln!(
@@ -1257,10 +1386,6 @@ fn list_verifier_cells_all() {
                     );
                     continue;
                 }
-                // Mirror the for_each_gauntlet_variant filter
-                // branching so perf-mode and no-perf-mode runs see
-                // the same set of accepted cells they would see in
-                // the gauntlet path.
                 let accepted = if no_perf_mode {
                     sched
                         .constraints
@@ -1277,8 +1402,10 @@ fn list_verifier_cells_all() {
                     continue;
                 }
                 println!(
-                    "verifier/{}/{kernel_label}/{}: test",
-                    sched.name, preset.name,
+                    "verifier/{}/{}/{}: test",
+                    sched.name,
+                    kernel_entry.sanitized,
+                    preset.name,
                 );
             }
         }
@@ -1287,16 +1414,30 @@ fn list_verifier_cells_all() {
 
 /// Parse `verifier/<sched_name>/<kernel_label>/<preset_name>`, look
 /// up the declared scheduler in [`super::KTSTR_SCHEDULERS`] + the
-/// gauntlet preset in [`crate::vm::gauntlet_presets`], resolve the
-/// scheduler binary path per [`super::SchedulerSpec`], boot the
-/// verifier VM via [`crate::verifier::collect_verifier_output`], and
-/// print the rendered output. Returns 0 on success, 1 on failure /
+/// gauntlet preset in [`crate::vm::gauntlet_presets`] + the kernel
+/// in [`KTSTR_KERNEL_LIST_ENV`](crate::KTSTR_KERNEL_LIST_ENV),
+/// resolve the scheduler binary path per
+/// [`super::SchedulerSpec`], boot the verifier VM via
+/// [`crate::verifier::collect_verifier_output`], and print the
+/// rendered output. Returns 0 on success, 1 on failure /
 /// malformed cell name.
 ///
-/// Eevdf + KernelBuiltin scheduler variants currently skip with a
-/// diagnostic — neither has a userspace binary to load BPF programs
-/// from, so the verifier path doesn't apply. They emit a "SKIP" line
-/// + exit 0 so nextest reports the cell as passed.
+/// The per-cell kernel directory is resolved by sanitized-label
+/// lookup in `KTSTR_KERNEL_LIST` — the
+/// `cargo ktstr verifier` dispatcher always populates the list,
+/// even with no `--kernel` flag (it synthesizes a single auto-
+/// discovered entry). There is no single-kernel-mode fallback.
+/// An unrecognised label or an absent list both surface as an
+/// exit-1 diagnostic naming the present labels and pointing at
+/// the dispatcher.
+///
+/// Eevdf + KernelBuiltin scheduler variants are filtered out at
+/// emission time in [`list_verifier_cells_all`], so nextest
+/// dispatch never reaches the SKIP arms in this function. The
+/// SKIP arms remain as defense-in-depth for direct
+/// `--exact verifier/<eevdf>/...` invocation outside nextest
+/// (the only path that bypasses the emission-time filter); in
+/// that case they emit a `SKIP` banner + exit 0.
 fn run_verifier_cell(full_name: &str) -> i32 {
     use super::SchedulerSpec;
 
@@ -1342,22 +1483,37 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         return 1;
     };
 
-    // Find which declared kernel spec matches the sanitized label
-    // emitted by list_verifier_cells_all. The label is a one-way
-    // sanitization (slashes / dots → underscores), so we can't simply
-    // reverse it — walk the scheduler's declared kernels and
-    // re-sanitize each to find the match. O(N) per cell where
-    // N = sched.kernels.len(); schedulers typically declare ≤ 4
-    // kernels so the scan is trivially cheap and re-sanitizing each
-    // time avoids storing a parallel label cache.
-    let Some(kernel_spec) = sched
-        .kernels
+    // Resolve the per-cell kernel directory by looking the cell's
+    // sanitized label up in `KTSTR_KERNEL_LIST`. The
+    // `cargo ktstr verifier` dispatcher always populates the list —
+    // even with no `--kernel` flag it synthesizes a single auto-
+    // discovered entry — so the lookup is the single source of
+    // truth and there is no single-kernel-mode fallback that would
+    // silently run a cell against an unrelated kernel.
+    //
+    // An empty list reaching this function means the test binary was
+    // invoked outside the dispatcher (direct `--exact verifier/...`
+    // under a hand-spawned nextest, for instance). Error with an
+    // actionable message rather than fall through to auto-discovery.
+    let kernel_list = read_kernel_list();
+    let Some(kernel_entry) = kernel_list
         .iter()
-        .find(|k| sanitize_kernel_label(k) == kernel_label)
+        .find(|k| k.sanitized.as_str() == kernel_label)
     else {
-        eprintln!(
-            "ktstr verifier: kernel label {kernel_label:?} doesn't match any declared kernel for {sched_name:?} (cell {full_name:?})",
-        );
+        if kernel_list.is_empty() {
+            eprintln!("{}", format_empty_kernel_list_error(full_name));
+        } else {
+            let present: Vec<&str> = kernel_list.iter().map(|k| k.sanitized.as_str()).collect();
+            eprintln!(
+                "{}",
+                format_unknown_kernel_label_error(
+                    full_name,
+                    kernel_label,
+                    sched_name,
+                    &present,
+                ),
+            );
+        }
         return 1;
     };
 
@@ -1379,10 +1535,9 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         }
         // Eevdf + KernelBuiltin are filtered at list time in
         // list_verifier_cells_all, so nextest dispatch never reaches
-        // these arms. Direct binary invocation outside nextest
-        // (`--exact verifier/<eevdf>/...`) is the only path that hits
-        // them; the SKIP branches preserve operator clarity in that
-        // case.
+        // these arms. The SKIP arms remain as defense-in-depth for
+        // direct `--exact verifier/<eevdf>/...` invocation outside
+        // nextest.
         SchedulerSpec::Eevdf => {
             println!(
                 "ktstr verifier: SKIP cell {full_name} (Eevdf has no userspace binary to verify)",
@@ -1408,47 +1563,7 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         }
     };
 
-    // Resolve the per-cell kernel directory:
-    //   - multi-kernel mode (KTSTR_KERNEL_LIST set with ≥2 entries
-    //     by `cargo ktstr verifier --kernel A --kernel B`): look up
-    //     the cell's sanitized label in the list so each cell runs
-    //     against its own kernel build. The kernel_spec lookup above
-    //     already validates the cell name; this lookup surfaces a
-    //     mismatch when the operator's --kernel set didn't cover the
-    //     declared sched.kernels values.
-    //   - single-kernel mode (only KTSTR_KERNEL set, or auto-resolve
-    //     from the cache): fall through to resolve_test_kernel().
-    //     Every cell runs against the same kernel regardless of label
-    //     — the cell name is informational only in this mode.
-    let kernel_list = read_kernel_list();
-    let kernel_path = if !kernel_list.is_empty() {
-        match kernel_list
-            .iter()
-            .find(|k| k.sanitized.as_str() == kernel_label)
-        {
-            Some(ke) => ke.kernel_dir.clone(),
-            None => {
-                eprintln!(
-                    "ktstr verifier: cell {full_name}: kernel label {kernel_label:?} \
-                     not in KTSTR_KERNEL_LIST ({n} entries — every emitted cell label \
-                     must appear in the --kernel set the dispatcher resolved)",
-                    n = kernel_list.len(),
-                );
-                return 1;
-            }
-        }
-    } else {
-        match resolve_test_kernel() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "ktstr verifier: resolve kernel for cell {full_name}: {e:#} (declared spec: {kernel_spec})",
-                );
-                return 1;
-            }
-        }
-    };
-
+    let kernel_path = kernel_entry.kernel_dir.clone();
     let topology = super::TopologyJson::from(preset.topology);
     let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
 
@@ -2420,6 +2535,257 @@ mod tests {
         assert_eq!(entries[1].sanitized, "kernel_6_15_0");
     }
 
+    /// `KernelEntry.label` preserves the producer-side label
+    /// string verbatim. Pinned because the
+    /// `sched_kernel_filter_accepts` range-membership branch reads
+    /// the raw label to feed into `decompose_version_for_compare`
+    /// (the sanitized form has lost dot separators required for
+    /// version parsing).
+    #[test]
+    fn parse_kernel_list_preserves_label() {
+        let entries = parse_kernel_list("6.14.2=/a;git_tj_sched_ext_main=/b;6.15-rc3=/c");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].label, "6.14.2");
+        assert_eq!(entries[1].label, "git_tj_sched_ext_main");
+        assert_eq!(entries[2].label, "6.15-rc3");
+    }
+
+    // ---------------------------------------------------------------
+    // sched_kernel_filter_accepts + entry_matches_spec
+    // (coverage for the per-scheduler kernel filter that gates
+    // verifier cell emission against KTSTR_KERNEL_LIST)
+    // ---------------------------------------------------------------
+
+    /// Build a `KernelEntry` for filter testing without round-
+    /// tripping through `parse_kernel_list`. Wraps the test-only
+    /// `SanitizedKernelLabel::from_pre_sanitized_for_test` so
+    /// fixtures can hand-write the exact label strings the
+    /// production parser would emit.
+    fn mk_entry(raw: &str, sanitized: &str, dir: &str) -> KernelEntry {
+        KernelEntry {
+            label: raw.to_string(),
+            sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test(sanitized),
+            kernel_dir: PathBuf::from(dir),
+        }
+    }
+
+    #[test]
+    fn filter_accepts_everything_when_declared_empty() {
+        // Empty sched.kernels means "no per-scheduler filter" — every
+        // KTSTR_KERNEL_LIST entry passes.
+        let e = mk_entry("6.14.2", "kernel_6_14_2", "/a");
+        assert!(sched_kernel_filter_accepts(&[], &e));
+        let weird = mk_entry("anything", "kernel_anything", "/b");
+        assert!(sched_kernel_filter_accepts(&[], &weird));
+    }
+
+    #[test]
+    fn filter_matches_version_by_label() {
+        let e = mk_entry("6.14.2", "kernel_6_14_2", "/a");
+        // Exact raw-label equality is the primary match path.
+        assert!(entry_matches_spec(&e, "6.14.2"));
+        // sched.kernels = ["6.14.2"] accepts this entry.
+        assert!(sched_kernel_filter_accepts(&["6.14.2"], &e));
+    }
+
+    #[test]
+    fn filter_matches_version_by_sanitized_label() {
+        // Different raw label but the spec sanitizes to the same
+        // sanitized form — match via the sanitized-equality fallback.
+        // Example: spec "6.14.2" sanitizes to "kernel_6_14_2" and
+        // the entry's sanitized label is the same.
+        let e = mk_entry("6.14.2-tarball-x86_64-kcabc", "kernel_6_14_2", "/a");
+        // label != "6.14.2", but sanitized matches.
+        assert!(entry_matches_spec(&e, "6.14.2"));
+    }
+
+    #[test]
+    fn filter_rejects_version_mismatch() {
+        let e = mk_entry("6.15.0", "kernel_6_15_0", "/a");
+        // Neither raw nor sanitized matches "6.14.2".
+        assert!(!entry_matches_spec(&e, "6.14.2"));
+        assert!(!sched_kernel_filter_accepts(&["6.14.2"], &e));
+    }
+
+    #[test]
+    fn filter_matches_range_membership_inclusive() {
+        // Range "6.14..6.16" (both endpoints inclusive). Entries
+        // inside the range match; outside reject.
+        let inside_low = mk_entry("6.14", "kernel_6_14", "/a");
+        let inside_mid = mk_entry("6.15.3", "kernel_6_15_3", "/b");
+        let inside_high = mk_entry("6.16", "kernel_6_16", "/c");
+        let below = mk_entry("6.13.7", "kernel_6_13_7", "/d");
+        let above = mk_entry("6.17.0", "kernel_6_17_0", "/e");
+
+        assert!(entry_matches_spec(&inside_low, "6.14..6.16"));
+        assert!(entry_matches_spec(&inside_mid, "6.14..6.16"));
+        assert!(entry_matches_spec(&inside_high, "6.14..6.16"));
+        assert!(!entry_matches_spec(&below, "6.14..6.16"));
+        assert!(!entry_matches_spec(&above, "6.14..6.16"));
+    }
+
+    #[test]
+    fn filter_matches_range_inclusive_form_too() {
+        // `..=` spelling produces the same inclusive range as `..`
+        // per KernelId::parse (both inclusive on both endpoints).
+        let inside = mk_entry("6.15.0", "kernel_6_15_0", "/a");
+        assert!(entry_matches_spec(&inside, "6.14..=6.16"));
+        let above = mk_entry("6.17.0", "kernel_6_17_0", "/b");
+        assert!(!entry_matches_spec(&above, "6.14..=6.16"));
+    }
+
+    #[test]
+    fn filter_handles_unparseable_entry_label_in_range() {
+        // Entry whose label isn't version-shaped (e.g. a Git
+        // label) can't be in a version range — reject.
+        let git_entry = mk_entry("git_tj_sched_ext_main", "kernel_git_tj_sched_ext_main", "/a");
+        assert!(!entry_matches_spec(&git_entry, "6.14..6.16"));
+    }
+
+    #[test]
+    fn filter_matches_path_spec_by_sanitized() {
+        // Path specs match by sanitized-label equality.
+        let e = mk_entry("path_linux_a3f2b1", "kernel_path_linux_a3f2b1", "/some/dir");
+        // The matching spec for a Path uses the path-derived sanitized
+        // form. A user-supplied "../linux" sanitizes differently from
+        // the producer's path_kernel_label output, so a Path spec in
+        // sched.kernels typically wouldn't be useful — but pin the
+        // sanitized-equality path anyway.
+        let same_path_spec = "/some/dir";
+        // KernelId::parse("/some/dir") → Path. sanitize_kernel_label
+        // turns it into "kernel_some_dir" — not equal to the entry's
+        // "kernel_path_linux_a3f2b1". Reject.
+        assert!(!entry_matches_spec(&e, same_path_spec));
+    }
+
+    #[test]
+    fn filter_matches_cache_key_spec_by_sanitized() {
+        // CacheKey spec matches when sanitized labels align.
+        let e = mk_entry(
+            "6.14.2-tarball-x86_64-kcabc",
+            "kernel_6_14_2_tarball_x86_64_kcabc",
+            "/cache/foo",
+        );
+        // The spec parsed as CacheKey sanitizes to the same form.
+        assert!(entry_matches_spec(
+            &e,
+            "6.14.2-tarball-x86_64-kcabc",
+        ));
+    }
+
+    #[test]
+    fn filter_accepts_when_any_declared_spec_matches() {
+        // Multiple declared specs; entry matches one of them.
+        let e = mk_entry("6.15.3", "kernel_6_15_3", "/a");
+        assert!(sched_kernel_filter_accepts(
+            &["6.14.2", "6.14..6.16", "git+https://example.com/r#main"],
+            &e,
+        ));
+    }
+
+    #[test]
+    fn filter_rejects_when_no_declared_spec_matches() {
+        let e = mk_entry("7.0.0", "kernel_7_0_0", "/a");
+        assert!(!sched_kernel_filter_accepts(
+            &["6.14.2", "6.14..6.16"],
+            &e,
+        ));
+    }
+
+    // ---------------------------------------------------------------
+    // Pin the exact diagnostic strings emitted by run_verifier_cell
+    // when the kernel-list lookup fails. Tests exercise the formatter
+    // helpers directly — no need to spawn a separate test binary
+    // because the eprintln! call sites now route through these pure
+    // formatters.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
+        let s = format_empty_kernel_list_error(
+            "verifier/sched_foo/kernel_6_14_2/tiny-1llc",
+        );
+        // Cell name appears verbatim so the operator can grep their
+        // own invocation for the failing cell.
+        assert!(
+            s.contains("verifier/sched_foo/kernel_6_14_2/tiny-1llc"),
+            "missing cell name in: {s}",
+        );
+        // Root cause is named explicitly.
+        assert!(s.contains("KTSTR_KERNEL_LIST is empty"), "missing cause: {s}");
+        // Actionable hint points back at the dispatcher subcommand
+        // (the only supported entry point).
+        assert!(
+            s.contains("cargo ktstr verifier"),
+            "missing actionable hint: {s}",
+        );
+    }
+
+    #[test]
+    fn format_unknown_kernel_label_error_lists_present_labels_and_both_fix_paths() {
+        let present = vec!["kernel_6_14_2", "kernel_6_15_0"];
+        let s = format_unknown_kernel_label_error(
+            "verifier/sched_foo/kernel_7_0_0/tiny-1llc",
+            "kernel_7_0_0",
+            "sched_foo",
+            &present,
+        );
+        // Cell name + missing label appear so operators see exactly
+        // which lookup failed.
+        assert!(
+            s.contains("verifier/sched_foo/kernel_7_0_0/tiny-1llc"),
+            "missing cell name: {s}",
+        );
+        // Debug-formatted missing label (`{kernel_label:?}` produces
+        // double-quoted output).
+        assert!(s.contains("\"kernel_7_0_0\""), "missing debug label: {s}");
+        // Present-labels enumeration: every entry must appear so the
+        // operator can see what IS available.
+        assert!(s.contains("kernel_6_14_2"), "missing present[0]: {s}");
+        assert!(s.contains("kernel_6_15_0"), "missing present[1]: {s}");
+        // Scheduler name surfaces in the declaration-side fix hint.
+        assert!(s.contains("sched_foo"), "missing scheduler name: {s}");
+        // Both fix paths are documented: add a kernel to the
+        // dispatcher OR drop the matching entry from the declaration.
+        assert!(s.contains("add --kernel"), "missing dispatcher-side fix: {s}");
+        assert!(
+            s.contains("declare_scheduler!"),
+            "missing declaration-side fix: {s}",
+        );
+    }
+
+    #[test]
+    fn format_unknown_kernel_label_error_empty_present_renders_empty_brackets() {
+        // Edge case: kernel_list has entries that fail the find()
+        // (string equality drifted) but the present slice the caller
+        // assembles is empty — still surfaces the bracket pair so the
+        // diagnostic format is uniform with the non-empty case.
+        let s = format_unknown_kernel_label_error(
+            "verifier/foo/kernel_x/tiny",
+            "kernel_x",
+            "foo",
+            &[],
+        );
+        assert!(s.contains("Present labels: []"), "missing empty brackets: {s}");
+    }
+
+    #[test]
+    fn format_unknown_kernel_label_error_joins_present_with_comma_space() {
+        // Three-entry present slice must render comma-space separated
+        // to match the `present.join(", ")` contract.
+        let present = vec!["a", "b", "c"];
+        let s = format_unknown_kernel_label_error(
+            "verifier/foo/kernel_x/tiny",
+            "kernel_x",
+            "foo",
+            &present,
+        );
+        assert!(
+            s.contains("Present labels: [a, b, c]"),
+            "wrong join delimiter: {s}",
+        );
+    }
+
     #[test]
     fn sanitize_kernel_label_pure_version() {
         assert_eq!(sanitize_kernel_label("6.14.2"), "kernel_6_14_2");
@@ -2593,6 +2959,7 @@ mod tests {
     #[test]
     fn strip_kernel_suffix_single_kernel_passthrough() {
         let kernel_list = vec![KernelEntry {
+            label: "6.14.2".to_string(),
             sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
             kernel_dir: PathBuf::from("/a"),
         }];
@@ -2611,10 +2978,12 @@ mod tests {
     fn strip_kernel_suffix_multi_kernel_peels_suffix() {
         let kernel_list = vec![
             KernelEntry {
+                label: "6.14.2".to_string(),
                 sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
                 kernel_dir: PathBuf::from("/a"),
             },
             KernelEntry {
+                label: "6.15.0".to_string(),
                 sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
                 kernel_dir: PathBuf::from("/b"),
             },
@@ -2639,10 +3008,12 @@ mod tests {
     fn strip_kernel_suffix_multi_kernel_missing_suffix_errors() {
         let kernel_list = vec![
             KernelEntry {
+                label: "6.14.2".to_string(),
                 sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
                 kernel_dir: PathBuf::from("/a"),
             },
             KernelEntry {
+                label: "6.15.0".to_string(),
                 sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
                 kernel_dir: PathBuf::from("/b"),
             },
@@ -2663,10 +3034,12 @@ mod tests {
     fn strip_kernel_suffix_does_not_peel_preset_segment() {
         let kernel_list = vec![
             KernelEntry {
+                label: "6.14.2".to_string(),
                 sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_14_2"),
                 kernel_dir: PathBuf::from("/a"),
             },
             KernelEntry {
+                label: "6.15.0".to_string(),
                 sanitized: SanitizedKernelLabel::from_pre_sanitized_for_test("kernel_6_15_0"),
                 kernel_dir: PathBuf::from("/b"),
             },

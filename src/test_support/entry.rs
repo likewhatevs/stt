@@ -377,7 +377,7 @@ pub struct Scheduler {
     /// (e.g. `"/include-files/layered.json"`). The framework
     /// `mkdir -p`s the parent and writes the config content there.
     pub config_file_def: Option<(&'static str, &'static str)>,
-    /// Kernel specs the verifier should exercise this scheduler against.
+    /// Per-scheduler filter on the verifier sweep matrix.
     ///
     /// Each entry is a string consumed by [`KernelId::parse`](crate::kernel_path::KernelId::parse)
     /// at verifier runtime — same parser as the
@@ -386,20 +386,27 @@ pub struct Scheduler {
     /// (`"6.14..7.0"` or `"6.14..=7.0"` — both inclusive on both
     /// endpoints), git refs (`"git+URL#REF"`), paths, and cache keys.
     ///
-    /// Drives the verifier sweep matrix:
-    /// `list_verifier_cells_all` in `test_support::dispatch` walks this
-    /// slice and emits one
-    /// `verifier/<sched>/<sanitized_kernel_label>/<preset>: test`
-    /// nextest cell per (declared kernel × accepted topology preset)
-    /// pair. Empty (`&[]`) means no verifier cells emit for this
-    /// scheduler — the scheduler is silently skipped by
-    /// `cargo ktstr verifier`.
+    /// The verifier sweep matrix is driven by the operator's
+    /// `cargo ktstr verifier --kernel <SPEC>` set (which the
+    /// dispatcher always populates into `KTSTR_KERNEL_LIST` — even
+    /// the no-`--kernel` case synthesizes a single auto-discovered
+    /// entry). For each scheduler,
+    /// `list_verifier_cells_all` in `test_support::dispatch`
+    /// emits a cell per (kernel-list entry that passes this filter ×
+    /// accepted gauntlet topology preset).
     ///
-    /// The operator's `cargo ktstr verifier --kernel <SPEC>` set
-    /// supplies the matching kernel paths via `KTSTR_KERNEL_LIST`;
-    /// the labels in that env must align with the sanitized form of
-    /// the values declared here so the cell handler can resolve
-    /// each cell to a directory.
+    /// Match semantics per spec variant:
+    /// - `Version`: raw-label string equality OR sanitized-label
+    ///   match against the kernel-list entry.
+    /// - `Range`: range-membership check via
+    ///   `decompose_version_for_compare` on the entry's raw version
+    ///   string. Lets a scheduler declaring
+    ///   `kernels = ["6.14..6.16"]` match any operator-supplied
+    ///   kernel whose version falls in `[6.14, 6.16]` inclusive.
+    /// - `Path` / `CacheKey` / `Git`: sanitized-label equality.
+    ///
+    /// Empty (`&[]`) means no filter — the scheduler verifies
+    /// against every entry in `KTSTR_KERNEL_LIST`.
     pub kernels: &'static [&'static str],
 }
 

@@ -1980,8 +1980,8 @@ fn parse_extra_kconfig_rejected_on_verifier_subcommand() {
         "cargo",
         "ktstr",
         "verifier",
-        "--scheduler",
-        "scx_rustland",
+        "--kernel",
+        "../linux",
         "--extra-kconfig",
         "/tmp/x.kconfig",
     ]);
@@ -2101,62 +2101,92 @@ fn parse_kernel_clean_keep() {
 }
 
 // -- try_get_matches_from: verifier --
+//
+// The verifier subcommand takes only --kernel (repeatable) and --raw.
+// The scheduler binary set is discovered from `declare_scheduler!`
+// registrations in linked test binaries, not from a CLI flag — the
+// matrix is driven by the test binary's `KTSTR_SCHEDULERS`
+// distributed slice.
 
 #[test]
-fn parse_verifier_with_scheduler() {
-    let m = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--scheduler", "scx_rustland"]);
-    assert!(m.is_ok(), "{}", m.err().unwrap());
+fn parse_verifier_bare() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier"]).unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { kernel, raw } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert!(kernel.is_empty(), "bare verifier must default --kernel to empty Vec");
+    assert!(!raw, "bare verifier must default --raw to false");
 }
 
 #[test]
-fn parse_verifier_with_scheduler_bin() {
-    let m = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "verifier",
-        "--scheduler-bin",
-        "/tmp/sched",
+fn parse_verifier_with_kernel_single() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--kernel", "6.14.2"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { kernel, raw } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(kernel, vec!["6.14.2"]);
+    assert!(!raw);
+}
+
+#[test]
+fn parse_verifier_with_kernel_repeatable() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from([
+        "cargo", "ktstr", "verifier",
+        "--kernel", "6.14.2",
+        "--kernel", "6.15.0",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { kernel, raw } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert_eq!(kernel, vec!["6.14.2", "6.15.0"]);
+    assert!(!raw);
+}
+
+#[test]
+fn parse_verifier_with_raw() {
+    let Cargo {
+        command: CargoSub::Ktstr(k),
+    } = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--raw"])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let KtstrCommand::Verifier { kernel, raw } = k.command else {
+        panic!("expected Verifier");
+    };
+    assert!(kernel.is_empty());
+    assert!(raw, "--raw must lift the flag to true");
+}
+
+/// `--scheduler` was removed when the verifier sweep moved to
+/// `declare_scheduler!`-driven discovery. Pin that the flag stays
+/// rejected so a future agent who reintroduces it without
+/// rebuilding the sweep dispatch trips this test.
+#[test]
+fn parse_verifier_scheduler_flag_rejected() {
+    let rejected = Cargo::try_parse_from([
+        "cargo", "ktstr", "verifier", "--scheduler", "scx_rustland",
     ]);
-    assert!(m.is_ok(), "{}", m.err().unwrap());
+    assert!(
+        rejected.is_err(),
+        "--scheduler must be rejected — the flag was removed when the \
+         verifier sweep moved to declare_scheduler!-driven discovery",
+    );
 }
 
-#[test]
-fn parse_verifier_scheduler_conflicts_with_scheduler_bin() {
-    let result = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "verifier",
-        "--scheduler",
-        "scx_rustland",
-        "--scheduler-bin",
-        "/tmp/sched",
-    ]);
-    match result {
-        Ok(_) => panic!("--scheduler + --scheduler-bin must be rejected at parse time"),
-        Err(err) => assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::ArgumentConflict,
-            "expected ArgumentConflict — a different ErrorKind would \
-             signal that the conflicts_with attribute regressed in a way \
-             the bare is_err() pin would silently mask. Full err: {err}",
-        ),
-    }
-}
-
-/// `--all-profiles` is no longer a valid flag on the verifier
-/// subcommand — the flag-profile sweep was removed. Pin the
-/// parse-time rejection so a future agent that re-adds the
-/// argument without rebuilding the sweep surface trips this
-/// test instead of silently shipping a dead flag.
+/// `--all-profiles` was removed alongside the flag-profile sweep.
+/// Pin the parse-time rejection so a future agent who re-adds the
+/// argument without rebuilding the sweep surface trips this test
+/// instead of silently shipping a dead flag.
 #[test]
 fn parse_verifier_all_profiles_rejected() {
     let rejected = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "verifier",
-        "--scheduler",
-        "scx_rustland",
-        "--all-profiles",
+        "cargo", "ktstr", "verifier", "--all-profiles",
     ]);
     assert!(
         rejected.is_err(),
@@ -2165,21 +2195,14 @@ fn parse_verifier_all_profiles_rejected() {
     );
 }
 
-/// `--profiles` is no longer a valid flag on the verifier
-/// subcommand — the flag-profile sweep was removed. Pin the
-/// parse-time rejection so a future agent that re-adds the
-/// argument without rebuilding the sweep surface trips this
-/// test instead of silently shipping a dead flag.
+/// `--profiles` was removed alongside the flag-profile sweep. Pin
+/// the parse-time rejection so a future agent who re-adds the
+/// argument without rebuilding the sweep surface trips this test
+/// instead of silently shipping a dead flag.
 #[test]
 fn parse_verifier_profiles_filter_rejected() {
     let rejected = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "verifier",
-        "--scheduler",
-        "scx_rustland",
-        "--profiles",
-        "default,llc,llc+steal",
+        "cargo", "ktstr", "verifier", "--profiles", "default,llc,llc+steal",
     ]);
     assert!(
         rejected.is_err(),
@@ -3384,7 +3407,10 @@ fn parse_llvm_cov_kernel_repeatable() {
 }
 
 /// `cargo ktstr verifier --kernel A --kernel B` accumulates both
-/// values via `ArgAction::Append`.
+/// values via `ArgAction::Append`. Mirrors
+/// `parse_test_kernel_repeatable` for the verifier subcommand —
+/// the verifier surface is `--kernel` + `--raw` only (no
+/// `--scheduler`).
 #[test]
 fn parse_verifier_kernel_repeatable() {
     let Cargo {
@@ -3393,8 +3419,6 @@ fn parse_verifier_kernel_repeatable() {
         "cargo",
         "ktstr",
         "verifier",
-        "--scheduler",
-        "scx_rustland",
         "--kernel",
         "6.14.2",
         "--kernel",
