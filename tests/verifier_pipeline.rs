@@ -22,7 +22,13 @@ fn __ktstr_inner_demo_verifier_brief(_ctx: &Ctx) -> Result<AssertResult> {
     let Some((sched_bin, ktstr_bin, kernel)) = resolve_verifier_paths("scx-ktstr")? else {
         return Ok(AssertResult::pass());
     };
-    let result = ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel, &[])?;
+    let result = ktstr::verifier::collect_verifier_output(
+        &sched_bin,
+        &ktstr_bin,
+        &kernel,
+        &[],
+        ktstr::test_support::TopologyJson::SINGLE_CPU,
+    )?;
     let output = ktstr::verifier::format_verifier_output("scx-ktstr", &result, false);
     anyhow::ensure!(
         output.contains("ktstr_enqueue"),
@@ -53,8 +59,20 @@ fn __ktstr_inner_demo_verifier_diff(_ctx: &Ctx) -> Result<AssertResult> {
     let Some((sched_bin, ktstr_bin, kernel)) = resolve_verifier_paths("scx-ktstr")? else {
         return Ok(AssertResult::pass());
     };
-    let result_a = ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel, &[])?;
-    let result_b = ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel, &[])?;
+    let result_a = ktstr::verifier::collect_verifier_output(
+        &sched_bin,
+        &ktstr_bin,
+        &kernel,
+        &[],
+        ktstr::test_support::TopologyJson::SINGLE_CPU,
+    )?;
+    let result_b = ktstr::verifier::collect_verifier_output(
+        &sched_bin,
+        &ktstr_bin,
+        &kernel,
+        &[],
+        ktstr::test_support::TopologyJson::SINGLE_CPU,
+    )?;
     let output = ktstr::verifier::format_verifier_diff(
         "scx-ktstr",
         &result_a.stats,
@@ -88,8 +106,13 @@ fn __ktstr_inner_verifier_cycle_collapse(_ctx: &Ctx) -> Result<AssertResult> {
         return Ok(AssertResult::pass());
     };
     let sched_args = vec!["--verify-loop".to_string()];
-    let result =
-        ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, &kernel, &sched_args)?;
+    let result = ktstr::verifier::collect_verifier_output(
+        &sched_bin,
+        &ktstr_bin,
+        &kernel,
+        &sched_args,
+        ktstr::test_support::TopologyJson::SINGLE_CPU,
+    )?;
     let output = ktstr::verifier::format_verifier_output("scx-ktstr", &result, false);
     anyhow::ensure!(
         output.contains("scheduler log"),

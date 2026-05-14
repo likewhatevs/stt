@@ -107,9 +107,16 @@ pub(crate) fn run_verifier(
         }
 
         eprintln!("cargo ktstr: collecting verifier stats");
-        let result =
-            ktstr::verifier::collect_verifier_output(&sched_bin, &ktstr_bin, kernel_path, &[])
-                .map_err(|e| format!("collect verifier output: {e:#}"))?;
+        // Single-CPU 1,1,1,1 topology — one verifier run per kernel
+        // with no scheduler args.
+        let result = ktstr::verifier::collect_verifier_output(
+            &sched_bin,
+            &ktstr_bin,
+            kernel_path,
+            &[],
+            ktstr::test_support::TopologyJson::SINGLE_CPU,
+        )
+        .map_err(|e| format!("collect verifier output: {e:#}"))?;
 
         let output = ktstr::verifier::format_verifier_output("verifier", &result, raw);
         print!("{output}");

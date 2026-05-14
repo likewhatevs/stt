@@ -565,23 +565,42 @@ pub struct VerifierVmResult {
 /// memory. On load failure, libbpf prints the verifier log to stderr;
 /// the returned `scheduler_log` field contains the scheduler's captured
 /// output from the VM.
+///
+/// `topology` selects the verifier VM's emulated topology via
+/// [`crate::test_support::TopologyJson`] — the same named-field
+/// shape carried in the per-scheduler `--ktstr-list-schedulers`
+/// JSON. The named fields force callers to spell every dimension
+/// at the call site, preventing position-swap misorders. Callers
+/// from the sweep dispatch pass per-cell topologies derived from
+/// declared constraints. Single-CPU baseline callers pass
+/// [`TopologyJson::SINGLE_CPU`].
 pub fn collect_verifier_output(
     sched_bin: &std::path::Path,
     ktstr_bin: &std::path::Path,
     kernel: &std::path::Path,
     extra_sched_args: &[String],
+    topology: crate::test_support::TopologyJson,
 ) -> anyhow::Result<VerifierVmResult> {
     use anyhow::Context;
 
     let sched_args: Vec<String> = extra_sched_args.to_vec();
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
+    // Destructure to the builder's four positional `u32` parameters.
+    // Named-field construction at the call site prevents misorder
+    // (`(num_llcs, num_numa_nodes, ...)`) that a bare 4-tuple would
+    // silently accept.
     let vm = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
         .scheduler_binary(sched_bin)
         .sched_args(&sched_args)
-        .topology(1, 1, 1, 1)
+        .topology(
+            topology.num_numa_nodes,
+            topology.num_llcs,
+            topology.cores_per_llc,
+            topology.threads_per_core,
+        )
         .memory_mb(2048)
         .timeout(std::time::Duration::from_secs(120))
         .no_perf_mode(no_perf_mode)

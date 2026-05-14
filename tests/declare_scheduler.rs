@@ -20,8 +20,8 @@
 use ktstr::assert::Assert;
 use ktstr::declare_scheduler;
 use ktstr::test_support::{
-    KTSTR_SCHEDULERS, Scheduler, SchedulerJson, SchedulerSpec, Sysctl, TopologyConstraints,
-    find_scheduler,
+    BinaryKindJson, KTSTR_SCHEDULERS, Scheduler, SchedulerJson, SchedulerSpec, Sysctl,
+    TopologyConstraints, find_scheduler,
 };
 
 // -- minimal expansion --
@@ -585,26 +585,59 @@ fn scheduler_json_serde_roundtrip() {
     let s = serde_json::to_string(&j).expect("serialize");
     let back: SchedulerJson = serde_json::from_str(&s).expect("deserialize");
     assert_eq!(back.name, "declare_scheduler_full");
-    assert_eq!(back.binary, Some("scx-full".to_string()));
+    assert_eq!(
+        back.binary_kind,
+        BinaryKindJson::Discover("scx-full".to_string())
+    );
     assert_eq!(back.sched_args, vec!["--a", "--b"]);
     assert_eq!(back.kernels, vec!["6.14", "7.0..7.2"]);
     assert_eq!(back.constraints.min_llcs, 1);
     assert_eq!(back.constraints.max_llcs, Some(8));
     assert_eq!(back.constraints.max_cpus, Some(64));
+    // Pin the topology wire-format fields so a serde rename or
+    // field drop on TopologyJson surfaces here. DECLARE_SCHEDULER_FULL
+    // declares topology = (1, 2, 4, 1).
+    assert_eq!(back.topology.num_numa_nodes, 1);
+    assert_eq!(back.topology.num_llcs, 2);
+    assert_eq!(back.topology.cores_per_llc, 4);
+    assert_eq!(back.topology.threads_per_core, 1);
 }
 
 #[test]
-fn scheduler_json_eevdf_has_no_binary() {
+fn scheduler_json_eevdf_kind() {
     let j = SchedulerJson::from_scheduler(&Scheduler::EEVDF);
     assert_eq!(j.name, "eevdf");
-    assert!(
-        j.binary.is_none(),
-        "EEVDF is SchedulerSpec::Eevdf — no binary artifact"
+    assert_eq!(
+        j.binary_kind,
+        BinaryKindJson::Eevdf,
+        "EEVDF is SchedulerSpec::Eevdf — unit BinaryKindJson::Eevdf variant"
     );
 }
 
 #[test]
 fn scheduler_json_discover_carries_binary() {
     let j = SchedulerJson::from_scheduler(&DECLARE_SCHEDULER_MINIMAL);
-    assert_eq!(j.binary, Some("scx-ktstr".to_string()));
+    assert_eq!(
+        j.binary_kind,
+        BinaryKindJson::Discover("scx-ktstr".to_string())
+    );
+}
+
+#[test]
+fn scheduler_json_path_variant_carries_path() {
+    let j = SchedulerJson::from_scheduler(&DECLARE_SCHEDULER_BINARY_PATH);
+    let s = serde_json::to_string(&j).expect("serialize");
+    let back: SchedulerJson = serde_json::from_str(&s).expect("deserialize");
+    assert_eq!(
+        back.binary_kind,
+        BinaryKindJson::Path("/usr/local/bin/scx_custom_binary".to_string())
+    );
+}
+
+#[test]
+fn scheduler_json_kernel_builtin_variant_emits_kernel_builtin() {
+    let j = SchedulerJson::from_scheduler(&DECLARE_SCHEDULER_KERNEL_BUILTIN);
+    let s = serde_json::to_string(&j).expect("serialize");
+    let back: SchedulerJson = serde_json::from_str(&s).expect("deserialize");
+    assert_eq!(back.binary_kind, BinaryKindJson::KernelBuiltin);
 }

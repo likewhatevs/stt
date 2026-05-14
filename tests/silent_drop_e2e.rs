@@ -1,7 +1,8 @@
 //! End-to-end regression tests for the failure-dump pipeline. The
-//! first three scenarios pin the always-on framing (Captured-baseline
-//! + clean-exit-gate-suppression) within which the silent-drop fixes
-//! operate. The last two use the freeze coordinator's test-only seams
+//! first three scenarios pin the always-on framing
+//! (Captured-baseline plus clean-exit-gate-suppression) within which
+//! the silent-drop fixes operate. The last two use the freeze
+//! coordinator's test-only seams
 //! (`FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE`,
 //! `FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED`) to force the
 //! KVA-translate-failure path on demand — exercising the silent-drop
@@ -324,8 +325,8 @@ struct FreezeCoordTestSeamGuard {
 impl FreezeCoordTestSeamGuard {
     fn set(translate_none: bool, bss_triggered: bool) -> Self {
         use std::sync::atomic::Ordering;
-        let translate_none_was = ktstr::FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE
-            .swap(translate_none, Ordering::Relaxed);
+        let translate_none_was =
+            ktstr::FREEZE_COORD_TEST_FORCE_TRANSLATE_NONE.swap(translate_none, Ordering::Relaxed);
         let bss_triggered_was =
             ktstr::FREEZE_COORD_TEST_FORCE_BSS_TRIGGERED.swap(bss_triggered, Ordering::Relaxed);
         Self {
@@ -462,17 +463,17 @@ fn scenario_translate_none_with_latch_triggered_emits_dump(
 
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]
-static __KTSTR_ENTRY_SILENT_DROP_TRANSLATE_NONE_LATCH_IDLE:
-    ktstr::test_support::KtstrTestEntry = ktstr::test_support::KtstrTestEntry {
-    name: "silent_drop_translate_none_with_latch_idle",
-    func: scenario_translate_none_with_latch_idle_suppresses_dump,
-    scheduler: &KTSTR_SCHED,
-    extra_sched_args: &[],
-    watchdog_timeout: std::time::Duration::from_secs(10),
-    duration: std::time::Duration::from_secs(3),
-    expect_err: false,
-    ..ktstr::test_support::KtstrTestEntry::DEFAULT
-};
+static __KTSTR_ENTRY_SILENT_DROP_TRANSLATE_NONE_LATCH_IDLE: ktstr::test_support::KtstrTestEntry =
+    ktstr::test_support::KtstrTestEntry {
+        name: "silent_drop_translate_none_with_latch_idle",
+        func: scenario_translate_none_with_latch_idle_suppresses_dump,
+        scheduler: &KTSTR_SCHED,
+        extra_sched_args: &[],
+        watchdog_timeout: std::time::Duration::from_secs(10),
+        duration: std::time::Duration::from_secs(3),
+        expect_err: false,
+        ..ktstr::test_support::KtstrTestEntry::DEFAULT
+    };
 
 #[ktstr::__private::linkme::distributed_slice(ktstr::test_support::KTSTR_TESTS)]
 #[linkme(crate = ktstr::__private::linkme)]

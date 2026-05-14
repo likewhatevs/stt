@@ -1268,31 +1268,88 @@ where
 }
 
 /// JSON shape projected from a registered [`Scheduler`]. Each entry
-/// carries scheduler name, binary identifier (`Discover` binary name
-/// or `Path` filesystem path; `None` for `Eevdf` / `KernelBuiltin`),
-/// always-on scheduler args, declared kernel set, and gauntlet
-/// constraints. Internal fields (assertion overrides, sysctls, kargs,
-/// cgroup parent, config-file plumbing) are intentionally omitted.
+/// carries scheduler name, a [`BinaryKindJson`]-tagged binary
+/// specification (Discover / Path / Eevdf / KernelBuiltin),
+/// per-scheduler default [`TopologyJson`], always-on scheduler
+/// args, declared kernel set, and gauntlet constraints. Internal
+/// fields (assertion overrides, sysctls, kargs, cgroup parent,
+/// config-file plumbing) are intentionally omitted.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerJson {
     /// Scheduler name — the `name = "..."` value supplied to
     /// [`declare_scheduler!`](crate::declare_scheduler) or
     /// [`Scheduler::new`].
     pub name: String,
-    /// Resolved binary identifier: the binary name (used to discover
-    /// the artifact in `target/{debug,release}/`) for
-    /// `SchedulerSpec::Discover`, the filesystem path for
-    /// `SchedulerSpec::Path`, or `None` for `SchedulerSpec::Eevdf`
-    /// and `SchedulerSpec::KernelBuiltin` (neither variant maps onto
-    /// a per-build binary artifact). Note: the Discover string is
-    /// matched against `[[bin]]` names, not the cargo package name.
-    pub binary: Option<String>,
+    /// Binary specification: distinguishes Discover (build via cargo
+    /// `[[bin]]` name), Path (use absolute path verbatim), Eevdf
+    /// (kernel default scheduler, no binary), and KernelBuiltin
+    /// (built into the kernel, enable/disable via guest commands).
+    /// The variant tag lets the verifier dispatch exhaustively `match`
+    /// on the binary type without parsing the string.
+    pub binary_kind: BinaryKindJson,
+    /// Default VM topology for tests using this scheduler. The
+    /// verifier sweep's per-cell topology comes from gauntlet presets
+    /// filtered through `constraints`; this field carries the
+    /// per-scheduler baseline that test-entry plumbing inherits when
+    /// a test does not override `numa_nodes`/`llcs`/`cores`/`threads`
+    /// in its `#[ktstr_test]` attributes. Mirror of
+    /// [`Scheduler::topology`].
+    pub topology: TopologyJson,
     /// Always-on scheduler CLI args.
     pub sched_args: Vec<String>,
     /// Kernel specs (consumed by `cargo_ktstr::kernel::resolve_kernel_set`).
     pub kernels: Vec<String>,
     /// Gauntlet preset constraints (filter the verifier's topology sweep).
     pub constraints: TopologyConstraintsJson,
+}
+
+/// JSON-friendly form of [`SchedulerSpec`] tagged so the verifier
+/// dispatch can exhaustively `match` on the variant. `Discover` and
+/// `Path` both carry a string identifier; `Eevdf` and
+/// `KernelBuiltin` both signal "no BPF to verify".
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum BinaryKindJson {
+    /// Cargo [[bin]] name. Verifier resolves via `build_and_find_binary`.
+    Discover(String),
+    /// Absolute filesystem path. Verifier checks `path.exists()` and uses verbatim.
+    Path(String),
+    /// Kernel default scheduler (EEVDF on current kernels). No BPF, no binary.
+    Eevdf,
+    /// Built into the kernel (e.g. `scx_simple` enabled via sysfs). No userspace binary.
+    KernelBuiltin,
+}
+
+/// JSON-friendly mirror of `Topology` for the verifier wire format.
+/// Captures the four-tuple shape (numa nodes × LLCs × cores × threads)
+/// the per-scheduler baseline topology was declared with. The verifier
+/// uses this when computing the sweep matrix — the baseline anchors
+/// the default cell when no gauntlet preset matches the
+/// scheduler's constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TopologyJson {
+    /// NUMA node count. Maps to [`Topology::num_numa_nodes`].
+    pub num_numa_nodes: u32,
+    /// Last-level cache (LLC) count, equivalent to "sockets" on
+    /// pre-CCX/CCD x86. Maps to [`Topology::num_llcs`].
+    pub num_llcs: u32,
+    /// Physical cores per LLC. Mirrors `Topology::cores_per_llc`.
+    pub cores_per_llc: u32,
+    /// Hardware threads per physical core. `1` for non-SMT; `2`
+    /// for x86 hyperthreading. Mirrors `Topology::threads_per_core`.
+    pub threads_per_core: u32,
+}
+
+impl TopologyJson {
+    /// Single-CPU baseline: 1 NUMA node × 1 LLC × 1 core × 1 thread.
+    /// Used by `cargo ktstr verifier` and verifier-pipeline tests as
+    /// the no-scheduling-workload default.
+    pub const SINGLE_CPU: Self = Self {
+        num_numa_nodes: 1,
+        num_llcs: 1,
+        cores_per_llc: 1,
+        threads_per_core: 1,
+    };
 }
 
 /// JSON-friendly mirror of [`TopologyConstraints`] — the host-side
@@ -1315,14 +1372,21 @@ pub struct TopologyConstraintsJson {
 impl SchedulerJson {
     /// Project a `Scheduler` static into its JSON shape.
     pub fn from_scheduler(s: &Scheduler) -> Self {
-        let binary = match s.binary {
-            SchedulerSpec::Discover(n) => Some(n.to_string()),
-            SchedulerSpec::Path(p) => Some(p.to_string()),
-            SchedulerSpec::Eevdf | SchedulerSpec::KernelBuiltin { .. } => None,
+        let binary_kind = match s.binary {
+            SchedulerSpec::Discover(n) => BinaryKindJson::Discover(n.to_string()),
+            SchedulerSpec::Path(p) => BinaryKindJson::Path(p.to_string()),
+            SchedulerSpec::Eevdf => BinaryKindJson::Eevdf,
+            SchedulerSpec::KernelBuiltin { .. } => BinaryKindJson::KernelBuiltin,
         };
         Self {
             name: s.name.to_string(),
-            binary,
+            binary_kind,
+            topology: TopologyJson {
+                num_numa_nodes: s.topology.num_numa_nodes(),
+                num_llcs: s.topology.num_llcs(),
+                cores_per_llc: s.topology.cores_per_llc,
+                threads_per_core: s.topology.threads_per_core,
+            },
             sched_args: s.sched_args.iter().map(|a| a.to_string()).collect(),
             kernels: s.kernels.iter().map(|k| k.to_string()).collect(),
             constraints: TopologyConstraintsJson {
