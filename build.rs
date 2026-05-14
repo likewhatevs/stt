@@ -298,22 +298,44 @@ int main(void) {{
         // Warning before network access so a hang is diagnosable.
         if !busybox_src.join("Makefile").exists() {
             let tarball_url = "https://github.com/mirror/busybox/archive/refs/tags/1_36_1.tar.gz";
-            println!(
-                "cargo:warning=downloading busybox source tarball from {tarball_url} (requires network)"
-            );
-            let tarball_err = (|| -> Result<(), String> {
+            // Authenticated GitHub requests get 1000/hr per token vs the
+            // 60/hr IP-based unauth limit. GitHub Actions auto-issues
+            // GITHUB_TOKEN per job; outside CI the env var is typically
+            // absent and the request goes unauth, which still works for
+            // public repos at low rate.
+            let github_token = std::env::var("GITHUB_TOKEN").ok();
+            let attempt = |attempt_idx: u32| -> Result<(), String> {
+                let extract_dir = out_dir.join("busybox-extract");
+                if extract_dir.exists() {
+                    let _ = std::fs::remove_dir_all(&extract_dir);
+                }
+                // `timeout()` bounds the whole request including the body
+                // when read via `.bytes()` (which uses `wait::timeout`
+                // internally per `reqwest::blocking::Response::bytes`),
+                // but does NOT apply when reading the response via the
+                // `Read` trait -- streaming bypasses reqwest's timeout
+                // machinery so a slow-drip server can hang the build
+                // indefinitely. Buffer the body so the timeout actually
+                // fires.
                 let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(60))
+                    .timeout(std::time::Duration::from_secs(120))
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .user_agent(concat!("ktstr-build/", env!("CARGO_PKG_VERSION")))
                     .build()
                     .map_err(|e| format!("http client: {e}"))?;
-                let resp = client
-                    .get(tarball_url)
+                let mut req = client.get(tarball_url);
+                if let Some(ref token) = github_token {
+                    req = req.bearer_auth(token);
+                }
+                let resp = req
                     .send()
                     .and_then(|r| r.error_for_status())
-                    .map_err(|e| format!("download: {e}"))?;
-                let gz = flate2::read::GzDecoder::new(resp);
+                    .map_err(|e| format!("attempt {attempt_idx} request: {e}"))?;
+                let body = resp
+                    .bytes()
+                    .map_err(|e| format!("attempt {attempt_idx} body: {e}"))?;
+                let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(body));
                 let mut archive = tar::Archive::new(gz);
-                let extract_dir = out_dir.join("busybox-extract");
                 archive
                     .unpack(&extract_dir)
                     .map_err(|e| format!("extract: {e}"))?;
@@ -326,8 +348,30 @@ int main(void) {{
                 })?;
                 std::fs::remove_dir_all(&extract_dir).ok();
                 Ok(())
-            })()
-            .err();
+            };
+
+            const MAX_TARBALL_ATTEMPTS: u32 = 4;
+            let mut tarball_err: Option<String> = None;
+            for i in 1..=MAX_TARBALL_ATTEMPTS {
+                println!(
+                    "cargo:warning=downloading busybox source tarball (attempt {i}/{MAX_TARBALL_ATTEMPTS}) from {tarball_url}"
+                );
+                match attempt(i) {
+                    Ok(()) => {
+                        tarball_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        println!("cargo:warning=busybox tarball attempt {i} failed: {e}");
+                        tarball_err = Some(e);
+                        if i < MAX_TARBALL_ATTEMPTS {
+                            // Exponential backoff: 2s, 4s, 8s before the next try.
+                            let backoff = 1u64 << i;
+                            std::thread::sleep(std::time::Duration::from_secs(backoff));
+                        }
+                    }
+                }
+            }
 
             // Fall back to shallow git clone if tarball failed.
             if !busybox_src.join("Makefile").exists() {

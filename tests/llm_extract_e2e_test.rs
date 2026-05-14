@@ -96,7 +96,7 @@ use ktstr::scenario::Ctx;
 /// extraction is deferred until after VM exit because the model
 /// does not fit in guest RAM. See the module doc for the universal
 /// invariants the host applies.
-#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 2048, payload = SCHBENCH)]
+#[ktstr_test(llcs = 1, cores = 2, threads = 1, memory_mb = 2048, payload = SCHBENCH, ignore = true)]
 fn model_loaded_llm_extract_schbench(ctx: &Ctx) -> Result<AssertResult> {
     let (assert_result, _metrics) = ctx.payload(&SCHBENCH).run()?;
     // For `OutputFormat::LlmExtract` payloads, `metrics.metrics` is

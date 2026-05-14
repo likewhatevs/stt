@@ -1465,7 +1465,7 @@ fn cpu_lock_contention_slides_window() {
         cleanup_lock(&cpu_lock_path(c));
     }
 
-    let holder = try_flock(&cpu_lock_path(91500), FlockMode::Exclusive)
+    let holder = try_flock(cpu_lock_path(91500), FlockMode::Exclusive)
         .unwrap()
         .unwrap();
 

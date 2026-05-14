@@ -17,6 +17,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
+  # Lifts github.com unauth rate limit (60/hr per IP, shared across
+  # runners) to 1000/hr per-token for build.rs's busybox tarball fetch.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   deploy:
