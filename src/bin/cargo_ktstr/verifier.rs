@@ -10,19 +10,23 @@
 //! retries, and failure isolation; this dispatcher only resolves the
 //! `--kernel` argument into the existing `KTSTR_KERNEL` /
 //! `KTSTR_KERNEL_LIST` env-var protocol the test binary already
-//! consumes, then exec's nextest with a verifier-prefix filter
-//! expression.
+//! consumes, plumbs `--raw` via `KTSTR_VERIFIER_RAW`, and spawns
+//! nextest with a verifier-prefix filter expression.
 
 use std::process::Command;
 
 use crate::kernel::{encode_kernel_list, resolve_kernel_set};
 
 /// Dispatch the `cargo ktstr verifier` subcommand.
-pub(crate) fn run_verifier(kernel: Vec<String>, _raw: bool) -> Result<(), String> {
+pub(crate) fn run_verifier(kernel: Vec<String>, raw: bool) -> Result<(), String> {
     let mut cmd = Command::new("cargo");
     cmd.args(["nextest", "run", "-E", "test(/^verifier/)"]);
 
-    if !kernel.is_empty() {
+    if raw {
+        cmd.env(ktstr::KTSTR_VERIFIER_RAW_ENV, "1");
+    }
+
+    let kernel_count = if !kernel.is_empty() {
         let resolved = resolve_kernel_set(&kernel)?;
         if resolved.is_empty() {
             return Err(
@@ -34,15 +38,21 @@ pub(crate) fn run_verifier(kernel: Vec<String>, _raw: bool) -> Result<(), String
         }
         let first_dir = &resolved[0].1;
         cmd.env(ktstr::KTSTR_KERNEL_ENV, first_dir);
-        if resolved.len() > 1 {
+        let count = resolved.len();
+        if count > 1 {
             let encoded = encode_kernel_list(&resolved)?;
-            eprintln!(
-                "cargo ktstr verifier: fanning across {n} kernels",
-                n = resolved.len(),
-            );
             cmd.env(ktstr::KTSTR_KERNEL_LIST_ENV, encoded);
         }
-    }
+        count
+    } else {
+        0
+    };
+
+    eprintln!(
+        "cargo ktstr verifier: dispatching to nextest with filter test(/^verifier/) \
+         on {kernel_count} resolved kernel(s){raw}",
+        raw = if raw { " (raw output)" } else { "" },
+    );
 
     let status = cmd
         .status()

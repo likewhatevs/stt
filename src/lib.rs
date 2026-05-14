@@ -779,6 +779,20 @@ pub const KTSTR_KERNEL_LIST_ENV: &str = "KTSTR_KERNEL_LIST";
 /// place instead of fanning out to every call site.
 pub const KTSTR_KERNEL_PARALLELISM_ENV: &str = "KTSTR_KERNEL_PARALLELISM";
 
+/// Name of the environment variable that switches the `cargo ktstr
+/// verifier` per-cell handler from the cycle-collapsed default
+/// rendering to a raw scheduler-log dump. Set to any value (the
+/// presence of the variable is what matters; the value is ignored)
+/// by the dispatcher in `src/bin/cargo_ktstr/verifier.rs` when the
+/// operator passes `--raw`, and read by
+/// [`crate::test_support::dispatch::run_verifier_cell`] before
+/// formatting via [`crate::verifier::format_verifier_output`].
+///
+/// Single source of truth so the name is not spelled by hand at
+/// each reader; if the name ever changes, the change lands in one
+/// place instead of fanning out to every call site.
+pub const KTSTR_VERIFIER_RAW_ENV: &str = "KTSTR_VERIFIER_RAW";
+
 /// Shared skip / error hint for call sites that cannot proceed
 /// without a resolvable kernel. Phrased so the user sees the same
 /// wording regardless of which layer surfaced the failure — tests,

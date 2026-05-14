@@ -190,13 +190,16 @@ pub(crate) enum KtstrCommand {
     },
     /// Collect BPF verifier statistics for declared schedulers.
     ///
-    /// Sweep mode: iterates every `declare_scheduler!` entry across
-    /// the linked test binaries × their declared `kernels` × accepted
-    /// gauntlet topology presets, reporting per-program verified
-    /// instruction counts from host-side memory introspection.
-    ///
-    /// Temporarily a placeholder while the nextest-generated cell
-    /// dispatch design lands; see task tracking for status.
+    /// Spawns `cargo nextest run -E 'test(/^verifier/)'` (waited on
+    /// via `Command::status()`, not `execvp`). Each test binary that
+    /// links ktstr-test-support and has at least one
+    /// `declare_scheduler!` declaration emits one nextest test per
+    /// (declared scheduler × declared kernel × accepted gauntlet
+    /// topology preset) cell. Each cell loads the scheduler's BPF
+    /// programs inside a VM with the declared topology and reports
+    /// per-program verified-instruction counts via host-side memory
+    /// introspection. Eevdf + KernelBuiltin scheduler variants are
+    /// skipped at cell-emission time (no userspace binary to verify).
     Verifier {
         /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
         /// (path / version / cache key / range / git source). Overrides
