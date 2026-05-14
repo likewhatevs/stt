@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.5.0"
+version = "0.5.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -75,7 +75,7 @@ vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.5.0", path = "ktstr-macros" }
+ktstr-macros = { version = "0.5.2", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in `try_flush_profraw` instead of reading
 # the whole binary into a Vec<u8>. Coverage-instrumented test binaries
