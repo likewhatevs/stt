@@ -13,18 +13,16 @@
 //!    `/sys/kernel/btf/vmlinux` (always present with sched_ext) plus
 //!    `/proc/kallsyms` for symbol lookups.
 //! 3. [`KallsymsTable::load_from`] parses the symbol table — root
-//!    only, but ktstr always runs as root in the test environment
-//!    (per the project memory's `project_always_root` note).
+//!    only, but ktstr always runs as root in the test environment.
 //!
 //! From the live-host pipeline's perspective the guest IS a real
 //! host: it runs a kernel, a loaded scx scheduler, BPF maps with
 //! data, and the relevant procfs/sysfs surfaces. The same code
 //! that a real-host capture-mode binary would call works here.
 //!
-//! Per `feedback_livehost_test_in_vm.md`: the guest is a real host
-//! from the pipeline's perspective. No bare-metal hardware needed
-//! for CI. The VM provides the complete kernel environment the
-//! live-host pipeline requires.
+//! The guest is a real host from the pipeline's perspective. No
+//! bare-metal hardware needed for CI. The VM provides the complete
+//! kernel environment the live-host pipeline requires.
 //!
 //! This test asserts the live-host pipeline's outputs have the
 //! expected SHAPE — non-zero map enumeration, BTF reachable,

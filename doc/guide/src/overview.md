@@ -51,11 +51,10 @@ management, `Assert` for composable assertion config, and
 For binary workloads (running `schbench`, `fio`, or any external
 executable as part of a test), see
 [Payload Definitions](writing-tests/scheduler-definitions.md#derive-payload).
-A `Payload` is the unified type for both binary workloads and the
-scheduler under test — `#[ktstr_test(payload = FIXTURE)]` runs a
-binary-kind payload alongside the cgroup workers, and the
-`scheduler =` slot accepts the scheduler-kind `_PAYLOAD` wrapper
-that `#[derive(Scheduler)]` emits.
+`#[ktstr_test(payload = FIXTURE)]` runs a `Payload` (binary
+workload) alongside the cgroup workers; the `scheduler =` slot
+takes a bare `Scheduler` reference — the const emitted by
+`declare_scheduler!`.
 
 ## What it tests
 
@@ -110,7 +109,7 @@ scenario with BPF probes attached to the crash-path functions. See
 | Component | Purpose |
 |---|---|
 | `ktstr` (lib) | Core library |
-| `ktstr-macros` | `#[ktstr_test]`, `#[derive(Scheduler)]`, and `#[derive(Payload)]` proc macros |
+| `ktstr-macros` | `#[ktstr_test]`, `declare_scheduler!`, and `#[derive(Payload)]` proc macros |
 | `ktstr` (bin) | Host-side CLI |
 | `cargo-ktstr` (bin) | Cargo-integrated workflow: test, coverage, llvm-cov, kernel mgmt, verifier analysis, stats, interactive shell |
 | `scx-ktstr` | Minimal BPF scheduler for testing |

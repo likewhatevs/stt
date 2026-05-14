@@ -733,9 +733,9 @@ impl KtstrVmBuilder {
             // Ok(None)`), the planner applies the 30%-of-allowed
             // default (`default_cpu_budget`). The resulting plan
             // reserves a subset of host LLCs, not "every LLC" as the
-            // 15ee285 path did — so no-perf-mode VMs never fight
-            // concurrent builds or other no-perf peers for the full
-            // host, regardless of whether the user set the flag.
+            // prior every-LLC path did — so no-perf-mode VMs never
+            // fight concurrent builds or other no-perf peers for the
+            // full host, regardless of whether the user set the flag.
             //
             // `cached` returning `Err` (non-Linux, sysfs absent — the
             // process-wide cache replays the first sysfs probe's

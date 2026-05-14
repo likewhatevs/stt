@@ -28,18 +28,18 @@ declare_scheduler!(MY_SCHED, {
     topology = (1,    2,    4,         1),
 });
 
-#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
+#[ktstr_test(scheduler = MY_SCHED)]
 fn inherited_topo(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1n2l4c1t from MY_SCHED_PAYLOAD
+    // Inherits 1n2l4c1t from MY_SCHED
     Ok(AssertResult::pass())
 }
 ```
 
-`declare_scheduler!` emits both the `Scheduler` static and its
-`*_PAYLOAD` `Payload` wrapper. The `scheduler =` slot accepts
-the `*_PAYLOAD` form; the bare `Scheduler` const will not
-type-check. Manual builders (no macro) compose the wrapper
-explicitly with `Payload::from_scheduler(&MY_SCHED)`.
+`declare_scheduler!` emits a `pub static MY_SCHED: Scheduler` and
+registers a private linkme static in the `KTSTR_SCHEDULERS`
+distributed slice. The `scheduler =` slot expects
+`&'static Scheduler` — pass the bare `MY_SCHED` ident; the macro
+takes a reference internally.
 
 The function must have signature
 `fn(&ktstr::scenario::Ctx) -> anyhow::Result<ktstr::assert::AssertResult>`.
@@ -78,7 +78,7 @@ so most tests do not need to set `numa_nodes`. See
 
 | Attribute | Default | Description |
 |---|---|---|
-| `scheduler = CONST` | `&Payload::KERNEL_DEFAULT` | Rust const path to a `&'static Payload` whose kind is `PayloadKind::Scheduler`. The `_PAYLOAD` wrapper emitted by `declare_scheduler!` (e.g. `MY_SCHED_PAYLOAD`) is the expected form here; the bare `Scheduler` const will not type-check. The default `Payload::KERNEL_DEFAULT` wraps `Scheduler::EEVDF` (the kernel's default scheduler — EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
+| `scheduler = CONST` | `&Scheduler::EEVDF` | Rust const path to a `&'static Scheduler`. The bare const emitted by `declare_scheduler!` (e.g. `MY_SCHED`) is the expected form. The default `Scheduler::EEVDF` runs tests under the kernel's default scheduler (EEVDF on Linux 6.6+) so tests without an explicit `scheduler =` run under the kernel default. |
 | `extra_sched_args = [...]` | `[]` | Extra CLI args for the scheduler, appended after `Scheduler::sched_args`. |
 | `watchdog_timeout_s` | 5 | scx watchdog override (seconds). Applied via `scx_sched.watchdog_timeout` on 7.1+ kernels (BTF-detected) and via the static `scx_watchdog_timeout` symbol on pre-7.1 kernels. When neither path is available the override silently no-ops. |
 
@@ -177,7 +177,6 @@ pieces wire this into a test:
    const LAYERED_SCHED: Scheduler = Scheduler::new("layered")
        .binary(SchedulerSpec::Discover("scx_layered"))
        .config_file_def("--config {file}", "/include-files/layered.json");
-   const LAYERED_PAYLOAD: Payload = Payload::from_scheduler(&LAYERED_SCHED);
    ```
 
    `{file}` in the arg template is replaced with the guest path. The
@@ -191,7 +190,7 @@ pieces wire this into a test:
    ```rust,ignore
    const LAYERED_CONFIG: &str = r#"{ "layers": [...] }"#;
 
-   #[ktstr_test(scheduler = LAYERED_PAYLOAD, config = LAYERED_CONFIG)]
+   #[ktstr_test(scheduler = LAYERED_SCHED, config = LAYERED_CONFIG)]
    fn layered_test(ctx: &Ctx) -> Result<AssertResult> {
        Ok(AssertResult::pass())
    }
@@ -236,21 +235,21 @@ declare_scheduler!(MY_SCHED, {
 });
 
 #[ktstr_test(
-    scheduler = MY_SCHED_PAYLOAD,
+    scheduler = MY_SCHED,
     not_starved = true,
     max_gap_ms = 5000,
 )]
 fn my_sched_basic(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1n2l4c1t from MY_SCHED_PAYLOAD
+    // Inherits 1n2l4c1t from MY_SCHED
     Ok(AssertResult::pass())
 }
 ```
 
-`declare_scheduler!` emits two consts — `MY_SCHED: Scheduler`
-(for builder composition) and `MY_SCHED_PAYLOAD: Payload` (for
-the `scheduler =` slot here) — and registers `MY_SCHED` in the
-`KTSTR_SCHEDULERS` distributed slice so
-`cargo ktstr verifier` discovers it. See
+`declare_scheduler!` emits a `pub static MY_SCHED: Scheduler`
+and registers it in the `KTSTR_SCHEDULERS` distributed slice via
+a private linkme static so `cargo ktstr verifier` discovers it.
+The bare `MY_SCHED` ident is what `#[ktstr_test(scheduler = ...)]`
+expects. See
 [Scheduler Definitions](scheduler-definitions.md#defining-a-scheduler)
 for the full macro grammar.
 

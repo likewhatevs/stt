@@ -27,13 +27,6 @@ compare`, `list-values`, `list-metrics`, and `show-host` operate on
 those sidecars. See [Runs](running-tests/runs.md) for the directory
 layout, last-writer-wins semantics, and the comparison workflow.
 
-## Flags
-
-Define flags via `#[derive(Scheduler)]` with `#[flag(...)]` attributes.
-Use `required_flags` and `excluded_flags` in `#[ktstr_test]` to constrain
-which flag profiles a test runs under. See
-[Flags](concepts/flags.md) for details.
-
 ## Budget-based test selection
 
 Set `KTSTR_BUDGET_SECS` to select the subset of tests that maximizes
@@ -49,8 +42,8 @@ KTSTR_BUDGET_SECS=600 cargo ktstr test --kernel ../linux -- --run-ignored all
 ```
 
 The selector encodes each test as a bitset of properties (scheduler,
-flags, topology class, SMT, workload characteristics) and greedily
-picks tests with the highest marginal coverage per estimated second.
+topology class, SMT, workload characteristics) and greedily picks
+tests with the highest marginal coverage per estimated second.
 Duration estimates account for VM boot overhead based on vCPU count.
 
 A summary is printed to stderr during `--list`:
@@ -63,22 +56,19 @@ When `KTSTR_BUDGET_SECS` is not set, all tests are listed as usual.
 
 ## Custom scheduler
 
-Define a `Scheduler` with `SchedulerSpec::Discover` or
-`SchedulerSpec::Path` to test a pre-built scheduler binary, then
-wrap it in a `Payload` so the `#[ktstr_test(scheduler = ...)]`
-slot accepts it:
+Declare a scheduler with `declare_scheduler!` and reference the
+bare const from `#[ktstr_test(scheduler = ...)]`:
 
 ```rust,ignore
-const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Discover("scx_my_sched"));
+use ktstr::declare_scheduler;
+use ktstr::prelude::*;
 
-// Wrap the bare `Scheduler` const in a `Payload` so it fits the
-// `scheduler =` slot's `&'static Payload` shape. Mirrors what
-// `#[derive(Scheduler)]` emits as `{NAME}_PAYLOAD` for the derive
-// path; the manual builder uses `Payload::from_scheduler`.
-const MY_SCHED_PAYLOAD: Payload = Payload::from_scheduler(&MY_SCHED);
+declare_scheduler!(MY_SCHED, {
+    name = "my_sched",
+    binary = "scx_my_sched",
+});
 
-#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
+#[ktstr_test(scheduler = MY_SCHED)]
 fn my_sched_test(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
@@ -88,6 +78,6 @@ The binary is injected into the VM's initramfs and started before
 scenarios run. See [Test a New Scheduler](recipes/test-new-scheduler.md)
 for the full end-to-end workflow, and
 [Payload Definitions](writing-tests/scheduler-definitions.md#derive-payload)
-for the `Payload::from_scheduler` constructor and the
-`#[derive(Payload)]` macro that handles binary-kind workloads
-(`schbench`, `fio`, etc.).
+for the `#[derive(Payload)]` macro that handles binary-kind
+workloads (`schbench`, `fio`, etc.) — distinct from the
+scheduler-under-test surface.

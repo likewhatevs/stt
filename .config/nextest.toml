@@ -142,7 +142,7 @@ filter = "test(demo_)"
 slow-timeout = { period = "120s", terminate-after = 2 }
 retries = 0
 
-# Gauntlet tests: topology x flags matrix, ignored by default.
+# Gauntlet tests: topology preset matrix, ignored by default.
 # Run with: cargo ktstr test -- --run-ignored ignored-only -E 'test(gauntlet/)'
 [[profile.default.overrides]]
 filter = "test(gauntlet/)"

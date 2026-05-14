@@ -625,7 +625,6 @@ fn has_kernel_artifacts(dir: &std::path::Path) -> bool {
     }
     false
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

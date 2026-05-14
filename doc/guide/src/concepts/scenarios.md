@@ -47,10 +47,3 @@ Most tests use these canned functions or build custom scenarios with
 and use the same building blocks; see
 [Custom Scenarios](../writing-tests/custom-scenarios.md) for the
 `Ctx` struct and helper functions.
-
-## Flag profiles
-
-`#[derive(Scheduler)]` declares the flag set for a scheduler. Each
-test then uses `required_flags` and `excluded_flags` on
-`#[ktstr_test]` to constrain which combinations the test runs under.
-See [Flags](flags.md) for profile generation.

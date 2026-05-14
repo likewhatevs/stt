@@ -97,8 +97,8 @@ Use
 `cargo ktstr stats list-values --dir DIR` to enumerate the
 distinct values of every filterable dimension (`kernel`,
 `commit`, `kernel_commit`, `source`, `scheduler`, `topology`,
-`work_type`, `flags`) present in the pool, so per-side filters
-target real values. The `commit` and `source` keys map to the
+`work_type`) present in the pool, so per-side filters target
+real values. The `commit` and `source` keys map to the
 internal `SidecarResult::project_commit` / `run_source` fields;
 the per-side filter flags spell as `--a-project-commit` /
 `--b-project-commit` and `--a-run-source` / `--b-run-source`
@@ -129,7 +129,7 @@ dimension is part of the dynamic *pairing key* the comparison
 joins on. Slicing on `project-commit` alone joins each
 baseline scenario with its matching experimental counterpart
 on every other dimension (kernel, kernel-commit, run-source,
-scheduler, topology, work_type, flags).
+scheduler, topology, work_type).
 
 Other slicing axes work the same way:
 
@@ -156,7 +156,7 @@ either side has `passed=false` are dropped from the math and
 counted in the summary line; the exit code is non-zero when
 any regression is detected, so the command can gate CI
 directly. Narrow further with `-E SUBSTRING` (matches the
-joined `scenario topology scheduler work_type flags` string),
+joined `scenario topology scheduler work_type` string),
 override the relative gate uniformly with `--threshold PCT`
 or per-metric via `--policy FILE`. The absolute gate from each
 `MetricDef` is unaffected by `--threshold` — a delta must

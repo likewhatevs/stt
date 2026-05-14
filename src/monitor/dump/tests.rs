@@ -6466,8 +6466,8 @@ fn resolve_arena_type_picks_correct_payload_when_multiple_allocators_in_index() 
         "payload-start chase at task allocator's 0x1008 must resolve to TASK_TYPE_ID",
     );
     // Cgroup allocator slot 0x3000 — slot-start chase. The bug
-    // surface for #89: if the merge collapses cgrp payload to
-    // task payload, this returns TASK_TYPE_ID instead of CGRP_TYPE_ID.
+    // surface: if the merge collapses cgrp payload to task payload,
+    // this returns TASK_TYPE_ID instead of CGRP_TYPE_ID.
     assert_eq!(
         r.resolve_arena_type(0x10_0000_3000),
         Some(ArenaResolveHit {

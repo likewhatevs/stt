@@ -79,45 +79,62 @@ cell-emission time. Direct invocation outside nextest
 (`--exact verifier/<eevdf-sched>/...`) prints a `SKIP` banner
 and exits 0.
 
-## Multi-kernel resolution
+## Matrix dimension + per-scheduler filter
 
-`--kernel A --kernel B` exports two environment variables to the
-nextest invocation:
+The verifier sweep matrix is driven by the operator's `--kernel`
+set, not by per-scheduler `declare_scheduler!` declarations. The
+dispatcher always exports `KTSTR_KERNEL_LIST`
+(`label1=path1;label2=path2;...`) to the nextest invocation —
+even with no `--kernel` flag it synthesizes a single entry from
+the auto-discovered kernel. The test binary's lister walks that
+list as the matrix dimension and emits one cell per (declared
+scheduler × kernel-list entry × accepted preset).
 
-- `KTSTR_KERNEL` — the first resolved path. Single-kernel
-  consumers (and the verifier handler's fallback) read this.
-- `KTSTR_KERNEL_LIST` — `label1=path1;label2=path2;...`
-  carrying every resolved (sanitized label, kernel directory)
-  pair. The verifier cell handler walks this list and matches
-  the cell-name kernel label against the supplied set so each
-  cell runs against its own kernel.
+Each scheduler's `declare_scheduler!` `kernels = [...]`
+declaration acts as a **per-scheduler filter** on the matrix:
 
-The sanitized kernel label embedded in the cell name is derived
-from the scheduler's declared `kernels` entry. For the
-multi-kernel sweep to find a path for every cell, the operator's
-`--kernel` set must cover the declared values:
+- Empty (`kernels = []`) accepts every kernel-list entry — the
+  scheduler verifies against everything the operator passes.
+- `Version` specs (`"6.14.2"`) match entries whose raw label
+  equals the version (or whose sanitized label equals the
+  sanitized form of the version).
+- `Range` specs (`"6.14..6.16"`, `"6.14..=6.16"`) match
+  entries whose raw version falls in the inclusive range,
+  parsed via the same `decompose_version_for_compare` helper
+  the operator-side range expansion uses.
+- `Path` / `CacheKey` / `Git` specs match by sanitized-label
+  equality.
 
 ```sh
-# Scheduler declares kernels = ["6.14.2", "6.15.0"]
+# Scheduler declares kernels = ["6.14..6.16"]
+# Operator runs --kernel 6.14.2 --kernel 6.15.0 --kernel 6.17.0
+# Dispatcher's KTSTR_KERNEL_LIST: kernel_6_14_2, kernel_6_15_0,
+#                                 kernel_6_17_0
+# Scheduler filter: 6.14.2 ∈ [6.14, 6.16] ✓
+#                   6.15.0 ∈ [6.14, 6.16] ✓
+#                   6.17.0 ∈ [6.14, 6.16] ✗ — rejected
 # Cells emitted: verifier/<sched>/kernel_6_14_2/<preset>
 #                verifier/<sched>/kernel_6_15_0/<preset>
+cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0 --kernel 6.17.0
 
-# Both cells succeed (label-aligned --kernel set).
-cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0
-
-# Cell with kernel_6_15_0 fails: label not in KTSTR_KERNEL_LIST.
-cargo ktstr verifier --kernel 6.14.2
-
-# Single-kernel mode: every cell runs against KTSTR_KERNEL.
-# The cell label is informational only; the actual kernel is
-# whatever resolve_test_kernel() returns.
-KTSTR_KERNEL=/path/to/linux cargo ktstr verifier
+# No --kernel: dispatcher auto-discovers one kernel via the
+# cache + filesystem chain and synthesizes a single-entry
+# KTSTR_KERNEL_LIST. The auto-discovered entry's label is
+# derived from the resolved path (`kernel_path_<basename>_<hash6>`).
+# Schedulers with non-empty `kernels = [...]` may filter the
+# entry out — operators wanting deterministic coverage should
+# always pass --kernel.
+cargo ktstr verifier
 ```
 
-When a scheduler declares an empty `kernels = []`, no cells
-emit for it. The declaration is metadata that drives the
-matrix; no declared kernels means no verifier coverage for
-that scheduler.
+The verifier cell handler resolves the per-cell kernel
+directory by looking up the cell's sanitized label in
+`KTSTR_KERNEL_LIST` — there is no single-kernel fallback that
+would silently run a cell against an unrelated kernel. A label
+that doesn't appear in the list errors out with an actionable
+diagnostic naming the present labels and pointing at both fix
+paths (add `--kernel <SPEC>` or drop the matching entry from
+`declare_scheduler!`).
 
 ## Output
 

@@ -222,8 +222,8 @@ fn kernel_build_extra_kconfig_nonexistent_path_errors() {
         ));
 }
 
-/// Coordinator item 25: a directory passed to `--extra-kconfig`
-/// must surface a clear "is a directory" error. The 4-arm error
+/// A directory passed to `--extra-kconfig` must surface a clear
+/// "is a directory" error. The 4-arm error
 /// classification in [`ktstr::cli::read_extra_kconfig`] maps the
 /// kernel's EISDIR to "is a directory; pass a file" — pin that
 /// the operator-facing message names BOTH `--extra-kconfig` and
@@ -249,8 +249,8 @@ fn kernel_build_extra_kconfig_directory_errors() {
         .stderr(predicate::str::contains("is a directory"));
 }
 
-/// Coordinator item 24: a non-UTF-8 file passed to
-/// `--extra-kconfig` must surface a clear "not valid UTF-8"
+/// A non-UTF-8 file passed to `--extra-kconfig` must surface a
+/// clear "not valid UTF-8"
 /// error. `read_extra_kconfig` rejects with a message that names
 /// `--extra-kconfig` + the path so the operator can fix the file.
 /// kconfig fragments are required to be ASCII text per kbuild's
@@ -278,8 +278,8 @@ fn kernel_build_extra_kconfig_invalid_utf8_errors() {
         .stderr(predicate::str::contains("not valid UTF-8"));
 }
 
-/// Coordinator item 19: an empty file passed to `--extra-kconfig`
-/// is NOT an error — `read_extra_kconfig` warns but proceeds. The
+/// An empty file passed to `--extra-kconfig` is NOT an error —
+/// `read_extra_kconfig` warns but proceeds. The
 /// build then bails when the source-tree check fails (we point
 /// `--source` at a nonexistent path), proving the empty-file
 /// branch passed through without aborting on the fragment read.
@@ -309,8 +309,8 @@ fn kernel_build_extra_kconfig_empty_file_warns_but_proceeds() {
         .stderr(predicate::str::contains("--extra-kconfig file is empty"));
 }
 
-/// Coordinator item 26: symlink chain resolution. A
-/// `--extra-kconfig` argument that points at a symlink chain
+/// Symlink chain resolution. A `--extra-kconfig` argument that
+/// points at a symlink chain
 /// (link → link → file) must resolve transparently — the
 /// `read_extra_kconfig` helper uses `std::fs::read` which goes
 /// through `open(2)` and follows symlinks per kernel default
@@ -361,8 +361,8 @@ fn kernel_build_extra_kconfig_symlink_chain_resolves() {
     );
 }
 
-/// Coordinator item 27: the `--extra-kconfig` validation fires
-/// BEFORE source acquisition. A nonexistent extra-kconfig path
+/// The `--extra-kconfig` validation fires BEFORE source
+/// acquisition. A nonexistent extra-kconfig path
 /// MUST produce the `--extra-kconfig`-named error even when
 /// `--source` is also nonexistent — proving the error precedence.
 /// If the order were reversed the test would see the

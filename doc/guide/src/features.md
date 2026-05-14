@@ -73,31 +73,30 @@ real topology.
 </details>
 
 <details>
-<summary><b>Combinatoric scheduler testing</b> — typed flag DSL generates every configuration automatically</summary>
+<summary><b>Declarative scheduler registration</b> — one macro declares the binary, default topology, kernels, and assertions</summary>
 
 Tests load [sched_ext](https://github.com/sched-ext/scx) schedulers
 via BPF struct_ops inside the VM. The
-[`#[derive(Scheduler)]`](writing-tests/scheduler-definitions.md)
-macro declares scheduler binaries with typed flag profiles and
-dependency constraints. Each flag combination becomes a test variant
-— the framework generates the power set of valid configurations so
-you test combinations you'd never write by hand.
+[`declare_scheduler!`](writing-tests/scheduler-definitions.md)
+macro registers a scheduler in the `KTSTR_SCHEDULERS` distributed
+slice — binary path, default topology, kernel filter for the
+verifier sweep, assertion overrides, and always-on CLI args all
+land in one declaration that tests reference via the bare const
+ident the macro emits.
 
 ```rust,ignore
-#[derive(Scheduler)]
-#[scheduler(name = "mitosis", binary = "scx_mitosis",
-            topology(1, 2, 4, 1),
-            sched_args = ["--exit-dump-len", "1048576"])]
-enum MitosisFlag {
-    #[flag(args = ["--enable-llc-awareness"])]
-    Llc,
-    #[flag(args = ["--enable-work-stealing"], requires = [Llc])]
-    Steal,
-}
+use ktstr::declare_scheduler;
+
+declare_scheduler!(MITOSIS, {
+    name = "mitosis",
+    binary = "scx_mitosis",
+    topology = (1, 2, 4, 1),
+    sched_args = ["--exit-dump-len", "1048576"],
+});
 ```
 
-Without a scheduler attribute, tests run under the kernel's default
-scheduler (EEVDF).
+Without a `scheduler = …` attribute on `#[ktstr_test]`, tests run
+under the kernel's default scheduler (EEVDF).
 
 </details>
 
@@ -128,16 +127,17 @@ catalog aggregator.)
 </details>
 
 <details>
-<summary><b>Gauntlet</b> — one test declaration, hundreds of topology × flag variants with budget-aware CI selection</summary>
+<summary><b>Gauntlet</b> — one test declaration, dozens of topology variants with budget-aware CI selection</summary>
 
 A single [`#[ktstr_test]`](writing-tests/ktstr-test-macro.md)
-auto-expands across topology presets and flag profiles.
-Budget-based selection (`KTSTR_BUDGET_SECS`) picks the subset that
-maximizes coverage within a CI time limit.
+auto-expands across topology presets. Multi-kernel runs
+(`cargo ktstr test --kernel A --kernel B`) add the kernel as
+an additional dimension. Budget-based selection
+(`KTSTR_BUDGET_SECS`) picks the subset that maximizes coverage
+within a CI time limit.
 
 **Constraint attributes:**
 - `min_llcs`, `max_llcs`, `min_cpus`, `max_cpus`, `min_numa_nodes`, `max_numa_nodes`, `requires_smt` — topology gates
-- `required_flags`, `excluded_flags` — flag profile filters
 - `extra_sched_args` — per-test scheduler CLI arguments
 
 </details>
@@ -530,11 +530,13 @@ authoritative.
 <details>
 <summary><b>Real-kernel verifier analysis</b> — boots the kernel, loads the scheduler, reads actual verified instruction counts</summary>
 
-Runs the BPF verifier against a scheduler's struct_ops programs
-inside a real kernel. Reports per-callback verified instruction
-counts with cycle collapse — deduplicating repeated verifier paths
-to show true unique cost. Per-flag-profile breakdown reveals which
-flag combinations increase verification complexity.
+Runs the BPF verifier against every `declare_scheduler!`-registered
+scheduler's struct_ops programs inside a real kernel. Reports
+per-program verified instruction counts with cycle collapse —
+deduplicating repeated verifier paths to show true unique cost.
+The sweep emits one nextest cell per (declared scheduler ×
+kernel-list entry × accepted topology preset) tuple, with
+parallelism and retries handled natively by nextest.
 
 Reads `bpf_prog_aux.verified_insns` from guest memory after loading
 the scheduler via struct_ops — the same path production uses.

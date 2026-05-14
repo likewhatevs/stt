@@ -2892,12 +2892,9 @@ impl KtstrVm {
                                     // single "test-verdict-bearing"
                                     // arm whose only action is to
                                     // accumulate the entry into the
-                                    // shared bucket. Reference VMMs
-                                    // (libkrun, cloud-hypervisor, qemu)
-                                    // all dispatch port-1 TX through a
-                                    // single typed-tag matcher; the
-                                    // prior if-ladder of `msg.msg_type
-                                    // == MSG_TYPE_*` checks let a new
+                                    // shared bucket. The prior if-
+                                    // ladder of `msg.msg_type ==
+                                    // MSG_TYPE_*` checks let a new
                                     // variant slip past the host
                                     // without an explicit decision.
                                     //
@@ -7245,7 +7242,7 @@ impl KtstrVm {
                         //                         shape (separate "reset
                         //                         hit + keep watching"
                         //                         vs "mark Done")
-                        //                         collapsed once #51's
+                        //                         collapsed once the
                         //                         cross-reference
                         //                         eliminated the bss-
                         //                         flipped-during-
@@ -7262,8 +7259,7 @@ impl KtstrVm {
                                 // time so it covers serialise + write.
                                 let map_count = late.maps.len();
                                 let vcpu_regs_count = late.vcpu_regs.len();
-                                // NEW-V9-2 (advphd_firecracker):
-                                // pre-compute vcpu_none_indices so
+                                // Pre-compute vcpu_none_indices so
                                 // emit_json's stderr fallback can
                                 // surface WHICH vCPUs stalled — same
                                 // operator-critical signal the drain's
@@ -7338,13 +7334,13 @@ impl KtstrVm {
                                         // neither applies here). The
                                         // structured summary is loud-
                                         // emitted to stderr when the
-                                        // user wired a sink (so the data
-                                        // loss represents a captured
-                                        // observation that the user
-                                        // asked for); skipped when no
-                                        // sink (verifier / shell /
-                                        // template paths never asked
-                                        // for preservation).
+                                        // user wired a sink (so the
+                                        // data loss represents a
+                                        // captured observation that
+                                        // the user asked for); skipped
+                                        // when no sink (verifier /
+                                        // shell / template paths never
+                                        // asked for preservation).
                                         tracing::error!(
                                             error = %e,
                                             map_count,

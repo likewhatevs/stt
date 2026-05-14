@@ -2116,7 +2116,10 @@ fn parse_verifier_bare() {
     let KtstrCommand::Verifier { kernel, raw } = k.command else {
         panic!("expected Verifier");
     };
-    assert!(kernel.is_empty(), "bare verifier must default --kernel to empty Vec");
+    assert!(
+        kernel.is_empty(),
+        "bare verifier must default --kernel to empty Vec"
+    );
     assert!(!raw, "bare verifier must default --raw to false");
 }
 
@@ -2138,9 +2141,7 @@ fn parse_verifier_with_kernel_repeatable() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from([
-        "cargo", "ktstr", "verifier",
-        "--kernel", "6.14.2",
-        "--kernel", "6.15.0",
+        "cargo", "ktstr", "verifier", "--kernel", "6.14.2", "--kernel", "6.15.0",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Verifier { kernel, raw } = k.command else {
@@ -2169,9 +2170,8 @@ fn parse_verifier_with_raw() {
 /// rebuilding the sweep dispatch trips this test.
 #[test]
 fn parse_verifier_scheduler_flag_rejected() {
-    let rejected = Cargo::try_parse_from([
-        "cargo", "ktstr", "verifier", "--scheduler", "scx_rustland",
-    ]);
+    let rejected =
+        Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--scheduler", "scx_rustland"]);
     assert!(
         rejected.is_err(),
         "--scheduler must be rejected — the flag was removed when the \
@@ -2185,9 +2185,7 @@ fn parse_verifier_scheduler_flag_rejected() {
 /// instead of silently shipping a dead flag.
 #[test]
 fn parse_verifier_all_profiles_rejected() {
-    let rejected = Cargo::try_parse_from([
-        "cargo", "ktstr", "verifier", "--all-profiles",
-    ]);
+    let rejected = Cargo::try_parse_from(["cargo", "ktstr", "verifier", "--all-profiles"]);
     assert!(
         rejected.is_err(),
         "--all-profiles must be rejected — the flag-profile sweep \
@@ -2202,7 +2200,11 @@ fn parse_verifier_all_profiles_rejected() {
 #[test]
 fn parse_verifier_profiles_filter_rejected() {
     let rejected = Cargo::try_parse_from([
-        "cargo", "ktstr", "verifier", "--profiles", "default,llc,llc+steal",
+        "cargo",
+        "ktstr",
+        "verifier",
+        "--profiles",
+        "default,llc,llc+steal",
     ]);
     assert!(
         rejected.is_err(),
@@ -3416,13 +3418,7 @@ fn parse_verifier_kernel_repeatable() {
     let Cargo {
         command: CargoSub::Ktstr(k),
     } = Cargo::try_parse_from([
-        "cargo",
-        "ktstr",
-        "verifier",
-        "--kernel",
-        "6.14.2",
-        "--kernel",
-        "6.15-rc3",
+        "cargo", "ktstr", "verifier", "--kernel", "6.14.2", "--kernel", "6.15-rc3",
     ])
     .unwrap_or_else(|e| panic!("{e}"));
     let KtstrCommand::Verifier { kernel, .. } = k.command else {

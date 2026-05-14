@@ -39,9 +39,10 @@ automates this:
 - **Automated assertions** -- checks for starvation, cgroup
   isolation violations, and CPU time fairness. No manual inspection.
 - **[Gauntlet](https://likewhatevs.github.io/ktstr/guide/running-tests/gauntlet.html)** --
-  one `#[ktstr_test]` expands across the cross-product of topology
-  presets (4-252 vCPUs, 1-15 LLCs, optional SMT and multi-NUMA) and
-  scheduler flag profiles, filtered by per-test constraints.
+  one `#[ktstr_test]` expands across topology presets (4-252 vCPUs,
+  1-15 LLCs, optional SMT and multi-NUMA), filtered by per-test
+  constraints. Multi-kernel runs (`--kernel A --kernel B`) add the
+  kernel as an additional dimension.
 - **Host-side introspection** -- reads kernel state and BPF maps
   from guest memory without guest-side instrumentation.
 - **Per-thread profile diff** -- `ktstr ctprof capture` walks
@@ -163,21 +164,20 @@ canned scenarios, see `scenarios::steady` in the
 
 ### Define a scheduler
 
-To test a custom sched_ext scheduler, use `#[derive(Scheduler)]` to
-declare the binary, default topology, and feature flags:
+To test a custom sched_ext scheduler, declare it with
+`declare_scheduler!`:
 
 ```rust
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-#[derive(Scheduler)]
-// topology(1, 2, 4, 1): 1 NUMA node, 2 LLCs, 4 cores/LLC, 1 thread/core
-#[scheduler(name = "my_sched", binary = "scx_my_sched", topology(1, 2, 4, 1))]
-enum MySchedFlag {
-    #[flag(args = ["--enable-llc"])]
-    Llc,
-    #[flag(args = ["--enable-stealing"], requires = [Llc])]
-    Steal,
-}
+declare_scheduler!(MY_SCHED, {
+    name = "my_sched",
+    binary = "scx_my_sched",
+    // (numa_nodes, llcs, cores_per_llc, threads_per_core)
+    topology = (1, 2, 4, 1),
+    sched_args = ["--enable-llc", "--enable-stealing"],
+});
 ```
 
 `binary = "scx_my_sched"` tells ktstr to auto-discover the scheduler
@@ -188,31 +188,27 @@ places it there and discovery is automatic. The resolved binary is
 packed into the VM's initramfs. Tests without a `scheduler` attribute
 run under EEVDF (the kernel's default scheduler).
 
-`topology(numa_nodes, llcs, cores_per_llc, threads_per_core)` sets
-the VM's CPU topology -- `topology(1, 2, 4, 1)` creates 1 NUMA node,
-2 LLCs, 4 cores per LLC, 1 thread per core (8 vCPUs). Topologies
-display as `NnNlNcNt` (e.g. `1n2l4c1t`). In `#[ktstr_test]`, use
-named attributes instead: `llcs = 2, cores = 4, threads = 1,
-numa_nodes = 1`. Unset dimensions inherit from the scheduler's
-topology. For non-uniform NUMA, see `Topology::with_nodes()` in the
+`topology = (numa_nodes, llcs, cores_per_llc, threads_per_core)`
+sets the VM's CPU topology — `topology = (1, 2, 4, 1)` creates 1
+NUMA node, 2 LLCs, 4 cores per LLC, 1 thread per core (8 vCPUs).
+Topologies display as `NnNlNcNt` (e.g. `1n2l4c1t`). In
+`#[ktstr_test]`, use named attributes instead: `llcs = 2, cores =
+4, threads = 1, numa_nodes = 1`. Unset dimensions inherit from the
+scheduler's topology. For non-uniform NUMA, see
+`Topology::with_nodes()` in the
 [topology guide](https://likewhatevs.github.io/ktstr/guide/concepts/topology.html).
 
-This generates two consts and per-variant flag constants:
+`sched_args = [...]` are CLI args prepended to every test using
+this scheduler. Per-test `#[ktstr_test(extra_sched_args = [...])]`
+appends additional args after these.
 
-- `const MY_SCHED: Scheduler` — the scheduler definition itself,
-  for use in builder chains and library code that needs the bare
-  `Scheduler` type.
-- `const MY_SCHED_PAYLOAD: Payload` — a `Payload` wrapper around
-  `MY_SCHED` (kind: `PayloadKind::Scheduler`), used wherever a
-  `Payload` value is expected. The `scheduler =` slot on
-  `#[ktstr_test]` is one such site; pass the `_PAYLOAD` form, not
-  the bare `Scheduler` form.
-
-Tests referencing `MY_SCHED_PAYLOAD` inherit its topology and
-flags. Add `scheduler = MY_SCHED_PAYLOAD` to `#[ktstr_test]` to use it:
+The macro emits `pub static MY_SCHED: Scheduler` and registers a
+private linkme static in the `KTSTR_SCHEDULERS` distributed slice
+so `cargo ktstr verifier` discovers it automatically. Add
+`scheduler = MY_SCHED` to `#[ktstr_test]` to target it:
 
 ```rust
-#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
+#[ktstr_test(scheduler = MY_SCHED)]
 fn sched_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("cg_0").workers(2),
@@ -221,9 +217,10 @@ fn sched_two_cgroups(ctx: &Ctx) -> Result<AssertResult> {
 }
 ```
 
-The topology macro argument requires `llcs` to be an exact multiple
-of `numa_nodes`; `topology(1, 2, 4, 1)` (2 LLCs, 1 NUMA node) is
-fine, `topology(2, 3, ...)` is rejected at compile time.
+Tests referencing `MY_SCHED` inherit its topology. The macro
+requires `llcs` to be an exact multiple of `numa_nodes`;
+`topology = (1, 2, 4, 1)` (2 LLCs, 1 NUMA node) is fine,
+`topology = (2, 3, ...)` is rejected at compile time.
 
 ### Multi-step scenarios
 
@@ -233,7 +230,7 @@ For dynamic topology changes, use `execute_steps` with `Step` and
 ```rust
 use ktstr::prelude::*;
 
-#[ktstr_test(scheduler = MY_SCHED_PAYLOAD, llcs = 1, cores = 4, threads = 1)]
+#[ktstr_test(scheduler = MY_SCHED, llcs = 1, cores = 4, threads = 1)]
 fn cpuset_split(ctx: &Ctx) -> Result<AssertResult> {
     let steps = vec![Step::with_defs(
         vec![
@@ -261,7 +258,7 @@ reference it via `payload = ...` (primary slot) or
 mod common; // requires tests/common/fixtures.rs setup -- see tests/common/ in the repo
 use common::fixtures::*;
 
-#[ktstr_test(scheduler = MY_SCHED_PAYLOAD, payload = SCHBENCH)]
+#[ktstr_test(scheduler = MY_SCHED, payload = SCHBENCH)]
 fn schbench_under_my_sched(ctx: &Ctx) -> Result<AssertResult> {
     let (result, _metrics) = ctx.payload(&SCHBENCH).run()?;
     Ok(result)
@@ -335,7 +332,8 @@ cargo ktstr kernel list                                    # list cached kernels
 cargo ktstr kernel clean --keep 3                          # keep 3 most recent
 cargo ktstr model fetch                                    # prefetch the LlmExtract model
 cargo ktstr model status                                   # report whether a SHA-checked model is cached
-cargo ktstr verifier --scheduler scx_my_sched              # BPF verifier stats
+cargo ktstr verifier                                       # BPF verifier sweep (auto-discover kernel)
+cargo ktstr verifier --kernel 6.14.2 --kernel 6.15.0       # sweep across multiple kernels
 cargo ktstr stats                                          # aggregate gauntlet sidecars
 cargo ktstr stats compare --a-kernel 6.14 --b-kernel 6.15  # diff sidecar partitions across kernels
 cargo ktstr stats show-host --run <key>                    # print archived HostContext for a run

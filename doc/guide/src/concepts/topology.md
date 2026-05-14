@@ -53,7 +53,7 @@ from a VM spec. `Topology` fields are big-to-little: NUMA nodes,
 last-level caches, cores per LLC, threads per core. Multiple LLCs
 can share a NUMA node when `numa_nodes < llcs`; `llcs` must be an
 exact multiple of `numa_nodes` so LLCs partition evenly across nodes
-(the `#[derive(Scheduler)]` macro rejects violations at compile time
+(the `declare_scheduler!` macro rejects violations at compile time
 and runtime callers inside ktstr hold the same invariant). CPUs
 numbered sequentially. Used as a fallback when sysfs is incomplete
 inside a guest VM. For the memory-aware variant, see

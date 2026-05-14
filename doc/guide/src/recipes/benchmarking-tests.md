@@ -27,14 +27,17 @@ Check that a scheduler passes performance gates under
 `performance_mode`. Use `#[ktstr_test]` with Assert thresholds:
 
 ```rust,ignore
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Discover("scx_my_sched"))
-    .topology(1, 1, 2, 1);
+declare_scheduler!(MY_SCHED, {
+    name = "my_sched",
+    binary = "scx_my_sched",
+    topology = (1, 1, 2, 1),
+});
 
 #[ktstr_test(
-    scheduler = MY_SCHED_PAYLOAD,
+    scheduler = MY_SCHED,
     performance_mode = true,
     duration_s = 3,
     sustained_samples = 15,
@@ -70,14 +73,17 @@ fails. The macro wraps the test with `assert!(result.is_err())` and
 disables auto-repro automatically.
 
 ```rust,ignore
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Discover("scx_my_sched"))
-    .topology(1, 1, 2, 1);
+declare_scheduler!(MY_SCHED, {
+    name = "my_sched",
+    binary = "scx_my_sched",
+    topology = (1, 1, 2, 1),
+});
 
 #[ktstr_test(
-    scheduler = MY_SCHED_PAYLOAD,
+    scheduler = MY_SCHED,
     performance_mode = true,
     duration_s = 5,
     extra_sched_args = ["--fail-verify"],
@@ -216,11 +222,14 @@ fixture binary ships on `PATH` under a project-controlled bin
 directory; the payload declares its own dependency:
 
 ```rust,ignore
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-const MY_SCHED: Scheduler = Scheduler::new("my_sched")
-    .binary(SchedulerSpec::Discover("scx_my_sched"))
-    .topology(1, 1, 2, 1);
+declare_scheduler!(MY_SCHED, {
+    name = "my_sched",
+    binary = "scx_my_sched",
+    topology = (1, 1, 2, 1),
+});
 
 #[derive(Payload)]
 #[payload(binary = "bench-driver")]
@@ -233,7 +242,7 @@ struct BenchDriver;
 // `#[ktstr_test]` attributes and from `ctx.payload(&...)` inside the body.
 
 #[ktstr_test(
-    scheduler = MY_SCHED_PAYLOAD,
+    scheduler = MY_SCHED,
     payload = BENCH_DRIVER,
     duration_s = 5,
 )]
@@ -264,7 +273,7 @@ the `#[ktstr_test]` attribute directly:
 
 ```rust,ignore
 #[ktstr_test(
-    scheduler = MY_SCHED_PAYLOAD,
+    scheduler = MY_SCHED,
     payload = FIO,
     extra_include_files = ["test-fixtures/workload.json"],
 )]

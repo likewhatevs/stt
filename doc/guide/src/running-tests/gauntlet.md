@@ -105,24 +105,13 @@ for the full attribute table and
 for a worked example showing which presets survive a given constraint
 set.
 
-## Flag profiles
-
-Gauntlet runs each test with all valid flag combinations generated from
-the scheduler's flag declarations and the test's `required_flags` /
-`excluded_flags` constraints. This adds a flag profile dimension:
-tests x topologies x flag_profiles.
-
-See [Flags](../concepts/flags.md) and
-[Gauntlet Tests](../writing-tests/gauntlet-tests.md) for how profiles
-are generated.
-
 ## Budget interaction
 
 When `KTSTR_BUDGET_SECS` is set, greedy coverage maximization selects
 the most diverse set of test configurations within the time budget.
 Each candidate test is represented as a feature bitset (CPU count
-bucket, LLC count, SMT vs non-SMT, flag profile, etc.). The selector
-greedily picks tests that cover the most uncovered feature bits per
+bucket, LLC count, SMT vs non-SMT, etc.). The selector greedily
+picks tests that cover the most uncovered feature bits per
 estimated second. The result is a mix of base tests and gauntlet
 variants that maximizes configuration diversity within the budget.
 

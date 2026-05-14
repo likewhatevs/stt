@@ -1,27 +1,27 @@
-//! VM integration tests for kernel-facing capture pipelines (#146).
+//! VM integration tests for kernel-facing capture pipelines.
 //!
 //! Each test boots a real KVM VM via `#[ktstr_test]`, runs a small
 //! workload under scx-ktstr with `--stall-after=1`, lets the freeze
 //! coordinator capture a `FailureDumpReport`, and asserts the
 //! captured JSON carries the field the test is responsible for
-//! pinning. Five tests cover the gaps from #7's audit (G4-G9, G16):
+//! pinning. Five tests cover the capture-pipeline gaps:
 //!
-//! - **DSQ + rq->scx walker** (G4): `dsq_states` and `rq_scx_states`
+//! - **DSQ + rq->scx walker**: `dsq_states` and `rq_scx_states`
 //!   in the dump JSON populated from real frozen-VM walk.
-//! - **Per-vCPU perf counters** (G5): `vcpu_perf_at_freeze` populated
+//! - **Per-vCPU perf counters**: `vcpu_perf_at_freeze` populated
 //!   with at least one non-`None` slot from a real
 //!   `perf_event_open(exclude_host=1)` read.
-//! - **Event-counter timeline** (G6): `event_counter_timeline`
+//! - **Event-counter timeline**: `event_counter_timeline`
 //!   populated with at least one entry across the run window — the
 //!   load-bearing surface for the sched-event capture path. (The
 //!   discrete tracepoint timeline is wired via `TimelineCapture` but
 //!   not yet attached to FailureDumpReport; the event-counter
 //!   timeline is the visible per-tick timeline today.)
-//! - **SchedPolicy::Deadline** (G9): worker spawned under
+//! - **SchedPolicy::Deadline**: worker spawned under
 //!   `SchedPolicy::Deadline` reaches `worker_main` without bailing —
 //!   proves the `sched_setattr(2)` syscall path runs end-to-end on
 //!   a real kernel that supports `SCHED_DEADLINE`.
-//! - **Failure-dump trigger** (G16): boot → stall → capture → render
+//! - **Failure-dump trigger**: boot → stall → capture → render
 //!   pipeline produces a non-empty top-level dump (overlaps with
 //!   `failure_dump_e2e.rs` but pins the schema discriminant + the
 //!   minimal cross-pipeline invariant).
@@ -93,7 +93,7 @@ fn run_stalled_workload(ctx: &ktstr::scenario::Ctx) -> Result<AssertResult> {
 }
 
 // ----------------------------------------------------------------------------
-// G4: DSQ + rq->scx walker
+// DSQ + rq->scx walker
 // ----------------------------------------------------------------------------
 
 /// Boot scx-ktstr, trigger a stall, and assert that the freeze-time
@@ -171,7 +171,7 @@ fn scenario_dsq_and_rq_walker_populates_failure_dump(
 }
 
 // ----------------------------------------------------------------------------
-// G5: Per-vCPU perf counters
+// Per-vCPU perf counters
 // ----------------------------------------------------------------------------
 
 /// Boot scx-ktstr, trigger a stall, and assert that
@@ -246,7 +246,7 @@ fn scenario_perf_counters_capture_populates_dump(
 }
 
 // ----------------------------------------------------------------------------
-// G6: Event-counter timeline (sched-event capture)
+// Event-counter timeline (sched-event capture)
 // ----------------------------------------------------------------------------
 
 /// Boot scx-ktstr, trigger a stall, and assert that
@@ -268,9 +268,8 @@ fn scenario_perf_counters_capture_populates_dump(
 ///
 /// The lower bound (>=1 sample) is the minimal signal that the
 /// per-tick capture surface is alive on a real kernel run. Sparkline
-/// rendering on top of this vec is unit-tested elsewhere (#2);
-/// this test pins the integration boundary where unit tests cannot
-/// reach.
+/// rendering on top of this vec is unit-tested elsewhere; this test
+/// pins the integration boundary where unit tests cannot reach.
 fn scenario_event_counter_timeline_populates_dump(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {
@@ -321,7 +320,7 @@ fn scenario_event_counter_timeline_populates_dump(
 }
 
 // ----------------------------------------------------------------------------
-// G9: SchedPolicy::Deadline real sched_setattr invocation
+// SchedPolicy::Deadline real sched_setattr invocation
 // ----------------------------------------------------------------------------
 
 /// Spawn a worker under `SchedPolicy::Deadline` inside the VM and
@@ -421,7 +420,7 @@ fn scenario_sched_deadline_real_setattr(ctx: &ktstr::scenario::Ctx) -> Result<As
 }
 
 // ----------------------------------------------------------------------------
-// G16: Failure-dump trigger, full-stack
+// Failure-dump trigger, full-stack
 // ----------------------------------------------------------------------------
 
 /// End-to-end sanity check for the failure-dump trigger: boot →
@@ -800,10 +799,10 @@ fn scenario_disk_read_only_rejects_write(_ctx: &ktstr::scenario::Ctx) -> Result<
     Ok(result)
 }
 
-// Counter-introspection scenario lives in follow-up #168 — once
-// `VmResult` exposes `virtio_blk_counters`, a separate test will
-// assert host-side counter values directly. The three scenarios
-// above cover guest-visible behavior end-to-end.
+// Counter-introspection scenario is a follow-up — once `VmResult`
+// exposes `virtio_blk_counters`, a separate test will assert
+// host-side counter values directly. The three scenarios above
+// cover guest-visible behavior end-to-end.
 
 // ----------------------------------------------------------------------------
 // Entry registrations
@@ -976,7 +975,7 @@ fn drive_ktstr_test(scenario_name: &str) {
     );
 }
 
-/// G4 — DSQ + rq->scx walker.
+/// DSQ + rq->scx walker.
 ///
 /// Boots scx-ktstr `--stall-after=1`, asserts `dsq_states` and
 /// `rq_scx_states` in the failure-dump JSON are both non-empty.
@@ -999,7 +998,7 @@ fn vm_integration_dsq_and_rq_walker() {
     drive_ktstr_test("vm_integration_dsq_and_rq_walker");
 }
 
-/// G5 — Per-vCPU perf counters via `perf_event_open(exclude_host=1)`.
+/// Per-vCPU perf counters via `perf_event_open(exclude_host=1)`.
 ///
 /// Boots a SpinWait workload, asserts `vcpu_perf_at_freeze` carries
 /// at least one non-null `VcpuPerfSample` after the stall freeze.
@@ -1018,7 +1017,7 @@ fn vm_integration_perf_counters_capture() {
     drive_ktstr_test("vm_integration_perf_counters_capture");
 }
 
-/// G6 — Event-counter timeline (per-tick sched-event capture).
+/// Event-counter timeline (per-tick sched-event capture).
 ///
 /// Asserts `event_counter_timeline` non-empty after a 15s run
 /// window. Pins the per-monitor-tick capture loop + SCX_EV_*
@@ -1033,7 +1032,7 @@ fn vm_integration_event_counter_timeline() {
     drive_ktstr_test("vm_integration_event_counter_timeline");
 }
 
-/// G9 — `SchedPolicy::Deadline` real `sched_setattr(2)` invocation.
+/// `SchedPolicy::Deadline` real `sched_setattr(2)` invocation.
 ///
 /// Spawns a SpinWait worker under SCHED_DEADLINE 5% bandwidth
 /// reservation; asserts the worker reports `completed=true` and
@@ -1053,7 +1052,7 @@ fn vm_integration_sched_deadline() {
     drive_ktstr_test("vm_integration_sched_deadline");
 }
 
-/// G16 — Failure-dump trigger, full-stack invariants.
+/// Failure-dump trigger, full-stack invariants.
 ///
 /// Asserts `schema == "single"`, `maps` non-empty,
 /// `vcpu_regs` non-empty after a stall freeze. Pins three

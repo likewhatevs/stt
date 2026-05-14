@@ -1718,7 +1718,7 @@ mod tests {
         assert_ne!(
             extra_kconfig_hash(lf),
             extra_kconfig_hash(crlf),
-            "CRLF and LF must hash differently per ruling D2"
+            "CRLF and LF must hash differently — raw-byte hashing is intentional for byte-deterministic discrimination"
         );
 
         let with_comment = "# user note\nCONFIG_FOO=y\n";
@@ -1726,16 +1726,16 @@ mod tests {
         assert_ne!(
             extra_kconfig_hash(with_comment),
             extra_kconfig_hash(without_comment),
-            "comments must affect the hash per ruling D1"
+            "comments must affect the hash — raw-byte hashing is intentional"
         );
     }
 
-    /// Coordinator item 18: CRLF cache-key discrimination. A user
-    /// who edits their fragment on a Windows host and saves with
-    /// CRLF line endings must land at a different cache slot from
-    /// a Unix-LF fragment with otherwise-identical content. Per
-    /// ruling D2 (no canonicalization), this is by design — the
-    /// disk waste is the price of byte-deterministic discrimination.
+    /// CRLF cache-key discrimination. A user who edits their
+    /// fragment on a Windows host and saves with CRLF line endings
+    /// must land at a different cache slot from a Unix-LF fragment
+    /// with otherwise-identical content. No canonicalization is
+    /// performed — the disk waste is the price of byte-deterministic
+    /// discrimination.
     #[test]
     fn cache_key_suffix_with_extra_crlf_differs_from_lf() {
         let lf = "CONFIG_FOO=y\n";
@@ -1745,15 +1745,15 @@ mod tests {
         assert_ne!(
             lf_suffix, crlf_suffix,
             "LF and CRLF user fragments must produce distinct cache \
-             keys per ruling D2 (no CRLF canonicalization). A Windows \
-             operator and a Unix operator who supplied 'the same' \
-             fragment land at distinct cache slots; this is the \
-             documented byte-deterministic cache contract."
+             keys (no CRLF canonicalization). A Windows operator and \
+             a Unix operator who supplied 'the same' fragment land at \
+             distinct cache slots; this is the documented \
+             byte-deterministic cache contract."
         );
     }
 
-    /// Coordinator item 22: legacy cache entry must NOT be served
-    /// when `--extra-kconfig` is passed. The cache key shape
+    /// Legacy cache entry must NOT be served when `--extra-kconfig`
+    /// is passed. The cache key shape
     /// `kc{baked}` (legacy, no extras) and `kc{baked}-xkc{...}`
     /// (with extras) are STRUCTURALLY distinct strings, so any
     /// cache lookup that builds its key via
@@ -1788,8 +1788,7 @@ mod tests {
         );
     }
 
-    /// Coordinator item 135 / item 29: pin that
-    /// `extra_kconfig_hash("")` is the legitimate CRC32 of zero
+    /// Pin that `extra_kconfig_hash("")` is the legitimate CRC32 of zero
     /// bytes (`00000000`), NOT a sentinel meaning "no extras".
     /// `None` is the no-extras signal — `Some("")` means "operator
     /// supplied an empty fragment file". An empty Some still
@@ -1850,7 +1849,7 @@ mod tests {
              last-wins rule (confdata.c::conf_read_simple) keeps the user \
              value (baked_pos={baked_pos}, user_pos={user_pos})",
         );
-        // Item 20: pin that the LAST occurrence of the symbol in
+        // Pin that the LAST occurrence of the symbol in
         // the merged content is the user's override. Walks every
         // line, tracks the last hit, and asserts it is the user's
         // disable directive — the kbuild parser walks lines top to

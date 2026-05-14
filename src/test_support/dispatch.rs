@@ -1070,12 +1070,6 @@ fn list_tests(ignored_only: bool) {
     }
 }
 
-/// Host capacity inputs for `TopologyConstraints::accepts`.
-///
-// host_capacity moved to crate::test_support::host_capacity for shared
-// use by both dispatch.rs (gauntlet variant filter) and
-// cargo_ktstr/verifier.rs (verifier sweep filter).
-
 /// Iterate topology presets that both fit the host capacity and
 /// match the entry's `TopologyConstraints`. Shared between the
 /// eager ("print every name") and budgeted ("push a candidate")
@@ -1251,8 +1245,7 @@ fn entry_matches_spec(entry: &KernelEntry, spec: &str) -> bool {
     use crate::kernel_path::{KernelId, decompose_version_for_compare};
     match KernelId::parse(spec) {
         KernelId::Version(spec_ver) => {
-            entry.label == spec_ver
-                || entry.sanitized.as_str() == sanitize_kernel_label(&spec_ver)
+            entry.label == spec_ver || entry.sanitized.as_str() == sanitize_kernel_label(&spec_ver)
         }
         KernelId::Range { start, end } => {
             let Some(entry_t) = decompose_version_for_compare(&entry.label) else {
@@ -1403,9 +1396,7 @@ fn list_verifier_cells_all() {
                 }
                 println!(
                     "verifier/{}/{}/{}: test",
-                    sched.name,
-                    kernel_entry.sanitized,
-                    preset.name,
+                    sched.name, kernel_entry.sanitized, preset.name,
                 );
             }
         }
@@ -1472,7 +1463,10 @@ fn run_verifier_cell(full_name: &str) -> i32 {
         return 1;
     }
 
-    let Some(sched) = super::KTSTR_SCHEDULERS.iter().find(|s| s.name == sched_name) else {
+    let Some(sched) = super::KTSTR_SCHEDULERS
+        .iter()
+        .find(|s| s.name == sched_name)
+    else {
         eprintln!("ktstr verifier: no declared scheduler {sched_name:?} (cell {full_name:?})",);
         return 1;
     };
@@ -1506,12 +1500,7 @@ fn run_verifier_cell(full_name: &str) -> i32 {
             let present: Vec<&str> = kernel_list.iter().map(|k| k.sanitized.as_str()).collect();
             eprintln!(
                 "{}",
-                format_unknown_kernel_label_error(
-                    full_name,
-                    kernel_label,
-                    sched_name,
-                    &present,
-                ),
+                format_unknown_kernel_label_error(full_name, kernel_label, sched_name, &present,),
             );
         }
         return 1;
@@ -2638,7 +2627,11 @@ mod tests {
     fn filter_handles_unparseable_entry_label_in_range() {
         // Entry whose label isn't version-shaped (e.g. a Git
         // label) can't be in a version range — reject.
-        let git_entry = mk_entry("git_tj_sched_ext_main", "kernel_git_tj_sched_ext_main", "/a");
+        let git_entry = mk_entry(
+            "git_tj_sched_ext_main",
+            "kernel_git_tj_sched_ext_main",
+            "/a",
+        );
         assert!(!entry_matches_spec(&git_entry, "6.14..6.16"));
     }
 
@@ -2667,10 +2660,7 @@ mod tests {
             "/cache/foo",
         );
         // The spec parsed as CacheKey sanitizes to the same form.
-        assert!(entry_matches_spec(
-            &e,
-            "6.14.2-tarball-x86_64-kcabc",
-        ));
+        assert!(entry_matches_spec(&e, "6.14.2-tarball-x86_64-kcabc",));
     }
 
     #[test]
@@ -2686,10 +2676,7 @@ mod tests {
     #[test]
     fn filter_rejects_when_no_declared_spec_matches() {
         let e = mk_entry("7.0.0", "kernel_7_0_0", "/a");
-        assert!(!sched_kernel_filter_accepts(
-            &["6.14.2", "6.14..6.16"],
-            &e,
-        ));
+        assert!(!sched_kernel_filter_accepts(&["6.14.2", "6.14..6.16"], &e,));
     }
 
     // ---------------------------------------------------------------
@@ -2702,9 +2689,7 @@ mod tests {
 
     #[test]
     fn format_empty_kernel_list_error_names_cell_and_dispatcher() {
-        let s = format_empty_kernel_list_error(
-            "verifier/sched_foo/kernel_6_14_2/tiny-1llc",
-        );
+        let s = format_empty_kernel_list_error("verifier/sched_foo/kernel_6_14_2/tiny-1llc");
         // Cell name appears verbatim so the operator can grep their
         // own invocation for the failing cell.
         assert!(
@@ -2712,7 +2697,10 @@ mod tests {
             "missing cell name in: {s}",
         );
         // Root cause is named explicitly.
-        assert!(s.contains("KTSTR_KERNEL_LIST is empty"), "missing cause: {s}");
+        assert!(
+            s.contains("KTSTR_KERNEL_LIST is empty"),
+            "missing cause: {s}"
+        );
         // Actionable hint points back at the dispatcher subcommand
         // (the only supported entry point).
         assert!(
@@ -2747,7 +2735,10 @@ mod tests {
         assert!(s.contains("sched_foo"), "missing scheduler name: {s}");
         // Both fix paths are documented: add a kernel to the
         // dispatcher OR drop the matching entry from the declaration.
-        assert!(s.contains("add --kernel"), "missing dispatcher-side fix: {s}");
+        assert!(
+            s.contains("add --kernel"),
+            "missing dispatcher-side fix: {s}"
+        );
         assert!(
             s.contains("declare_scheduler!"),
             "missing declaration-side fix: {s}",
@@ -2760,13 +2751,12 @@ mod tests {
         // (string equality drifted) but the present slice the caller
         // assembles is empty — still surfaces the bracket pair so the
         // diagnostic format is uniform with the non-empty case.
-        let s = format_unknown_kernel_label_error(
-            "verifier/foo/kernel_x/tiny",
-            "kernel_x",
-            "foo",
-            &[],
+        let s =
+            format_unknown_kernel_label_error("verifier/foo/kernel_x/tiny", "kernel_x", "foo", &[]);
+        assert!(
+            s.contains("Present labels: []"),
+            "missing empty brackets: {s}"
         );
-        assert!(s.contains("Present labels: []"), "missing empty brackets: {s}");
     }
 
     #[test]

@@ -585,8 +585,7 @@ static __KTSTR_ENTRY_FAILURE_DUMP_BSS: ktstr::test_support::KtstrTestEntry =
 ///
 /// Distinct from `scenario_failure_dump_renders_bss_fields`:
 /// that test exercises the BTF / arena render path; this one
-/// exercises the live-walker captures wired into freeze_coord
-/// at #68/#69/#70.
+/// exercises the live-walker captures wired into freeze_coord.
 fn scenario_failure_dump_renders_capture_modules(
     ctx: &ktstr::scenario::Ctx,
 ) -> Result<AssertResult> {

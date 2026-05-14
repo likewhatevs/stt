@@ -75,8 +75,8 @@ For the full attribute reference, see
 ## Step 2: Define your scheduler
 
 To target a sched_ext scheduler, declare it with
-`declare_scheduler!` and reference the generated `_PAYLOAD` const
-from `#[ktstr_test(scheduler = …)]`. The example uses `scx-ktstr`,
+`declare_scheduler!` and reference the generated const from
+`#[ktstr_test(scheduler = …)]`. The example uses `scx-ktstr`,
 the test-fixture scheduler shipped in this workspace; substitute
 your own binary name to target a different scheduler.
 
@@ -89,21 +89,19 @@ declare_scheduler!(KTSTR_SCHED, {
     binary = "scx-ktstr",
 });
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     let _ = ctx;
     Ok(AssertResult::pass())
 }
 ```
 
-`declare_scheduler!` emits two consts:
-
-- `pub static KTSTR_SCHED: Scheduler` — the bare scheduler record,
-  registered in the `KTSTR_SCHEDULERS` distributed slice so
-  `cargo ktstr verifier` discovers it automatically.
-- `pub const KTSTR_SCHED_PAYLOAD: Payload` — the `Payload`
-  wrapper. The `scheduler =` slot on `#[ktstr_test]` expects a
-  `Payload`, so pass `KTSTR_SCHED_PAYLOAD`.
+`declare_scheduler!` emits a `pub static KTSTR_SCHED: Scheduler`
+holding the declared fields and registers a private static in the
+`KTSTR_SCHEDULERS` distributed slice via `linkme` so
+`cargo ktstr verifier` discovers it automatically. The
+`scheduler =` slot on `#[ktstr_test]` expects an `&'static Scheduler`
+— pass the bare `KTSTR_SCHED` ident.
 
 The macro fields:
 
@@ -149,7 +147,7 @@ will swap one of them for a phased workload:
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 1, cores = 2, threads = 1)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 1, cores = 2, threads = 1)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("background_spinner")
@@ -199,7 +197,7 @@ Bump the topology to two LLCs with two cores each (4 CPUs total) so
 each cgroup can own its own LLC:
 
 ```rust,ignore
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 2, cores = 2, threads = 1)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 2, cores = 2, threads = 1)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("background_spinner")
@@ -244,7 +242,7 @@ the last phase ends the loop restarts from `first`. Phases:
 use std::time::Duration;
 use ktstr::prelude::*;
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 2, cores = 2, threads = 1)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 2, cores = 2, threads = 1)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         // Persistent CPU pressure on LLC 0 for the whole run.
@@ -308,7 +306,7 @@ phase iteration repeats many times):
 
 ```rust,ignore
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     llcs = 2,
     cores = 2,
     threads = 1,
@@ -351,7 +349,7 @@ use std::time::Duration;
 use ktstr::prelude::*;
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     llcs = 2,
     cores = 2,
     threads = 1,
@@ -502,7 +500,7 @@ and a `hold` duration:
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(scheduler = KTSTR_SCHED_PAYLOAD, llcs = 2, cores = 2, threads = 1, duration_s = 20)]
+#[ktstr_test(scheduler = KTSTR_SCHED, llcs = 2, cores = 2, threads = 1, duration_s = 20)]
 fn mixed_workloads(ctx: &Ctx) -> Result<AssertResult> {
     execute_steps(ctx, vec![
         Step {
@@ -615,11 +613,10 @@ const LAYERED_SCHED: Scheduler = Scheduler::new("layered")
     .binary(SchedulerSpec::Discover("scx_layered"))
     .topology(1, 2, 4, 1)
     .config_file_def("--config {file}", "/include-files/layered.json");
-const LAYERED_PAYLOAD: Payload = Payload::from_scheduler(&LAYERED_SCHED);
 
 const LAYERED_CONFIG: &str = r#"{ "layers": [{ "name": "default" }] }"#;
 
-#[ktstr_test(scheduler = LAYERED_PAYLOAD, config = LAYERED_CONFIG)]
+#[ktstr_test(scheduler = LAYERED_SCHED, config = LAYERED_CONFIG)]
 fn layered_default(ctx: &Ctx) -> Result<AssertResult> {
     Ok(AssertResult::pass())
 }
@@ -716,7 +713,7 @@ fn check_dispatch_advances(result: &VmResult) -> Result<()> {
 }
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     llcs = 2,
     cores = 2,
     threads = 1,
@@ -803,24 +800,22 @@ CI). For the full subcommand surface, see
 
 ## The complete test
 
-The shape exercised by every step above, in one file. `Slow` and
-`Scattershot` enable scx-ktstr's `--slow` / `--scattershot` modes via
-the gauntlet (Step 10); `watchdog_timeout_s = 10` overrides the
-sched_ext stall threshold (Step 6); `num_snapshots` + `post_vm`
-enable periodic capture and a temporal assertion (Step 14):
+The shape exercised by every step above, in one file.
+`sched_args = ["--slow"]` always-applies scx-ktstr's `--slow` mode
+(Step 2); `watchdog_timeout_s = 10` overrides the sched_ext stall
+threshold (Step 6); `num_snapshots` + `post_vm` enable periodic
+capture and a temporal assertion (Step 14):
 
 ```rust,ignore
 use std::time::Duration;
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-#[derive(Scheduler)]
-#[scheduler(name = "ktstr_sched", binary = "scx-ktstr")]
-enum KtstrSchedFlag {
-    #[flag(args = ["--slow"])]
-    Slow,
-    #[flag(args = ["--scattershot"])]
-    Scattershot,
-}
+declare_scheduler!(KTSTR_SCHED, {
+    name = "ktstr_sched",
+    binary = "scx-ktstr",
+    sched_args = ["--slow"],
+});
 
 fn check_dispatch_advances(result: &VmResult) -> Result<()> {
     let series = SampleSeries::from_drained(
@@ -842,7 +837,7 @@ fn check_dispatch_advances(result: &VmResult) -> Result<()> {
 }
 
 #[ktstr_test(
-    scheduler = KTSTR_SCHED_PAYLOAD,
+    scheduler = KTSTR_SCHED,
     llcs = 2,
     cores = 2,
     threads = 1,

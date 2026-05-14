@@ -1,7 +1,7 @@
 error[E0277]: `MonotonicNs` is not Maxable — `max` is undefined for this category
-  --> tests/compile_fail/metric_types_monotonic_ns_not_maxable.rs:15:23
+  --> tests/compile_fail/metric_types_monotonic_ns_not_maxable.rs:14:23
    |
-15 |     require_maxable::<ktstr::metric_types::MonotonicNs>();
+14 |     require_maxable::<ktstr::metric_types::MonotonicNs>();
    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this metric type does not support max-across
    |
    = help: the trait `Maxable` is not implemented for `MonotonicNs`
@@ -26,8 +26,8 @@ help: the following other types implement trait `Maxable`
    | impl_maxable_only_u64!(GaugeCount);
    | ---------------------------------- in this macro invocation
 note: required by a bound in `require_maxable`
-  --> tests/compile_fail/metric_types_monotonic_ns_not_maxable.rs:12:23
+  --> tests/compile_fail/metric_types_monotonic_ns_not_maxable.rs:11:23
    |
-12 | fn require_maxable<T: ktstr::metric_types::Maxable>() {}
+11 | fn require_maxable<T: ktstr::metric_types::Maxable>() {}
    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `require_maxable`
    = note: this error originates in the macro `impl_maxable_only_u64` (in Nightly builds, run with -Z macro-backtrace for more info)

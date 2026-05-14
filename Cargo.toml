@@ -9,7 +9,7 @@ repository = "https://github.com/likewhatevs/ktstr"
 
 [package]
 name = "ktstr"
-version = "0.4.23"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -35,7 +35,7 @@ crc32fast = "1.5"
 # (`features/serde/ser.rs` + `de_owned.rs`); the wire format pin uses
 # `bincode::config::standard()` (little-endian, variable-int) for both
 # guest and host so layout never diverges. Pre-1.0 — old sidecar /
-# baseline data is disposable per project policy.
+# baseline data is disposable; re-running tests regenerates the cache.
 bincode = { version = "2", features = ["serde"] }
 itoa = "1"
 gix = { version = "0.81", default-features = false, features = ["sha1", "blocking-network-client", "blocking-http-transport-reqwest-rust-tls", "worktree-mutation", "status", "revision"] }
@@ -75,7 +75,7 @@ vm-superio = "0.8.1"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 polars = { version = "0.53.0", default-features = false, features = ["lazy", "describe"] }
 linkme = "0.3"
-ktstr-macros = { version = "0.4.8", path = "ktstr-macros" }
+ktstr-macros = { version = "0.5.0", path = "ktstr-macros" }
 goblin = { version = "0.10.5", features = ["elf64"] }
 # Memory-map /proc/self/exe in `try_flush_profraw` instead of reading
 # the whole binary into a Vec<u8>. Coverage-instrumented test binaries

@@ -24,7 +24,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::kernel::{encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set};
+use crate::kernel::{
+    encode_kernel_list, path_kernel_label, resolve_kernel_image, resolve_kernel_set,
+};
 
 /// Dispatch the `cargo ktstr verifier` subcommand.
 pub(crate) fn run_verifier(kernel: Vec<String>, raw: bool) -> Result<(), String> {

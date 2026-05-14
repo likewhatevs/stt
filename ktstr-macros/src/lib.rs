@@ -4,17 +4,8 @@ use syn::{
     Data, DeriveInput, Fields, ItemFn, Meta, MetaNameValue, parse::Parser, parse_macro_input,
 };
 
-// `kernel_path` is mirrored from the parent ktstr crate via
-// `build.rs` (see that file for the rationale). It exposes
-// `KernelId::parse` + `KernelId::validate` — the same parser the
-// verifier uses at runtime — so `declare_scheduler!` can reject
-// obviously-malformed `kernels = [..]` entries at macro expand time
-// instead of letting them surface as "cache key not found" errors
-// inside the verifier.
 #[allow(dead_code)]
-mod kernel_path {
-    include!(concat!(env!("OUT_DIR"), "/kernel_path.rs"));
-}
+mod kernel_path;
 
 /// Emit `Some(value)` or `None` as token streams.
 fn option_tokens<T: ToTokens>(opt: &Option<T>) -> proc_macro2::TokenStream {

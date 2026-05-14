@@ -14,7 +14,7 @@
 //! re-collapses the four-way result back to a plain bool fails here
 //! before reaching production.
 //!
-//! Cases (a)-(g) from the F11 finding map to the named tests below:
+//! Cases (a)-(g) for the cached_bss_pa resolver map to the named tests below:
 //!   (a) cached_bss_pa pointing at OOB PA returning 0 vs OutOfBounds
 //!       → `out_of_bounds_pa_distinguished_from_zero`
 //!   (b) cached_bss_offset wrap-around → `wrap_around_pa_lands_oob`
@@ -124,9 +124,9 @@ fn triggered_on_arbitrary_nonzero_value() {
 /// bare `mem.read_u32(pa, 0)` would return `0` per `read_scalar`'s
 /// OOB-zero contract; the helper must return `OutOfBounds` so the
 /// freeze coordinator can warn rather than silently mistake a stale
-/// cache for "no fire". This is the load-bearing invariant the
-/// F11(a) finding names: the distinction the production code lacked
-/// before this fix.
+/// cache for "no fire". This is the load-bearing invariant: the
+/// distinction between stale-cache OOB and zero-valued in-bounds
+/// read that the production code lacked before this guard landed.
 #[test]
 fn out_of_bounds_pa_distinguished_from_zero() {
     let (mem, _buf) = build_mem(0x1000);
@@ -201,8 +201,7 @@ fn pa_one_byte_before_end_returns_oob() {
 /// Each row in this matrix exercises one of the eight reachable
 /// combinations of (watchpoint_hit, bss_state). Pins the production
 /// semantics: only Triggered contributes to the bss side;
-/// OutOfBounds and NotResolved do NOT count as a fire. This is case
-/// (c) from the F11 finding.
+/// OutOfBounds and NotResolved do NOT count as a fire.
 #[test]
 fn err_triggered_or_gate_combinations() {
     struct Row {
@@ -228,7 +227,7 @@ fn err_triggered_or_gate_combinations() {
             wp_hit: false,
             bss_state: BssReadState::OutOfBounds,
             expected_err: false,
-            label: "OOB must NOT count as a fire (the F11(a) invariant)",
+            label: "OOB must NOT count as a fire (stale-cache invariant)",
         },
         Row {
             wp_hit: false,

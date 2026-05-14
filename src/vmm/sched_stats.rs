@@ -587,15 +587,14 @@ impl SchedStatsClient {
         // trailing newline scx_stats expects. Bound the device
         // mutex critical section to the queue_input_port2 call.
         //
-        // B15 fix: drop any host→guest bytes that are still
-        // sitting in `port2_pending_rx` from a prior request that
-        // was abandoned mid-push (e.g. a freeze rendezvous landed
-        // before the guest read those bytes). Without this clear,
-        // the new request would be concatenated onto the dead
-        // tail of the previous one and the guest relay would
-        // forward torn JSON to the scheduler. Account for the
-        // discard via `discarded_bytes` so a stuck-stats
-        // post-mortem can see it.
+        // Drop any host→guest bytes that are still sitting in
+        // `port2_pending_rx` from a prior request that was abandoned
+        // mid-push (e.g. a freeze rendezvous landed before the guest
+        // read those bytes). Without this clear, the new request
+        // would be concatenated onto the dead tail of the previous
+        // one and the guest relay would forward torn JSON to the
+        // scheduler. Account for the discard via `discarded_bytes`
+        // so a stuck-stats post-mortem can see it.
         {
             let mut g = self.shared.virtio_con.lock();
             let stale_in = g.clear_port2_pending_rx();
@@ -893,7 +892,7 @@ fn drainer_loop(
             match ev.data() {
                 TOKEN_KILL => {
                     let _ = kill_drainer.read();
-                    // B5 fix: acquire the response_buf lock BEFORE
+                    // Acquire the response_buf lock BEFORE
                     // notifying the cvar. Without the lock the
                     // notify_all can fire after the request thread
                     // has dropped the lock-guard but BEFORE it has
@@ -928,7 +927,7 @@ fn drainer_loop(
                     if let Some(c) = cancel_evt.as_ref() {
                         let _ = c.read();
                     }
-                    // Lock-then-notify, same B5 TOCTOU rationale
+                    // Lock-then-notify, same TOCTOU rationale
                     // as the TOKEN_KILL arm above.
                     let (lock, cvar) = &*response_buf;
                     let _guard = lock.lock();
@@ -937,8 +936,7 @@ fn drainer_loop(
                 }
                 TOKEN_DATA => {
                     let _ = stats_tx_evt.read();
-                    // Drain regardless of in-flight state. F14
-                    // ruling: the drainer always drains so a
+                    // Drain regardless of in-flight state so a
                     // hostile or runaway guest can't grow
                     // port2_tx_buf without bound when no host
                     // request is outstanding.
@@ -955,9 +953,9 @@ fn drainer_loop(
                             // Hard 2x cap to prevent unbounded growth
                             // even when a request is mid-flight (a
                             // hostile guest could send bytes faster
-                            // than the request can complete). B4
-                            // fix: inject a synthetic error envelope
-                            // so request_raw wakes from cvar.wait,
+                            // than the request can complete).
+                            // Inject a synthetic error envelope so
+                            // request_raw wakes from cvar.wait,
                             // observes a complete `\n`-terminated
                             // line, and surfaces NoScheduler — the
                             // prior code dropped bytes silently and
@@ -979,7 +977,7 @@ fn drainer_loop(
                             cvar.notify_all();
                         }
                     } else {
-                        // F14 ruling: discard bytes when no request is
+                        // Discard bytes when no request is
                         // outstanding, log the discard count.
                         let total = discarded_bytes
                             .fetch_add(bytes.len() as u64, Ordering::Relaxed)

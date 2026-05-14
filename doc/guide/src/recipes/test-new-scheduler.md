@@ -21,10 +21,11 @@ declare_scheduler!(MY_SCHED, {
 });
 ```
 
-The macro generates `pub static MY_SCHED: Scheduler` and a
-`pub const MY_SCHED_PAYLOAD: Payload` wrapper. Tests reference
-the `*_PAYLOAD` form; the bare `MY_SCHED` form is for library
-code that composes `Scheduler` builders directly.
+The macro generates `pub static MY_SCHED: Scheduler` plus a
+private `linkme` registration so `cargo ktstr verifier`
+discovers the scheduler automatically. Tests reference the
+bare `MY_SCHED` ident via
+`#[ktstr_test(scheduler = MY_SCHED)]`.
 
 See [Scheduler Definitions](../writing-tests/scheduler-definitions.md)
 for every supported field.
@@ -37,13 +38,13 @@ Tests inherit the scheduler's topology. Override with explicit
 ```rust,ignore
 use ktstr::prelude::*;
 
-#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
+#[ktstr_test(scheduler = MY_SCHED)]
 fn basic_steady(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits 1n2l4c1t from MY_SCHED_PAYLOAD
+    // Inherits 1n2l4c1t from MY_SCHED
     scenarios::steady(ctx)
 }
 
-#[ktstr_test(scheduler = MY_SCHED_PAYLOAD, threads = 2)]
+#[ktstr_test(scheduler = MY_SCHED, threads = 2)]
 fn smt_steady(ctx: &Ctx) -> Result<AssertResult> {
     // Inherits llcs=2, cores=4; overrides threads to exercise SMT
     scenarios::steady(ctx)
@@ -79,8 +80,10 @@ cargo ktstr verifier
 # Pin to a specific kernel build.
 cargo ktstr verifier --kernel ../linux
 
-# Sweep across the declared kernels (labels must align with
-# the scheduler's `kernels = [...]` declaration).
+# Sweep across multiple kernels. Each scheduler's
+# `kernels = [...]` declaration acts as a per-scheduler filter on
+# the operator-supplied set; an empty (or omitted) `kernels` field
+# means the scheduler runs against every kernel in the sweep.
 cargo ktstr verifier --kernel 6.14 --kernel 7.0
 ```
 

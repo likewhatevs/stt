@@ -3283,7 +3283,7 @@ mod tests {
         assert!(
             super::SHARED_CLIENT.get().is_none(),
             "is_shared_client's None branch must NOT initialize \
-             SHARED_CLIENT — the optimization in #111 relies on \
+             SHARED_CLIENT — the singleton optimization relies on \
              skipping `get_or_init` when no shared client has \
              been requested yet",
         );

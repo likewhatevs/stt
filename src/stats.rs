@@ -6652,9 +6652,9 @@ mod tests {
 
     /// `(Some, Some)` identical with both sides carrying the SAME
     /// arch: the helper appends `(arch: {value})` to the identical
-    /// confirmation line. Pins GAP-D so an operator running
-    /// `stats compare` on two same-arch runs sees that the
-    /// matching dimension covers arch — distinguishing
+    /// confirmation line. Pins the identical-arch surfacing contract
+    /// so an operator running `stats compare` on two same-arch runs
+    /// sees that the matching dimension covers arch — distinguishing
     /// "both x86_64, identical" from "both aarch64, identical"
     /// without inspecting individual sidecars.
     #[test]
@@ -9527,9 +9527,9 @@ mod tests {
     }
 
     /// `sorted_run_entries` extracts the arch from the first
-    /// sidecar that carries `host.arch`. Pins the GAP-A contract
-    /// so a regression that drops the field, scans the wrong
-    /// option leg, or stops short on a host-None sidecar
+    /// sidecar that carries `host.arch`. Pins the arch-extraction
+    /// contract so a regression that drops the field, scans the
+    /// wrong option leg, or stops short on a host-None sidecar
     /// surfaces here.
     #[test]
     fn sorted_run_entries_extracts_arch_from_first_sidecar() {

@@ -6,32 +6,20 @@ or relaxed event rates.
 
 ## Scheduler-level overrides
 
-Define a `Scheduler` with custom checks:
+Declare a scheduler with custom assertion overrides:
 
 ```rust,ignore
+use ktstr::declare_scheduler;
 use ktstr::prelude::*;
 
-static MY_LLC: FlagDecl = FlagDecl {
-    name: "llc",
-    args: &["--enable-llc"],
-    requires: &[],
-};
-
-static MY_BORROW: FlagDecl = FlagDecl {
-    name: "borrow",
-    args: &["--enable-borrowing"],
-    requires: &[],
-};
-
-const RELAXED: Scheduler = Scheduler::new("relaxed")
-    .binary(SchedulerSpec::Discover("scx_relaxed"))
-    .flags(&[&MY_LLC, &MY_BORROW])
-    .assert(
-        Assert::NO_OVERRIDES
-            .max_imbalance_ratio(5.0)    // tolerate 5:1 imbalance
-            .max_fallback_rate(500.0)     // higher fallback rate ok
-            .fail_on_stall(false)         // don't fail on stall
-    );
+declare_scheduler!(RELAXED, {
+    name = "relaxed",
+    binary = "scx_relaxed",
+    assert = Assert::NO_OVERRIDES
+        .max_imbalance_ratio(5.0)    // tolerate 5:1 imbalance
+        .max_fallback_rate(500.0)     // higher fallback rate ok
+        .fail_on_stall(false),        // don't fail on stall
+});
 ```
 
 These overrides sit between `Assert::default_checks()` and per-test
@@ -41,14 +29,14 @@ overrides in the merge chain.
 
 ```rust,ignore
 #[ktstr_test(
-    scheduler = RELAXED_PAYLOAD,
+    scheduler = RELAXED,
     not_starved = true,
     max_gap_ms = 5000,
     max_imbalance_ratio = 10.0,
     sustained_samples = 10,
 )]
 fn high_imbalance_test(ctx: &Ctx) -> Result<AssertResult> {
-    // Inherits topology from RELAXED_PAYLOAD
+    // Inherits topology from RELAXED
     Ok(AssertResult::pass())
 }
 ```

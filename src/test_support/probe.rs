@@ -3982,7 +3982,7 @@ mod tests {
     // non-empty stderr). Without the disambiguation, the second case
     // surfaces the misleading "scheduler crashed before kernel
     // printk reached the UART buffer" diagnostic against a clean
-    // run — the bug the cleaner caught.
+    // run — caught during code review.
 
     #[test]
     fn render_dmesg_tail_filter_empties_non_empty_stderr_emits_pointer_diag() {
@@ -4065,7 +4065,7 @@ mod tests {
 
     #[test]
     fn render_dmesg_tail_dump_plus_replacement_noise_emits_pointer_diag() {
-        // F1: stderr contains sched_ext_dump lines plus U+FFFD
+        // stderr contains sched_ext_dump lines plus U+FFFD
         // corruption residue (lossy-decoded raw 0xFF bytes from the
         // UART). The filter strips dump lines; the residue triggers
         // `classify_dmesg_corruption`. The "scheduler crashed before
@@ -4088,7 +4088,7 @@ mod tests {
 
     #[test]
     fn render_dmesg_tail_dump_plus_control_noise_emits_pointer_diag() {
-        // F1 variant: residue is C0 control chars (uninitialised NUL
+        // Variant: residue is C0 control chars (uninitialised NUL
         // bytes — valid UTF-8 arriving as U+0000) instead of U+FFFD.
         // Same outcome: point at the dump section.
         let stderr = "[  0.5] sched_ext_dump: header\n\0\0\0\n";
@@ -4102,7 +4102,7 @@ mod tests {
 
     #[test]
     fn render_dmesg_tail_dump_plus_whitespace_emits_pointer_diag() {
-        // F2: stderr like `"[1.0] sched_ext_dump: dump\n   \n\t\n"`
+        // stderr like `"[1.0] sched_ext_dump: dump\n   \n\t\n"`
         // filters to whitespace-only residue, which the classifier
         // labels "empty (scheduler crashed...)". Surfacing that
         // diagnostic against real dump lines would be misleading.
@@ -4147,7 +4147,7 @@ mod tests {
 
     #[test]
     fn render_dmesg_tail_latin1_residue_no_dump_passes_through() {
-        // Post-#20 audit: legitimate Latin-1 bytes (U+00A0..=U+00FF
+        // Latin-1 audit: legitimate Latin-1 bytes (U+00A0..=U+00FF
         // outside the C1 control range U+0080..=U+009F) are NOT
         // corruption. A kernel printk that mentions a Latin-1 letter
         // (e.g. an NLS-translated filename, a hardware vendor string,

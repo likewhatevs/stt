@@ -233,7 +233,7 @@ pub struct TaskWalkerEntry {
 /// pre-test baseline) is the consumer's job; this type does not
 /// derive deltas.
 ///
-/// Field semantics match the kernel sources verified by PhD:
+/// Field semantics match the kernel sources:
 ///   - `cpustat_*_ns`: ns counter from
 ///     `kernel_cpustat::cpustat[CPUTIME_*]`. Updated by
 ///     `account_user_time` / `account_system_index_time` and
@@ -2848,8 +2848,8 @@ pub fn dump_state(ctx: DumpContext<'_>) -> FailureDumpReport {
              low-32 keying would misroute every chase",
         );
     }
-    // F7 mitigation: `user_vm_start == 0` is technically 4 GiB-
-    // aligned (and the gate above accepts it), but the
+    // `user_vm_start == 0` is technically 4 GiB-aligned (and the
+    // gate above accepts it), but the
     // [`super::dump::render_map::is_arena_addr_in_snapshot`] helper
     // rejects every address when `user_vm_start == 0` — silently
     // disabling the bridge. Surface a warn so an operator

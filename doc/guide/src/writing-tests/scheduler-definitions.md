@@ -2,9 +2,9 @@
 
 A `Scheduler` tells the test framework how to launch and configure
 the scheduler under test. Tests reference one via
-`#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]`; the verifier sweep
-reads every declared scheduler from the `KTSTR_SCHEDULERS`
-distributed slice automatically.
+`#[ktstr_test(scheduler = MY_SCHED)]`; the verifier sweep reads
+every declared scheduler from the `KTSTR_SCHEDULERS` distributed
+slice automatically.
 
 ## The Scheduler type
 
@@ -50,16 +50,31 @@ binary's CLI — use `sched_args` for that). Do not override the
 kargs ktstr injects itself (`console=`, `loglevel=`, `init=`):
 those break guest-side init and leave the VM unable to run tests.
 
-`kernels` drives the
-[BPF Verifier sweep](../running-tests/verifier.md). Each entry is
-a string consumed by `KernelId::parse` at verifier runtime — the
-same parser as the `cargo ktstr verifier --kernel <SPEC>` CLI
-flag. Accepts exact versions (`"6.14"`), closed ranges spelled
-either `..` or `..=` (`"6.14..7.0"` or `"6.14..=7.0"` — both
-inclusive on both endpoints), git refs (`"git+URL#REF"`), paths,
-and cache keys. An empty `kernels` slice means no verifier cells
-emit for this scheduler — `cargo ktstr verifier` silently skips
-it.
+`kernels` is the **per-scheduler filter** on the
+[BPF Verifier sweep](../running-tests/verifier.md) matrix. The
+matrix dimension itself is the operator's `cargo ktstr verifier
+--kernel <SPEC>` set (which the dispatcher always populates into
+`KTSTR_KERNEL_LIST`, including a single auto-discovered entry
+when `--kernel` is omitted). For each scheduler, the lister
+emits one cell per (kernel-list entry that passes this filter ×
+accepted topology preset).
+
+Each entry is a string consumed by `KernelId::parse` — the same
+parser as the `cargo ktstr verifier --kernel <SPEC>` CLI flag.
+Match semantics per variant:
+
+- Exact `Version` (`"6.14.2"`) — matches an entry whose raw or
+  sanitized label equals the version.
+- `Range` (`"6.14..7.0"` or `"6.14..=7.0"` — both inclusive on
+  both endpoints) — matches entries whose raw version falls
+  inside `[start, end]` via
+  `decompose_version_for_compare`.
+- `Path` / `CacheKey` / `Git` (`"git+URL#REF"`, `"path/to/dir"`,
+  `"6.14.2-tarball-x86_64-kc..."`) — matches by sanitized-label
+  equality.
+
+An empty `kernels = []` means **no filter** — the scheduler
+verifies against every kernel-list entry the operator supplied.
 
 ## SchedulerSpec
 
@@ -118,7 +133,7 @@ declare_scheduler!(MY_SCHED, {
     kernels = ["6.14", "6.15..=7.0"],
 });
 
-#[ktstr_test(scheduler = MY_SCHED_PAYLOAD)]
+#[ktstr_test(scheduler = MY_SCHED)]
 fn basic(ctx: &Ctx) -> Result<AssertResult> {
     execute_defs(ctx, vec![
         CgroupDef::named("cg_0").workers(2),
@@ -130,12 +145,14 @@ fn basic(ctx: &Ctx) -> Result<AssertResult> {
 The macro emits:
 
 - `pub static MY_SCHED: Scheduler` with the supplied fields.
-- A `#[distributed_slice(KTSTR_SCHEDULERS)]` registration so
-  `cargo ktstr verifier` discovers it.
-- `pub const MY_SCHED_PAYLOAD: Payload` — a wrapper around
-  `MY_SCHED` (kind `PayloadKind::Scheduler(&MY_SCHED)`).
-  `#[ktstr_test(scheduler = ...)]` expects the `Payload` form;
-  pass `MY_SCHED_PAYLOAD` to that slot.
+- A private `static __KTSTR_SCHED_REG_MY_SCHED: &'static Scheduler`
+  registered in the `KTSTR_SCHEDULERS` distributed slice via
+  `linkme` so `cargo ktstr verifier` discovers it.
+
+`#[ktstr_test(scheduler = ...)]` expects an `&'static Scheduler` —
+pass the bare ident (e.g. `MY_SCHED`). The macro takes a reference
+internally, so passing the bare const yields the correct
+`&Scheduler`.
 
 ### Accepted fields
 
@@ -303,8 +320,8 @@ individual dimensions. Unset dimensions still inherit from the
 scheduler:
 
 ```rust,ignore
-// Inherits llcs=2, cores=4 from MITOSIS_PAYLOAD; overrides threads to 2
-#[ktstr_test(scheduler = MITOSIS_PAYLOAD, threads = 2)]
+// Inherits llcs=2, cores=4 from MITOSIS; overrides threads to 2
+#[ktstr_test(scheduler = MITOSIS, threads = 2)]
 fn smt_test(ctx: &Ctx) -> Result<AssertResult> { /* ... */ }
 ```
 
@@ -354,15 +371,18 @@ attribution and sidecar identification.
 ## Payload Definitions {#derive-payload}
 
 A `Payload` describes a binary workload that a test can run
-alongside (or in place of) its cgroup workers. The same struct
-encodes both `PayloadKind::Binary` (an external executable —
-`schbench`, `fio`, `stress-ng`) and `PayloadKind::Scheduler`
-(the scheduler under test, constructed via
-`Payload::from_scheduler` and re-emitted by `declare_scheduler!`
-as `*_PAYLOAD`). Tests reference a `Payload` via
-`#[ktstr_test(payload = FIXTURE)]` (primary slot) or
-`#[ktstr_test(workloads = [FIXTURE_A, FIXTURE_B])]` (additional
-slots); the test body then runs it via `ctx.payload(&FIXTURE)`.
+alongside its cgroup workers. The struct encodes
+`PayloadKind::Binary` (an external executable — `schbench`,
+`fio`, `stress-ng`) for the workload role. Tests reference a
+`Payload` via `#[ktstr_test(payload = FIXTURE)]` (primary slot)
+or `#[ktstr_test(workloads = [FIXTURE_A, FIXTURE_B])]`
+(additional slots); the test body then runs it via
+`ctx.payload(&FIXTURE)`.
+
+The `scheduler` slot is separate from the `payload` / `workloads`
+slots — `#[ktstr_test(scheduler = MY_SCHED)]` takes a bare
+`Scheduler` reference (the `declare_scheduler!` const), not a
+`Payload`.
 
 ### `#[non_exhaustive]` and construction rules
 
@@ -376,10 +396,9 @@ functions:
   — minimal binary-kind `Payload` with exit-code-only defaults
   (no declared args, checks, metrics, or include files). Fills
   `name`, sets `kind = PayloadKind::Binary(binary)`.
-- [`Payload::from_scheduler(&'static Scheduler)`](https://likewhatevs.github.io/ktstr/api/ktstr/test_support/struct.Payload.html#method.from_scheduler)
-  — wraps a `Scheduler` const into a `PayloadKind::Scheduler`
-  payload. `declare_scheduler!` uses this internally to emit
-  the `*_PAYLOAD` const; test authors rarely call it directly.
+- [`Payload::new(...)`](https://likewhatevs.github.io/ktstr/api/ktstr/test_support/struct.Payload.html#method.new)
+  — full positional constructor; the [`#[derive(Payload)]`](#derive-payload)
+  macro emits a call to this internally.
 
 For richer binary payloads (custom default args, declared
 `MetricCheck`s, `MetricHint`s, `include_files`), use
@@ -401,8 +420,11 @@ populated by `Payload::binary` + the derive's builder methods:
   same `schbench` binary with a different label.
 - `kind: PayloadKind` — either `Binary(executable_name)` (for
   test payloads like `schbench`) or `Scheduler(&'static Scheduler)`
-  (for the scheduler slot; constructed via
-  `Payload::from_scheduler`).
+  (the in-memory shape of `Payload::KERNEL_DEFAULT` and similar
+  scheduler-wrapping payloads). Test authors normally do not
+  construct `PayloadKind::Scheduler` directly — the
+  `#[ktstr_test(scheduler = MY_SCHED)]` slot takes the bare
+  `Scheduler` ref without a Payload wrapper.
 - `output: OutputFormat` — how to interpret the payload's
   stdout/stderr. `ExitCode` (status code only), `Json` (parse
   numeric leaves), or `LlmExtract(Option<&'static str>)` (route

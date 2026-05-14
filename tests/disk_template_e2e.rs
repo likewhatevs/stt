@@ -3,7 +3,7 @@
 //! Two scenarios pin the lifecycle described in
 //! `src/vmm/disk_template.rs` end-to-end on a real KVM VM:
 //!
-//! - **Template-build VM end-to-end** (`#443`): a `Filesystem::Btrfs`
+//! - **Template-build VM end-to-end**: a `Filesystem::Btrfs`
 //!   disk on the very first invocation triggers
 //!   [`ktstr::vmm::disk_template::ensure_template`]'s
 //!   miss path. The framework boots a one-shot template-build VM
@@ -14,7 +14,7 @@
 //!   a btrfs filesystem (via `BLKID`-equivalent: `statfs.f_type ==
 //!   BTRFS_SUPER_MAGIC`) on `/dev/vda`.
 //!
-//! - **Per-test FICLONE clone** (`#439`): on a warm cache (template
+//! - **Per-test FICLONE clone**: on a warm cache (template
 //!   already published), each test starts from an FICLONE clone
 //!   of the template image. The single-run scenario asserts the
 //!   strongest invariants the entry-level API offers: (a) the
@@ -91,7 +91,7 @@ const KTSTR_DISK_BTRFS: ktstr::prelude::DiskConfig = ktstr::prelude::DiskConfig 
 };
 
 // ----------------------------------------------------------------------------
-// #443 — Template-build VM end-to-end: btrfs filesystem visible on /dev/vda
+// Template-build VM end-to-end: btrfs filesystem visible on /dev/vda
 // ----------------------------------------------------------------------------
 
 /// Boot a `ktstr_test` with `Filesystem::Btrfs`, assert the guest
@@ -186,7 +186,7 @@ fn scenario_btrfs_filesystem_visible_at_dev_vda(
 }
 
 // ----------------------------------------------------------------------------
-// #439 — Per-test FICLONE clone: writes are isolated per-test
+// Per-test FICLONE clone: writes are isolated per-test
 // ----------------------------------------------------------------------------
 
 /// Boot a `ktstr_test` with `Filesystem::Btrfs`, write a sentinel
@@ -394,7 +394,7 @@ fn drive_ktstr_test(scenario_name: &str) {
     );
 }
 
-/// #443 — Template-build VM end-to-end on a CI runner.
+/// Template-build VM end-to-end on a CI runner.
 ///
 /// Boots a `ktstr_test` with `Filesystem::Btrfs`. On a cold cache
 /// this triggers the template-build VM (one-shot guest running
@@ -425,7 +425,7 @@ fn disk_template_e2e_btrfs_template_build() {
     drive_ktstr_test("disk_template_e2e_btrfs_template_build");
 }
 
-/// #439 — Per-test FICLONE clone produces an isolated, writable
+/// Per-test FICLONE clone produces an isolated, writable
 /// btrfs filesystem.
 ///
 /// Asserts the clone is fresh (no pre-existing sentinel file),

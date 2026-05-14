@@ -1784,7 +1784,7 @@ mod tests {
     /// canonical disk-attached VM test. Pins that the gate fires
     /// only on the actual conflict (host_only=true) and not on any
     /// `disk=Some(..)` entry — a future tightening that rejected
-    /// every Some(DiskConfig) would break the entire #18/#165 disk
+    /// every Some(DiskConfig) would break the entire disk
     /// integration test surface.
     #[test]
     fn validate_accepts_vm_with_disk() {
@@ -2746,7 +2746,9 @@ mod tests {
 
     #[test]
     fn topology_json_try_into_topology_accepts_single_cpu() {
-        let topo: Topology = TopologyJson::SINGLE_CPU.try_into().expect("SINGLE_CPU valid");
+        let topo: Topology = TopologyJson::SINGLE_CPU
+            .try_into()
+            .expect("SINGLE_CPU valid");
         assert_eq!(topo.numa_nodes, 1);
         assert_eq!(topo.llcs, 1);
         assert_eq!(topo.cores_per_llc, 1);
@@ -2852,8 +2854,7 @@ mod tests {
             cores_per_llc: u32::MAX / 4,
             threads_per_core: 4,
         };
-        let err =
-            Topology::try_from(json).expect_err("u32 overflow on total cpus must reject");
+        let err = Topology::try_from(json).expect_err("u32 overflow on total cpus must reject");
         assert!(
             err.contains("overflow"),
             "error should mention overflow: {err}"

@@ -2988,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr"
-version = "0.4.23"
+version = "0.5.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "ktstr-macros"
-version = "0.4.23"
+version = "0.5.0"
 dependencies = [
  "proc-macro2",
  "quote",
