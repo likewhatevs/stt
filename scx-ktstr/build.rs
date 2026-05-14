@@ -199,14 +199,8 @@ fn stamp_scx_tag(dest: &Path) -> Result<(), String> {
 /// a top-level `<repo>-<tag>/` prefix component that is stripped here
 /// without depending on the exact prefix shape.
 fn fetch_via_tarball(url: &str, dest: &Path) -> Result<(), String> {
-    // 5s timeout matches the busybox fetch in the workspace root
-    // build.rs. A short timeout is the right choice for a build-time
-    // dependency: a slow or stalled GitHub mirror should fall through
-    // to the gix clone fallback quickly rather than dragging out the
-    // first build, and the tarball is small enough (~MB-scale) that
-    // 5s is far more than enough on a working network.
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let resp = client

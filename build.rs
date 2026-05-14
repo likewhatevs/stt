@@ -303,7 +303,7 @@ int main(void) {{
             );
             let tarball_err = (|| -> Result<(), String> {
                 let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(60))
                     .build()
                     .map_err(|e| format!("http client: {e}"))?;
                 let resp = client

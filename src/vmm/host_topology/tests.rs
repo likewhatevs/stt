@@ -1139,7 +1139,7 @@ fn resource_lock_exclusive_success() {
         locks: Vec::new(),
     };
     let llc_indices = &[90100usize];
-    cleanup_lock("/tmp/ktstr-llc-90100.lock");
+    cleanup_lock(&llc_lock_path(90100));
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
     match outcome {
         LockOutcome::Acquired { llc_offset, locks } => {
@@ -1151,7 +1151,7 @@ fn resource_lock_exclusive_success() {
             panic!("expected Acquired, got Unavailable: {reason}");
         }
     }
-    cleanup_lock("/tmp/ktstr-llc-90100.lock");
+    cleanup_lock(&llc_lock_path(90100));
 }
 
 #[test]
@@ -1163,9 +1163,9 @@ fn resource_lock_shared_includes_cpu_locks() {
         locks: Vec::new(),
     };
     let llc_indices = &[90200usize];
-    cleanup_lock("/tmp/ktstr-llc-90200.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90200.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90201.lock");
+    cleanup_lock(&llc_lock_path(90200));
+    cleanup_lock(&cpu_lock_path(90200));
+    cleanup_lock(&cpu_lock_path(90201));
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
     match outcome {
@@ -1177,9 +1177,9 @@ fn resource_lock_shared_includes_cpu_locks() {
             panic!("expected Acquired, got Unavailable: {reason}");
         }
     }
-    cleanup_lock("/tmp/ktstr-llc-90200.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90200.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90201.lock");
+    cleanup_lock(&llc_lock_path(90200));
+    cleanup_lock(&cpu_lock_path(90200));
+    cleanup_lock(&cpu_lock_path(90201));
 }
 
 #[test]
@@ -1191,9 +1191,9 @@ fn resource_lock_shared_with_service_cpu() {
         locks: Vec::new(),
     };
     let llc_indices = &[90300usize];
-    cleanup_lock("/tmp/ktstr-llc-90300.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90300.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90301.lock");
+    cleanup_lock(&llc_lock_path(90300));
+    cleanup_lock(&cpu_lock_path(90300));
+    cleanup_lock(&cpu_lock_path(90301));
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Shared).unwrap();
     match outcome {
@@ -1205,9 +1205,9 @@ fn resource_lock_shared_with_service_cpu() {
             panic!("expected Acquired, got Unavailable: {reason}");
         }
     }
-    cleanup_lock("/tmp/ktstr-llc-90300.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90300.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90301.lock");
+    cleanup_lock(&llc_lock_path(90300));
+    cleanup_lock(&cpu_lock_path(90300));
+    cleanup_lock(&cpu_lock_path(90301));
 }
 
 #[test]
@@ -1220,7 +1220,7 @@ fn resource_lock_exclusive_skips_cpu_locks() {
         locks: Vec::new(),
     };
     let llc_indices = &[90400usize];
-    cleanup_lock("/tmp/ktstr-llc-90400.lock");
+    cleanup_lock(&llc_lock_path(90400));
 
     let outcome = acquire_resource_locks(&plan, llc_indices, LlcLockMode::Exclusive).unwrap();
     match outcome {
@@ -1232,7 +1232,7 @@ fn resource_lock_exclusive_skips_cpu_locks() {
             panic!("expected Acquired, got Unavailable: {reason}");
         }
     }
-    cleanup_lock("/tmp/ktstr-llc-90400.lock");
+    cleanup_lock(&llc_lock_path(90400));
 }
 
 #[test]
@@ -1245,9 +1245,10 @@ fn resource_lock_contention_returns_unavailable() {
         locks: Vec::new(),
     };
     let llc_indices = &[90500usize];
-    cleanup_lock("/tmp/ktstr-llc-90500.lock");
+    let lock_path = llc_lock_path(90500);
+    cleanup_lock(&lock_path);
 
-    let holder = try_flock("/tmp/ktstr-llc-90500.lock", FlockMode::Exclusive)
+    let holder = try_flock(&lock_path, FlockMode::Exclusive)
         .unwrap()
         .unwrap();
 
@@ -1264,7 +1265,7 @@ fn resource_lock_contention_returns_unavailable() {
         }
     }
     drop(holder);
-    cleanup_lock("/tmp/ktstr-llc-90500.lock");
+    cleanup_lock(&lock_path);
 }
 
 #[test]
@@ -1278,10 +1279,12 @@ fn resource_lock_all_or_nothing() {
         locks: Vec::new(),
     };
     let llc_indices = &[90600usize, 90601];
-    cleanup_lock("/tmp/ktstr-llc-90600.lock");
-    cleanup_lock("/tmp/ktstr-llc-90601.lock");
+    let llc_600 = llc_lock_path(90600);
+    let llc_601 = llc_lock_path(90601);
+    cleanup_lock(&llc_600);
+    cleanup_lock(&llc_601);
 
-    let holder = try_flock("/tmp/ktstr-llc-90601.lock", FlockMode::Exclusive)
+    let holder = try_flock(&llc_601, FlockMode::Exclusive)
         .unwrap()
         .unwrap();
 
@@ -1293,13 +1296,13 @@ fn resource_lock_all_or_nothing() {
 
     // LLC 90600 should be released (all-or-nothing). Verify by
     // acquiring it successfully.
-    let reacquire = try_flock("/tmp/ktstr-llc-90600.lock", FlockMode::Exclusive)
+    let reacquire = try_flock(&llc_600, FlockMode::Exclusive)
         .unwrap()
         .expect("LLC 90600 should be released after all-or-nothing failure");
     drop(reacquire);
     drop(holder);
-    cleanup_lock("/tmp/ktstr-llc-90600.lock");
-    cleanup_lock("/tmp/ktstr-llc-90601.lock");
+    cleanup_lock(&llc_600);
+    cleanup_lock(&llc_601);
 }
 
 #[test]
@@ -1312,10 +1315,12 @@ fn resource_lock_shared_cpu_contention() {
         locks: Vec::new(),
     };
     let llc_indices = &[90700usize];
-    cleanup_lock("/tmp/ktstr-llc-90700.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90700.lock");
+    let llc_path = llc_lock_path(90700);
+    let cpu_path = cpu_lock_path(90700);
+    cleanup_lock(&llc_path);
+    cleanup_lock(&cpu_path);
 
-    let holder = try_flock("/tmp/ktstr-cpu-90700.lock", FlockMode::Exclusive)
+    let holder = try_flock(&cpu_path, FlockMode::Exclusive)
         .unwrap()
         .unwrap();
 
@@ -1326,13 +1331,13 @@ fn resource_lock_shared_cpu_contention() {
     );
 
     // LLC lock should be released (all-or-nothing).
-    let reacquire = try_flock("/tmp/ktstr-llc-90700.lock", FlockMode::Shared)
+    let reacquire = try_flock(&llc_path, FlockMode::Shared)
         .unwrap()
         .expect("LLC 90700 should be released after CPU contention");
     drop(reacquire);
     drop(holder);
-    cleanup_lock("/tmp/ktstr-llc-90700.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90700.lock");
+    cleanup_lock(&llc_path);
+    cleanup_lock(&cpu_path);
 }
 
 #[test]
@@ -1369,12 +1374,15 @@ fn resource_lock_service_cpu_contention() {
         locks: Vec::new(),
     };
     let llc_indices = &[90850usize];
-    cleanup_lock("/tmp/ktstr-llc-90850.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90900.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90901.lock");
+    let llc_path = llc_lock_path(90850);
+    let cpu_900 = cpu_lock_path(90900);
+    let cpu_901 = cpu_lock_path(90901);
+    cleanup_lock(&llc_path);
+    cleanup_lock(&cpu_900);
+    cleanup_lock(&cpu_901);
 
     // Hold the service CPU lock.
-    let holder = try_flock("/tmp/ktstr-cpu-90901.lock", FlockMode::Exclusive)
+    let holder = try_flock(&cpu_901, FlockMode::Exclusive)
         .unwrap()
         .unwrap();
 
@@ -1392,38 +1400,40 @@ fn resource_lock_service_cpu_contention() {
     }
 
     // All prior locks should be released (all-or-nothing).
-    let reacquire_llc = try_flock("/tmp/ktstr-llc-90850.lock", FlockMode::Shared)
+    let reacquire_llc = try_flock(&llc_path, FlockMode::Shared)
         .unwrap()
         .expect("LLC 90850 should be released after service CPU contention");
-    let reacquire_cpu = try_flock("/tmp/ktstr-cpu-90900.lock", FlockMode::Exclusive)
+    let reacquire_cpu = try_flock(&cpu_900, FlockMode::Exclusive)
         .unwrap()
         .expect("CPU 90900 should be released after service CPU contention");
     drop(reacquire_llc);
     drop(reacquire_cpu);
     drop(holder);
-    cleanup_lock("/tmp/ktstr-llc-90850.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90900.lock");
-    cleanup_lock("/tmp/ktstr-cpu-90901.lock");
+    cleanup_lock(&llc_path);
+    cleanup_lock(&cpu_900);
+    cleanup_lock(&cpu_901);
 }
 
 #[test]
 fn cpu_lock_window_success() {
     for c in 91300..91303 {
-        cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
+        cleanup_lock(&cpu_lock_path(c));
     }
     let locks = try_acquire_cpu_window(91300, 3).unwrap();
     assert_eq!(locks.len(), 3);
     for c in 91300..91303 {
-        cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
+        cleanup_lock(&cpu_lock_path(c));
     }
 }
 
 #[test]
 fn cpu_lock_window_contention_all_or_nothing() {
-    cleanup_lock("/tmp/ktstr-cpu-91400.lock");
-    cleanup_lock("/tmp/ktstr-cpu-91401.lock");
+    let cpu_400 = cpu_lock_path(91400);
+    let cpu_401 = cpu_lock_path(91401);
+    cleanup_lock(&cpu_400);
+    cleanup_lock(&cpu_401);
 
-    let holder = try_flock("/tmp/ktstr-cpu-91400.lock", FlockMode::Exclusive)
+    let holder = try_flock(&cpu_400, FlockMode::Exclusive)
         .unwrap()
         .unwrap();
 
@@ -1433,7 +1443,7 @@ fn cpu_lock_window_contention_all_or_nothing() {
     // Hold 91401 instead — 91400 acquires then drops on failure.
     drop(holder);
 
-    let holder2 = try_flock("/tmp/ktstr-cpu-91401.lock", FlockMode::Exclusive)
+    let holder2 = try_flock(&cpu_401, FlockMode::Exclusive)
         .unwrap()
         .unwrap();
     let result2 = try_acquire_cpu_window(91400, 2);
@@ -1441,13 +1451,13 @@ fn cpu_lock_window_contention_all_or_nothing() {
 
     // 91400 was acquired then dropped (all-or-nothing). Verify
     // it's available.
-    let reacquire = try_flock("/tmp/ktstr-cpu-91400.lock", FlockMode::Exclusive)
+    let reacquire = try_flock(&cpu_400, FlockMode::Exclusive)
         .unwrap()
         .expect("CPU 91400 should be released after all-or-nothing");
     drop(reacquire);
     drop(holder2);
-    cleanup_lock("/tmp/ktstr-cpu-91400.lock");
-    cleanup_lock("/tmp/ktstr-cpu-91401.lock");
+    cleanup_lock(&cpu_400);
+    cleanup_lock(&cpu_401);
 }
 
 #[test]
@@ -1462,10 +1472,10 @@ fn cpu_lock_contention_slides_window() {
     // Hold CPU at offset 91500, verify next window succeeds
     // via try_acquire_cpu_window (unit-level sliding test).
     for c in 91500..91503 {
-        cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
+        cleanup_lock(&cpu_lock_path(c));
     }
 
-    let holder = try_flock("/tmp/ktstr-cpu-91500.lock", FlockMode::Exclusive)
+    let holder = try_flock(&cpu_lock_path(91500), FlockMode::Exclusive)
         .unwrap()
         .unwrap();
 
@@ -1478,7 +1488,7 @@ fn cpu_lock_contention_slides_window() {
     drop(locks);
     drop(holder);
     for c in 91500..91503 {
-        cleanup_lock(&format!("/tmp/ktstr-cpu-{c}.lock"));
+        cleanup_lock(&cpu_lock_path(c));
     }
 }
 
@@ -1631,8 +1641,9 @@ fn pid_window_offset_max_start_one() {
 
 #[test]
 fn cpu_lock_acquire_slides_past_held() {
-    cleanup_lock("/tmp/ktstr-cpu-0.lock");
-    let holder = try_flock("/tmp/ktstr-cpu-0.lock", FlockMode::Exclusive)
+    let cpu0 = cpu_lock_path(0);
+    cleanup_lock(&cpu0);
+    let holder = try_flock(&cpu0, FlockMode::Exclusive)
         .unwrap()
         .unwrap();
 
@@ -1640,7 +1651,7 @@ fn cpu_lock_acquire_slides_past_held() {
         Ok(r) => r,
         Err(e) if e.downcast_ref::<ResourceContention>().is_some() => {
             drop(holder);
-            cleanup_lock("/tmp/ktstr-cpu-0.lock");
+            cleanup_lock(&cpu0);
             panic!("{e}");
         }
         Err(e) => panic!("{e:#}"),
@@ -1650,7 +1661,7 @@ fn cpu_lock_acquire_slides_past_held() {
 
     drop(result);
     drop(holder);
-    cleanup_lock("/tmp/ktstr-cpu-0.lock");
+    cleanup_lock(&cpu0);
 }
 
 #[test]
@@ -2803,8 +2814,8 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
     let topo = synth_host_topo(&[(vec![93500], 0), (vec![93501], 0)]);
     // Clean the lockfile paths DISCOVER materializes so the
     // test is idempotent across re-runs.
-    cleanup_lock("/tmp/ktstr-llc-0.lock");
-    cleanup_lock("/tmp/ktstr-llc-1.lock");
+    cleanup_lock(&llc_lock_path(0));
+    cleanup_lock(&llc_lock_path(1));
 
     let test_topo = crate::topology::TestTopology::synthetic(2, 1);
     let counter = std::cell::Cell::new(0u32);
@@ -2832,8 +2843,8 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
     // the second LLC stays unlocked.
     assert_eq!(plan.locked_llcs, vec![0]);
 
-    cleanup_lock("/tmp/ktstr-llc-0.lock");
-    cleanup_lock("/tmp/ktstr-llc-1.lock");
+    cleanup_lock(&llc_lock_path(0));
+    cleanup_lock(&llc_lock_path(1));
 }
 
 /// TOCTOU retry EXHAUSTED path via the acquire-fn seam: every
@@ -2851,7 +2862,7 @@ fn acquire_llc_plan_retry_succeeds_on_attempt_one() {
 fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
     let _allowed = AllowedCpusGuard::new(vec![93600]);
     let topo = synth_host_topo(&[(vec![93600], 0)]);
-    cleanup_lock("/tmp/ktstr-llc-0.lock");
+    cleanup_lock(&llc_lock_path(0));
     let test_topo = crate::topology::TestTopology::synthetic(1, 1);
 
     let counter = std::cell::Cell::new(0u32);
@@ -2881,7 +2892,7 @@ fn acquire_llc_plan_retry_exhausted_bails_with_resource_contention() {
         "message must name the attempt count: {msg}",
     );
 
-    cleanup_lock("/tmp/ktstr-llc-0.lock");
+    cleanup_lock(&llc_lock_path(0));
 }
 
 /// `plan_from_snapshots` MUST-CONSOLIDATE invariant: on a
@@ -3246,7 +3257,7 @@ fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
         llc_indices: vec![95200],
         locks: Vec::new(),
     };
-    cleanup_lock("/tmp/ktstr-llc-95200.lock");
+    cleanup_lock(&llc_lock_path(95200));
     let outcome = acquire_resource_locks(&plan, &[95200usize], LlcLockMode::Exclusive).unwrap();
     match outcome {
         LockOutcome::Acquired { locks, .. } => {
@@ -3263,5 +3274,5 @@ fn acquire_resource_locks_cargo_test_mode_empty_string_inert() {
             panic!("expected Acquired with empty-string bypass inert, got Unavailable: {reason}");
         }
     }
-    cleanup_lock("/tmp/ktstr-llc-95200.lock");
+    cleanup_lock(&llc_lock_path(95200));
 }
