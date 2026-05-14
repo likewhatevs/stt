@@ -1,39 +1,60 @@
-//! `cargo ktstr verifier` subcommand placeholder.
+//! `cargo ktstr verifier` subcommand: thin wrapper around
+//! `cargo nextest run` filtered to the `verifier/` test-name prefix.
 //!
-//! The prior dispatch path (Stage C) used `--scheduler` /
-//! `--scheduler-bin` to point at a scheduler binary and spawned it
-//! with `--ktstr-list-schedulers` for metadata discovery. That design
-//! was structurally wrong: scheduler binaries under test are not
-//! `ktstr-test-support`-linked and won't intercept the flag — at best
-//! the dispatch silently falls back to a single-cell run, at worst
-//! (host with CAP_BPF + sched_ext kernel) the scheduler binary
-//! attaches as the system scheduler and hijacks the host.
-//!
-//! Replacement design: each `tests/*.rs` integration test crate that
-//! contains `declare_scheduler!` declarations emits verifier cells
-//! (one per declared scheduler × declared kernel × accepted gauntlet
-//! preset) as nextest test names like
-//! `verifier/<sched>/<kernel>/<preset>`. `cargo ktstr verifier` will
-//! invoke `cargo nextest run` with a verifier-prefix filter; nextest
-//! gets per-cell parallelism, retries, and failure isolation for free
-//! — same pattern as `cargo ktstr test`'s gauntlet listing in
-//! `src/test_support/dispatch.rs::list_tests_all`.
-//!
-//! The cell enumerator + cell handler still need to land; this stub
-//! prints a deliberate diagnostic until then so a user invoking
-//! `cargo ktstr verifier` sees the regression explicitly instead of
-//! a partial sweep.
+//! Each test binary that links ktstr-test-support and has at least
+//! one `declare_scheduler!` declaration emits one nextest test per
+//! (declared scheduler × declared kernel × accepted gauntlet preset)
+//! cell. The lister + cell handler live in
+//! `src/test_support/dispatch.rs::list_verifier_cells_all` and
+//! `run_verifier_cell`. Nextest provides per-cell parallelism,
+//! retries, and failure isolation; this dispatcher only resolves the
+//! `--kernel` argument into the existing `KTSTR_KERNEL` /
+//! `KTSTR_KERNEL_LIST` env-var protocol the test binary already
+//! consumes, then exec's nextest with a verifier-prefix filter
+//! expression.
 
-/// Stub dispatch for the verifier subcommand.
-pub(crate) fn run_verifier(_kernel: Vec<String>, _raw: bool) -> Result<(), String> {
-    Err(
-        "cargo ktstr verifier: nextest-based cell sweep is pending; \
-         the prior `--scheduler` / `--scheduler-bin` dispatch was removed \
-         because it required scheduler binaries to link ktstr-test-support \
-         (architecturally wrong — and unsafe on hosts with sched_ext where \
-         the unmodified scheduler binary would attach and hijack the host). \
-         The replacement walks each test binary's `declare_scheduler!` \
-         entries and emits one nextest test per cell."
-            .to_string(),
-    )
+use std::process::Command;
+
+use crate::kernel::{encode_kernel_list, resolve_kernel_set};
+
+/// Dispatch the `cargo ktstr verifier` subcommand.
+pub(crate) fn run_verifier(kernel: Vec<String>, _raw: bool) -> Result<(), String> {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["nextest", "run", "-E", "test(/^verifier/)"]);
+
+    if !kernel.is_empty() {
+        let resolved = resolve_kernel_set(&kernel)?;
+        if resolved.is_empty() {
+            return Err(
+                "--kernel: every supplied value parsed to empty / whitespace; \
+                 omit the flag for auto-discovery, or supply a kernel \
+                 identifier"
+                    .to_string(),
+            );
+        }
+        let first_dir = &resolved[0].1;
+        cmd.env(ktstr::KTSTR_KERNEL_ENV, first_dir);
+        if resolved.len() > 1 {
+            let encoded = encode_kernel_list(&resolved)?;
+            eprintln!(
+                "cargo ktstr verifier: fanning across {n} kernels",
+                n = resolved.len(),
+            );
+            cmd.env(ktstr::KTSTR_KERNEL_LIST_ENV, encoded);
+        }
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| format!("spawn cargo nextest run: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo nextest run exited with {}",
+            status
+                .code()
+                .map_or("signal".to_string(), |c| c.to_string()),
+        ))
+    }
 }
