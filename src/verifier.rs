@@ -583,23 +583,29 @@ pub fn collect_verifier_output(
 ) -> anyhow::Result<VerifierVmResult> {
     use anyhow::Context;
 
+    // Pre-validate via TryFrom so a clean "topology rejected" error
+    // surfaces here instead of the builder's Topology::new panic on
+    // bad input.
+    let validated: crate::vmm::topology::Topology = topology
+        .try_into()
+        .map_err(|e: String| anyhow::anyhow!("invalid topology {topology:?}: {e}"))?;
+
     let sched_args: Vec<String> = extra_sched_args.to_vec();
 
     let no_perf_mode = std::env::var("KTSTR_NO_PERF_MODE").is_ok();
-    // Destructure to the builder's four positional `u32` parameters.
-    // Named-field construction at the call site prevents misorder
-    // (`(num_llcs, num_numa_nodes, ...)`) that a bare 4-tuple would
-    // silently accept.
+    // Use the validated Topology's fields as the source of truth at
+    // the builder boundary. Named-field destructure here prevents the
+    // misorder a bare 4-tuple would silently accept.
     let vm = crate::vmm::KtstrVm::builder()
         .kernel(kernel)
         .init_binary(ktstr_bin)
         .scheduler_binary(sched_bin)
         .sched_args(&sched_args)
         .topology(
-            topology.num_numa_nodes,
-            topology.num_llcs,
-            topology.cores_per_llc,
-            topology.threads_per_core,
+            validated.numa_nodes,
+            validated.llcs,
+            validated.cores_per_llc,
+            validated.threads_per_core,
         )
         .memory_mb(2048)
         .timeout(std::time::Duration::from_secs(120))

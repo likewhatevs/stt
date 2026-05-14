@@ -1352,6 +1352,31 @@ impl TopologyJson {
     };
 }
 
+/// Result-based validation for wire-format topology values. Lets the
+/// verifier dispatch surface a per-cell "topology rejected" diagnostic
+/// instead of taking the [`Topology::new`] panic surface in the builder.
+/// Mirrors [`Topology::validate`] — any field == 0, overflow in total
+/// CPU count, or `llcs` not divisible by `numa_nodes` returns `Err`.
+/// The result is a uniform-distribution [`Topology`] (`nodes = None`,
+/// `distances = None`); explicit per-node config and distance matrices
+/// require constructing [`Topology`] directly.
+impl TryFrom<TopologyJson> for Topology {
+    type Error = String;
+
+    fn try_from(value: TopologyJson) -> Result<Self, Self::Error> {
+        let topo = Self {
+            llcs: value.num_llcs,
+            cores_per_llc: value.cores_per_llc,
+            threads_per_core: value.threads_per_core,
+            numa_nodes: value.num_numa_nodes,
+            nodes: None,
+            distances: None,
+        };
+        topo.validate()?;
+        Ok(topo)
+    }
+}
+
 /// JSON-friendly mirror of [`TopologyConstraints`] — the host-side
 /// `Option<u32>` fields serialize as `null` (default serde behavior;
 /// no `skip_serializing_if`) rather than the `Some(N)`/`None`-tagged
@@ -2662,5 +2687,121 @@ mod tests {
         static A: Scheduler = Scheduler::new("alias_test");
         let map = build_scheduler_index_or_panic([&A, &A]);
         assert!(std::ptr::eq(*map.get("alias_test").unwrap(), &A));
+    }
+
+    #[test]
+    fn topology_json_try_into_topology_accepts_single_cpu() {
+        let topo: Topology = TopologyJson::SINGLE_CPU.try_into().expect("SINGLE_CPU valid");
+        assert_eq!(topo.numa_nodes, 1);
+        assert_eq!(topo.llcs, 1);
+        assert_eq!(topo.cores_per_llc, 1);
+        assert_eq!(topo.threads_per_core, 1);
+        assert!(topo.nodes.is_none());
+        assert!(topo.distances.is_none());
+    }
+
+    #[test]
+    fn topology_json_try_into_topology_accepts_multi_cpu() {
+        let json = TopologyJson {
+            num_numa_nodes: 2,
+            num_llcs: 4,
+            cores_per_llc: 8,
+            threads_per_core: 2,
+        };
+        let topo: Topology = json.try_into().expect("2x4x8x2 valid");
+        assert_eq!(topo.numa_nodes, 2);
+        assert_eq!(topo.llcs, 4);
+        assert_eq!(topo.cores_per_llc, 8);
+        assert_eq!(topo.threads_per_core, 2);
+    }
+
+    #[test]
+    fn topology_json_try_into_topology_rejects_zero_numa_nodes() {
+        let json = TopologyJson {
+            num_numa_nodes: 0,
+            num_llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+        };
+        let err = Topology::try_from(json).expect_err("zero numa_nodes must reject");
+        assert!(
+            err.contains("numa_nodes"),
+            "error should mention numa_nodes: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_json_try_into_topology_rejects_zero_llcs() {
+        let json = TopologyJson {
+            num_numa_nodes: 1,
+            num_llcs: 0,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+        };
+        let err = Topology::try_from(json).expect_err("zero llcs must reject");
+        assert!(err.contains("llcs"), "error should mention llcs: {err}");
+    }
+
+    #[test]
+    fn topology_json_try_into_topology_rejects_zero_cores() {
+        let json = TopologyJson {
+            num_numa_nodes: 1,
+            num_llcs: 1,
+            cores_per_llc: 0,
+            threads_per_core: 1,
+        };
+        let err = Topology::try_from(json).expect_err("zero cores_per_llc must reject");
+        assert!(
+            err.contains("cores_per_llc"),
+            "error should mention cores_per_llc: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_json_try_into_topology_rejects_zero_threads() {
+        let json = TopologyJson {
+            num_numa_nodes: 1,
+            num_llcs: 1,
+            cores_per_llc: 1,
+            threads_per_core: 0,
+        };
+        let err = Topology::try_from(json).expect_err("zero threads_per_core must reject");
+        assert!(
+            err.contains("threads_per_core"),
+            "error should mention threads_per_core: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_json_try_into_topology_rejects_indivisible_llcs() {
+        // 3 LLCs across 2 NUMA nodes — not divisible.
+        let json = TopologyJson {
+            num_numa_nodes: 2,
+            num_llcs: 3,
+            cores_per_llc: 1,
+            threads_per_core: 1,
+        };
+        let err = Topology::try_from(json).expect_err("indivisible llcs must reject");
+        assert!(
+            err.contains("divisible"),
+            "error should mention divisibility: {err}"
+        );
+    }
+
+    #[test]
+    fn topology_json_try_into_topology_rejects_overflow_total_cpus() {
+        // 2 LLCs × (u32::MAX / 4) cores × 4 threads overflows u32.
+        let json = TopologyJson {
+            num_numa_nodes: 1,
+            num_llcs: 2,
+            cores_per_llc: u32::MAX / 4,
+            threads_per_core: 4,
+        };
+        let err =
+            Topology::try_from(json).expect_err("u32 overflow on total cpus must reject");
+        assert!(
+            err.contains("overflow"),
+            "error should mention overflow: {err}"
+        );
     }
 }
