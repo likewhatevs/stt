@@ -509,6 +509,20 @@ pub fn ktstr_test_early_dispatch() {
                 std::process::exit(0);
             } else if let Some(pos) = args.iter().position(|a| a == "--exact")
                 && let Some(name) = args.get(pos + 1)
+                && name.starts_with("verifier/")
+            {
+                // verifier/<sched>/<kernel>/<preset> cells bypass
+                // libtest entirely — the cell handler resolves the
+                // scheduler binary, kernel, and preset topology, runs
+                // collect_verifier_output, prints the result, and
+                // exits. No #[test] wrapper exists for declared
+                // schedulers (declare_scheduler! only emits a static),
+                // so argv-rewrite + DEFERRED_DISPATCH doesn't apply.
+                let code = run_verifier_cell(name);
+                try_flush_profraw();
+                std::process::exit(code);
+            } else if let Some(pos) = args.iter().position(|a| a == "--exact")
+                && let Some(name) = args.get(pos + 1)
                 && (name.starts_with("ktstr/") || name.starts_with("gauntlet/"))
             {
                 let bare = name
@@ -1180,6 +1194,144 @@ fn list_verifier_cells_all() {
                     sched.name, preset.name,
                 );
             }
+        }
+    }
+}
+
+/// Parse `verifier/<sched_name>/<kernel_label>/<preset_name>`, look
+/// up the declared scheduler in [`super::KTSTR_SCHEDULERS`] + the
+/// gauntlet preset in [`crate::vm::gauntlet_presets`], resolve the
+/// scheduler binary path per [`super::SchedulerSpec`], boot the
+/// verifier VM via [`crate::verifier::collect_verifier_output`], and
+/// print the rendered output. Returns 0 on success, 1 on failure /
+/// malformed cell name.
+///
+/// Eevdf + KernelBuiltin scheduler variants currently skip with a
+/// diagnostic — neither has a userspace binary to load BPF programs
+/// from, so the verifier path doesn't apply. They emit a "SKIP" line
+/// + exit 0 so nextest reports the cell as passed.
+fn run_verifier_cell(full_name: &str) -> i32 {
+    use super::SchedulerSpec;
+
+    let rest = match full_name.strip_prefix("verifier/") {
+        Some(r) => r,
+        None => {
+            eprintln!("ktstr verifier: missing 'verifier/' prefix in {full_name:?}");
+            return 1;
+        }
+    };
+    let parts: Vec<&str> = rest.splitn(3, '/').collect();
+    if parts.len() != 3 {
+        eprintln!(
+            "ktstr verifier: malformed cell name {full_name:?}; expected verifier/<sched>/<kernel>/<preset>",
+        );
+        return 1;
+    }
+    let (sched_name, kernel_label, preset_name) = (parts[0], parts[1], parts[2]);
+
+    let Some(sched) = super::KTSTR_SCHEDULERS.iter().find(|s| s.name == sched_name) else {
+        eprintln!(
+            "ktstr verifier: no declared scheduler {sched_name:?} (cell {full_name:?})",
+        );
+        return 1;
+    };
+
+    let preset_list = crate::vm::gauntlet_presets();
+    let Some(preset) = preset_list.iter().find(|p| p.name == preset_name) else {
+        eprintln!(
+            "ktstr verifier: no gauntlet preset {preset_name:?} (cell {full_name:?})",
+        );
+        return 1;
+    };
+
+    // Find which declared kernel spec matches the sanitized label
+    // emitted by list_verifier_cells_all. The label is a one-way
+    // sanitization (slashes / dots → underscores), so we can't simply
+    // reverse it — walk the scheduler's declared kernels and re-sanitize
+    // each to find the match.
+    let Some(kernel_spec) = sched
+        .kernels
+        .iter()
+        .find(|k| sanitize_kernel_label(k) == kernel_label)
+    else {
+        eprintln!(
+            "ktstr verifier: kernel label {kernel_label:?} doesn't match any declared kernel for {sched_name:?} (cell {full_name:?})",
+        );
+        return 1;
+    };
+
+    let sched_bin: std::path::PathBuf = match sched.binary {
+        SchedulerSpec::Discover(pkg) => match crate::build_and_find_binary(pkg) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("ktstr verifier: build scheduler {pkg:?}: {e:#}");
+                return 1;
+            }
+        },
+        SchedulerSpec::Path(p) => {
+            let path = std::path::PathBuf::from(p);
+            if !path.exists() {
+                eprintln!("ktstr verifier: scheduler binary not found: {p}");
+                return 1;
+            }
+            path
+        }
+        SchedulerSpec::Eevdf => {
+            println!(
+                "ktstr verifier: SKIP cell {full_name} (Eevdf has no userspace binary to verify)",
+            );
+            return 0;
+        }
+        SchedulerSpec::KernelBuiltin { .. } => {
+            println!(
+                "ktstr verifier: SKIP cell {full_name} (KernelBuiltin has no userspace binary to verify)",
+            );
+            return 0;
+        }
+    };
+
+    let ktstr_bin = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("ktstr verifier: locate ktstr binary via current_exe(): {e}");
+            return 1;
+        }
+    };
+
+    // Resolve kernel path. KTSTR_TEST_KERNEL takes precedence; fall
+    // back to the kernel_spec itself if it parses as a path.
+    let kernel_path = match resolve_test_kernel() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "ktstr verifier: resolve kernel for cell {full_name}: {e:#} (declared spec: {kernel_spec})",
+            );
+            return 1;
+        }
+    };
+
+    let topology = super::TopologyJson::from(preset.topology);
+    let sched_args: Vec<String> = sched.sched_args.iter().map(|s| s.to_string()).collect();
+
+    println!(
+        "\n=== {sched_name} | kernel {kernel_label} | topology {preset_name} ==="
+    );
+
+    match crate::verifier::collect_verifier_output(
+        &sched_bin,
+        &ktstr_bin,
+        &kernel_path,
+        &sched_args,
+        topology,
+    ) {
+        Ok(result) => {
+            let output = crate::verifier::format_verifier_output("verifier", &result, false);
+            print!("{output}");
+            0
+        }
+        Err(e) => {
+            eprintln!("ktstr verifier: cell {full_name} FAILED: {e:#}");
+            1
         }
     }
 }
