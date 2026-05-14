@@ -156,12 +156,7 @@ fn main() {
             ModelCommand::Status => misc::run_model_status(),
             ModelCommand::Clean => misc::run_model_clean(),
         },
-        KtstrCommand::Verifier {
-            scheduler,
-            scheduler_bin,
-            kernel,
-            raw,
-        } => verifier::run_verifier(scheduler, scheduler_bin, kernel, raw),
+        KtstrCommand::Verifier { kernel, raw } => verifier::run_verifier(kernel, raw),
         KtstrCommand::Funify {
             input,
             seed,

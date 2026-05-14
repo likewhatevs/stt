@@ -188,29 +188,19 @@ pub(crate) enum KtstrCommand {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// Collect BPF verifier statistics for a scheduler.
+    /// Collect BPF verifier statistics for declared schedulers.
     ///
-    /// Builds the scheduler (or uses a pre-built binary), boots a VM,
-    /// loads the scheduler's BPF programs, and reports per-program
-    /// verified instruction counts from host-side memory introspection.
+    /// Sweep mode: iterates every `declare_scheduler!` entry across
+    /// the linked test binaries × their declared `kernels` × accepted
+    /// gauntlet topology presets, reporting per-program verified
+    /// instruction counts from host-side memory introspection.
+    ///
+    /// Temporarily a placeholder while the nextest-generated cell
+    /// dispatch design lands; see task tracking for status.
     Verifier {
-        /// Scheduler package name to build and analyze.
-        #[arg(long)]
-        scheduler: Option<String>,
-        /// Path to pre-built scheduler binary (alternative to --scheduler).
-        #[arg(long, conflicts_with = "scheduler")]
-        scheduler_bin: Option<PathBuf>,
         /// Repeatable. See [`KERNEL_HELP_NO_RAW`] for accepted shapes
-        /// (path / version / cache key / range / git source). When
-        /// the resolved set has 2+ entries, the verifier collects
-        /// stats per kernel sequentially and outputs per-kernel
-        /// blocks separated by a header line — there is no
-        /// cross-kernel summary table. Single-kernel runs are
-        /// unchanged. Raw image files are rejected here for the
-        /// same reason as `cargo ktstr test`/`coverage`/`llvm-cov`:
-        /// the verifier needs the cached `vmlinux` and kconfig
-        /// fragment alongside the image, which a bare `bzImage`
-        /// path does not carry.
+        /// (path / version / cache key / range / git source). Overrides
+        /// the per-scheduler declared `kernels` set when supplied.
         #[arg(long, action = ArgAction::Append, help = KERNEL_HELP_NO_RAW)]
         kernel: Vec<String>,
         /// Print raw verifier output without formatting.
