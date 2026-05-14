@@ -500,7 +500,13 @@ pub fn ktstr_test_early_dispatch() {
     // nextest from running it.
     if std::env::var_os("NEXTEST").is_some() {
         let has_real_tests = KTSTR_TESTS.iter().any(|e| !is_test_sentinel(e.name));
-        if has_real_tests {
+        // A binary may carry only `declare_scheduler!` declarations
+        // (no `#[ktstr_test]` entries) — pure verifier-only test
+        // binaries. Without the scheduler check below the listing
+        // branch would never fire for such a binary and the
+        // verifier cells would silently fail to emit under nextest.
+        let has_schedulers = !super::KTSTR_SCHEDULERS.is_empty();
+        if has_real_tests || has_schedulers {
             let args: Vec<String> = std::env::args().collect();
             if args.iter().any(|a| a == "--list") {
                 ktstr_list_only();
@@ -590,6 +596,36 @@ pub fn ktstr_test_early_dispatch() {
                      `cargo nextest run` (or `cargo ktstr test`) to exercise the full gauntlet, \
                      or set KTSTR_CARGO_TEST_MODE=1 to opt into single-variant bare-`cargo test` \
                      mode without this warning.",
+                );
+            }
+            // Verifier cells are emitted by `list_verifier_cells_all`
+            // which runs ONLY from the NEXTEST listing branch above.
+            // A bare `cargo test` invocation on a binary carrying
+            // `declare_scheduler!` declarations gets zero verifier
+            // coverage — surface the gap with the same opt-out shape
+            // as the gauntlet warning so an unaware operator does not
+            // trust a green run that never reached the verifier.
+            // Eevdf + KernelBuiltin variants don't produce userspace
+            // binaries to verify, so they are excluded from the count
+            // (matching the emission-time filter in
+            // `list_verifier_cells_all`).
+            let verifier_schedulers = super::KTSTR_SCHEDULERS
+                .iter()
+                .filter(|s| {
+                    !matches!(
+                        s.binary,
+                        super::SchedulerSpec::Eevdf | super::SchedulerSpec::KernelBuiltin { .. }
+                    )
+                })
+                .count();
+            if verifier_schedulers > 0 {
+                eprintln!(
+                    "warning: {verifier_schedulers} `declare_scheduler!` declaration(s) in this \
+                     binary will not generate verifier cells — NEXTEST env var is not set and \
+                     verifier cells are emitted only by ktstr's `--list` handler under nextest. \
+                     Use `cargo ktstr verifier` to exercise the verifier sweep, or set \
+                     KTSTR_CARGO_TEST_MODE=1 to acknowledge the verifier-cell-free path without \
+                     this warning.",
                 );
             }
         }
